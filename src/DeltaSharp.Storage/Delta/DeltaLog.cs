@@ -775,9 +775,10 @@ internal sealed class DeltaLog
             // choose which column-mapping identity seeds the baseline snapshot the #671 CDF identity gate then
             // validates: a forged row can govern a checkpointed file while the clean row satisfies the gate,
             // emitting mismapped change data. The count is cross-part (a split forgery, metaData(Y) in one part
-            // and metaData(X) in another, must not slip through). A malformed checkpoint is non-authoritative
-            // (design §2.10.3): this throw is caught below, the partial seed discarded, and the read falls back
-            // to JSON replay — which fails closed on the aged-out gap rather than serving a forged identity.
+            // and metaData(X) in another, must not slip through). A forged checkpoint is non-authoritative
+            // (design §2.10.3): the guard below emits the distinguished forged-reject signal, discards the
+            // partial seed, and returns null so the read falls back to JSON replay — which fails closed on the
+            // aged-out gap rather than serving a forged identity.
             int metadataActions = 0;
             foreach (string partPath in checkpoint.PartPaths)
             {
@@ -818,9 +819,17 @@ internal sealed class DeltaLog
 
                     if (metadataActions > 1)
                     {
-                        throw DeltaProtocolException.Malformed(string.Create(
-                            CultureInfo.InvariantCulture,
-                            $"Checkpoint at version {checkpoint.Version} carries {metadataActions} metaData actions; a checkpoint must summarize at most one."));
+                        // Forged multi-metaData checkpoint (#671 cross-part identity forgery). Distinguish it
+                        // HERE, at the guard, not in the catch below: a corrupt-Parquet decode and this reject
+                        // both surface as a DeltaProtocolException with MalformedAction, so the catch cannot tell
+                        // them apart by introspection (PR #786 council). Emit the distinguished forged-reject
+                        // signal and return null directly — the checkpoint is non-authoritative (design §2.10.3),
+                        // so the partial seed is discarded and the read falls back to JSON replay exactly as the
+                        // catch would, but the forged case is now attributed to `forged_multi_metadata` instead of
+                        // the generic `malformed`. Returning here (rather than throwing to the catch) keeps the
+                        // emission exactly-once. The attacker-chosen metaData count/content is never rendered.
+                        RecordForgedCheckpoint(checkpoint.Version);
+                        return null;
                     }
 
                     state.ApplyAll(actions);
@@ -851,9 +860,29 @@ internal sealed class DeltaLog
     /// seed-time discard and are intentionally not signalled here.</para></summary>
     private void RecordCheckpointFallback(CheckpointFallbackReason reason, long version)
     {
+        // The forged-reject reason has a dedicated emit path (RecordForgedCheckpoint) that pairs it with its
+        // own EventId 4401; routing it through the generic helper would emit the forged metric label under the
+        // generic 4400 log line, silently breaking the reason⇔EventId pairing both design docs assert (#763).
+        Debug.Assert(reason != CheckpointFallbackReason.ForgedMultiMetadata,
+            "Use RecordForgedCheckpoint for the forged-reject reason so it pairs with EventId 4401.");
         _telemetry.RecordCheckpointFallback(reason);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointFallback(_logger, version, DeltaStorageTelemetry.ToLabel(reason));
+    }
+
+    /// <summary>Emits the distinguished forged multi-<c>metaData</c> checkpoint reject signal (#763): the same
+    /// bounded metric increment as <see cref="RecordCheckpointFallback"/> but under the
+    /// <see cref="CheckpointFallbackReason.ForgedMultiMetadata"/> label (<c>forged_multi_metadata</c>), paired
+    /// with a distinct Warning log (<see cref="DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected"/>,
+    /// EventId 4401) so a #671 identity-forgery reject is alertable independently of routine bit-rot. Kept
+    /// exactly-once by the caller returning immediately after (so the generic
+    /// <c>catch (DeltaProtocolException)</c> never re-emits). Renders only the discarded <b>version</b> — never
+    /// the attacker-chosen metaData count/content.</summary>
+    private void RecordForgedCheckpoint(long version)
+    {
+        _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.ForgedMultiMetadata);
+        using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
+        DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected(_logger, version);
     }
 
     /// <summary>Replays JSON commits <c>[start, target]</c> in ascending order into <paramref name="state"/>,

@@ -51,8 +51,28 @@ public sealed class DeltaStorageTelemetryMappingTests
     [Fact]
     public void CheckpointFallbackReason_MapsToBoundedLabel()
     {
-        Assert.Equal("unsupported_feature", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.UnsupportedFeature));
-        Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel(CheckpointFallbackReason.Malformed));
+        // Exhaustive net (#763): every declared reason must have an explicit, pinned label here. This is not a
+        // convenience — the ToLabel switch ends in a `_ => "malformed"` fail-safe, so a future reason (e.g. a new
+        // security class) added WITHOUT its own arm would ship silently mapped to `malformed`, re-introducing the
+        // exact bit-rot/forgery conflation this issue exists to remove. The Assert.True below fails the moment a
+        // reason lacks a pinned expectation, forcing the author to add both a ToLabel arm and an entry here.
+        var expected = new Dictionary<CheckpointFallbackReason, string>
+        {
+            [CheckpointFallbackReason.UnsupportedFeature] = "unsupported_feature",
+            [CheckpointFallbackReason.Malformed] = "malformed",
+            [CheckpointFallbackReason.ForgedMultiMetadata] = "forged_multi_metadata",
+        };
+
+        foreach (CheckpointFallbackReason reason in Enum.GetValues<CheckpointFallbackReason>())
+        {
+            Assert.True(
+                expected.ContainsKey(reason),
+                $"CheckpointFallbackReason.{reason} has no pinned label — add a ToLabel arm and an expectation "
+                + "here rather than relying on the `_ => \"malformed\"` fail-safe (#763).");
+            Assert.Equal(expected[reason], DeltaStorageTelemetry.ToLabel(reason));
+        }
+
+        // The runtime fail-safe for an out-of-range cast stays the bounded `malformed` (never free-text).
         Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel((CheckpointFallbackReason)999));
     }
 

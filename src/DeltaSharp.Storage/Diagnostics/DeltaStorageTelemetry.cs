@@ -78,9 +78,17 @@ internal enum CheckpointFallbackReason
     /// <see cref="StorageErrorKind.UnsupportedFeature"/> from the checkpoint reader.</summary>
     UnsupportedFeature,
 
-    /// <summary>The checkpoint is malformed/corrupt (unreadable Parquet, a protocol-illegal action set, or a
-    /// forged multi-<c>metaData</c> part set) — a <see cref="DeltaProtocolException"/> raised while seeding.</summary>
+    /// <summary>The checkpoint is malformed/corrupt (unreadable Parquet or a protocol-illegal action set) — a
+    /// <see cref="DeltaProtocolException"/> raised while seeding.</summary>
     Malformed,
+
+    /// <summary>The checkpoint carries more than one <c>metaData</c> action across its parts — the #671 cross-part
+    /// identity forgery the single-<c>metaData</c> seed guard rejects. Distinguished from <see cref="Malformed"/>
+    /// because the two are indistinguishable by exception introspection (both surface as a
+    /// <see cref="DeltaProtocolException"/> with <see cref="DeltaProtocolErrorKind.MalformedAction"/>); the reason is
+    /// therefore minted at the guard call site, not derived from the caught exception. A deliberate, individually
+    /// actionable <b>security</b> signal (identity forgery), not routine bit-rot.</summary>
+    ForgedMultiMetadata,
 }
 
 /// <summary>
@@ -281,8 +289,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
 
     /// <summary>The bounded <c>deltasharp.checkpoint.fallback.reason</c> metric label key sub-classifying a
     /// discarded checkpoint by why reconstruction fell back to JSON replay (<c>unsupported_feature</c>,
-    /// <c>malformed</c>). A closed value set (metric-label-safe); the discarded checkpoint <i>version</i> is
-    /// never a metric tag (unbounded over a table's lifetime — it lives only on the fallback log line).</summary>
+    /// <c>malformed</c>, <c>forged_multi_metadata</c>). A closed value set (metric-label-safe); the discarded
+    /// checkpoint <i>version</i> is never a metric tag (unbounded over a table's lifetime — it lives only on the
+    /// fallback log line).</summary>
     internal const string CheckpointFallbackReasonKey = "deltasharp.checkpoint.fallback.reason";
 
     private static readonly string AssemblyVersion =
@@ -643,6 +652,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     {
         CheckpointFallbackReason.UnsupportedFeature => "unsupported_feature",
         CheckpointFallbackReason.Malformed => "malformed",
+        CheckpointFallbackReason.ForgedMultiMetadata => "forged_multi_metadata",
         _ => "malformed",
     };
 
