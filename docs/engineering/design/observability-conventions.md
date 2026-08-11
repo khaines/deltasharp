@@ -328,7 +328,8 @@ rendering it**, not by a redactor:
   blindly `Activity.RecordException(ex)`/`AddException(ex)` (which capture `exception.message`) on a span, nor
   flow a diagnostic `.Message`/`.SimpleString` into a span tag/status/event, nor attach a raw EXPLAIN/plan
   string to a span or structured log, when the identifier can carry tenant identity — scrub/omit the
-  identifier and emit a **bounded structural** value instead. **Audited (#455):** spans, tags and events *are*
+  identifier and emit a **bounded structural** value instead (never the message itself — even sanitized;
+  emit a bounded label/enum/id, e.g. an error-kind classification). **Audited (#455):** spans, tags and events *are*
   emitted today (only the collector is host-gated, #458), and the whole live span surface was enumerated —
   every `SetTag`/`SetStatus`/`AddEvent` uses bounded keys/values, `deltasharp.table` has **zero** producers, no
   `.Message`/`.SimpleString` reaches a tag/status/event, and Core/Executor have no `ILogger`, so an
