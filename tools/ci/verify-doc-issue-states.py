@@ -16,14 +16,13 @@ DOCS = [
     REPO_ROOT / "docs/engineering/design/observability-conventions.md",
 ]
 EXPECTED_ANNOTATED_COUNTS = {
-    "docs/engineering/design/storage-exception-log-routing.md": 8,
+    "docs/engineering/design/storage-exception-log-routing.md": 6,
     "docs/engineering/design/observability-conventions.md": 4,
 }
 EXPECTED_ANNOTATED_ISSUE_FREQUENCIES = {
     "docs/engineering/design/storage-exception-log-routing.md": {
         664: 1,
         689: 1,
-        744: 2,
         746: 1,
         747: 1,
         749: 1,
@@ -40,12 +39,10 @@ EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
     "docs/engineering/design/storage-exception-log-routing.md": [
         (4, 689),
         (6, 664),
-        (20, 744),
-        (298, 749),
-        (335, 744),
-        (561, 750),
-        (654, 746),
-        (662, 747),
+        (299, 749),
+        (569, 750),
+        (662, 746),
+        (670, 747),
     ],
     "docs/engineering/design/observability-conventions.md": [
         (46, 479),
