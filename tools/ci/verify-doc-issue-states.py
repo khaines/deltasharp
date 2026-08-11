@@ -39,10 +39,10 @@ EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
     "docs/engineering/design/storage-exception-log-routing.md": [
         (4, 689),
         (6, 664),
-        (299, 749),
-        (569, 750),
-        (662, 746),
-        (670, 747),
+        (300, 749),
+        (572, 750),
+        (665, 746),
+        (673, 747),
     ],
     "docs/engineering/design/observability-conventions.md": [
         (46, 479),

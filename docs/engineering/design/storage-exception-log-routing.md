@@ -17,8 +17,9 @@
 > recommends is the deploying host's to instantiate and operate, so this page's 07 obligation is to
 > *define, require, name owners for, and ratify defaults for* the retention, audited access, ownership,
 > collection, review, failure-signal, residency, and erasure governance below — which it now does. The
-> `privacy-compliance-grc-lead` sign-off ratifying those default recommendations landed in #744; the host
-> remains the data controller/processor for the sink it deploys. See
+> `privacy-compliance-grc-lead` sign-off ratifying those default recommendations landed in #744; the host —
+> not DeltaSharp — is the accountable party for the sink it deploys (controller or processor per the Owner
+> row). See
 > [What a storage `.Message` still retains](#what-a-storage-message-still-retains). Read with
 > [observability-conventions.md](observability-conventions.md) (the repo-wide logging, metrics, tracing,
 > and redaction rules) and [storage-delta-architecture.md](storage-delta-architecture.md) (the storage
@@ -309,8 +310,9 @@ removes the tenant's own data from a relative path or column name.
 - If your sink is shared across tenants, or is retained beyond your table-data retention, treat
   `.Message` as tenant data: scope it, retain it no longer than the data it describes, and include it in
   erasure scope.
-- If the sink is hosted or third-party, treat it as a sub-processor receiving tenant personal data:
-  its region, residency, support access, and transfer basis are part of the routing decision.
+- If the sink is hosted or third-party, the provider is your **processor or sub-processor** depending on
+  your own posture (see the **Owner** row below): its region, residency, support access, and transfer
+  basis are part of the routing decision.
 - The library-side minimum-disclosure improvement drops partition values from surfaced paths that use
   `DiagnosticText.DescribePath`; producers not yet routed through it remain a routing obligation rather
   than a library guarantee.
@@ -332,9 +334,9 @@ duration, shorter is always compliant, up to and including not retaining at all.
 | **Collection path** | How records reach the sink and stay attributable | A documented, bounded route with **no ambient fan-out**. Attribution keys on every record: **table id + Delta version + timestamp**. Separately maintain an **owned, documented table-id → tenant + storage-location/region mapping**, retained ≥ the sink's retention **plus your breach-notification window** — table id alone resolves neither tenant nor region, both of which 07 breach-triage and residency require. |
 | **Review cadence** | How often retention, access, residency, need are reassessed | At least annually, **and on-event** after any sink/provider, region/residency, or data-classification change (including a new producer entering the message-posture door list, or a `ToString()`/typed-property change). |
 | **Failure signal** | How governance failures surface | An owned, **non-silent** alert / compliance-control failure across **five** classes: (1) collection, (2) retention/expiry, (3) access-audit-logging, (4) erasure failures → **operations owner**; and (5) **unauthorized/anomalous read or exposure** — a denied cross-tenant read, the sink surfaced on a shared or tenant-visible dashboard, or a routing change feeding the raw inner to a chain-walking provider → **security alert to the security/incident owner**, not only ops. |
-| **Erasure path** | How a subject-erasure request reaches this sink | table id + time window yields a **candidate set, not a subject** — the payload is unsanitized free text, so table+time resolves a *window*, not a person. The host either **deletes the whole candidate window (the defensible default)** or content-matches within it, and **must record which**. **Subject-level enumeration is out of scope** — it runs via the source table. Co-erasure scope with the source row: `_delta_log`, time-travel versions, backups, derived tables, **caches, and object-store versions**. Emit an **erasure completion/verification record**: tables, version range, time window, count of records deleted, verification result, and exceptions — carrying **no new PII**. |
+| **Erasure path** | How a subject-erasure request reaches this sink | Table id + time window yields a **candidate set, not a subject** — the payload is unsanitized free text, so table+time resolves a *window*, not a person. The host either **deletes the whole candidate window (the defensible default)** or content-matches within it, and **must record which**. **Subject-level enumeration is out of scope** — it runs via the source table. Co-erasure scope with the source row: `_delta_log`, time-travel versions, backups, derived tables, **caches, and object-store versions**. Emit an **erasure completion/verification record**: tables, version range, time window, count of records deleted, verification result, and exceptions — carrying **no new PII**. |
 | **Breach triage** | How affected parties are resolved on the clock | Use the **table-id → tenant + storage-location/region mapping** (Collection path) to resolve affected **tenants, storage locations, and regions** within the regulatory clock. Subject-level identification is out of scope for the sink and runs via the source table. |
-| **Hosted / third-party sink** | Sub-processor, residency, transfer basis | Treat the provider as a **processor / sub-processor** (per the Owner determination) receiving **unsanitized** tenant personal data. Before use, pin and bind: sub-processor status disclosed; the primary region; **and its cross-region DR/replication regions, lifecycle-tiering regions, and the provider's own sub-processors (fourth parties)** — a region pin that does not bind backup and DR is not a residency commitment. Document the transfer basis where data crosses borders: **DPA executed, SCCs in place, TIA completed, support-access geography reviewed.** |
+| **Hosted / third-party sink** | Processor / sub-processor, residency, transfer basis | Treat the provider as a **processor / sub-processor** (per the Owner determination) receiving **unsanitized** tenant personal data. Before use, pin and bind: sub-processor status disclosed; the primary region; **and its cross-region DR/replication regions, lifecycle-tiering regions, and the provider's own sub-processors (fourth parties)** — a region pin that does not bind backup and DR is not a residency commitment. Document the transfer basis where data crosses borders: **DPA executed, SCCs in place, TIA completed, support-access geography reviewed.** |
 
 `privacy-compliance-grc-lead` has ratified these default recommendations (#744). With them, **this page
 satisfies checklist 07 for the guidance it provides** — you still own instantiating and operating a sink
@@ -480,9 +482,10 @@ their own call-out:
   1), not ephemeral console output. They remain subject to the personal-data, readership, retention, and
   erasure obligations above. Encode and bound the message before writing it — the sweep covers all
   producers known as of `76d2c8e`; any producer at a new guard is a reviewer obligation — and include
-  these sinks: the **retention, erasure, failure-signal, and review-cadence** rows of the #744 governance
-  above apply; the **access-scope** row does not — CRD status and Kubernetes Events are tenant-readable by
-  design, which is why they are `.Message`-only sinks. See also the hygiene work in #749.
+  these sinks: **every #744 governance row above applies except _Access scope_** — CRD status and
+  Kubernetes Events are tenant-readable by design, which is why they are `.Message`-only sinks, so the
+  access-scope row does not apply; retention, owner, collection, review cadence, failure signal, erasure,
+  breach triage, and the hosted-sink row all do. See also the hygiene work in #749.
 
 - If you need the raw inner for on-node debugging, route it to a **server-side-only** sink that no tenant
   can read, with the governance properties in
