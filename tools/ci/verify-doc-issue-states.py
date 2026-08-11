@@ -17,7 +17,7 @@ DOCS = [
 ]
 EXPECTED_ANNOTATED_COUNTS = {
     "docs/engineering/design/storage-exception-log-routing.md": 8,
-    "docs/engineering/design/observability-conventions.md": 4,
+    "docs/engineering/design/observability-conventions.md": 3,
 }
 EXPECTED_ANNOTATED_ISSUE_FREQUENCIES = {
     "docs/engineering/design/storage-exception-log-routing.md": {
@@ -30,7 +30,6 @@ EXPECTED_ANNOTATED_ISSUE_FREQUENCIES = {
         750: 1,
     },
     "docs/engineering/design/observability-conventions.md": {
-        455: 1,
         479: 1,
         747: 1,
         749: 1,
@@ -49,9 +48,8 @@ EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
     ],
     "docs/engineering/design/observability-conventions.md": [
         (46, 479),
-        (332, 455),
-        (338, 747),
-        (339, 749),
+        (342, 747),
+        (343, 749),
     ],
 }
 MAX_MARKER_DISTANCE_CHARS = 200

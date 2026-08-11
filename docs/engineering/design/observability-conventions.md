@@ -327,9 +327,13 @@ rendering it**, not by a redactor:
   The tenant-scrubbing rule applies at the moment such a diagnostic **crosses into telemetry**: do **not**
   blindly `Activity.RecordException(ex)` (which captures `exception.message`) on a span, nor attach a raw
   EXPLAIN/plan string to a span or structured log, when the identifier can carry tenant identity — record a
-  structural/redacted form or omit the identifier. Auditing the existing diagnostic-render paths against
-  this rule once instrumentation is wired is tracked in
-  [#455](https://github.com/khaines/deltasharp/issues/455) <!-- issue-state:open -->.
+  structural/redacted form or omit the identifier. **Audited (#455):** there are no exception-onto-span
+  recording call sites today (telemetry export is host-gated, #458), so there is no live leak;
+  `Activity.AddException` and `Activity.RecordException` are now banned APIs (`BannedSymbols.txt` → RS0030),
+  so a future telemetry site must consciously scrub/omit the identifier (or record a structural form) rather
+  than blindly record a raw diagnostic, and a source-scan test pins zero call sites. The sibling "no raw
+  EXPLAIN/plan string on a span or structured log" rule stays a review-enforced convention — a free-text tag
+  cannot be mechanically banned.
 - **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
   yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed
   through `DiagnosticText.Sanitize`, others are interpolated raw, and the reviewed producer examples are
