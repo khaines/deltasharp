@@ -415,8 +415,8 @@ it did. See [Verification](#verification) for versions and provenance.
 | `Serilog.Exceptions` `Enrich.WithExceptionDetails()` | **Leaks** | (4) destructurer walks the graph |
 | `{@Ex}` destructuring in the message template | **Leaks** | (4) default destructurer reflects public properties — and puts raw `FilePath` first |
 | **Tracing** | | |
-| `Activity.AddException(ex)` (.NET 9+) | Safe | (1)/(2) tags are `.Message`, `.ToString()`, type name |
-| OpenTelemetry `activity.RecordException(ex)` (obsolete in favor of `AddException`) | Safe | (1)/(2) same three tags |
+| `Activity.AddException(ex)` (.NET 9+) | Safe (chain-walk) — but **RS0030-banned in DeltaSharp** | (1)/(2) tags are `.Message`, `.ToString()`, type name. Safe for the `.InnerException`-walk axis, but the `.Message` tag can carry a tenant-bearing identifier, so it is banned here (#455); scrub/omit first. |
+| OpenTelemetry `activity.RecordException(ex)` (obsolete in favor of `AddException`) | Safe (chain-walk) — but **RS0030-banned in DeltaSharp** | (1)/(2) same three tags; banned for the same tenant-identifier reason (#455, forward ban). |
 | **APM SDKs** | | |
 | `TelemetryClient.TrackException(ex)` | **Leaks** | (3) one `ExceptionDetails` entry per chain level |
 | **Serializers and hand-rolled walks** | | |
@@ -459,11 +459,15 @@ their own call-out:
   logger.LogError(ex, "Delta read failed for {Table}.", tableId);
   ```
 
-- On a span, use the built-in exception recording, which captures `exception.message`
-  (`ex.Message`), `exception.stacktrace` (`ex.ToString()`), and `exception.type`:
+- On a span, the built-in exception recording (`activity?.AddException(ex)`) captures `exception.message`
+  (`ex.Message`), `exception.stacktrace` (`ex.ToString()`), and `exception.type` — which is *safe on the
+  chain-walk axis* but **RS0030-banned in DeltaSharp production code (#455)** because `ex.Message` can carry a
+  tenant-bearing table/catalog identifier. Do not call it; instead scrub/omit the identifier and emit a
+  **bounded structural tag** (the sanctioned form), or leave the exception off the span entirely:
 
   ```csharp
-  activity?.AddException(ex);
+  // BANNED (RS0030, #455): activity?.AddException(ex);  // ex.Message may carry a tenant identifier
+  activity?.SetTag("deltasharp.error.kind", classifiedKind);  // bounded, tenant-free
   ```
 
 - Treat CRD status-condition messages and Kubernetes Events as durable `.Message`-only sinks (question

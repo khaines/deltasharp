@@ -73,6 +73,11 @@
   <ItemGroup>
     <PackageVersion Include="Microsoft.CodeAnalysis.PublicApiAnalyzers" Version="5.6.0" />
     <PackageVersion Include="Microsoft.CodeAnalysis.BannedApiAnalyzers" Version="5.6.0" />
+    <!-- Microsoft.CodeAnalysis.CSharp is referenced ONLY by DeltaSharp.Core.Tests as a runtime
+         library (not an analyzer) to parse production source with a real C# parser for the #455
+         telemetry-leak guard (TelemetryExceptionScrubbingGuardTests) — retiring a bug-prone
+         hand-rolled masker. Test-only; never a production/runtime dependency. -->
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
   </ItemGroup>
 
 </Project>

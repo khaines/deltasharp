@@ -30,10 +30,10 @@ EXPECTED_ANNOTATED_ISSUE_FREQUENCIES = {
         750: 1,
     },
     "docs/engineering/design/observability-conventions.md": {
-        455: 1,
         479: 1,
         747: 1,
         749: 1,
+        790: 1,
     },
 }
 EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
@@ -43,15 +43,15 @@ EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
         (20, 744),
         (298, 749),
         (335, 744),
-        (557, 750),
-        (650, 746),
-        (658, 747),
+        (561, 750),
+        (654, 746),
+        (662, 747),
     ],
     "docs/engineering/design/observability-conventions.md": [
         (46, 479),
-        (332, 455),
-        (338, 747),
-        (339, 749),
+        (356, 790),
+        (364, 747),
+        (365, 749),
     ],
 }
 MAX_MARKER_DISTANCE_CHARS = 200

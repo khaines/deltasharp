@@ -325,11 +325,37 @@ rendering it**, not by a redactor:
   embeds the table identifier in its message, and `SinkDescriptor.SimpleString`/EXPLAIN render
   `table=<identifier>` — that is required for the diagnostic to be useful and is **not** a telemetry sink.
   The tenant-scrubbing rule applies at the moment such a diagnostic **crosses into telemetry**: do **not**
-  blindly `Activity.RecordException(ex)` (which captures `exception.message`) on a span, nor attach a raw
-  EXPLAIN/plan string to a span or structured log, when the identifier can carry tenant identity — record a
-  structural/redacted form or omit the identifier. Auditing the existing diagnostic-render paths against
-  this rule once instrumentation is wired is tracked in
-  [#455](https://github.com/khaines/deltasharp/issues/455) <!-- issue-state:open -->.
+  blindly `Activity.RecordException(ex)`/`AddException(ex)` (which capture `exception.message`) on a span, nor
+  flow a diagnostic `.Message`/`.SimpleString` into a span tag/status/event, nor attach a raw EXPLAIN/plan
+  string to a span or structured log, when the identifier can carry tenant identity — scrub/omit the
+  identifier and emit a **bounded structural** value instead (never the message itself — even sanitized;
+  emit a bounded label/enum/id, e.g. an error-kind classification). **Audited (#455):** spans, tags and events *are*
+  emitted today (only the collector is host-gated, #458), and the whole live span surface was enumerated —
+  every `SetTag`/`SetStatus`/`AddEvent` uses bounded keys/values, `deltasharp.table` has **zero** producers, no
+  `.Message`/`.SimpleString` reaches a tag/status/event, and Core/Executor have no `ILogger`, so an
+  `AnalysisException` message reaches no persisted or exported channel — i.e. **no live leak**. The mechanical
+  guard: `Activity.AddException`/`RecordException` (and `TelemetrySpan.RecordException`) are banned
+  (`BannedSymbols.txt` → RS0030, **no `#pragma` exemption** — the sanctioned form is a bounded structural tag,
+  not a pragma'd raw record), and a source-scan test (`TelemetryExceptionScrubbingGuardTests`, a real-parser
+  AST walk) additionally pins that no production code flows a diagnostic member (`.Message`/`.SimpleString`/
+  `.ToString()` of an exception/`.FilePath`/`.ColumnName`/`.Constraint`/`.Reference`/`.TableIdentifier`), an
+  `exception.message`/`exception.stacktrace`/`deltasharp.table` literal key, or the `TableKey` constant, onto
+  **any** span-attribution sink (`SetTag`/`AddTag`/`SetStatus`/`AddEvent`/`ActivityEvent`/`SetBaggage`/
+  `AddBaggage`/`SetCustomProperty`/`StartActivity`/`CreateActivity`/`DisplayName`) **or a metric-tag carrier**
+  (a `KeyValuePair`/`TagList`/`ActivityTagsCollection` construction — a metric label is subject to the same
+  rule as a span attribute) — within a statement, across both the Debug and Release conditional-compilation
+  legs. The scan is deliberately **conservative** (fail-safe: it prefers a false positive — e.g. any
+  `.ToString()`, or a same-named member on an unrelated type — to a miss; pass the typed/bounded value or
+  rename). Residuals stay outside the mechanical guard, each a **review-enforced** obligation: (1) an arbitrary
+  human-chosen free-text EXPLAIN/plan string attached to a span/log (a free-text value cannot be symbol- or
+  scan-banned); (2) a diagnostic value **reached through dataflow the syntactic scan cannot bind** — an
+  intermediate `var` local/helper (`var m = ex.Message; SetTag(k, m);`), an exception via a non-`Exception`-
+  typed carrier (`Task.Exception`, `this` inside an exception type), or a key built by concatenation — where
+  the authoritative dataflow-proof control is the RS0030 ban on the recording APIs plus review; and (3) a
+  tenant-scrubbing seam for the `deltasharp.table` key when a producer is added, tracked in
+  [#790](https://github.com/khaines/deltasharp/issues/790) <!-- issue-state:open --> (gated on #458). The
+  storage-side structured-log axis of this rule is owned separately by `storage-exception-log-routing.md`
+  (#747/#749).
 - **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
   yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed
   through `DiagnosticText.Sanitize`, others are interpolated raw, and the reviewed producer examples are
@@ -341,7 +367,8 @@ rendering it**, not by a redactor:
   `Exception.ToString()` recurses through the inner's *own* virtual `ToString()`. So the safe/unsafe axis
   is **not** "renders vs reflects" — it is **"does the sink walk `.InnerException` itself"**:
   - Safe: a sink that prints `.Message`, or calls `ToString()` **once** — the built-in console providers,
-    Serilog's default `{Exception}` token and JSON formatters, `Activity.AddException(ex)`.
+    Serilog's default `{Exception}` token and JSON formatters, `Activity.AddException(ex)` (safe on this
+    chain-walk axis, but separately **RS0030-banned** for the tenant-identifier reason above — #455).
   - **Leaks:** a sink that enumerates the chain itself even while *rendering* each level — measured on
     NLog's `${exception:maxInnerExceptionLevel=…}` and on Application Insights' `ExceptionDetails` list —
     or that reflects over the object graph (a destructurer, `{@Ex}` in a Serilog template, an

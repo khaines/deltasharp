@@ -92,6 +92,18 @@ ban. Lines are grouped into category sections with `//` comment banners, which
 (no diagnostic), so a mistyped documentation-ID is a no-op — entries must use exact IDs and
 new bans must be proven to fire.
 
+**Forward bans (a deliberate, tracked exception to "proven to fire").** A ban may target an API
+from a package the repository does not yet reference (e.g. an `OpenTelemetry.Trace.*` sink banned
+before `OpenTelemetry.Api` is added), so it is *dormant* — resolvable and firing only once the
+package lands. Such an entry must: (a) be labelled `(Forward ban: resolves once <package> is
+referenced.)` in its remediation text; (b) have its doc-ID verified to fire against a throwaway
+project that *does* reference the package (so it is a deliberate dormant ban, not a typo that stays
+a no-op forever); and (c) where a non-package guard exists in the meantime (e.g. a source-scan
+test), that guard is the active enforcement until the package is referenced. The verification
+obligation is *deferred*, not waived — record the discharge point (re-run the activation probe when
+the package is adopted). Example: the #455 `RecordException` forward bans, verified to fire against
+`OpenTelemetry.Api` and backstopped by `TelemetryExceptionScrubbingGuardTests` until then.
+
 | Category | Examples | Why it is banned | Safe alternative |
 | --- | --- | --- | --- |
 | dynamic-code / AOT | `Expression.Compile`, `System.Reflection.Emit.*` | Emit IL at runtime; NativeAOT-incompatible (ADR-0001, ADR-0014). | Interpreted vectorized backend; gate any compiled tier behind `RuntimeFeature.IsDynamicCodeSupported` with `[RequiresDynamicCode]`. |
