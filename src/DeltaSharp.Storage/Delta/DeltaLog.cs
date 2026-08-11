@@ -860,6 +860,11 @@ internal sealed class DeltaLog
     /// seed-time discard and are intentionally not signalled here.</para></summary>
     private void RecordCheckpointFallback(CheckpointFallbackReason reason, long version)
     {
+        // The forged-reject reason has a dedicated emit path (RecordForgedCheckpoint) that pairs it with its
+        // own EventId 4401; routing it through the generic helper would emit the forged metric label under the
+        // generic 4400 log line, silently breaking the reason⇔EventId pairing both design docs assert (#763).
+        Debug.Assert(reason != CheckpointFallbackReason.ForgedMultiMetadata,
+            "Use RecordForgedCheckpoint for the forged-reject reason so it pairs with EventId 4401.");
         _telemetry.RecordCheckpointFallback(reason);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointFallback(_logger, version, DeltaStorageTelemetry.ToLabel(reason));
@@ -867,14 +872,15 @@ internal sealed class DeltaLog
 
     /// <summary>Emits the distinguished forged multi-<c>metaData</c> checkpoint reject signal (#763): the same
     /// bounded metric increment as <see cref="RecordCheckpointFallback"/> but under the
-    /// <see cref="CheckpointFallbackReason.ForgedMetadata"/> label (<c>forged_multi_metadata</c>), paired with a
-    /// distinct Warning log (<see cref="DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected"/>, EventId 4401)
-    /// so a #671 identity-forgery reject is alertable independently of routine bit-rot. Kept exactly-once by the
-    /// caller returning immediately after (so the generic <c>catch (DeltaProtocolException)</c> never re-emits).
-    /// Renders only the discarded <b>version</b> — never the attacker-chosen metaData count/content.</summary>
+    /// <see cref="CheckpointFallbackReason.ForgedMultiMetadata"/> label (<c>forged_multi_metadata</c>), paired
+    /// with a distinct Warning log (<see cref="DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected"/>,
+    /// EventId 4401) so a #671 identity-forgery reject is alertable independently of routine bit-rot. Kept
+    /// exactly-once by the caller returning immediately after (so the generic
+    /// <c>catch (DeltaProtocolException)</c> never re-emits). Renders only the discarded <b>version</b> — never
+    /// the attacker-chosen metaData count/content.</summary>
     private void RecordForgedCheckpoint(long version)
     {
-        _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.ForgedMetadata);
+        _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.ForgedMultiMetadata);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected(_logger, version);
     }

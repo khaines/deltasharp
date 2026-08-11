@@ -11,8 +11,10 @@ namespace DeltaSharp.Storage.Diagnostics;
 /// </summary>
 /// <remarks>
 /// Messages name only low-cardinality, non-sensitive values — the discarded checkpoint <b>version</b> (an
-/// integer, safe) and the bounded <b>reason</b> (<c>unsupported_feature</c>/<c>malformed</c>/
-/// <c>forged_multi_metadata</c>). A raw storage
+/// integer, safe) and, on the generic fallback site (4400) only, the bounded <b>reason</b>
+/// (<c>unsupported_feature</c>/<c>malformed</c>). The forged-reject site (4401) carries <b>no</b> <c>Reason</c>
+/// field — its <c>forged_multi_metadata</c> attribution rides its distinct <see cref="EventId"/> and the
+/// sibling <c>deltasharp.delta.checkpoint.fallbacks</c> metric label, not a rendered field. A raw storage
 /// path, the checkpoint's contents, or any table/credential value is never rendered (§7.2.2
 /// redaction-by-omission), and the site takes no <see cref="System.Exception"/> object, so a swallowed
 /// (attacker-influenced) exception message can never leak. The shared
@@ -49,6 +51,11 @@ internal static partial class DeltaCheckpointLog
     /// this EventId and the sibling <c>reason=forged_multi_metadata</c> metric label. Renders only the discarded
     /// <b>version</b> (an integer, safe) and takes no <see cref="System.Exception"/> object, so the attacker-chosen
     /// <c>metaData</c> content the reject message would embed can never leak (§7.2.2 redaction-by-omission).
+    /// <para>Logged at <c>Warning</c>, not <c>Critical</c>/<c>Error</c>, deliberately: the forgery was
+    /// <i>successfully blocked</i> — the control worked and the table still reads correctly via fallback — so this
+    /// is a detected-and-contained event, not the unrecoverable security/data-integrity failure the
+    /// <c>Critical</c> tier is reserved for (logging checklist 09a). It sits alongside the sibling 4400 discard at
+    /// the same level; operators page on it by <see cref="EventId"/> (4401) or the bounded metric label.</para>
     /// </summary>
     [LoggerMessage(EventId = 4401, EventName = "DeltaCheckpointForgedMultiMetadataRejected", Level = LogLevel.Warning,
         Message = "Delta checkpoint at version {Version} was rejected as forged and not used to seed the snapshot: "
