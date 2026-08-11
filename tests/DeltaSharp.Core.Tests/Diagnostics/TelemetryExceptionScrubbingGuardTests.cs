@@ -76,10 +76,15 @@ public sealed class TelemetryExceptionScrubbingGuardTests
     // net9+ API in a multi-targeted library) or `#if DEBUG` is not invisible.
     private static readonly CSharpParseOptions[] ParseLegs =
     [
+        // net8.0 · Debug
         new CSharpParseOptions(LanguageVersion.Latest).WithPreprocessorSymbols(
             "NET", "NETCOREAPP", "NET8_0", "NET8_0_OR_GREATER", "DEBUG", "TRACE"),
+        // net10.0 · Debug (also defines the net8/net9 _OR_GREATER symbols a real net10 compile carries)
         new CSharpParseOptions(LanguageVersion.Latest).WithPreprocessorSymbols(
-            "NET", "NETCOREAPP", "NET9_0_OR_GREATER", "NET10_0", "NET10_0_OR_GREATER", "DEBUG", "TRACE"),
+            "NET", "NETCOREAPP", "NET8_0_OR_GREATER", "NET9_0_OR_GREATER", "NET10_0", "NET10_0_OR_GREATER", "DEBUG", "TRACE"),
+        // net10.0 · Release (DEBUG/TRACE undefined — the shipping configuration; covers `#if !DEBUG` / `#else`)
+        new CSharpParseOptions(LanguageVersion.Latest).WithPreprocessorSymbols(
+            "NET", "NETCOREAPP", "NET8_0_OR_GREATER", "NET9_0_OR_GREATER", "NET10_0", "NET10_0_OR_GREATER", "RELEASE"),
     ];
 
     [Fact]
@@ -147,6 +152,11 @@ public sealed class TelemetryExceptionScrubbingGuardTests
             "class C { void M(System.Diagnostics.Activity a, string v){ a?.SetTag(DeltaSharpTelemetry.TableKey, v); } }",
             "class C { void M(System.Collections.Generic.IDictionary<string,object> tags, System.Exception ex){ tags[\"exception.message\"] = ex.Message; } }",
             "class C { void M(System.Diagnostics.Activity a, System.Exception ex){ System.Diagnostics.ActivityEvent e = new(\"x\", tags: new System.Diagnostics.ActivityTagsCollection { { \"d\", ex.Message } }); a?.AddEvent(e); } }",
+            "class C { void M(System.Diagnostics.Metrics.Counter<long> c, System.Exception ex){ c.Add(1, new System.Collections.Generic.KeyValuePair<string, object?>(\"kind\", ex.Message)); } }",
+            "class C { void M(System.Diagnostics.Metrics.Counter<long> c, string v){ c.Add(1, new System.Collections.Generic.KeyValuePair<string, object?>(DeltaSharpTelemetry.TableKey, v)); } }",
+            "class C { void M(System.Exception ex){ var tags = new System.Diagnostics.ActivityTagsCollection { { \"exception.message\", ex.Message } }; System.GC.KeepAlive(tags); } }",
+            "class C { void M(System.Diagnostics.Activity a){ System.Exception failure = Build(); a?.SetTag(\"e\", failure); } System.Exception Build() => new System.Exception(); }",
+            "#if !DEBUG\nclass C { void M(System.Diagnostics.Activity a, System.Exception ex){ a?.SetTag(\"e\", ex.Message); } }\n#endif",
         ];
         foreach (string bad in knownBad)
         {
@@ -161,6 +171,8 @@ public sealed class TelemetryExceptionScrubbingGuardTests
             "// see AddException(ex) — banned; do not call it",
             "class C { const string K = \"the OTel key is exception.message — do not emit it\"; }",
             "class C { void M(System.Diagnostics.Activity a, string boundedValue){ var doc = \"https://x/y see .Message\"; a?.SetTag(\"u\", boundedValue); } }",
+            "class C { void M(System.Diagnostics.Metrics.Counter<long> c, int outcome){ c.Add(1, new System.Collections.Generic.KeyValuePair<string, object?>(\"deltasharp.outcome\", DeltaStorageTelemetry.ToLabel(outcome))); } }",
+            "class C { void M(System.Diagnostics.Activity a, long version){ a?.AddEvent(new System.Diagnostics.ActivityEvent(\"e\", tags: new System.Diagnostics.ActivityTagsCollection { { \"deltasharp.table.version\", version } })); } }",
         ];
         foreach (string good in knownGood)
         {
@@ -265,7 +277,8 @@ public sealed class TelemetryExceptionScrubbingGuardTests
         {
             if (literal.IsKind(SyntaxKind.StringLiteralExpression)
                 && TenantTagKeys.Contains(literal.Token.ValueText)
-                && literal.Ancestors().OfType<ArgumentSyntax>().Any())
+                && (literal.Ancestors().OfType<ArgumentSyntax>().Any()
+                    || literal.Ancestors().OfType<InitializerExpressionSyntax>().Any()))
             {
                 return true;
             }
@@ -293,7 +306,7 @@ public sealed class TelemetryExceptionScrubbingGuardTests
 
         foreach (BaseObjectCreationExpressionSyntax creation in root.DescendantNodes().OfType<BaseObjectCreationExpressionSyntax>())
         {
-            if (CreationIsActivityEvent(creation)
+            if (CreationIsTelemetryTagCarrier(creation)
                 && ((creation.ArgumentList?.Arguments.Any(a => CarriesDiagnostic(a, exceptionVars)) ?? false)
                     || (creation.Initializer is not null && CarriesDiagnostic(creation.Initializer, exceptionVars))))
             {
@@ -360,19 +373,41 @@ public sealed class TelemetryExceptionScrubbingGuardTests
                 names.Add(parameter.Identifier.ValueText);
             }
         }
+        // Locals/fields declared with an exception type (`Exception ex = …;`, `private Exception? _last;`) — the
+        // same syntactic technique as parameters. A `var`-typed local remains the documented laundering residual.
+        foreach (VariableDeclarationSyntax declaration in root.DescendantNodes().OfType<VariableDeclarationSyntax>())
+        {
+            if (TypeSimpleName(declaration.Type) is string declType
+                && declType.EndsWith("Exception", StringComparison.Ordinal))
+            {
+                foreach (VariableDeclaratorSyntax variable in declaration.Variables)
+                {
+                    names.Add(variable.Identifier.ValueText);
+                }
+            }
+        }
         return names;
     }
 
-    private static bool CreationIsActivityEvent(BaseObjectCreationExpressionSyntax creation)
+    // Telemetry tag-carrier constructions whose arguments/initializer must not carry a diagnostic — the span
+    // event plus the metric-tag shapes (a metric label is subject to the same tenant-scrubbing rule as a span
+    // attribute — observability-conventions.md; a Counter.Add/Histogram.Record tag is built as one of these).
+    private static readonly HashSet<string> TelemetryTagCarrierTypes = new(StringComparer.Ordinal)
+    {
+        "ActivityEvent", "ActivityTagsCollection", "TagList", "KeyValuePair",
+    };
+
+    private static bool CreationIsTelemetryTagCarrier(BaseObjectCreationExpressionSyntax creation)
     {
         if (creation is ObjectCreationExpressionSyntax explicitCreation)
         {
-            return TypeSimpleName(explicitCreation.Type) == "ActivityEvent";
+            return TypeSimpleName(explicitCreation.Type) is string typeName && TelemetryTagCarrierTypes.Contains(typeName);
         }
 
-        // Target-typed `ActivityEvent e = new(...)`: read the type from the enclosing declaration.
+        // Target-typed `ActivityEvent e = new(...)` / `KeyValuePair<…> t = new(...)`: read the declared type.
         TypeSyntax? declaredType = creation.Ancestors().OfType<VariableDeclarationSyntax>().FirstOrDefault()?.Type;
-        return declaredType is not null && TypeSimpleName(declaredType) == "ActivityEvent";
+        return declaredType is not null && TypeSimpleName(declaredType) is string declType
+            && TelemetryTagCarrierTypes.Contains(declType);
     }
 
     private static string? InvokedSimpleName(InvocationExpressionSyntax invocation) => invocation.Expression switch

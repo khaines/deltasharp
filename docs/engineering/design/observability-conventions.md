@@ -341,14 +341,21 @@ rendering it**, not by a redactor:
   `.ToString()` of an exception/`.FilePath`/`.ColumnName`/`.Constraint`/`.Reference`/`.TableIdentifier`), an
   `exception.message`/`exception.stacktrace`/`deltasharp.table` literal key, or the `TableKey` constant, onto
   **any** span-attribution sink (`SetTag`/`AddTag`/`SetStatus`/`AddEvent`/`ActivityEvent`/`SetBaggage`/
-  `AddBaggage`/`SetCustomProperty`/`StartActivity`/`DisplayName`) — within a statement. Three residuals stay
-  outside the mechanical guard, each a **review-enforced** obligation: (1) an arbitrary human-chosen free-text
-  EXPLAIN/plan string attached to a span/log (a free-text value cannot be symbol- or scan-banned); (2) a
-  diagnostic value **laundered through an intermediate local, field, or helper** (`var m = ex.Message;
-  SetTag(k, m);`) — intra-procedural dataflow beyond a syntactic scan, where the authoritative dataflow-proof
-  control is the RS0030 ban on the recording APIs plus review; and (3) a tenant-scrubbing seam for the
-  `deltasharp.table` key when a producer is added, tracked in
-  [#790](https://github.com/khaines/deltasharp/issues/790) <!-- issue-state:open --> (gated on #458).
+  `AddBaggage`/`SetCustomProperty`/`StartActivity`/`CreateActivity`/`DisplayName`) **or a metric-tag carrier**
+  (a `KeyValuePair`/`TagList`/`ActivityTagsCollection` construction — a metric label is subject to the same
+  rule as a span attribute) — within a statement, across both the Debug and Release conditional-compilation
+  legs. The scan is deliberately **conservative** (fail-safe: it prefers a false positive — e.g. any
+  `.ToString()`, or a same-named member on an unrelated type — to a miss; pass the typed/bounded value or
+  rename). Residuals stay outside the mechanical guard, each a **review-enforced** obligation: (1) an arbitrary
+  human-chosen free-text EXPLAIN/plan string attached to a span/log (a free-text value cannot be symbol- or
+  scan-banned); (2) a diagnostic value **reached through dataflow the syntactic scan cannot bind** — an
+  intermediate `var` local/helper (`var m = ex.Message; SetTag(k, m);`), an exception via a non-`Exception`-
+  typed carrier (`Task.Exception`, `this` inside an exception type), or a key built by concatenation — where
+  the authoritative dataflow-proof control is the RS0030 ban on the recording APIs plus review; and (3) a
+  tenant-scrubbing seam for the `deltasharp.table` key when a producer is added, tracked in
+  [#790](https://github.com/khaines/deltasharp/issues/790) <!-- issue-state:open --> (gated on #458). The
+  storage-side structured-log axis of this rule is owned separately by `storage-exception-log-routing.md`
+  (#747/#749).
 - **Exception objects are diagnostics too — let `Exception.ToString()` do the chain walk, never do it
   yourself.** Treat every storage `Exception.Message` as untrusted tenant data: some tokens are routed
   through `DiagnosticText.Sanitize`, others are interpolated raw, and the reviewed producer examples are
