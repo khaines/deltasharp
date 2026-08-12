@@ -40,9 +40,9 @@ EXPECTED_ANNOTATED_ISSUE_LINE_ANCHORS = {
         (4, 689),
         (6, 664),
         (300, 749),
-        (572, 750),
-        (665, 746),
-        (673, 747),
+        (614, 750),
+        (707, 746),
+        (715, 747),
     ],
     "docs/engineering/design/observability-conventions.md": [
         (46, 479),
