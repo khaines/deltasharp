@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text;
 using DeltaSharp.Types;
 using Xunit;
 
@@ -330,5 +331,197 @@ public sealed class SchemaJsonSerializerPropertyTests
             .ToArray();
 
         Assert.Equal(serialized.Length, serialized.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    // #709: a byte-literal pin over a double needing MORE than 15 significant digits, so a regression that
+    // truncated the persisted rendering (e.g. "R" -> "G15", or any precision-losing format specifier) fails
+    // the suite. Every other double pinned in the repo is <= 15 significant digits, so "R" and a 15-digit
+    // "G" render identically for all of them and none of them can catch this drift.
+    //
+    // metaData.schemaString is persistent, cross-engine-visible, and retroactively unfixable once committed,
+    // so silent drift here is permanent. On modern .NET "R", "G", and the dropped-specifier default all emit
+    // the shortest round-trippable form (identical to the literal below); an explicit lower-precision
+    // specifier such as "G15" would emit "0.3" and turn this assertion RED.
+    [Fact]
+    public void HighPrecisionDouble_SerializesToItsFullRoundTrippableBytes()
+    {
+        double highPrecision = 0.1 + 0.2; // 0.30000000000000004 — 17 significant digits.
+        var schema = new StructType(new[]
+        {
+            new StructField("d", DataTypes.DoubleType, nullable: true, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("k", MetadataValue.Double(highPrecision)),
+            })),
+        });
+
+        Assert.Equal(
+            "{\"type\":\"struct\",\"fields\":[{\"name\":\"d\",\"type\":\"double\",\"nullable\":true," +
+            "\"metadata\":{\"k\":0.30000000000000004}}]}",
+            SchemaJson.ToJson(schema));
+
+        // The exponent-formatted extremes pin that a specifier change also cannot corrupt very large/small
+        // magnitudes, and that an integral-in-"G" double still keeps a fractional/exponent form so it
+        // re-reads as a Double, not a Long (#330).
+        Assert.Equal("{\"k\":1.7976931348623157E+308}", MetadataOnlyJson(double.MaxValue));
+        Assert.Equal("{\"k\":5E-324}", MetadataOnlyJson(double.Epsilon));
+
+        // Round-trips as a Double after the high-precision serialize (kind is preserved, value is exact).
+        var parsed = (StructType)SchemaJson.FromJson(SchemaJson.ToJson(schema));
+        Assert.True(parsed["d"].Metadata.TryGetValue("k", out MetadataValue? k));
+        Assert.Equal(MetadataValueKind.Double, k!.Kind);
+        Assert.Equal(highPrecision, k.AsDouble());
+    }
+
+    private static string MetadataOnlyJson(double value)
+    {
+        string json = SchemaJson.ToJson(new StructType(new[]
+        {
+            new StructField("d", DataTypes.DoubleType, nullable: true, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("k", MetadataValue.Double(value)),
+            })),
+        }));
+
+        int open = json.IndexOf("{\"k\":", StringComparison.Ordinal);
+        return json.Substring(open, json.IndexOf('}', open) - open + 1);
+    }
+
+    // #711: the write side must refuse to serialize a schema nested deeper than FromJson can re-read, so a
+    // schema can never commit to metaData.schemaString and then be permanently unreadable. FromJson parses
+    // with JsonDocumentOptions.MaxDepth = 64: a 64-deep type tree round-trips, a 65-deep one is rejected on
+    // BOTH sides — the write side fails closed at ToJson rather than emitting bytes only the write side can
+    // produce. The two bounds are one shared constant so they cannot drift apart again.
+    [Fact]
+    public void DeeplyNestedSchema_AtTheReadCap_RoundTrips_ButOneDeeperFailsClosedOnWrite()
+    {
+        // At the cap: writes AND reads.
+        DataType atCap = NestedArrays(64);
+        string json = SchemaJson.ToJson(atCap);
+        Assert.Equal(atCap, SchemaJson.FromJson(json));
+
+        // One level deeper: the write door refuses it (fail-closed), so it can never reach a schemaString.
+        DataType overCap = NestedArrays(65);
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(overCap));
+        Assert.Contains("maximum supported depth of 64", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReadCap_And_WriteCap_AgreeExactly_SoNeitherCanDriftPastTheOther()
+    {
+        // Independently prove the two bounds meet at the same level: build the 65-deep JSON as raw text (so
+        // the read path is exercised even though the write path now refuses to emit it) and confirm FromJson
+        // rejects EXACTLY what ToJson refuses to write.
+        var deep = new StringBuilder();
+        for (int i = 0; i < 65; i++)
+        {
+            deep.Append("{\"type\":\"array\",\"elementType\":");
+        }
+
+        deep.Append("\"string\"");
+        for (int i = 0; i < 65; i++)
+        {
+            deep.Append(",\"containsNull\":true}");
+        }
+
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(deep.ToString()));
+    }
+
+    private static DataType NestedArrays(int depth)
+    {
+        DataType type = DataTypes.StringType;
+        for (int i = 0; i < depth; i++)
+        {
+            type = DataTypes.CreateArrayType(type, containsNull: true);
+        }
+
+        return type;
+    }
+
+    // #710: invalid UTF-16 (an unpaired surrogate) in a field name / metadata key / metadata string value is
+    // rejected at the WRITE door. Utf8JsonWriter would otherwise transcode it to U+FFFD — a lossy,
+    // non-round-tripping write. Failing closed at ToJson keeps "anything we agree to persist, we can read
+    // back", and the message carries only the sanitized ROLE, never the raw (invalid) content.
+    //
+    // The invalid strings are built from char codes at RUNTIME (not [InlineData]): xUnit serializes theory
+    // arguments for discovery, and a lone surrogate does not survive that round trip intact.
+    [Fact]
+    public void FieldNameWithInvalidUtf16_IsRejectedOnWrite()
+    {
+        var invalidNames = new[]
+        {
+            "x" + (char)0xD800,          // trailing lone high surrogate
+            "x" + (char)0xDC00,          // trailing lone low surrogate
+            (char)0xD800 + "x",          // high surrogate not followed by a low surrogate
+            (char)0xDFFF + "y",          // leading lone low surrogate
+            "a" + (char)0xD800 + "b",    // lone high surrogate mid-string
+        };
+
+        foreach (string invalidName in invalidNames)
+        {
+            var schema = new StructType(new[]
+            {
+                new StructField(invalidName, DataTypes.StringType, nullable: true),
+            });
+
+            SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(schema));
+            Assert.Contains("field name", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("invalid UTF-16", ex.Message, StringComparison.Ordinal);
+            // The message must never echo the invalid content itself.
+            Assert.DoesNotContain('\uFFFD', ex.Message);
+            Assert.DoesNotContain('\uD800', ex.Message);
+        }
+    }
+
+    [Fact]
+    public void MetadataKeyWithInvalidUtf16_IsRejectedOnWrite()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("f", DataTypes.LongType, nullable: true, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("k\uD800", MetadataValue.Long(1)),
+            })),
+        });
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(schema));
+        Assert.Contains("metadata key", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("invalid UTF-16", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MetadataStringValueWithInvalidUtf16_IsRejectedOnWrite()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("f", DataTypes.LongType, nullable: true, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("k", MetadataValue.String("v\uDC00")),
+            })),
+        });
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(schema));
+        Assert.Contains("metadata string value", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("invalid UTF-16", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TwoDistinctNamesThatWouldCollideOnUFFFD_AreBothRejected_SoNeitherCanBrickTheTable()
+    {
+        // The bricking case from #710: "x\uD800" and "x\uDC00" are DISTINCT legal names (StructType accepts
+        // both), but both would serialize to "x\uFFFD" — the commit succeeds, then every read fails
+        // duplicate-field-name detection. Rejecting each on write means the colliding schemaString can never
+        // be committed in the first place.
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(
+            new StructType(new[] { new StructField("x\uD800", DataTypes.StringType, nullable: true) })));
+        Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(
+            new StructType(new[] { new StructField("x\uDC00", DataTypes.StringType, nullable: true) })));
+
+        // And a well-formed astral pair (a legitimate surrogate pair) still serializes fine — the guard
+        // rejects ONLY unpaired surrogates, not all surrogate code units.
+        string astralJson = SchemaJson.ToJson(
+            new StructType(new[] { new StructField("x\uD83D\uDE00", DataTypes.StringType, nullable: true) }));
+        Assert.Equal(
+            new StructType(new[] { new StructField("x\uD83D\uDE00", DataTypes.StringType, nullable: true) }),
+            SchemaJson.FromJson(astralJson));
     }
 }

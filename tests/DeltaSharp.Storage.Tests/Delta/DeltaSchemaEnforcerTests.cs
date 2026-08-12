@@ -1,4 +1,5 @@
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
@@ -19,6 +20,30 @@ public sealed class DeltaSchemaEnforcerTests
     private static StructField Field(string name, DataType type, bool nullable) => new(name, type, nullable);
 
     private static StructType Schema(params StructField[] fields) => new(fields);
+
+    // ---- #702: NullType ("void") reachability through the Delta WRITE door -----------------------------
+
+    // VERDICT (#702): a NullType column CANNOT reach a committed metaData.schemaString, so SchemaJson
+    // emitting the non-protocol type name "void" is documentation-only — not a live write defect.
+    //
+    // DeltaSchemaEnforcer.Reconcile is NOT the guard that closes this: it runs only for an append/overwrite
+    // against an EXISTING table (a CREATE at version 0 bypasses it entirely), and to reach even the enforcer
+    // a write must first produce staged Parquet data files. The write door stages every file through
+    // ParquetFileWriter -> ParquetTypeMapping.CreateField, whose default arm rejects NullType fail-closed
+    // (StorageErrorKind.UnsupportedFeature) BEFORE any metaData is written. A NullType column also has no
+    // physical layout (PhysicalLayoutResolver.TryResolve returns false), so it cannot even be materialized
+    // into a ColumnVector/ColumnBatch to hand to the door. Both facts are upstream of serialization, so the
+    // "void" string is never committed by DeltaSharp. Read-side tolerance is deliberately unchanged
+    // (SchemaJson.FromJson still accepts "void"/"null"), so a schemaString another engine wrote — delta-rs
+    // 1.6.2 maps "void" to Arrow Null — still round-trips.
+    [Fact]
+    public void NullTypeColumn_IsRejectedAtTheWriteDoor_SoVoidCannotReachSchemaString()
+    {
+        DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
+            () => ParquetTypeMapping.CreateField(new StructField("n", DataTypes.NullType, nullable: true)));
+
+        Assert.Contains("is not supported", ex.Message, StringComparison.Ordinal);
+    }
 
     // ---- AC1: reject-before-commit, classified by DeltaSchemaMismatchKind (mode = None) ----------------
 

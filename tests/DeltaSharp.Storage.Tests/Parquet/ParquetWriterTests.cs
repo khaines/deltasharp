@@ -2498,9 +2498,13 @@ public sealed class ParquetWriterTests
         int deepest = 0;
         for (int depth = 1; depth <= DepthProbeCeiling; depth++)
         {
-            string json = SchemaJson.ToJson(BuildDepthProbeSchema(depth));
             try
             {
+                // #711: the write side now enforces the SAME depth bound as the read side, so ToJson itself
+                // fails closed once the schema would serialize past what FromJson can re-read. That is the
+                // symmetric limit this probe measures, so the FIRST ToJson is inside the try too — a
+                // write-side rejection means "this depth does not round-trip" exactly like a read-side one.
+                string json = SchemaJson.ToJson(BuildDepthProbeSchema(depth));
                 if (!string.Equals(SchemaJson.ToJson(SchemaJson.FromJson(json)), json, StringComparison.Ordinal))
                 {
                     break;
@@ -2573,10 +2577,13 @@ public sealed class ParquetWriterTests
 
         // Non-vacuity of the probe itself: one deeper than the measured limit must NOT round-trip,
         // or the loop is stopping for a reason other than the reader's depth handling.
-        string tooDeep = SchemaJson.ToJson(BuildDepthProbeSchema(probed + 1));
+        // #711: with the write side now bounded too, "does not round-trip" includes ToJson itself failing
+        // closed at probed+1 — so the serialize is inside the try and a write-side rejection counts as
+        // not-round-tripping exactly like a read-side one.
         bool roundTripped;
         try
         {
+            string tooDeep = SchemaJson.ToJson(BuildDepthProbeSchema(probed + 1));
             roundTripped = string.Equals(
                 SchemaJson.ToJson(SchemaJson.FromJson(tooDeep)), tooDeep, StringComparison.Ordinal);
         }

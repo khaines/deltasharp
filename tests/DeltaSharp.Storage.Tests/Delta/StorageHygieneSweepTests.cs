@@ -85,6 +85,35 @@ public sealed class StorageHygieneSweepTests
         _ => throw new ArgumentOutOfRangeException(nameof(name)),
     };
 
+    // #710: a lone unpaired surrogate in a field name / metadata key / value is now rejected fail-closed at
+    // the schemaString WRITE door (SchemaJson.ToJson), so it can no longer be routed through a fixture that
+    // serializes a schema. Reproduce EXACTLY the bytes the PRE-#710 writer emitted for it: Utf8JsonWriter
+    // transcoded an unpaired surrogate to U+FFFD, so this is the precise name every schema-serializing READ
+    // door in this file actually saw for the `loneSurr` row (it pinned the door's SHAPE via that transcode,
+    // per PoisonsByMappingMode's note — never the raw code unit). Applying it at fixture-build time keeps the
+    // read/write door coverage byte-identical to before #710, while the message-hygiene assertions still run
+    // against the caller's RAW payload (which contains U+D800). All other poison classes are unchanged.
+    private static string SchemaFixtureName(string value)
+    {
+        char[]? chars = null;
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.IsHighSurrogate(c) && i + 1 < value.Length && char.IsLowSurrogate(value[i + 1]))
+            {
+                i++; // A valid surrogate pair is left intact.
+                continue;
+            }
+
+            if (char.IsSurrogate(c))
+            {
+                (chars ??= value.ToCharArray())[i] = '\uFFFD';
+            }
+        }
+
+        return chars is null ? value : new string(chars);
+    }
+
     // DERIVED, not guessed. The widest legitimate message renders TWO bounded identifier LISTS (e.g. the
     // Parquet writer's batch-vs-writer schema mismatch): each is MaxEchoedListItems (16) names, each capped at
     // DefaultMaxLength (128) plus an ellipsis and a ", " separator, so ~16 * 131 = ~2,100 characters per list.
@@ -591,7 +620,11 @@ public sealed class StorageHygieneSweepTests
         foreach (DataType type in (DataType[])
             [DataTypes.LongType, DataTypes.CreateDecimalType(10, 2), DataTypes.StringType, DataTypes.BinaryType])
         {
-            var schema = new StructType([new StructField(p, type, nullable: false)]);
+            // #710: a `loneSurr` column NAME is now rejected at the schemaString write door (the footer
+            // schema ToJson inside WriteAsync) before the null-lane guard is reached, so feed the writer the
+            // U+FFFD form the pre-#710 writer would have produced — the null-lane echo under test is
+            // unchanged, and the raw payload still drives the hygiene assertion below.
+            var schema = new StructType([new StructField(SchemaFixtureName(p), type, nullable: false)]);
 
             MutableColumnVector vector = ColumnVectors.Create(type, 1);
             vector.AppendNull();
@@ -1767,6 +1800,14 @@ public sealed class StorageHygieneSweepTests
         string poison, string mode, string topLevelColumn = "s", bool omitColumnFromBody = false)
     {
         bool mapped = mode != "none";
+
+        // #710: the poison becomes a schemaString field NAME below (via DeltaSchemaJson.ToJson and the
+        // Parquet footer), and a lone unpaired surrogate is now rejected there fail-closed. Build the fixture
+        // from the exact bytes the pre-#710 writer emitted (an unpaired surrogate -> U+FFFD) so the READ door
+        // under test sees the identical poisoned schemaString it always did; only the `loneSurr` row differs
+        // and only in the way it already behaved. The caller still asserts hygiene against the raw payload.
+        poison = SchemaFixtureName(poison);
+        topLevelColumn = SchemaFixtureName(topLevelColumn);
 
         // A wide nested struct so the pre-fix render is a FLOOD, not merely an echo: 200 filler leaves plus the
         // poisoned one. Rendering this type recursively is exactly the unbounded behavior under test.

@@ -19,11 +19,27 @@ namespace DeltaSharp.Types;
 internal static class SchemaJson
 {
     /// <summary>
+    /// The single JSON container-nesting bound shared by BOTH directions, so the write side can never
+    /// persist a schema the read side would then refuse (#711). <see cref="FromJson(string)"/> parses with
+    /// <c>JsonDocumentOptions.MaxDepth = MaxDepth</c> (rejecting any JSON nested deeper) and
+    /// <see cref="ToJson(DataType)"/> refuses to open a container once <see cref="Utf8JsonWriter.CurrentDepth"/>
+    /// reaches this bound. <see cref="Utf8JsonWriter.CurrentDepth"/> counts open objects/arrays exactly as
+    /// <see cref="JsonDocument"/> measures depth, so the two agree to the level: JSON with container depth
+    /// &lt;= <see cref="MaxDepth"/> round-trips and depth &gt; <see cref="MaxDepth"/> is rejected on both
+    /// sides. Kept as one constant so a future edit cannot drift the bounds apart.
+    /// </summary>
+    private const int MaxDepth = 64;
+
+    /// <summary>
     /// Serializes a <see cref="DataType"/> tree to the Spark-compatible schema JSON (the same
     /// format Delta stores in its log), round-trippable with <see cref="FromJson(string)"/>
     /// (STORY-02.5.1 AC3).
     /// </summary>
     /// <exception cref="ArgumentNullException"><paramref name="type"/> is null.</exception>
+    /// <exception cref="SchemaValidationException">The type tree nests deeper than <see cref="MaxDepth"/>
+    /// (would serialize to JSON <see cref="FromJson(string)"/> could never re-read, #711), or a field name,
+    /// metadata key, or metadata string value contains invalid UTF-16 (an unpaired surrogate) that
+    /// <see cref="Utf8JsonWriter"/> would lossily transcode to U+FFFD, #710.</exception>
     public static string ToJson(DataType type)
     {
         ArgumentNullException.ThrowIfNull(type);
@@ -46,8 +62,9 @@ internal static class SchemaJson
         {
             // Pin the parse depth bound explicitly (JsonDocument's default is 64) so deeply nested
             // metadata objects fail closed at the untrusted read boundary rather than relying on an
-            // implicit default that a future runtime could change.
-            using JsonDocument document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = 64 });
+            // implicit default that a future runtime could change. ToJson enforces the SAME MaxDepth on
+            // the write side (#711), so anything DeltaSharp agrees to persist it can also read back.
+            using JsonDocument document = JsonDocument.Parse(json, new JsonDocumentOptions { MaxDepth = MaxDepth });
             return ReadType(document.RootElement);
         }
         catch (JsonException ex)
@@ -61,7 +78,7 @@ internal static class SchemaJson
         switch (type)
         {
             case ArrayType array:
-                writer.WriteStartObject();
+                StartObject(writer);
                 writer.WriteString("type", "array");
                 writer.WritePropertyName("elementType");
                 WriteType(writer, array.ElementType);
@@ -70,7 +87,7 @@ internal static class SchemaJson
                 break;
 
             case MapType map:
-                writer.WriteStartObject();
+                StartObject(writer);
                 writer.WriteString("type", "map");
                 writer.WritePropertyName("keyType");
                 WriteType(writer, map.KeyType);
@@ -81,14 +98,14 @@ internal static class SchemaJson
                 break;
 
             case StructType structType:
-                writer.WriteStartObject();
+                StartObject(writer);
                 writer.WriteString("type", "struct");
                 writer.WritePropertyName("fields");
-                writer.WriteStartArray();
+                StartArray(writer);
                 foreach (StructField field in structType)
                 {
-                    writer.WriteStartObject();
-                    writer.WriteString("name", field.Name);
+                    StartObject(writer);
+                    writer.WriteString("name", ValidateUtf16(field.Name, "field name"));
                     writer.WritePropertyName("type");
                     WriteType(writer, field.DataType);
                     writer.WriteBoolean("nullable", field.Nullable);
@@ -105,6 +122,17 @@ internal static class SchemaJson
                 // Atomic and decimal types serialize as their type-name string. The default
                 // arm fails fast so a future DataType added without a matching case cannot be
                 // silently mis-serialized.
+                //
+                // #702: NullType serializes to the type name "void", which is NOT a Delta-protocol primitive.
+                // That string is intentionally still EMITTED here (and FromJson still ACCEPTS "void"/"null")
+                // so DeltaSharp stays tolerant of a schemaString another engine wrote — delta-rs 1.6.2 reads
+                // "void" as Arrow Null. It cannot, however, reach a schemaString DeltaSharp itself commits:
+                // NullType has no physical layout (PhysicalLayoutResolver.TryResolve returns false), so no
+                // ColumnVector/ColumnBatch can carry a NullType column into the write door, and even a
+                // partition-less data column is rejected fail-closed at ParquetTypeMapping.CreateField
+                // (UnsupportedFeature) BEFORE any metaData/schemaString is written. The write door is thus
+                // closed to NullType upstream of serialization; pinned by DeltaSchemaEnforcerTests and
+                // StorageHygieneSweepTests.Door_ParquetTypeMapping_UnsupportedScalarWrite.
                 if (type is AtomicType or DecimalType)
                 {
                     writer.WriteStringValue(type.TypeName);
@@ -115,13 +143,80 @@ internal static class SchemaJson
         }
     }
 
+    // Opens a JSON object only if doing so keeps the writer's container nesting within the shared MaxDepth
+    // bound FromJson enforces on read (#711) — so a schema this method serializes is one FromJson can always
+    // re-read. See EnsureDepth for why the check is fail-closed rather than clamped.
+    private static void StartObject(Utf8JsonWriter writer)
+    {
+        EnsureDepth(writer);
+        writer.WriteStartObject();
+    }
+
+    // Opens a JSON array under the same MaxDepth guard as StartObject (#711).
+    private static void StartArray(Utf8JsonWriter writer)
+    {
+        EnsureDepth(writer);
+        writer.WriteStartArray();
+    }
+
+    // Fails closed BEFORE opening another JSON container when the writer already holds MaxDepth open
+    // containers: one more would emit JSON at depth MaxDepth+1, which FromJson (JsonDocumentOptions.MaxDepth
+    // = MaxDepth) rejects — a schema that would commit to metaData.schemaString and then be permanently
+    // unreadable (#711). Utf8JsonWriter.CurrentDepth counts open objects/arrays exactly as JsonDocument
+    // measures depth, so the two bounds meet at the same level. The message names the limit and carries no
+    // caller-supplied content.
+    private static void EnsureDepth(Utf8JsonWriter writer)
+    {
+        if (writer.CurrentDepth >= MaxDepth)
+        {
+            throw new SchemaValidationException(
+                $"Schema nesting exceeds the maximum supported depth of {MaxDepth}; a deeper schema would "
+                + "serialize to a schemaString that could never be read back.");
+        }
+    }
+
+    // Rejects a field name / metadata key / metadata string value containing invalid UTF-16 (an unpaired
+    // surrogate) at the WRITE door (#710). Utf8JsonWriter silently transcodes such input to U+FFFD, which is
+    // lossy and non-round-tripping: two distinct legal names (e.g. "x\uD800" and "x\uDC00") both collapse to
+    // "x\uFFFD", so the commit succeeds but every subsequent read fails duplicate-name detection — the table
+    // is bricked. Failing closed here keeps the invariant "anything we agree to persist, we can read back".
+    // The offending value is invalid UTF-16 and untrusted, so the message echoes only the sanitized ROLE
+    // (never the raw content) and the offending UTF-16 code-unit offset.
+    private static string ValidateUtf16(string value, string role)
+    {
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (char.IsHighSurrogate(c))
+            {
+                if (i + 1 >= value.Length || !char.IsLowSurrogate(value[i + 1]))
+                {
+                    throw InvalidUtf16(role, i);
+                }
+
+                i++; // A valid surrogate pair — skip the trailing low surrogate.
+            }
+            else if (char.IsLowSurrogate(c))
+            {
+                throw InvalidUtf16(role, i);
+            }
+        }
+
+        return value;
+    }
+
+    private static SchemaValidationException InvalidUtf16(string role, int offset) =>
+        new($"A {role} contains invalid UTF-16 (an unpaired surrogate at code-unit offset "
+            + $"{offset.ToString(CultureInfo.InvariantCulture)}) and cannot be persisted to a Delta "
+            + "schemaString without lossy transcoding.");
+
     private static void WriteMetadata(Utf8JsonWriter writer, FieldMetadata metadata)
     {
-        writer.WriteStartObject();
+        StartObject(writer);
         foreach (KeyValuePair<string, MetadataValue> entry in metadata)
         {
             // FieldMetadata enumerates in sorted key order => deterministic output.
-            writer.WritePropertyName(entry.Key);
+            writer.WritePropertyName(ValidateUtf16(entry.Key, "metadata key"));
             WriteMetadataValue(writer, entry.Value);
         }
 
@@ -142,7 +237,7 @@ internal static class SchemaJson
                 writer.WriteNullValue();
                 break;
             case MetadataValueKind.String:
-                writer.WriteStringValue(value.AsString());
+                writer.WriteStringValue(ValidateUtf16(value.AsString(), "metadata string value"));
                 break;
             case MetadataValueKind.Long:
                 writer.WriteNumberValue(value.AsLong());
@@ -154,7 +249,7 @@ internal static class SchemaJson
                 writer.WriteBooleanValue(value.AsBoolean());
                 break;
             case MetadataValueKind.Array:
-                writer.WriteStartArray();
+                StartArray(writer);
                 foreach (MetadataValue element in value.AsArray())
                 {
                     WriteMetadataValue(writer, element);
