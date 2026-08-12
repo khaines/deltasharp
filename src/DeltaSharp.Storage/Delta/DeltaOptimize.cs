@@ -8,6 +8,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -209,10 +210,6 @@ internal sealed class DeltaOptimize
     /// <c>parquet.block.size</c>). A file smaller than the target is a compaction candidate; a compaction
     /// group's combined input size is packed to at most the target.</summary>
     public const long DefaultTargetFileSize = 128L * 1024 * 1024;
-
-    /// <summary>Spark's sentinel partition-directory segment for a null partition value, used when composing
-    /// a Hive-style output path.</summary>
-    private const string HiveDefaultPartition = "__HIVE_DEFAULT_PARTITION__";
 
     private static readonly ImmutableSortedDictionary<string, string?> EmptyPartition =
         ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal);
@@ -796,8 +793,10 @@ internal sealed class DeltaOptimize
         foreach (string column in partitionColumns)
         {
             partitionValues.TryGetValue(column, out string? value);
-            string encoded = value is null ? HiveDefaultPartition : Uri.EscapeDataString(value);
-            sb.Append(column).Append('=').Append(encoded).Append('/');
+            // #708: encode BOTH key and value, IDENTICAL to the write path
+            // (DeltaWriteTarget.DataFilePath -> DeltaWriteEncoding.HivePartitionSegment), so a compacted
+            // output's directory layout matches a freshly-written one for every column name.
+            sb.Append(DeltaWriteEncoding.HivePartitionSegment(column, value)).Append('/');
         }
 
         sb.Append(name);

@@ -219,6 +219,58 @@ public sealed class DeltaWriteTargetTests : IDisposable
             Sorted(rows));
     }
 
+    // ---------------------------------------------------------------- #708 hostile partition column name
+
+    [Fact]
+    public async Task Append_PartitionColumnNameWithSpaceAndQuote_IsPercentEncodedInPath_AndRoundTrips()
+    {
+        // #708: a legal-but-hostile partition column name (space AND quote) must be percent-encoded into
+        // add.path (BOTH key and value), yet round-trip correctly on read because partition truth lives in
+        // add.partitionValues, not in the directory string. This also retires the write-path half of the
+        // Hive-redaction residual #714 (a DeltaSharp-authored key can no longer carry a quote or whitespace).
+        const string hostileColumn = "my col'x";
+        var schema = new StructType(new[]
+        {
+            new StructField(hostileColumn, DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+
+        MutableColumnVector partition = ColumnVectors.Create(DataTypes.StringType, 2);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 2);
+        AppendString(partition, "east");
+        id.AppendValue(1L);
+        AppendString(partition, "west");
+        id.AppendValue(2L);
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { partition, id }, 2);
+
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(schema, new[] { hostileColumn }, new[] { batch });
+
+        Snapshot snapshot = await LoadSnapshotAsync();
+        Assert.Equal(2, snapshot.ActiveFiles.Length);
+
+        foreach (AddFileAction add in snapshot.ActiveFiles)
+        {
+            // The physical directory is percent-encoded: neither the raw space nor the raw quote survive.
+            Assert.DoesNotContain(' ', add.Path);
+            Assert.DoesNotContain('\'', add.Path);
+            Assert.Contains("my%20col%27x=", add.Path, StringComparison.Ordinal);
+
+            // Partition truth is preserved under the RAW logical column name in add.partitionValues.
+            Assert.True(add.PartitionValues.ContainsKey(hostileColumn));
+
+            // The value directory is also encoded, and the physical file exists at exactly add.path.
+            string full = Path.Combine(_root, add.Path);
+            Assert.True(File.Exists(full), $"expected data file at encoded path {add.Path}");
+        }
+
+        Assert.Equal(
+            new[] { "east", "west" },
+            snapshot.ActiveFiles
+                .Select(a => a.PartitionValues[hostileColumn])
+                .OrderBy(v => v, StringComparer.Ordinal));
+    }
+
     // ---------------------------------------------------------------- unpartitioned
 
     [Fact]

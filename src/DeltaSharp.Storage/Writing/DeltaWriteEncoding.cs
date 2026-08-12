@@ -103,6 +103,39 @@ internal static class DeltaWriteEncoding
         };
     }
 
+    /// <summary>
+    /// Composes a single Hive-style partition directory segment, <c>column=value</c>, percent-encoding
+    /// <b>both</b> the column name and the value with <see cref="Uri.EscapeDataString(string)"/> (#708). A
+    /// null value uses the <see cref="HiveDefaultPartition"/> sentinel.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>#708 — the encoding asymmetry is settled here, deliberately, in one place.</b> DeltaSharp
+    /// previously percent-encoded only the value and emitted the column name raw, so a legal Delta column
+    /// name containing a space, quote, or control character landed verbatim in <c>add.path</c>. Apache Spark
+    /// percent-encodes both the key and the value when composing a Hive partition directory
+    /// (<c>ExternalCatalogUtils.escapePathName</c> is applied to each), so encoding both is the
+    /// interoperable choice and removes the ambiguity.
+    /// </para>
+    /// <para>
+    /// This is safe on read because <b>partition truth is authoritative from <c>add.partitionValues</c></b>,
+    /// never recovered by parsing the directory path (see <c>DeltaWriteTarget.DataFilePath</c>). Tables
+    /// written previously carry a raw key; nothing re-parses the key for correctness, and
+    /// <c>OrphanCleanup</c> already matches on the union of the raw path and its
+    /// <see cref="Uri.UnescapeDataString(string)"/> decoding, so previously-written raw-key layouts still
+    /// resolve. Encoding the key also retires the write-path half of the Hive-redaction residuals (#714):
+    /// DeltaSharp-authored keys can no longer carry a quote or whitespace.
+    /// </para>
+    /// <para>Both the write path (<c>DeltaWriteTarget.DataFilePath</c>) and OPTIMIZE
+    /// (<c>DeltaOptimize.BuildOutputPath</c>) call this, so the two cannot drift.</para>
+    /// </remarks>
+    public static string HivePartitionSegment(string column, string? value)
+    {
+        ArgumentNullException.ThrowIfNull(column);
+        string encodedValue = value is null ? HiveDefaultPartition : Uri.EscapeDataString(value);
+        return Uri.EscapeDataString(column) + "=" + encodedValue;
+    }
+
     /// <summary>Formats the value at <paramref name="row"/> of a partition column <paramref name="source"/>
     /// into its canonical Delta partition-value string, or <see langword="null"/> for a null value.</summary>
     public static string? FormatPartitionValue(ColumnVector source, int row)

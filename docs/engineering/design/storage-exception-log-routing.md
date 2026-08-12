@@ -57,7 +57,7 @@ test, the test is named inline.
 
 > **Contract.** Treat every storage `.Message` as untrusted tenant data. Fixed literals and tokens actually
 > routed through `DiagnosticText.Sanitize` have the posture described below; the message-posture table
-> below lists the **verified producers for call sites known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory**,
+> below lists the **verified producers for call sites known as of `76d2c8e`; coverage is now cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`), so a new or reclassified producer fails CI until it is classified**,
 > enforced by `StorageHygieneSweepTests` (a mutation turning a `Sanitize` call into an identity turns a
 > sweep-test case red). Eight of the nine `DeltaStorageException` factories accept a fully-composed
 > message and carry the hygiene obligation in the type-level XML `<remarks>` (only
@@ -271,7 +271,7 @@ table; a type-level membership match cannot hide a missing property.
 
 `Sanitized` is a **record-forgery and raw-decoder-text** property, not a personal-data property. This page
 previously let the two be read as the same thing. The table below is a behavior-pinned set of
-**verified producers for call sites known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory**,
+**verified producers for call sites known as of `76d2c8e`; coverage is now cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`), so a new or reclassified producer fails CI until it is classified**,
 enforced by `StorageHygieneSweepTests` for LocalFileSystemBackend and ColumnNotPresentInFile producers,
 `ParquetMessageHygieneTests` and `ParquetCorruptionTests` for Parquet `columnLabel`/`columnName` producers
 (a mutation on any listed sanitizer turns the respective suite red; #749).
@@ -781,7 +781,7 @@ The compiled guards cannot catch every future integration, so a reviewer must ch
 - **A message that starts carrying a new class of tenant data.** `Sanitize` is an injection control, not
   a classification control; only a reviewer decides whether a newly echoed token is personal data.
 - **The full exception-message producer inventory.** The posture table above covers all call sites
-  known as of `76d2c8e`; coverage is a manually maintained door list, not an automated inventory.
+  known as of `76d2c8e`; coverage is now cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`), so a new or reclassified producer fails CI until it is classified.
   Verified by `StorageHygieneSweepTests` (each entry has a live behavior pin; the sweep door-matrix is hand-enumerated, not auto-generated). #749 tracks
   additional producers. The sweep door-matrix catches new raw echoes *inside* already-covered guards; a producer at a wholly new guard is not automatically detected and remains a reviewer obligation.
 - **Inherited `Exception.Data`.** Current storage code does not populate it, but layouts such as NLog's

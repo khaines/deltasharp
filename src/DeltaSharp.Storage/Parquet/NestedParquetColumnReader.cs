@@ -147,8 +147,12 @@ internal static class NestedParquetColumnReader
                     $"map column '{columnName}' value");
                 break;
             default:
+                // #705 predicate: struct/array/map are handled by the cases above, so this arm fires only for
+                // a SCALAR requestedType — DescribeType renders it as a bounded atomic literal (== SimpleString
+                // for atomics), but is used instead of raw SimpleString so a hypothetical future non-atomic kind
+                // is bounded by default rather than recursing into raw nested field names.
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.Sanitize(requestedType.SimpleString)}' "
+                    $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.DescribeType(requestedType)}' "
                     + "is not supported.");
         }
     }
@@ -212,7 +216,10 @@ internal static class NestedParquetColumnReader
                 rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, budget, cancellationToken)
                 .ConfigureAwait(false),
             _ => throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.Sanitize(requestedType.SimpleString)}' "
+                // #705 predicate: struct/array/map are the three explicit switch arms above, so this `_` arm
+                // fires only for a SCALAR requestedType. DescribeType bounds it (== the atomic SimpleString
+                // literal today) and keeps a future non-atomic kind from recursing into raw nested names.
+                $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.DescribeType(requestedType)}' "
                 + "is not supported."),
         };
     }
@@ -639,8 +646,11 @@ internal static class NestedParquetColumnReader
                 return ReadLeafAsync<ReadOnlyMemory<byte>>(rowGroup, leaf, scalarType, presentFloor, budget,
                     static (v, x) => v.AppendBytes(x.Span), cancellationToken);
             default:
+                // #705 predicate: every atomic leaf kind is a case above, so this arm fires for a scalar the
+                // decoder does not decode here (or, defensively, a non-atomic type reaching the leaf path).
+                // DescribeType bounds either — a raw SimpleString would recurse for the non-atomic case.
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet nested read for leaf type '{DiagnosticText.Sanitize(scalarType.SimpleString)}' is not supported.");
+                    $"Parquet nested read for leaf type '{DiagnosticText.DescribeType(scalarType)}' is not supported.");
         }
     }
 
@@ -692,7 +702,7 @@ internal static class NestedParquetColumnReader
             // log-injection vector. Named by the requested leaf type
             // so the message is accurate for whichever leaf raised it (not hard-coded to date/time).
             throw DeltaStorageException.CorruptData(
-                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' of type '{DiagnosticText.Sanitize(elementType.SimpleString)}' has a physical value outside "
+                $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}' of type '{DiagnosticText.DescribeType(elementType)}' has a physical value outside "
                 + "its representable range.", ex);
         }
 
@@ -1151,9 +1161,13 @@ internal static class NestedParquetColumnReader
 
         if (!matches)
         {
+            // #705 predicate: this is the genuinely-defective site of the three flagged in this file. `requested`
+            // is a leaf position's type, but a nested request (e.g. array<array<int>>) drives a non-atomic
+            // ElementType through here, where `_ => false` fires and a raw `requested.SimpleString` would recurse
+            // into every nested field name. DescribeType renders the bounded kind instead.
             throw DeltaStorageException.SchemaMismatch(
                 $"Parquet nested read for {context}: the file physical type '{leaf.ClrType.Name}' does not match "
-                + $"the requested '{DiagnosticText.Sanitize(requested.SimpleString)}'.");
+                + $"the requested '{DiagnosticText.DescribeType(requested)}'.");
         }
     }
 }

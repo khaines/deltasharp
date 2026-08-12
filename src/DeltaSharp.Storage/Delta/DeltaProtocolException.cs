@@ -61,7 +61,10 @@ internal enum DeltaProtocolErrorKind
 /// <see cref="UnsupportedFeatures"/> instead; it applies <see cref="DiagnosticText.SanitizeAndJoin"/>
 /// which also bounds list length (#666). Call sites known as of <c>76d2c8e</c> are verified by
 /// <c>StorageMessageHygieneTests</c> and <c>StorageHygieneSweepTests</c>; new call sites carry
-/// the same obligation.
+/// the same obligation. Every interpolated token in this producer is also classified by the source-scan
+/// guard <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
+/// <c>storage-exception-producer-inventory.tsv</c>), which fails CI when a new or reclassified token is
+/// neither hygiene-wrapped nor inventoried (#749).
 /// </remarks>
 internal sealed class DeltaProtocolException : Exception
 {

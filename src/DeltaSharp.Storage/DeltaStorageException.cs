@@ -98,7 +98,10 @@ internal enum StorageErrorKind
 /// <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
 /// stronger drop/minimization — BEFORE interpolation. The sweep test in
 /// <c>StorageHygieneSweepTests</c> covers call sites known as of <c>76d2c8e</c>; new call sites carry the
-/// same obligation.
+/// same obligation. Coverage is no longer a hand-maintained count: the source-scan guard
+/// <c>StorageExceptionProducerInventoryGuardTests</c> (with the checked-in
+/// <c>storage-exception-producer-inventory.tsv</c>) classifies every interpolated token in this and every
+/// sibling storage producer and fails CI when a new or reclassified token is not wrapped or inventoried (#749).
 /// </remarks>
 internal sealed class DeltaStorageException : Exception
 {

@@ -883,10 +883,9 @@ public sealed class DeltaWriteTarget : IDisposable
         foreach (string column in partitionColumns)
         {
             partitionValues.TryGetValue(column, out string? value);
-            string encoded = value is null
-                ? DeltaWriteEncoding.HiveDefaultPartition
-                : Uri.EscapeDataString(value);
-            segments.Add(column + "=" + encoded);
+            // #708: encode BOTH the column name and the value via DeltaWriteEncoding.HivePartitionSegment,
+            // so a legal-but-hostile column name (space, quote, control char) cannot land raw in add.path.
+            segments.Add(DeltaWriteEncoding.HivePartitionSegment(column, value));
         }
 
         segments.Add(fileName);

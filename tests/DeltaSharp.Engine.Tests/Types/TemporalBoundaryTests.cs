@@ -1,3 +1,4 @@
+using System;
 using DeltaSharp.Types;
 using Xunit;
 
@@ -49,6 +50,26 @@ public class TemporalBoundaryTests
         Assert.Throws<ArithmeticOverflowException>(() => TemporalValues.TimestampToDate(TemporalValues.MinEpochMicros - 1, AnsiMode.Ansi));
         Assert.Null(TemporalValues.TimestampToDate(long.MaxValue, AnsiMode.Legacy));
         Assert.Null(TemporalValues.TimestampToDate(TemporalValues.MaxEpochMicros + 1, AnsiMode.Legacy));
+    }
+
+    [Fact]
+    public void Boundary_OverflowMessages_ContainNoRawOperandValue()
+    {
+        // #355: the cast-overflow message must not embed the raw operand cell value (potential PII/secret
+        // reachable from untrusted batch data via CastEvaluator on a shared executor). Only type/target
+        // names survive, matching DecimalValue.ToType's value-free form.
+        const int hostileDay = int.MaxValue; // a distinctive operand value that must NOT appear
+        const long hostileMicros = long.MaxValue;
+
+        ArithmeticOverflowException dateEx = Assert.Throws<ArithmeticOverflowException>(
+            () => TemporalValues.DateToTimestamp(hostileDay, AnsiMode.Ansi));
+        ArithmeticOverflowException tsEx = Assert.Throws<ArithmeticOverflowException>(
+            () => TemporalValues.TimestampToDate(hostileMicros, AnsiMode.Ansi));
+
+        Assert.DoesNotContain(hostileDay.ToString(System.Globalization.CultureInfo.InvariantCulture), dateEx.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostileMicros.ToString(System.Globalization.CultureInfo.InvariantCulture), tsEx.Message, StringComparison.Ordinal);
+        Assert.Equal("Date out of range for timestamp cast.", dateEx.Message);
+        Assert.Equal("Timestamp out of range for date cast.", tsEx.Message);
     }
 
     [Fact]

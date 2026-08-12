@@ -11,6 +11,14 @@ namespace DeltaSharp.Storage;
 /// (the Executor's file-relation resolver) can catch and re-surface as an analysis diagnostic, so a bad
 /// read never reaches an execution backend.
 /// </summary>
+/// <remarks>
+/// This facade composes its <see cref="Exception.Message"/> from an already-sanitized inner storage
+/// message (<c>new DeltaReadException(inner.Message, inner)</c>); it introduces no new attacker-influenceable
+/// token of its own. Producers that DO build a message here are classified by the source-scan guard
+/// <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
+/// <c>storage-exception-producer-inventory.tsv</c>), which fails CI when a new or reclassified token is
+/// neither hygiene-wrapped nor inventoried (#749).
+/// </remarks>
 public sealed class DeltaReadException : Exception
 {
     /// <summary>Creates a read failure with a caller-facing <paramref name="message"/>.</summary>

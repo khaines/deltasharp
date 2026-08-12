@@ -6662,6 +6662,27 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
             LocalFileSystemBackend.HivePartitionValue().Replace(detail, "${key}=<value>"));
     }
 
+    // #704(b), THE QUERY-STRING `?` DECISION, PINNED. The key classes deliberately do NOT exclude `?`, so a
+    // query-string `key=value` reached through a path separator is treated as a Hive segment and its value
+    // redacted. This is the chosen SAFE direction: a presigned-URL credential MUST be redacted, and
+    // over-redacting a benign query parameter is diagnosability-only, never a disclosure. If someone later
+    // excludes `?` to preserve query context, these cases go green->the-signature-leaks and this test fails,
+    // forcing the credential-leak trade to be re-litigated explicitly.
+    [Theory]
+    // Desirable: a presigned S3 signature arriving as a query parameter is redacted.
+    [InlineData("Request to /bucket/obj?X-Amz-Signature=deadbeefsig", "deadbeefsig")]
+    [InlineData("GET /o?X-Amz-Credential=AKIAEXAMPLE", "AKIAEXAMPLE")]
+    // Accepted over-redaction (same safe direction): a benign query parameter's value is also redacted.
+    [InlineData("Request to /v1/objects?prefix=secretprefix", "secretprefix")]
+    public void Redact_QueryStringKeyValue_IsRedacted_TheChosenSafeDirection(string detail, string value)
+    {
+        string redacted = LocalFileSystemBackend.HivePartitionValue()
+            .Replace(detail, "${key}=<value>");
+
+        Assert.Contains("<value>", redacted, StringComparison.Ordinal);
+        Assert.DoesNotContain(value, redacted, StringComparison.Ordinal);
+    }
+
     // R5, CHARACTERIZED RATHER THAN CLAIMED CLOSED. A partition value containing an apostrophe inside a
     // single-quoted framework message is byte-identical to a message truncated at that apostrophe. The
     // recognizer implements the reader's parse -- opening quote to the first quote of that kind -- so the

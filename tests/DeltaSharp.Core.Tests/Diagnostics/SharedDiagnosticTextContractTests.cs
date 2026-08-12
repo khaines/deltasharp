@@ -512,4 +512,106 @@ public sealed class SharedDiagnosticTextContractTests
         Assert.Throws<ArgumentOutOfRangeException>(
             () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: -1, maxItems: 16));
     }
+
+    // ---- #751: unambiguous separator escaping ----------------------------------------------------------
+
+    [Fact]
+    public void SanitizeAndJoin_ItemContainingTheSeparator_IsQuotedSoItCannotBeMistakenForThreeItems()
+    {
+        // The defect this issue closes: a single item named "a, b, c" was byte-identical to three items.
+        // With CSV-style quoting the one item is wrapped, so a reader can tell them apart.
+        string threeItems = SharedDiagnosticText.SanitizeAndJoin(
+            ["a", "b", "c"], maxItemLength: 32, maxItems: 16);
+        string oneItem = SharedDiagnosticText.SanitizeAndJoin(
+            ["a, b, c"], maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal("a, b, c", threeItems);      // clean items are untouched (no golden churn)
+        Assert.Equal("\"a, b, c\"", oneItem);      // the embedded-separator item is quoted
+        Assert.NotEqual(threeItems, oneItem);      // the ambiguity is gone
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_ItemContainingAQuote_HasItsQuotesDoubledAndIsWrapped()
+    {
+        // CSV / RFC 4180 escaping: an embedded quote is doubled and the item is wrapped, so the closing
+        // quote of the token is always the next UN-doubled quote.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["say \"hi\""], maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal("\"say \"\"hi\"\"\"", rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_CleanItems_AreReturnedVerbatim_NoQuoting()
+    {
+        // A raw (unquoted) item never contains the separator or a quote — that is the whole invariant that
+        // makes the grammar unambiguous. Verify ordinary identifiers pass through untouched.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["col_a", "col.b", "feature-x"], maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal("col_a, col.b, feature-x", rendered);
+        Assert.DoesNotContain('"', rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_ControlCharsInItem_AreNeutralizedBeforeQuoting()
+    {
+        // Sanitize runs first, so CR/LF/NEL/U+2028/U+2029 become U+FFFD; quoting only decides how the
+        // already-neutralized content is delimited. An item bearing a separator AND a control char is both
+        // neutralized and quoted.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["a, \r\nb"], maxItemLength: 32, maxItems: 16);
+
+        Assert.DoesNotContain('\r', rendered);
+        Assert.DoesNotContain('\n', rendered);
+        Assert.Equal("\"a, \uFFFD\uFFFDb\"", rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_QuotingIsAppliedAfterTheItemBound_ContentStaysBounded()
+    {
+        // Per-item bound is preserved: Sanitize caps the CONTENT at maxItemLength; quoting adds only the
+        // bounded escape overhead (<= 2*content + 2). The separator survives the cap here, so the bounded
+        // content is quoted — never the full 50-plus-char item.
+        string longItem = "a, " + new string('x', 50);
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            [longItem], maxItemLength: 10, maxItems: 16);
+
+        // 10 chars of content ("a, xxxxxxx"), then the truncation ellipsis, all wrapped.
+        Assert.Equal("\"a, xxxxxxx…\"", rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_OverflowMarker_IsNeverQuoted_AndStaysDistinctFromQuotedItems()
+    {
+        // The elision marker is a structural suffix, not an item, so it renders bare. Even when the shown
+        // items are quoted (they contain separators), the "… (+N more)" tail is verbatim and countable.
+        string[] items = Enumerable.Range(0, 20)
+            .Select(i => string.Create(CultureInfo.InvariantCulture, $"v{i}, x"))
+            .ToArray();
+
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(items, maxItemLength: 32, maxItems: 16);
+
+        Assert.Contains("\"v0, x\"", rendered);              // shown items are quoted
+        Assert.EndsWith("… (+4 more)", rendered);            // marker bare and un-quoted
+        Assert.DoesNotContain("\"… (+4 more)\"", rendered);
+    }
+
+    [Theory]
+    [InlineData(1, 16)]
+    [InlineData(5, 2)]
+    [InlineData(40, 16)]
+    public void SanitizeAndJoin_QuotedItems_RenderIdenticallyOnFastAndLazyPaths(int tokenCount, int maxItems)
+    {
+        // The escaping must be path-independent — the #767 fast/lazy equivalence extends to quoted output.
+        string[] tokens = Enumerable.Range(0, tokenCount)
+            .Select(i => string.Create(CultureInfo.InvariantCulture, $"n{i}, \"q\""))
+            .ToArray();
+        IEnumerable<string> lazy = tokens.Select(x => x);
+
+        string fast = SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength: 32, maxItems: maxItems);
+        string slow = SharedDiagnosticText.SanitizeAndJoin(lazy, maxItemLength: 32, maxItems: maxItems);
+
+        Assert.Equal(fast, slow);
+    }
 }

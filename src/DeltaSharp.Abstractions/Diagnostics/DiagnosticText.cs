@@ -158,6 +158,24 @@ internal static class DiagnosticText
     /// a log line even though every element is individually bounded.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>#751 — items are quoted so the separator is unambiguous.</b> A raw join renders a single item named
+    /// <c>a, b, c</c> byte-identically to the three items <c>a</c>, <c>b</c>, <c>c</c>. To make the list
+    /// self-describing this method quotes an item — CSV / RFC&#160;4180 style — <b>iff</b> it contains the
+    /// separator or a double quote: it is wrapped in <c>"</c>…<c>"</c> and every embedded <c>"</c> is doubled
+    /// (<c>""</c>). A raw (unquoted) item therefore never contains the separator and never contains a quote, so
+    /// the reader's grammar — <em>a token that begins with <c>"</c> is quoted and runs to the next un-doubled
+    /// <c>"</c>; otherwise it is literal</em> — parses the list back without ambiguity. The overwhelmingly
+    /// common case (clean identifiers, protocol keys, column names) contains neither and is rendered exactly as
+    /// before, so this changes no golden output for well-formed tokens.
+    /// </para>
+    /// <para>
+    /// Quoting is applied <b>after</b> <see cref="Sanitize"/>, so the per-item content bound and the aggregate
+    /// item-count bound are both preserved; the escape overhead is itself bounded (at most twice the sanitized
+    /// content plus the two surrounding quotes). The <c>… (+N more)</c> elision marker is a fixed structural
+    /// suffix, not a list item, so it is never quoted.
+    /// </para>
+    /// <para>
     /// <b>Both bounds are caller-supplied on purpose.</b> This primitive owns the ALGORITHM; the calling layer
     /// owns its POSTURE — the per-item length cap and the item count cap are the layer's policy, and only the
     /// layer knows what a legitimate list looks like there (a Delta reader/writer feature set is not a SQL
@@ -167,6 +185,7 @@ internal static class DiagnosticText
     /// it, so its declared constant is provably the one in force on every path. Adding a default here would
     /// re-create exactly the silent-drift hazard the shared primitive exists to eliminate: two independent
     /// constants, one name, and no signal when they diverge.
+    /// </para>
     /// </remarks>
     /// <param name="tokens">The untrusted tokens to render. When not already an
     /// <see cref="IReadOnlyList{T}"/>, at most <paramref name="maxItems"/> tokens are materialized; the
@@ -195,7 +214,7 @@ internal static class DiagnosticText
                     builder.Append(separator);
                 }
 
-                builder.Append(Sanitize(list[i], maxItemLength));
+                builder.Append(EscapeItem(Sanitize(list[i], maxItemLength), separator));
             }
 
             if (list.Count > shown)
@@ -222,7 +241,7 @@ internal static class DiagnosticText
                     lazyBuilder.Append(separator);
                 }
 
-                lazyBuilder.Append(Sanitize(token, maxItemLength));
+                lazyBuilder.Append(EscapeItem(Sanitize(token, maxItemLength), separator));
                 lazyShown++;
             }
             else
@@ -237,6 +256,39 @@ internal static class DiagnosticText
         }
 
         return lazyBuilder.ToString();
+    }
+
+    /// <summary>
+    /// #751 — quotes a <b>sanitized</b> item so an embedded separator or quote cannot be mistaken for a list
+    /// boundary. CSV / RFC&#160;4180 semantics: the item is wrapped in <c>"</c>…<c>"</c> and every embedded
+    /// <c>"</c> is doubled, but <b>only</b> when it contains the separator or a quote — a clean identifier is
+    /// returned verbatim (the SAME instance), so the common case allocates nothing and its golden output is
+    /// unchanged. Applied after <see cref="Sanitize"/>, so it operates on already-bounded content and the
+    /// per-item bound is preserved.
+    /// </summary>
+    private static string EscapeItem(string sanitized, string separator)
+    {
+        bool needsQuoting = sanitized.Contains('"')
+            || (separator.Length > 0 && sanitized.Contains(separator, StringComparison.Ordinal));
+        if (!needsQuoting)
+        {
+            return sanitized;
+        }
+
+        var builder = new StringBuilder(sanitized.Length + 2);
+        builder.Append('"');
+        foreach (char c in sanitized)
+        {
+            if (c == '"')
+            {
+                builder.Append('"');
+            }
+
+            builder.Append(c);
+        }
+
+        builder.Append('"');
+        return builder.ToString();
     }
 
     /// <summary>

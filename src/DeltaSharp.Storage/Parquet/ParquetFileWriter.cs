@@ -293,9 +293,13 @@ internal sealed class ParquetFileWriter
                     .ConfigureAwait(false);
                 break;
             default:
+                // #705 predicate: the scalar kinds are cased above; nested types are rejected earlier by
+                // ParquetTypeMapping.ToParquetField, so this arm is reached only for a scalar today. DescribeType
+                // (== the atomic SimpleString literal here) bounds a defensively-reachable nested type instead of
+                // recursing into raw nested field names.
                 throw DeltaStorageException.UnsupportedFeature(
                     $"Parquet write for column '{DiagnosticText.Sanitize(schemaField.Name)}' of type "
-                    + $"'{DiagnosticText.Sanitize(schemaField.DataType.SimpleString)}' is not supported.");
+                    + $"'{DiagnosticText.DescribeType(schemaField.DataType)}' is not supported.");
         }
     }
 
