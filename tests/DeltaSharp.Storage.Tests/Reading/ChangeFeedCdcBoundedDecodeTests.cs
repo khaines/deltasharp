@@ -14,7 +14,7 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// flagged (<c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148 — a 957-byte cdc file with an
 /// intact footer whose decode Parquet.Net 6.0.3 drove into a non-terminating, cancellation-ignoring CPU loop)
 /// must now fail closed with a typed <see cref="DeltaStorageException"/> WITHIN the bounded-decode budget,
-/// not hang (design §5.4 C-DECODE "never hangs").
+/// not hang (design §5.4 C-DECODE — the bounded wall-clock decode ceiling).
 /// </summary>
 /// <remarks>
 /// The cdc file's bytes are reproduced deterministically by rebuilding the same table the fuzz builds (create
@@ -54,9 +54,16 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
     {
         byte[] cdc = await BuildFuzzCdcFileAsync();
 
-        // The #647 minimized input: seed 42, the fuzz's scope-combined RNG, replayed to iteration 148.
-        byte[] mutated = ReplayFuzzMutationToIteration(cdc, baseSeed: 42, iteration: 148);
-        Assert.Equal(957, mutated.Length); // pin the exact minimized shape the issue recorded
+        // The #647 minimized input: seed 42, the fuzz's scope-combined RNG, replayed to iteration 148, via the
+        // SHARED mutation helper both suites call (so this pin cannot drift off the live fuzz strategy).
+        byte[] mutated = CdcFuzzMutation.ReplayToIteration(cdc, baseSeed: 42, scope: FuzzScope, iteration: 148);
+
+        // Pin the exact minimized shape the issue recorded — by CONTENT (SHA-256), not merely length: a length
+        // check alone would accept a different 957-byte mutation if the (deterministic) build or replay drifted.
+        Assert.Equal(957, mutated.Length);
+        Assert.Equal(
+            "8d77ac2c287569275768573755f99966d69598ead15380599029646ea34df6f1",
+            Sha256Hex(mutated));
 
         // Read the (unmutated) cdc data schema so we can decode the mutated file through the shared reader.
         StructType schema;
@@ -78,12 +85,19 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
         });
         stopwatch.Stop();
 
-        // (a) a typed fail-closed exception, and (b) it returns well under the real default budget (30s) —
-        // without the bounded-decode policy this input runs > 4 minutes.
+        // Non-vacuous proof the ROW-GROUP/page-decode bounded path fired (not the generic malformed-footer
+        // fast-fail): (a) the DISTINCT DecodeBudgetExceeded kind — unique to the bounded-decode timeout, so
+        // deleting the row-group BoundedDecode wrapper turns this red (the input hangs → watchdog fires, or the
+        // decode never terminates as anything else); and (b) the read ran AT LEAST the budget — a fast-fail
+        // corrupt-detection would return well under it. Without the policy this input runs > 4 minutes.
         DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
-        Assert.Equal(StorageErrorKind.CorruptData, ex.Kind);
+        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
+        Assert.True(stopwatch.Elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {stopwatch.Elapsed}.");
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(5), $"expected a fast fail-closed, took {stopwatch.Elapsed}.");
     }
+
+    private static string Sha256Hex(byte[] bytes) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
 
     // Rebuilds the same explicit cdc file the CDF read-door fuzz mutates: create empty → enable CDF → append
     // three east rows → partial delete of two ids, which materializes exactly one cdc file (the explicit CDF
@@ -101,52 +115,6 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
         IReadOnlyList<string> cdcFiles = table.CdcFilePaths();
         Assert.NotEmpty(cdcFiles);
         return await File.ReadAllBytesAsync(table.AbsolutePath(cdcFiles[0]));
-    }
-
-    // Replays the EXACT mutation stream the CDF read-door fuzz uses (same seed combine, same Mutate strategy)
-    // up to and including the given iteration, returning that iteration's mutated bytes. Byte-for-byte
-    // identical to ChangeFeedCdcFuzzTests's private Mutate so the pin tracks the real fuzz.
-    private static byte[] ReplayFuzzMutationToIteration(byte[] original, int baseSeed, int iteration)
-    {
-        var random = new Random(TestSeed.Combine(baseSeed, FuzzScope));
-        byte[] mutated = original;
-        for (int i = 0; i <= iteration; i++)
-        {
-            mutated = Mutate(original, random);
-        }
-
-        return mutated;
-    }
-
-    private static byte[] Mutate(byte[] original, Random random)
-    {
-        switch (random.Next(4))
-        {
-            case 0:
-                byte[] noise = new byte[random.Next(0, original.Length + 8)];
-                random.NextBytes(noise);
-                return noise;
-            case 1:
-                return original[..random.Next(0, original.Length)];
-            case 2:
-                byte[] flipped = (byte[])original.Clone();
-                int flips = random.Next(1, 8);
-                for (int f = 0; f < flips; f++)
-                {
-                    flipped[random.Next(flipped.Length)] ^= (byte)(1 << random.Next(8));
-                }
-
-                return flipped;
-            default:
-                byte[] appended = new byte[original.Length + random.Next(1, 32)];
-                original.CopyTo(appended, 0);
-                for (int k = original.Length; k < appended.Length; k++)
-                {
-                    appended[k] = (byte)random.Next(256);
-                }
-
-                return appended;
-        }
     }
 
     private static async Task<Exception?> RunWatchdoggedAsync(Func<Task> operation)

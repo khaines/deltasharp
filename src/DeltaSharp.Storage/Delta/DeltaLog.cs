@@ -1,6 +1,8 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
@@ -46,6 +48,27 @@ internal sealed class DeltaLog
     private readonly long _maxLogObjectBytes;
     private readonly ILogger<DeltaLog> _logger;
     private readonly DeltaStorageTelemetry _telemetry;
+    private readonly TimeProvider _timeProvider;
+    private readonly TimeSpan? _checkpointDecodeBudget;
+
+    /// <summary>Process-wide, bounded <b>negative cache</b> of checkpoint parts that tripped the bounded
+    /// wall-clock decode ceiling, <b>scoped per backend instance</b> (a <see cref="ConditionalWeakTable{TKey,TValue}"/>
+    /// keyed by the <see cref="IStorageBackend"/>). <see cref="DeltaLog"/> is constructed per operation but the
+    /// backend is reused for a table's lifetime, so scoping the cache to the backend (a) survives between
+    /// snapshot loads that share a backend — so a persistently non-terminating (crafted) checkpoint is not
+    /// re-decoded on EVERY load, self-renewing a detached-decode strand each time (the CRITICAL finding) — and
+    /// (b) cannot cross-table collide: the checkpoint <b>part path</b> is only table-relative
+    /// (<c>_delta_log/&lt;version&gt;.checkpoint.parquet</c>, identical across tables), so a process-wide
+    /// path-keyed cache would wrongly skip a healthy checkpoint in an <i>unrelated</i> table (whose early
+    /// commits may be log-cleaned, making the forced JSON replay fail). Keying by the backend confines the
+    /// cache to one table root; the per-backend entry is reclaimed with the backend (no leak). Each inner map
+    /// is bounded to <see cref="NegativeCacheCapacity"/> with coarse whole-map eviction. NativeAOT-safe.</summary>
+    private static readonly ConditionalWeakTable<IStorageBackend, ConcurrentDictionary<string, byte>>
+        TimedOutCheckpointParts = new();
+
+    /// <summary>The cap on <see cref="TimedOutCheckpointParts"/> so the negative cache can never grow without
+    /// bound under a stream of distinct crafted checkpoint identities.</summary>
+    private const int NegativeCacheCapacity = 1024;
 
     /// <summary>The shared <c>deltasharp.component</c>/<c>deltasharp.operation</c>/<c>deltasharp.backend</c>
     /// correlation scope attached to the checkpoint-fallback log line (design §7.2.1; #772), so an operator
@@ -73,13 +96,25 @@ internal sealed class DeltaLog
         IStorageBackend backend,
         long maxLogObjectBytes,
         ILogger<DeltaLog>? logger = null,
-        DeltaStorageTelemetry? telemetry = null)
+        DeltaStorageTelemetry? telemetry = null,
+        TimeSpan? checkpointDecodeBudget = null,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
+        if (checkpointDecodeBudget is { } budget)
+        {
+            // Fail fast on a misconfigured operator budget with an explicit paramName — never as a raw
+            // Task.Delay ArgumentOutOfRangeException surfacing mid-decode.
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(budget.Ticks, nameof(checkpointDecodeBudget));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(budget, BoundedDecode.MaxBudget, nameof(checkpointDecodeBudget));
+        }
+
         _backend = backend;
         _maxLogObjectBytes = maxLogObjectBytes;
         _logger = logger ?? NullLogger<DeltaLog>.Instance;
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
+        _checkpointDecodeBudget = checkpointDecodeBudget;
+        _timeProvider = timeProvider ?? TimeProvider.System;
         _checkpointLogScope = new KeyValuePair<string, object?>[]
         {
             new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),
@@ -782,13 +817,28 @@ internal sealed class DeltaLog
             int metadataActions = 0;
             foreach (string partPath in checkpoint.PartPaths)
             {
+                // Negative-cache short-circuit (CRITICAL fix): a checkpoint part that already tripped the
+                // bounded decode ceiling on a prior snapshot load is known non-terminating. Re-decoding it here
+                // would spawn ANOTHER detached decode on every load — self-renewing strands that the admission
+                // cap alone would eventually reject with visible read failures. Skip the read entirely and fall
+                // back to JSON replay, re-emitting the (rate-alertable) decode-timeout signal so a persistently
+                // bad checkpoint stays observable without re-incurring the decode.
+                if (IsCheckpointPartKnownTimedOut(partPath))
+                {
+                    RecordCheckpointDecodeTimeout(checkpoint.Version);
+                    return null;
+                }
+
                 Stream stream = await _backend.OpenReadAsync(partPath, cancellationToken).ConfigureAwait(false);
                 await using (stream.ConfigureAwait(false))
                 {
                     IReadOnlyList<DeltaAction> actions;
                     try
                     {
-                        actions = await DeltaCheckpointReader.ReadAsync(stream, cancellationToken).ConfigureAwait(false);
+                        actions = await DeltaCheckpointReader.ReadAsync(
+                            stream, cancellationToken,
+                            decodeBudget: _checkpointDecodeBudget,
+                            timeProvider: _timeProvider).ConfigureAwait(false);
                     }
                     catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
                     {
@@ -806,6 +856,29 @@ internal sealed class DeltaLog
                         // unreadable, and swallowing that would mask it behind a silent full JSON replay, so
                         // it must keep propagating (PR #698 security review, FIX 1).
                         RecordCheckpointFallback(CheckpointFallbackReason.UnsupportedFeature, checkpoint.Version);
+                        return null;
+                    }
+                    catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeBudgetExceeded)
+                    {
+                        // The checkpoint decode tripped the bounded wall-clock ceiling (a non-terminating
+                        // crafted decode, #647/#699/#716). This is a RESOURCE fault, NOT proven corruption
+                        // (classification contract, #649/#655/#681): route it to JSON replay under the distinct
+                        // DecodeTimeout reason (EventId 4402), and SEED the negative cache so this known-bad
+                        // part is never re-decoded on a later snapshot load (stopping the self-renewing strand).
+                        // Scoped to THIS call so an OpenReadAsync-origin DecodeBudgetExceeded (there is none
+                        // today) could not be silently swallowed as a checkpoint miss.
+                        SeedTimedOutCheckpointPart(partPath);
+                        RecordCheckpointDecodeTimeout(checkpoint.Version);
+                        return null;
+                    }
+                    catch (DecodeCapacityExhaustedException)
+                    {
+                        // The bounded-decode worker is at capacity (too many strands already detached): the
+                        // decode was rejected fail-fast WITHOUT starting. This is transient — the checkpoint may
+                        // be perfectly healthy — so DO NOT seed the negative cache (that would wrongly poison a
+                        // good checkpoint). Fall back to JSON replay and emit the decode-timeout signal so the
+                        // capacity pressure is observable.
+                        RecordCheckpointDecodeTimeout(checkpoint.Version);
                         return null;
                     }
 
@@ -883,6 +956,46 @@ internal sealed class DeltaLog
         _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.ForgedMultiMetadata);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected(_logger, version);
+    }
+
+    /// <summary>Emits the distinct bounded wall-clock decode-timeout fallback signal for the checkpoint door:
+    /// the <c>DecodeTimeout</c> checkpoint-fallback metric label plus the door-dimensioned
+    /// <c>decode.budget_exceeded</c> counter (door = checkpoint), paired with a distinct Warning log
+    /// (<see cref="DeltaCheckpointLog.CheckpointDecodeTimeout"/>, EventId 4402) so a decode-DoS trip is
+    /// alertable independently of routine bit-rot (<c>Malformed</c>) and encrypted (<c>UnsupportedFeature</c>)
+    /// discards. A wall-clock stall is a resource fault, NOT proven corruption, so it must NOT reuse the
+    /// <c>Malformed</c> reason (classification contract, #649/#655/#681). Renders only the discarded
+    /// version.</summary>
+    private void RecordCheckpointDecodeTimeout(long version)
+    {
+        _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.DecodeTimeout);
+        _telemetry.RecordDecodeBudgetExceeded(DecodeDoor.Checkpoint);
+        using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
+        DeltaCheckpointLog.CheckpointDecodeTimeout(_logger, version);
+    }
+
+    /// <summary>Whether a checkpoint part in THIS backend's (table's) negative cache already tripped the
+    /// bounded decode ceiling on a prior load — so it is skipped rather than re-decoded (which would spawn
+    /// another detached strand).</summary>
+    private bool IsCheckpointPartKnownTimedOut(string partPath) =>
+        TimedOutCheckpointParts.TryGetValue(_backend, out ConcurrentDictionary<string, byte>? parts)
+        && parts.ContainsKey(partPath);
+
+    /// <summary>Records a checkpoint part identity that tripped the bounded decode ceiling so it is not
+    /// re-decoded on a later snapshot load. Scoped to THIS backend (table), so it can never skip a healthy
+    /// checkpoint in an unrelated table. Bounded: on reaching <see cref="NegativeCacheCapacity"/> the table's
+    /// map is cleared (coarse but O(1)-amortized and provably bounded) before inserting, so a stream of
+    /// distinct crafted identities cannot grow the cache without limit.</summary>
+    private void SeedTimedOutCheckpointPart(string partPath)
+    {
+        ConcurrentDictionary<string, byte> parts = TimedOutCheckpointParts.GetValue(
+            _backend, static _ => new ConcurrentDictionary<string, byte>(StringComparer.Ordinal));
+        if (parts.Count >= NegativeCacheCapacity)
+        {
+            parts.Clear();
+        }
+
+        parts[partPath] = 0;
     }
 
     /// <summary>Replays JSON commits <c>[start, target]</c> in ascending order into <paramref name="state"/>,

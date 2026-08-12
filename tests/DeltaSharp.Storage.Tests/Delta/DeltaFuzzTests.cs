@@ -10,8 +10,10 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// Fuzz coverage for the untrusted-input parsers (design §5.4 C-DECODE; "fail deterministically, name the
 /// defect, publish no partial state, fail closed"). Random and mutated inputs to the JSON action reader,
 /// the checkpoint Parquet reader, the <c>_last_checkpoint</c> hint, and the log-file classifier must only
-/// ever succeed or throw the typed <see cref="DeltaProtocolException"/> — never an unexpected exception,
-/// and never hang.
+/// ever succeed or fail closed with a typed exception — the parse-shape faults as
+/// <see cref="DeltaProtocolException"/>, a wall-clock decode-budget trip as a
+/// <see cref="DeltaStorageException"/> with <see cref="StorageErrorKind.DecodeBudgetExceeded"/> — never an
+/// unexpected exception, and never hang.
 /// </summary>
 /// <remarks>
 /// <para><b>Termination is now an ORACLE, not just a comment (#647/#699/#716).</b> The checkpoint oracle
@@ -159,17 +161,27 @@ public sealed class DeltaFuzzTests
             .Add("a.parquet", size: 1)
             .ToParquetAsync();
 
-        // Pin the fixture size so the hard-coded byte index stays the byte the issue minimized to.
+        // Pin the fixture size AND content so the hard-coded byte index stays the byte the issue minimized to;
+        // assert the PRE-mutation value the repro flipped (0x00 at index 5595 → 0xB4) so a fixture drift that
+        // moved that byte cannot silently pass a different mutation.
         Assert.Equal(5604, valid.Length);
+        Assert.Equal(0x00, valid[5595]);
         valid[5595] = 0xB4;
+        Assert.Equal(
+            "adc4ae4b08b536affbf63283aaf9870467e4524bb028342f3f498ddfe3f13042",
+            Sha256Hex(valid));
 
         (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(valid), default, decodeBudget: TestDecodeBudget));
 
-        // (a) a TYPED fail-closed exception — this door's corrupt-checkpoint contract (DeltaProtocolException),
-        // so DeltaLog still discards the non-authoritative checkpoint and falls back to JSON replay; and
-        // (b) it returns well under the real default budget (BoundedDecode.DefaultBudget, 30s).
-        Assert.IsType<DeltaProtocolException>(thrown);
+        // (a) the DISTINCT typed DecodeBudgetExceeded (a DeltaStorageException, NOT DeltaProtocolException: a
+        // wall-clock stall is a resource fault, not proven corruption — #649/#655/#681 classification), which
+        // DeltaLog still routes to JSON replay (under the DecodeTimeout reason); and (b) it returns AT LEAST
+        // the budget yet well under the real default (BoundedDecode.DefaultBudget, 30s). This kind is unique to
+        // the bounded-decode path, so removing the wrapper turns this red (the input hangs → watchdog fires).
+        DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
+        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
+        Assert.True(elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {elapsed}.");
         Assert.True(elapsed < TimeSpan.FromSeconds(5), $"expected a fast fail-closed, took {elapsed}.");
     }
 
@@ -191,7 +203,11 @@ public sealed class DeltaFuzzTests
         (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(
             () => DeltaCheckpointReader.ReadAsync(new MemoryStream(valid), default, decodeBudget: TestDecodeBudget));
 
-        Assert.IsType<DeltaProtocolException>(thrown);
+        // A wall-clock stall on the checkpoint door — the DISTINCT DecodeBudgetExceeded kind (a
+        // DeltaStorageException), NOT DeltaProtocolException; DeltaLog routes it to JSON replay all the same.
+        DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
+        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
+        Assert.True(elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {elapsed}.");
         Assert.True(elapsed < TimeSpan.FromSeconds(5), $"expected a fast fail-closed, took {elapsed}.");
     }
 
@@ -240,15 +256,21 @@ public sealed class DeltaFuzzTests
     private static async Task AssertCheckpointReadIsClosedAsync(byte[] bytes)
     {
         // Bound each read with BOTH a low internal decode budget AND a wall-clock watchdog. The read runs on
-        // the thread pool so a (hypothetical) CPU-bound non-terminating decode — which the underlying decoder
-        // does not cancel — cannot block the assertion thread; on a watchdog trip we fail the test rather than
-        // stall CI (§5.4 C-DECODE "never hangs").
+        // the thread pool so a CPU-bound non-terminating decode — which the underlying decoder does not
+        // cancel — cannot block the assertion thread; on a watchdog trip we fail the test rather than stall CI
+        // (§5.4 C-DECODE — the bounded wall-clock decode ceiling). A fail-closed outcome is EITHER a
+        // DeltaProtocolException (parse-shape fault) OR a DeltaStorageException with DecodeBudgetExceeded (a
+        // wall-clock stall that the budget converted to a typed release).
         Task read = Task.Run(async () =>
         {
             try
             {
                 _ = await DeltaCheckpointReader.ReadAsync(
                     new MemoryStream(bytes), default, decodeBudget: TestDecodeBudget);
+            }
+            catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeBudgetExceeded)
+            {
+                // acceptable: fail closed on a wall-clock decode-budget trip
             }
             catch (DeltaProtocolException)
             {
@@ -300,4 +322,7 @@ public sealed class DeltaFuzzTests
         stopwatch.Stop();
         return (thrown, stopwatch.Elapsed);
     }
+
+    private static string Sha256Hex(byte[] bytes) =>
+        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
 }

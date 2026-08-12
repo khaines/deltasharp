@@ -27,7 +27,8 @@ internal sealed record ParquetDecodeLimits
     /// below 1, or a non-positive time budget would disable or invert a guard).</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxRowGroupDecodedBytes"/> is not
     /// positive, <paramref name="maxDecompressionRatio"/> is less than 1, or <paramref name="decodeTimeBudget"/>
-    /// (when supplied) is not positive.</exception>
+    /// (when supplied) is not positive or exceeds <see cref="BoundedDecode.MaxBudget"/> (a budget that large
+    /// disables the DoS control and is rejected as a misconfiguration).</exception>
     public ParquetDecodeLimits(
         long maxRowGroupDecodedBytes = DefaultMaxRowGroupDecodedBytes,
         long maxDecompressionRatio = DefaultMaxDecompressionRatio,
@@ -36,7 +37,8 @@ internal sealed record ParquetDecodeLimits
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxRowGroupDecodedBytes);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxDecompressionRatio, 1);
         TimeSpan budget = decodeTimeBudget ?? BoundedDecode.DefaultBudget;
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(budget.Ticks);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(budget.Ticks, nameof(decodeTimeBudget));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(budget, BoundedDecode.MaxBudget, nameof(decodeTimeBudget));
         MaxRowGroupDecodedBytes = maxRowGroupDecodedBytes;
         MaxDecompressionRatio = maxDecompressionRatio;
         DecodeTimeBudget = budget;

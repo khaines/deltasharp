@@ -25,6 +25,8 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     // The stable literal strings operators/exporters key on (the metric instrument name and its bounded
     // reason label), asserted here so a rename cannot silently break a dashboard/alert.
     private const string FallbackInstrument = "deltasharp.delta.checkpoint.fallbacks";
+    private const string DecodeBudgetInstrument = "deltasharp.storage.decode.budget_exceeded";
+    private const string DecodeDoorKey = "deltasharp.decode.door";
     private const string ReasonKey = "deltasharp.checkpoint.fallback.reason";
     private const string TableVersionKey = "deltasharp.table.version";
     private const string ComponentKey = "deltasharp.component";
@@ -241,6 +243,80 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         Assert.Empty(meters.ForInstrument(FallbackInstrument));
         Assert.False(logger.Has(FallbackEvent));
         Assert.False(logger.Has(ForgedEvent));
+    }
+
+    [Fact]
+    public async Task DecodeTimeoutCheckpoint_EmitsDecodeTimeoutSignal_AndNegativeCacheSkipsReDecode()
+    {
+        IStorageBackend backend = NewBackend();
+        await WriteHistoryAsync(backend);
+
+        // A hanging checkpoint: a single bit flip in the LAST footer byte (the terminal Thrift STOP of
+        // FileMetaData, index len-9 before the footer_length + PAR1 magic) drives DeltaCheckpointReader into
+        // unbounded, cancellation-ignoring work (the #699/#716 decode-DoS class). Under a LOW injected budget
+        // the reader must fail closed with the DISTINCT decode-timeout signal (not the generic `malformed`
+        // bit-rot reason) and still fall back to JSON replay.
+        byte[] hanging = await CheckpointAtV1().ToParquetAsync();
+        hanging[^9] ^= 1;
+        await DeltaTestHarness.WriteRawCheckpointAsync(backend, 1, hanging);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        var budget = TimeSpan.FromMilliseconds(300);
+
+        // FIRST load: the decode runs the full budget, then is failed closed and routed to JSON replay under
+        // the decode_timeout reason (EventId 4402) with the door-dimensioned decode.budget_exceeded counter.
+        var logger = new RecordingLogger<DeltaLog>();
+        using (var telemetry = new DeltaStorageTelemetry())
+        using (var deltaMeter = new MeterCapture(telemetry.DeltaMeter))
+        using (var storageMeter = new MeterCapture(telemetry.StorageMeter))
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            Snapshot snapshot = await new DeltaLog(
+                backend, DeltaLog.MaxLogObjectBytes, logger, telemetry, checkpointDecodeBudget: budget)
+                .LoadSnapshotAsync();
+            stopwatch.Stop();
+
+            // Fell back to JSON replay (checkpoint discarded, not seeded).
+            Assert.Null(snapshot.Metrics.CheckpointVersion);
+            Assert.Equal(2, snapshot.Metrics.ReplayedCommitCount);
+
+            // Distinct decode-timeout fallback reason (NOT `malformed`) + EventId 4402.
+            MeterCapture.Measurement fallback = Assert.Single(deltaMeter.ForInstrument(FallbackInstrument));
+            Assert.Equal("decode_timeout", fallback.Tags[ReasonKey]);
+            RecordingLogger<DeltaLog>.Entry log = logger.Single("DeltaCheckpointDecodeTimeout");
+            Assert.Equal(4402, log.EventId.Id);
+            Assert.Equal(1L, log.Field("Version"));
+
+            // The door-dimensioned decode.budget_exceeded counter fired for the checkpoint door.
+            MeterCapture.Measurement door = Assert.Single(storageMeter.ForInstrument(DecodeBudgetInstrument));
+            Assert.Equal("checkpoint", door.Tags[DecodeDoorKey]);
+
+            // The decode actually ran the budget on the first (uncached) load.
+            Assert.True(stopwatch.Elapsed >= budget, $"expected the first load to run the budget, took {stopwatch.Elapsed}.");
+        }
+
+        // SECOND load (same table / same part path): the negative cache short-circuits the read, so the
+        // known-bad checkpoint is NOT re-decoded — proven by the load returning WELL under the decode budget
+        // (no decode ran) while still re-emitting the decode_timeout signal so a persistently bad checkpoint
+        // stays observable. If the negative cache were reverted, this second load would again run the full
+        // budget (elapsed >= budget) and this assertion would go red.
+        var logger2 = new RecordingLogger<DeltaLog>();
+        using (var telemetry2 = new DeltaStorageTelemetry())
+        using (var deltaMeter2 = new MeterCapture(telemetry2.DeltaMeter))
+        {
+            var stopwatch2 = System.Diagnostics.Stopwatch.StartNew();
+            Snapshot snapshot2 = await new DeltaLog(
+                backend, DeltaLog.MaxLogObjectBytes, logger2, telemetry2, checkpointDecodeBudget: budget)
+                .LoadSnapshotAsync();
+            stopwatch2.Stop();
+
+            Assert.Null(snapshot2.Metrics.CheckpointVersion);
+            Assert.Equal(2, snapshot2.Metrics.ReplayedCommitCount);
+            MeterCapture.Measurement fallback2 = Assert.Single(deltaMeter2.ForInstrument(FallbackInstrument));
+            Assert.Equal("decode_timeout", fallback2.Tags[ReasonKey]);
+            Assert.True(stopwatch2.Elapsed < budget,
+                $"expected the negative cache to skip the re-decode (fast), took {stopwatch2.Elapsed}.");
+        }
     }
 
     private async Task<(Snapshot Snapshot, MeterCapture.Measurement Metric, RecordingLogger<DeltaLog>.Entry Log)>

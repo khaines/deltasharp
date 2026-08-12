@@ -89,6 +89,30 @@ internal enum CheckpointFallbackReason
     /// therefore minted at the guard call site, not derived from the caught exception. A deliberate, individually
     /// actionable <b>security</b> signal (identity forgery), not routine bit-rot.</summary>
     ForgedMultiMetadata,
+
+    /// <summary>The checkpoint's decode did not terminate within the wall-clock decode budget
+    /// (<see cref="BoundedDecode"/>, #647/#699/#716): a crafted checkpoint drove Parquet.Net into effectively
+    /// unbounded, cancellation-ignoring work. Distinguished from <see cref="Malformed"/> because a timeout is a
+    /// resource/throttling fault, not proof the bytes are malformed — it is minted at the bounded-decode call
+    /// site (surfaced as a <see cref="DeltaStorageException"/> with
+    /// <see cref="StorageErrorKind.DecodeBudgetExceeded"/>), pairs with its own EventId, and seeds the
+    /// checkpoint-layer negative cache so a known-timing-out checkpoint is not re-decoded on every load.</summary>
+    DecodeTimeout,
+}
+
+/// <summary>
+/// Which decode door tripped its wall-clock budget (design §5.4 C-DECODE): the general data-file
+/// (<c>ParquetFileReader</c>) reader or the classic-checkpoint (<c>DeltaCheckpointReader</c>) reader. A closed
+/// two-value set, safe as the <see cref="DeltaStorageTelemetry.DecodeDoorKey"/> metric label so an operator can
+/// tell WHICH untrusted-decode surface is being driven non-terminating.
+/// </summary>
+internal enum DecodeDoor
+{
+    /// <summary>The general data-file Parquet reader (open + row-group decode).</summary>
+    DataFile,
+
+    /// <summary>The classic-checkpoint Parquet reader.</summary>
+    Checkpoint,
 }
 
 /// <summary>
@@ -294,6 +318,11 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// fallback log line).</summary>
     internal const string CheckpointFallbackReasonKey = "deltasharp.checkpoint.fallback.reason";
 
+    /// <summary>The bounded <c>deltasharp.decode.door</c> metric label key sub-classifying a decode-budget
+    /// timeout by which untrusted-decode surface tripped it (<c>data_file</c> / <c>checkpoint</c>). A closed
+    /// value set (metric-label-safe); no untrusted byte content or path ever becomes a tag.</summary>
+    internal const string DecodeDoorKey = "deltasharp.decode.door";
+
     private static readonly string AssemblyVersion =
         typeof(DeltaStorageTelemetry).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
@@ -320,6 +349,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _deleteFiles;
     private readonly Counter<long> _deleteRows;
     private readonly Counter<long> _checkpointFallback;
+    private readonly Counter<long> _decodeBudgetExceeded;
 
     internal DeltaStorageTelemetry()
     {
@@ -382,6 +412,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _checkpointFallback = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.checkpoint.fallbacks", unit: "{fallback}",
             description: "Selected classic checkpoints discarded while SEEDING a snapshot (a post-selection decode failure — unsupported feature or malformed; state not seeded, reconstruction falls back to an older checkpoint or full JSON replay), by reason. Selection-time skips (incomplete multi-part groups, V2/UUID checkpoints, a failed _last_checkpoint hint) are not counted.");
+        _decodeBudgetExceeded = _storageMeter.CreateCounter<long>(
+            "deltasharp.storage.decode.budget_exceeded", unit: "{timeout}",
+            description: "Untrusted Parquet decodes that did NOT terminate within their wall-clock decode budget and were failed closed (a crafted byte driving a non-terminating decode — #647/#699/#716), by door (data_file / checkpoint). The rate instrument to alert on for a decode-DoS attempt.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -570,6 +603,14 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     internal void RecordCheckpointFallback(CheckpointFallbackReason reason) =>
         _checkpointFallback.Add(1, new KeyValuePair<string, object?>(CheckpointFallbackReasonKey, ToLabel(reason)));
 
+    /// <summary>Increments the decode-budget-exceeded counter for one untrusted decode that did not terminate
+    /// within its wall-clock budget and was failed closed (design §5.4 C-DECODE; #647/#699/#716), tagged with
+    /// the bounded <see cref="DecodeDoorKey"/> door dimension. The input is a bounded <see cref="DecodeDoor"/>
+    /// (never a raw string), and no untrusted byte content, path, or checkpoint version ever becomes a tag —
+    /// this is the rate instrument an operator alerts on for a decode-DoS attempt.</summary>
+    internal void RecordDecodeBudgetExceeded(DecodeDoor door) =>
+        _decodeBudgetExceeded.Add(1, new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(door)));
+
     /// <summary>The bounded <c>deltasharp.outcome</c> string for an <see cref="OptimizeOutcome"/>.</summary>
     internal static string ToLabel(OptimizeOutcome outcome) => outcome switch
     {
@@ -653,7 +694,18 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CheckpointFallbackReason.UnsupportedFeature => "unsupported_feature",
         CheckpointFallbackReason.Malformed => "malformed",
         CheckpointFallbackReason.ForgedMultiMetadata => "forged_multi_metadata",
+        CheckpointFallbackReason.DecodeTimeout => "decode_timeout",
         _ => "malformed",
+    };
+
+    /// <summary>The bounded <c>deltasharp.decode.door</c> string for a <see cref="DecodeDoor"/> (design §7.3
+    /// closed value set). An unrecognized value maps to <c>data_file</c> — the fail-safe generic door — so no
+    /// free-text value can reach the metric tag.</summary>
+    internal static string ToLabel(DecodeDoor door) => door switch
+    {
+        DecodeDoor.DataFile => "data_file",
+        DecodeDoor.Checkpoint => "checkpoint",
+        _ => "data_file",
     };
 
     public void Dispose()

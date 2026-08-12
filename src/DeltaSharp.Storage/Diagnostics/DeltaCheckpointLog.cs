@@ -62,4 +62,27 @@ internal static partial class DeltaCheckpointLog
             + "it carries more than one metaData action across its parts (a checkpoint must summarize at most one); "
             + "reconstruction falls back to an older checkpoint or full JSON replay.")]
     internal static partial void CheckpointForgedMultiMetadataRejected(ILogger logger, long version);
+
+    /// <summary>
+    /// A distinct signal (EventId 4402) for a classic checkpoint whose decode did not terminate within the
+    /// wall-clock decode budget (<c>BoundedDecode</c>, #647/#699/#716) and was failed closed: the checkpoint
+    /// was discarded (non-authoritative) and reconstruction fell back to an older checkpoint or full JSON
+    /// replay. Kept separate from the generic <see cref="CheckpointFallback"/> (4400) so an operator can alert
+    /// on a decode-DoS attempt (a crafted checkpoint driving a non-terminating decode) independently of routine
+    /// bit-rot — the two are indistinguishable by exception type downstream, so the distinction is carried by
+    /// this EventId and the sibling <c>reason=decode_timeout</c> metric label plus the
+    /// <c>deltasharp.storage.decode.budget_exceeded{door=checkpoint}</c> counter. Renders only the discarded
+    /// <b>version</b> (an integer, safe) and takes no <see cref="System.Exception"/> object, so no crafted byte
+    /// content can leak (§7.2.2 redaction-by-omission).
+    /// <para>Logged at <c>Warning</c>: the read still succeeds via fallback (the control worked), but a
+    /// checkpoint that persistently times out is an actionable operator signal. The checkpoint layer negatively
+    /// caches the timed-out identity, so the decode is not re-attempted (no new stranded decode) on subsequent
+    /// loads; this log line still re-emits per load as the per-occurrence detail — alert on the counter.</para>
+    /// </summary>
+    [LoggerMessage(EventId = 4402, EventName = "DeltaCheckpointDecodeTimeout", Level = LogLevel.Warning,
+        Message = "Delta checkpoint at version {Version} was discarded because its decode did not terminate within "
+            + "the bounded-decode budget (a crafted checkpoint driving a non-terminating decode); reconstruction "
+            + "falls back to an older checkpoint or full JSON replay, and the timed-out checkpoint is negatively "
+            + "cached so it is not re-decoded.")]
+    internal static partial void CheckpointDecodeTimeout(ILogger logger, long version);
 }

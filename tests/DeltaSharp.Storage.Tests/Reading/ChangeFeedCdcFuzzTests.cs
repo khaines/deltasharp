@@ -21,18 +21,20 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// <c>ParquetCorruptionTests</c>: garbage / malformed-footer / truncated / byte-flipped Parquet all throw a
 /// typed <c>DeltaStorageException</c>). Raw-byte Parquet decode-exception fuzzing is therefore inherited; this
 /// test does NOT re-fuzz Parquet decode exception-mapping.</para>
-/// <para><b>Termination is NOT fully inherited — this fuzz found a real gap.</b>
-/// <c>storage-delta-architecture.md</c> §5.4 (C-DECODE) also requires the decode to NEVER hang, but a corrupt
-/// Parquet <i>data-page header</i> can drive <c>Parquet.Net</c>'s synchronous decode into a non-terminating CPU
-/// loop that no exception handler or <c>CancellationToken</c> can interrupt (repro: this fuzz with
-/// <c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148). That is a Parquet-reader-tier gap
-/// affecting ALL Parquet reads, not fixable at the DeltaSharp layer today; the production non-termination /
-/// multi-tenant-DoS exposure it creates is tracked by #647.</para>
-/// <para><b>The <see cref="WatchdogTimeout"/> here is a CI/TEST-TIER bound, NOT a production control.</b> It
-/// exists only to convert such a hang into a deterministic, attributable <i>test</i> failure (citing #647)
-/// instead of stalling CI — it enforces "never hangs" <i>as a test observation</i>. It does NOT bound a
-/// production reader (a real deployment gets no watchdog); the production fix is tracked by #647. The delivered
-/// default seed never trips it (all 200 iterations fail closed in ms).</para>
+/// <para><b>Termination is a PRODUCTION control now, corroborated here (#647).</b>
+/// <c>storage-delta-architecture.md</c> §5.4 (C-DECODE) requires the decode to fail closed and terminate: a
+/// corrupt Parquet <i>data-page header</i> can drive <c>Parquet.Net</c>'s synchronous decode into a
+/// non-terminating CPU loop that no exception handler or <c>CancellationToken</c> can interrupt (repro: this
+/// fuzz with <c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148). That non-termination is now
+/// bounded at the shared reader by the wall-clock decode ceiling (<c>BoundedDecode</c>, #647/#699/#716): the
+/// decode races an aggregate per-read deadline and fails closed with a typed
+/// <see cref="StorageErrorKind.DecodeBudgetExceeded"/>. The pinned repro
+/// <c>ChangeFeedCdcBoundedDecodeTests</c> asserts that fix directly on this cdc door.</para>
+/// <para><b>The <see cref="WatchdogTimeout"/> here is a CI/TEST-TIER safety net, not the production control.</b>
+/// The production control is the bounded-decode ceiling above; this watchdog only converts a hypothetical
+/// regression (the ceiling failing to release the caller) into a deterministic, attributable <i>test</i>
+/// failure (citing #647) instead of stalling CI. The delivered default seed never trips it (all 200 iterations
+/// fail closed in ms).</para>
 /// <para><b>New coverage added here.</b> The END-TO-END read door layers CDF-specific logic ON TOP of the
 /// shared reader — exception classification/wrapping (Parquet <c>DeltaStorageException</c> →
 /// <see cref="DeltaReadException"/>), <c>_change_type</c> domain validation, per-version leaf-schema
@@ -102,7 +104,7 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
         {
             for (int i = 0; i < iterations; i++)
             {
-                byte[] mutated = Mutate(original, random);
+                byte[] mutated = CdcFuzzMutation.Mutate(original, random);
                 await File.WriteAllBytesAsync(cdcPath, mutated);
 
                 // Alternate the read range: the cdc-only version [3,3], and the full range [1,3] (which yields
@@ -121,14 +123,14 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
         }
     }
 
-    // CI/TEST-TIER watchdog — NOT a production control. A benign or fail-closed door read completes in
-    // MILLISECONDS; this generous ceiling only ever trips on a genuinely non-terminating decode.
-    // storage-delta-architecture.md §5.4 (C-DECODE) requires the decode to fail closed and NEVER hang, but a
-    // corrupt Parquet data-page header can drive Parquet.Net's synchronous decode into a pathological CPU loop
-    // that observes no CancellationToken (a Parquet-reader-tier gap; see the class remarks). This watchdog only
-    // converts such a hang into a deterministic, attributable TEST failure so this fuzz enforces "never hangs"
-    // as a test observation instead of stalling CI. It does NOT bound a production reader — the production
-    // non-termination / multi-tenant-DoS fix is tracked by #647. The delivered default seed never trips it.
+    // CI/TEST-TIER watchdog — a safety net corroborating the production control, not the control itself. A
+    // benign or fail-closed door read completes in MILLISECONDS; this generous ceiling only ever trips on a
+    // genuinely non-terminating decode. storage-delta-architecture.md §5.4 (C-DECODE) requires the decode to
+    // fail closed and terminate; a corrupt Parquet data-page header can drive Parquet.Net's synchronous decode
+    // into a pathological CPU loop that observes no CancellationToken, which the shared reader now bounds with
+    // the wall-clock decode ceiling (BoundedDecode, #647). This watchdog only converts a hypothetical
+    // regression of that ceiling into a deterministic, attributable TEST failure instead of stalling CI. The
+    // delivered default seed never trips it.
     private static readonly TimeSpan WatchdogTimeout = TimeSpan.FromSeconds(30);
 
     private async Task AssertDoorFailsClosedAsync(
@@ -145,9 +147,10 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
                 $"CDF read door did NOT terminate within {WatchdogTimeout.TotalSeconds:0}s on a mutated cdc file "
                 + $"(range=[{range.StartingVersion},{range.EndingVersion}], mutatedBytes={mutatedLength}, "
                 + $"iteration={iteration}). storage-delta-architecture.md §5.4 (C-DECODE) requires the decode to "
-                + "fail closed and NEVER hang. This is the known Parquet-reader-tier decode-termination gap "
-                + "tracked by #647 (a corrupt data-page header drives Parquet.Net's synchronous decode into a "
-                + "non-terminating CPU loop that observes no CancellationToken) — NOT a CDF-layer defect.");
+                + "fail closed and terminate. The shared reader bounds this via the wall-clock decode ceiling "
+                + "(BoundedDecode, #647) — a trip here means that ceiling regressed (a corrupt data-page header "
+                + "drives Parquet.Net's synchronous decode into a non-terminating CPU loop that observes no "
+                + "CancellationToken) — NOT a CDF-layer defect.");
         }
 
         try
@@ -195,39 +198,7 @@ public sealed class ChangeFeedCdcFuzzTests : IDisposable
         }
     }
 
-    private static byte[] Mutate(byte[] original, Random random)
-    {
-        switch (random.Next(4))
-        {
-            case 0: // random overwrite (arbitrary length, including empty)
-                byte[] noise = new byte[random.Next(0, original.Length + 8)];
-                random.NextBytes(noise);
-                return noise;
-
-            case 1: // truncate to a random shorter length (including 0)
-                return original[..random.Next(0, original.Length)];
-
-            case 2: // flip a handful of random bits
-                byte[] flipped = (byte[])original.Clone();
-                int flips = random.Next(1, 8);
-                for (int f = 0; f < flips; f++)
-                {
-                    flipped[random.Next(flipped.Length)] ^= (byte)(1 << random.Next(8));
-                }
-
-                return flipped;
-
-            default: // append trailing garbage (corrupts the Parquet footer-length interpretation)
-                byte[] appended = new byte[original.Length + random.Next(1, 32)];
-                original.CopyTo(appended, 0);
-                for (int k = original.Length; k < appended.Length; k++)
-                {
-                    appended[k] = (byte)random.Next(256);
-                }
-
-                return appended;
-        }
-    }
+    private static byte[] Mutate(byte[] original, Random random) => CdcFuzzMutation.Mutate(original, random);
 
     private CdfTable NewTable()
     {

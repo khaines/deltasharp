@@ -3,6 +3,7 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Types;
 using Parquet;
 using Parquet.Data;
@@ -67,6 +68,8 @@ internal sealed class ParquetFileReader
     internal const long MaxRowGroupDecodedBytes = ParquetDecodeLimits.DefaultMaxRowGroupDecodedBytes;
 
     private readonly ParquetDecodeLimits _limits;
+    private readonly TimeProvider _timeProvider;
+    private readonly DeltaStorageTelemetry _telemetry;
 
     // Micros per calendar day (86_400 s × 1_000_000 µs), for the date→timestamp_ntz read-promotion
     // (midnight-of-date epoch-micros). #533.
@@ -74,7 +77,83 @@ internal sealed class ParquetFileReader
 
     /// <summary>Creates a reader whose eager-decode guard uses <paramref name="limits"/> (or the safe
     /// <see cref="ParquetDecodeLimits.Default"/> when unset).</summary>
-    public ParquetFileReader(ParquetDecodeLimits? limits = null) => _limits = limits ?? ParquetDecodeLimits.Default;
+    /// <param name="limits">The eager-decode + bounded-time guard limits (default
+    /// <see cref="ParquetDecodeLimits.Default"/>).</param>
+    /// <param name="timeProvider">The clock the wall-clock decode deadline is measured against (default
+    /// <see cref="TimeProvider.System"/>), injected per the storage-layer convention so deadline tests can
+    /// drive it deterministically.</param>
+    /// <param name="telemetry">The storage telemetry surface a decode-budget timeout is reported on (default
+    /// the process-wide no-op <see cref="DeltaStorageTelemetry.Shared"/>).</param>
+    public ParquetFileReader(
+        ParquetDecodeLimits? limits = null,
+        TimeProvider? timeProvider = null,
+        DeltaStorageTelemetry? telemetry = null)
+    {
+        _limits = limits ?? ParquetDecodeLimits.Default;
+        _timeProvider = timeProvider ?? TimeProvider.System;
+        _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
+    }
+
+    // A single per-read/per-call AGGREGATE wall-clock deadline (design §5.4 C-DECODE). Every bounded decode a
+    // read performs — the open AND every row-group/metadata step — shares ONE deadline computed at the start of
+    // the call, so the worst-case total read time is the single budget regardless of the file's
+    // (attacker-controlled) row-group count. Without this, a crafted footer declaring millions of row groups
+    // would multiply the per-decode budget by RowGroupCount; the aggregate deadline trips the whole read on the
+    // first step that runs past it.
+    private readonly struct DecodeDeadline
+    {
+        private readonly TimeProvider _timeProvider;
+        private readonly long _start;
+
+        internal DecodeDeadline(TimeProvider timeProvider, TimeSpan budget)
+        {
+            _timeProvider = timeProvider;
+            _start = timeProvider.GetTimestamp();
+            Budget = budget;
+        }
+
+        internal TimeProvider TimeProvider => _timeProvider;
+
+        internal TimeSpan Budget { get; }
+
+        // The wall-clock budget still remaining before the aggregate deadline. Non-positive once the deadline
+        // has passed (the caller then fails the whole read closed without starting another decode).
+        internal TimeSpan Remaining() => Budget - _timeProvider.GetElapsedTime(_start);
+    }
+
+    // Records the data-file decode-budget timeout on the storage meter (door=data_file) and returns the typed
+    // DecodeBudgetExceeded fail-closed exception. Called both as the BoundedDecode onTimeout factory and by the
+    // aggregate-deadline pre-check, so a timeout is observable exactly once per read.
+    private Exception DataFileDecodeTimeout(string message)
+    {
+        _telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile);
+        return DeltaStorageException.DecodeBudgetExceeded(message);
+    }
+
+    // Best-effort disposal of a ParquetReader whose (non-terminating) open completed AFTER the deadline — the
+    // reader owns its input stream (leaveStreamOpen:false), so a late win must not leak it. Fire-and-forget on
+    // the detached path (there is no caller to await); any dispose fault is swallowed.
+    private static void DisposeAbandonedReader(ParquetReader? reader)
+    {
+        if (reader is null)
+        {
+            return;
+        }
+
+        _ = SafeDisposeAsync(reader);
+
+        static async Task SafeDisposeAsync(ParquetReader r)
+        {
+            try
+            {
+                await r.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort cleanup on a detached, abandoned decode — nothing to observe it.
+            }
+        }
+    }
 
     /// <summary>A row-group pruning hint: return <see langword="false"/> to skip a row group whose
     /// <see cref="RowGroupStatistics"/> prove it cannot match. Pruning is a hint only — a kept group is
@@ -177,7 +256,8 @@ internal sealed class ParquetFileReader
             ParquetTypeMapping.EnsureReadSupported(requested[c]);
         }
 
-        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
+        var deadline = new DecodeDeadline(_timeProvider, _limits.DecodeTimeBudget);
+        ParquetReader reader = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
@@ -190,8 +270,12 @@ internal sealed class ParquetFileReader
             for (int group = 0; group < reader.RowGroupCount; group++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
+                // Every row group's bounded decode shares the SAME aggregate deadline created above, so the
+                // worst-case total read time is one budget regardless of the (attacker-controlled)
+                // RowGroupCount — the door trips the whole read on the first group that runs past it.
                 ColumnBatch? batch = await ReadRowGroupAsync(
-                    reader, group, requested, fileFields, keepRowGroup, _limits, allowTypeWideningPromotion, cancellationToken)
+                    reader, group, requested, fileFields, keepRowGroup, _limits, deadline, _telemetry,
+                    allowTypeWideningPromotion, cancellationToken)
                     .ConfigureAwait(false);
                 if (batch is not null)
                 {
@@ -251,7 +335,8 @@ internal sealed class ParquetFileReader
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
+        var deadline = new DecodeDeadline(_timeProvider, _limits.DecodeTimeBudget);
+        ParquetReader reader = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             // Fail-closed row-group-count boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
@@ -262,24 +347,51 @@ internal sealed class ParquetFileReader
             // CorruptData contract. The typed negative-count CorruptData (a DeltaStorageException) and
             // cooperative cancellation (an OperationCanceledException) are both EXCLUDED by the predicates below,
             // so they still propagate UNWRAPPED (never double-mapped, cancellation still wins).
+            //
+            // Bounded-time (#647). The loop iterates the ATTACKER-CONTROLLED RowGroupCount, and each
+            // OpenRowGroupReader/RowCount touches untrusted footer metadata that Parquet.Net 6.0.3 can be driven
+            // into non-terminating, cancellation-ignoring work over. This DV-bounding door (used to bound a
+            // deletion vector's decoded positions by the truth on disk) must therefore be bounded under the SAME
+            // aggregate wall-clock deadline as the data-page decode: race the whole summation against the shared
+            // BoundedDecode policy so a crafted footer fails closed with a DISTINCT DecodeBudgetExceeded rather
+            // than hanging here. The eventual-fault/late-result of an abandoned metadata scan is bounded exactly
+            // as any other detached decode (it holds only the reader, already owned by the caller).
             try
             {
-                long total = 0;
-                for (int group = 0; group < reader.RowGroupCount; group++)
+                TimeSpan remaining = deadline.Remaining();
+                if (remaining <= TimeSpan.Zero)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                    long rows = rowGroup.RowCount;
-                    if (rows < 0)
-                    {
-                        throw DeltaStorageException.CorruptData(
-                            $"Row group {group} declares a negative row count ({rows}).");
-                    }
-
-                    total = checked(total + rows);
+                    throw DataFileDecodeTimeout(
+                        "The Parquet footer row-group metadata could not be read within the bounded-decode time "
+                        + "budget (the aggregate per-read wall-clock deadline elapsed).");
                 }
 
-                return total;
+                return await BoundedDecode.RunAsync(
+                    decodeToken =>
+                    {
+                        long total = 0;
+                        for (int group = 0; group < reader.RowGroupCount; group++)
+                        {
+                            decodeToken.ThrowIfCancellationRequested();
+                            using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                            long rows = rowGroup.RowCount;
+                            if (rows < 0)
+                            {
+                                throw DeltaStorageException.CorruptData(
+                                    $"Row group {group} declares a negative row count ({rows}).");
+                            }
+
+                            total = checked(total + rows);
+                        }
+
+                        return Task.FromResult(total);
+                    },
+                    remaining,
+                    _ => DataFileDecodeTimeout(
+                        "The Parquet footer row-group metadata could not be summed within the bounded-decode "
+                        + "time budget (possible crafted footer driving a non-terminating metadata scan)."),
+                    cancellationToken,
+                    timeProvider: deadline.TimeProvider).ConfigureAwait(false);
             }
             catch (Exception ex) when (IsParquetDefect(ex))
             {
@@ -315,7 +427,8 @@ internal sealed class ParquetFileReader
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
+        var deadline = new DecodeDeadline(_timeProvider, _limits.DecodeTimeBudget);
+        ParquetReader reader = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             return MapFooterSchemaFailClosed(reader);
@@ -380,7 +493,8 @@ internal sealed class ParquetFileReader
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
+        var deadline = new DecodeDeadline(_timeProvider, _limits.DecodeTimeBudget);
+        ParquetReader reader = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             StructType schema = MapFooterSchemaFailClosed(reader);
@@ -651,41 +765,71 @@ internal sealed class ParquetFileReader
         _ => IntPtr.Size,
     };
 
-    private static async Task<ParquetReader> OpenAsync(Stream input, TimeSpan decodeBudget, CancellationToken cancellationToken)
+    private async Task<ParquetReader> OpenAsync(Stream input, DecodeDeadline deadline, CancellationToken cancellationToken)
     {
         ParquetReader? reader = null;
         try
         {
             // Bounded-time open (#699). Parquet.Net 6.0.3 can be driven by a single flipped terminal footer
             // byte into effectively UNBOUNDED work inside CreateAsync (and the forced lazy Schema
-            // materialization) that IGNORES the CancellationToken. Race the open against a wall-clock deadline
-            // via the shared BoundedDecode policy so a crafted footer fails closed with a deterministic
-            // CorruptData rather than hanging the caller. The timeout is a DeltaStorageException, which
-            // IsUndecodableParquetInput EXCLUDES, so it propagates UNWRAPPED past the catch below (never
-            // re-masked, and — correctly — never reclassified as encryption). Cooperative caller cancellation
-            // surfaces as OperationCanceledException, also excluded.
+            // materialization) that IGNORES the CancellationToken. Race the open against the aggregate
+            // wall-clock deadline via the shared BoundedDecode policy so a crafted footer fails closed with a
+            // deterministic, DISTINCT DecodeBudgetExceeded (NOT CorruptData — a wall-clock timeout is a
+            // resource fault, not proof the bytes are corrupt) rather than hanging the caller. The timeout is a
+            // DeltaStorageException, which IsUndecodableParquetInput EXCLUDES, so it propagates UNWRAPPED past
+            // the catch below (never re-masked, and — correctly — never reclassified as encryption).
+            // Cooperative caller cancellation surfaces as OperationCanceledException, also excluded.
+            //
+            // Disposal on the two abandoned paths (both restored here): (a) the SCHEMA-FAULT path disposes the
+            // half-built reader INSIDE the work delegate (the outer `reader` stays null when the work throws,
+            // so the outer catch cannot dispose it); (b) the ABANDONED-SUCCESS path (a non-terminating open that
+            // eventually wins AFTER the deadline) is disposed via the onAbandonedResult hook so the late reader
+            // — which owns the input stream (leaveStreamOpen:false) — is never leaked.
+            TimeSpan remaining = deadline.Remaining();
+            if (remaining <= TimeSpan.Zero)
+            {
+                throw DataFileDecodeTimeout(
+                    "The Parquet stream could not be opened within the bounded-decode time budget "
+                    + "(the aggregate per-read wall-clock deadline elapsed).");
+            }
+
             reader = await BoundedDecode.RunAsync(
                 async innerToken =>
                 {
                     ParquetReader r = await ParquetReader.CreateAsync(input, null, false, innerToken).ConfigureAwait(false);
+                    try
+                    {
+                        // Parquet.Net parses the footer LAZILY: CreateAsync reads the thrift FileMetaData, but
+                        // the high-level ParquetSchema is built ON FIRST ACCESS
+                        // (ThriftFooter.CreateModelSchema), which raises raw BCL exceptions (the #193 CDF
+                        // cdc-file fuzz drove InvalidOperationException, and a byte-flipped footer drives
+                        // NullReferenceException from InitRowGroupReaders) on a malformed schema footer. Every
+                        // caller (ReadDataSchemaAsync, ReadAsync) reads reader.Schema OUTSIDE this boundary, so
+                        // force that materialization HERE — inside the fail-closed footer-parse boundary AND the
+                        // bounded-time budget — so a corrupt footer can neither escape as a raw BCL exception at
+                        // a later reader.Schema access nor hang there (storage-delta-architecture.md §5.4
+                        // C-DECODE).
+                        _ = r.Schema;
+                    }
+                    catch
+                    {
+                        // The forced Schema access failed after the reader was constructed: dispose it HERE
+                        // (leaveStreamOpen:false also releases the input stream) before rethrowing, so the
+                        // successful ParquetReader that owns the input stream is never dropped undisposed when
+                        // the work faults inside BoundedDecode (the outer `reader` is still null on this path).
+                        await r.DisposeAsync().ConfigureAwait(false);
+                        throw;
+                    }
 
-                    // Parquet.Net parses the footer LAZILY: CreateAsync reads the thrift FileMetaData, but the
-                    // high-level ParquetSchema is built ON FIRST ACCESS (ThriftFooter.CreateModelSchema), which
-                    // raises raw BCL exceptions (the #193 CDF cdc-file fuzz drove InvalidOperationException, and a
-                    // byte-flipped footer drives NullReferenceException from InitRowGroupReaders) on a malformed
-                    // schema footer. Every caller (ReadDataSchemaAsync, ReadAsync) reads reader.Schema OUTSIDE
-                    // this boundary, so force that materialization HERE — inside the fail-closed footer-parse
-                    // boundary AND the bounded-time budget — so a corrupt footer can neither escape as a raw BCL
-                    // exception at a later reader.Schema access nor hang there
-                    // (storage-delta-architecture.md §5.4 C-DECODE).
-                    _ = r.Schema;
                     return r;
                 },
-                decodeBudget,
-                static _ => DeltaStorageException.CorruptData(
+                remaining,
+                _ => DataFileDecodeTimeout(
                     "The Parquet stream could not be decoded within the bounded-decode time budget "
                     + "(possible malformed footer driving a non-terminating decode)."),
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken,
+                onAbandonedResult: DisposeAbandonedReader,
+                timeProvider: deadline.TimeProvider).ConfigureAwait(false);
 
             // Plaintext-footer Parquet Modular Encryption — SUCCESS-path arm (#655). A plaintext-footer
             // encrypted file keeps the ordinary PAR1 magic; when its encrypted columns RETAIN their plaintext
@@ -754,22 +898,14 @@ internal sealed class ParquetFileReader
             // corruption and stays CorruptData (see the ReadRowGroupAsync catch).
             string? unsupportedEncryption = ParquetEncryption.ClassifyUnreadableInput(input);
 
-            if (reader is not null)
-            {
-                // The forced Schema access failed after the reader was constructed: dispose it (leaveStreamOpen
-                // is false, so this also releases the input stream) before failing closed. Guard the dispose so
-                // a dispose-time fault on the half-built reader cannot escape UNMAPPED and replace the
-                // deterministic CorruptData contract — the boundary stays exception-total.
-                try
-                {
-                    await reader.DisposeAsync().ConfigureAwait(false);
-                }
-                catch (Exception disposeFault) when (IsUndecodableParquetInput(disposeFault))
-                {
-                    // Cleanup fault on an already-corrupt reader: ignore it so the corrupt-footer failure below
-                    // remains the single, meaningful outcome.
-                }
-            }
+            // NOTE: on this catch path the outer `reader` is ALWAYS null — BoundedDecode.RunAsync assigns
+            // `reader` only on a successful return, and a schema-materialization fault is disposed INSIDE the
+            // work delegate (which releases the input stream via leaveStreamOpen:false) before the fault
+            // propagates here. There is therefore no half-built reader to dispose at this site (the pre-PR
+            // dispose branch is dead now that disposal moved into the work delegate); the ClassifyUnreadableInput
+            // probe above still reads the caller's still-open input stream (CreateAsync leaves it open on
+            // failure), which is correct because that stream is caller-owned and only the reader-owned wrapper
+            // was disposed inside the work.
 
             if (unsupportedEncryption is not null)
             {
@@ -1065,6 +1201,8 @@ internal sealed class ParquetFileReader
         ResolvedColumn[] fileFields,
         RowGroupPredicate? keepRowGroup,
         ParquetDecodeLimits limits,
+        DecodeDeadline deadline,
+        DeltaStorageTelemetry telemetry,
         bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
@@ -1078,21 +1216,37 @@ internal sealed class ParquetFileReader
         //
         // Bounded-time decode (#647). A corrupt data-page header can drive Parquet.Net 6.0.3's SYNCHRONOUS
         // page/level decode into a non-terminating CPU loop that observes NO CancellationToken mid-page — a
-        // hang is not an exception, so the catches below cannot intercept it. Race the whole decode against a
-        // wall-clock deadline via the shared BoundedDecode policy: on expiry it fails closed with a
-        // deterministic CorruptData (a DeltaStorageException the catches EXCLUDE, so it propagates unwrapped),
-        // never hanging the caller. The decode runs on a threadpool thread; its own library faults surface as
-        // the work's outcome and are mapped by the catches below exactly as before.
-        ParquetDecodeLimits effectiveLimits = limits ?? ParquetDecodeLimits.Default;
+        // hang is not an exception, so the catches below cannot intercept it. Race the whole decode against the
+        // AGGREGATE per-read wall-clock deadline (shared across the open + every row group, so the total read
+        // time is bounded by one budget regardless of RowGroupCount) via the shared BoundedDecode policy: on
+        // expiry it fails closed with a DISTINCT DecodeBudgetExceeded (NOT CorruptData — a wall-clock timeout is
+        // a resource fault, not proof the page is corrupt; a DeltaStorageException the catches EXCLUDE, so it
+        // propagates unwrapped), never hanging the caller. The decode runs on the dedicated, hard-capped decode
+        // scheduler; its own library faults surface as the work's outcome and are mapped by the catches below
+        // exactly as before.
         try
         {
+            TimeSpan remaining = deadline.Remaining();
+            if (remaining <= TimeSpan.Zero)
+            {
+                telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile);
+                throw DeltaStorageException.DecodeBudgetExceeded(
+                    "A Parquet row group could not be decoded within the bounded-decode time budget "
+                    + "(the aggregate per-read wall-clock deadline elapsed before this row group).");
+            }
+
             return await BoundedDecode.RunAsync(
                 DecodeGroupAsync,
-                effectiveLimits.DecodeTimeBudget,
-                static _ => DeltaStorageException.CorruptData(
-                    "A Parquet row group could not be decoded within the bounded-decode time budget "
-                    + "(possible corrupt data-page header driving a non-terminating decode)."),
-                cancellationToken).ConfigureAwait(false);
+                remaining,
+                _ =>
+                {
+                    telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile);
+                    return DeltaStorageException.DecodeBudgetExceeded(
+                        "A Parquet row group could not be decoded within the bounded-decode time budget "
+                        + "(possible corrupt data-page header driving a non-terminating decode).");
+                },
+                cancellationToken,
+                timeProvider: deadline.TimeProvider).ConfigureAwait(false);
 
             async Task<ColumnBatch?> DecodeGroupAsync(CancellationToken decodeToken)
             {
@@ -1117,7 +1271,7 @@ internal sealed class ParquetFileReader
                 // so a crafted footer (inflated decompressed size or row count) surfaces as a deterministic
                 // CorruptData error rather than an OOM or a raw OverflowException escaping the codec contract.
                 long declaredRows = rowGroup.RowCount;
-                EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group, effectiveLimits);
+                EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group, limits);
                 int rowCount;
                 try
                 {
@@ -1139,7 +1293,7 @@ internal sealed class ParquetFileReader
                 // bounds the raw declared bytes cumulatively; this bounds reconstruction overhead that aggregate
                 // misses.
                 var nestedBudget = new NestedParquetColumnReader.NestedDecodeBudget(
-                    effectiveLimits.MaxRowGroupDecodedBytes);
+                    limits.MaxRowGroupDecodedBytes);
                 for (int c = 0; c < requested.Count; c++)
                 {
                     ResolvedColumn resolved = fileFields[c];
@@ -1679,15 +1833,18 @@ internal sealed class ParquetFileReader
     // exercises), the boundary must map EVERYTHING to a deterministic CorruptData EXCEPT: (a)
     // OperationCanceledException — cooperative
     // cancellation is control flow and must propagate; and (b) DeltaStorageException — DeltaSharp's OWN typed
-    // fail-closed signal (e.g. UnsupportedFeature for a genuinely unsupported but VALID feature, or a
-    // CorruptData already mapped at an inner site such as ReadValueAsync), which must propagate UNWRAPPED
-    // rather than be re-masked. Every remaining exception at those boundaries originates in the library
+    // fail-closed signal (e.g. UnsupportedFeature for a genuinely unsupported but VALID feature, a
+    // CorruptData already mapped at an inner site such as ReadValueAsync, or a DecodeBudgetExceeded minted by
+    // the bounded-decode policy on a wall-clock timeout), which must propagate UNWRAPPED rather than be
+    // re-masked; and (c) DecodeCapacityExhaustedException — the admission-control fail-fast the bounded-decode
+    // worker raises when saturated by other stranded decodes, a transient RESOURCE signal that must never be
+    // conflated with corrupt bytes. Every remaining exception at those boundaries originates in the library
     // decoding corrupt bytes — never in our own (request-shaped, bounded-by-construction) code, and never our
     // own unsupported-feature path (which is raised TYPED) — so it is safe to fail closed on all of them
     // without masking a genuine bug in our code. This is the fail-closed superset of the IsParquetDefect
     // whitelist above (it also covers every type IsParquetDefect matches).
     internal static bool IsUndecodableParquetInput(Exception ex) =>
-        ex is not (OperationCanceledException or DeltaStorageException);
+        ex is not (OperationCanceledException or DeltaStorageException or DecodeCapacityExhaustedException);
 
     /// <summary>
     /// A read-only view of one row group's per-column statistics, exposed to a

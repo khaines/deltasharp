@@ -74,87 +74,130 @@ internal static class DeltaCheckpointReader
     /// or carries an action row that violates the required Delta action shape (fail closed).</exception>
     /// <exception cref="DeltaStorageException">The part is a valid Parquet file written with a feature
     /// DeltaSharp cannot read — Parquet Modular Encryption, either footer mode
-    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #681). Distinct from
-    /// <see cref="DeltaProtocolException"/> so an unreadable-but-VALID checkpoint is not reported as a corrupt
-    /// one; the checkpoint stays non-authoritative either way (<see cref="DeltaLog"/> falls back to JSON
-    /// replay).</exception>
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #681) — OR it could not be decoded within the
+    /// bounded wall-clock decode ceiling (<see cref="StorageErrorKind.DecodeBudgetExceeded"/>). Both are
+    /// distinct from <see cref="DeltaProtocolException"/> so an unreadable-but-VALID or a resource-exhausting
+    /// (but not provably corrupt) checkpoint is not reported as a corrupt one; the checkpoint stays
+    /// non-authoritative either way (<see cref="DeltaLog"/> falls back to JSON replay).</exception>
     public static async Task<IReadOnlyList<DeltaAction>> ReadAsync(
         Stream stream, CancellationToken cancellationToken,
         long maxPartBytes = MaxCheckpointPartBytes, long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes,
-        TimeSpan? decodeBudget = null)
+        TimeSpan? decodeBudget = null, TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
-        MemoryStream buffer = await BufferAsync(stream, maxPartBytes, cancellationToken).ConfigureAwait(false);
-        await using (buffer.ConfigureAwait(false))
+        // Fail fast on a misconfigured budget (positive and within the accepted ceiling) BEFORE any I/O, with
+        // an explicit paramName — never as a raw ArgumentOutOfRangeException surfacing mid-decode from
+        // Task.Delay. A null budget means "derive a size-aware budget below".
+        if (decodeBudget is { } configured)
         {
-            // Bounded-time decode (#716/#699/#647). A single corrupted byte (the terminal footer STOP flipped,
-            // #699; the byte at index 5595 in the #716 minimized repro; a corrupt data-page header, #647) can
-            // drive Parquet.Net 6.0.3 into effectively UNBOUNDED work — inside ParquetReader.CreateAsync at
-            // open, or inside the synchronous column/page decode — that IGNORES the CancellationToken. A hang is
-            // not an exception, so the fail-closed catch inside DecodeBufferedAsync cannot intercept it. Race the
-            // WHOLE open+decode against a wall-clock deadline via the shared BoundedDecode policy so a corrupt
-            // checkpoint fails closed deterministically (→ the non-authoritative checkpoint is discarded and
-            // DeltaLog falls back to JSON replay) rather than stalling the table read indefinitely. On expiry
-            // the fixed-message DeltaProtocolException.Malformed matches this door's existing corrupt-checkpoint
-            // contract (so the JSON-replay fallback path is unchanged); a valid-but-unsupported
-            // UnsupportedFeature and cooperative cancellation both finish inside the budget and propagate
-            // unwrapped as the work's own outcome.
-            return await BoundedDecode.RunAsync(
-                decodeToken => DecodeBufferedAsync(buffer, maxDecodedBytes, decodeToken),
-                decodeBudget ?? BoundedDecode.DefaultBudget,
-                static _ => DeltaProtocolException.Malformed(
-                    "The Delta checkpoint Parquet could not be decoded within the bounded-decode time budget."),
-                cancellationToken).ConfigureAwait(false);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(configured.Ticks, nameof(decodeBudget));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(configured, BoundedDecode.MaxBudget, nameof(decodeBudget));
         }
+
+        // Buffer to an IMMUTABLE byte[] (not a MemoryStream the caller then disposes). Isolation contract: the
+        // bounded decode below opens its OWN MemoryStream over these bytes INSIDE the work delegate, so a
+        // stranded (detached-past-deadline) decode never touches a caller-owned/pooled stream — it can never
+        // observe a disposed buffer nor a rewound position, eliminating the wrong-result race on timeout. The
+        // bytes are read-only and shared; only a stranded decode's own MemoryStream pins them (≤ maxPartBytes,
+        // the accepted residual).
+        byte[] bytes = await BufferAsync(stream, maxPartBytes, cancellationToken).ConfigureAwait(false);
+
+        // Bounded-time decode (#716/#699/#647). A single corrupted byte (the terminal footer STOP flipped,
+        // #699; the byte at index 5595 in the #716 minimized repro; a corrupt data-page header, #647) can
+        // drive Parquet.Net 6.0.3 into effectively UNBOUNDED work — inside ParquetReader.CreateAsync at
+        // open, or inside the synchronous column/page decode — that IGNORES the CancellationToken. A hang is
+        // not an exception, so the fail-closed catch inside DecodeBufferedAsync cannot intercept it. Race the
+        // WHOLE open+decode against a wall-clock deadline via the shared BoundedDecode policy so a corrupt
+        // checkpoint fails closed deterministically (→ the non-authoritative checkpoint is discarded and
+        // DeltaLog falls back to JSON replay) rather than stalling the table read indefinitely. On expiry a
+        // DecodeBudgetExceeded DeltaStorageException (NOT Malformed: a wall-clock stall is a resource fault,
+        // not proven corruption — #649/#655/#681 classification contract) routes DeltaLog to JSON replay under
+        // the DecodeTimeout reason; a valid-but-unsupported UnsupportedFeature and cooperative cancellation
+        // both finish inside the budget and propagate unwrapped as the work's own outcome.
+        return await BoundedDecode.RunAsync(
+            decodeToken => DecodeBufferedAsync(bytes, maxDecodedBytes, decodeToken),
+            decodeBudget ?? SizeAwareBudget(bytes.Length),
+            static _ => DeltaStorageException.DecodeBudgetExceeded(
+                "The Delta checkpoint Parquet could not be decoded within the bounded-decode time budget."),
+            cancellationToken,
+            onAbandonedResult: null,
+            timeProvider).ConfigureAwait(false);
+    }
+
+    /// <summary>Derives the checkpoint decode budget from the buffered (compressed) part size so a HEALTHY
+    /// large part the byte ceilings admit (up to <see cref="MaxCheckpointPartBytes"/> = 512&#160;MiB) is never
+    /// discarded merely for taking longer than a flat default, while a crafted part that stalls indefinitely
+    /// still trips. Stated FLOOR decode throughput = 8&#160;MiB/s: a legitimate part decodes at least this fast
+    /// (real Parquet decode is &gt;&gt; 100&#160;MiB/s), so 512&#160;MiB ⇒ 64&#160;s ≥ the worst case the byte
+    /// ceilings permit. The budget is floored at <see cref="BoundedDecode.DefaultBudget"/> (small parts still
+    /// get the full default) and capped at <see cref="BoundedDecode.MaxBudget"/>.</summary>
+    private static TimeSpan SizeAwareBudget(long compressedBytes)
+    {
+        const double FloorBytesPerSecond = 8.0 * 1024 * 1024;
+        TimeSpan derived = TimeSpan.FromSeconds(compressedBytes / FloorBytesPerSecond);
+        if (derived < BoundedDecode.DefaultBudget)
+        {
+            derived = BoundedDecode.DefaultBudget;
+        }
+
+        return derived > BoundedDecode.MaxBudget ? BoundedDecode.MaxBudget : derived;
     }
 
     // The open + full row-group decode of one buffered checkpoint part (bounded in time by the caller's
     // BoundedDecode.RunAsync). Kept as its own method so the bounded-decode policy wraps a single unit of work
-    // whose CancellationToken is the linked (deadline + caller) token.
+    // whose CancellationToken is the linked (deadline + caller) token. Opens an ISOLATED MemoryStream over the
+    // caller-supplied immutable bytes so a stranded decode never shares a caller-owned stream (see ReadAsync).
     private static async Task<IReadOnlyList<DeltaAction>> DecodeBufferedAsync(
-        MemoryStream buffer, long maxDecodedBytes, CancellationToken cancellationToken)
+        byte[] bytes, long maxDecodedBytes, CancellationToken cancellationToken)
     {
-        ParquetReader reader = await OpenAsync(buffer, cancellationToken).ConfigureAwait(false);
-        await using (reader.ConfigureAwait(false))
+        var buffer = new MemoryStream(bytes, writable: false);
+        await using (buffer.ConfigureAwait(false))
         {
-            try
+            ParquetReader reader = await OpenAsync(buffer, cancellationToken).ConfigureAwait(false);
+            await using (reader.ConfigureAwait(false))
             {
-                var schema = CheckpointSchema.Resolve(reader.Schema);
-                var actions = new List<DeltaAction>();
-                for (int group = 0; group < reader.RowGroupCount; group++)
+                try
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                    await ReadRowGroupAsync(rowGroup, schema, actions, group, maxDecodedBytes, cancellationToken).ConfigureAwait(false);
-                }
+                    var schema = CheckpointSchema.Resolve(reader.Schema);
+                    var actions = new List<DeltaAction>();
+                    for (int group = 0; group < reader.RowGroupCount; group++)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                        await ReadRowGroupAsync(rowGroup, schema, actions, group, maxDecodedBytes, cancellationToken).ConfigureAwait(false);
+                    }
 
-                return actions;
-            }
-            catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException))
-            {
-                // Any lower-level decode failure (a page-level defect a byte-flip introduced past the
-                // footer) is a corrupt checkpoint: fail closed so the caller falls back to JSON replay.
-                // Fixed message (no ex.Message interpolation): an attacker-controlled checkpoint footer
-                // field name must never echo into the surfaced error text (info-leak parity with the
-                // ParquetFileReader fail-closed boundaries, #651). The cause is preserved as the inner
-                // exception for logs/diagnostics.
-                throw DeltaProtocolException.Malformed(
-                    "The Delta checkpoint Parquet is malformed.", ex);
+                    return actions;
+                }
+                catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException or DeltaStorageException))
+                {
+                    // Any lower-level decode failure (a page-level defect a byte-flip introduced past the
+                    // footer) is a corrupt checkpoint: fail closed so the caller falls back to JSON replay.
+                    // Fixed message (no ex.Message interpolation): an attacker-controlled checkpoint footer
+                    // field name must never echo into the surfaced error text (info-leak parity with the
+                    // ParquetFileReader fail-closed boundaries, #651). The cause is preserved as the inner
+                    // exception for logs/diagnostics. A DeltaStorageException (UnsupportedFeature) already
+                    // carries its own classification and propagates unwrapped.
+                    throw DeltaProtocolException.Malformed(
+                        "The Delta checkpoint Parquet is malformed.", ex);
+                }
             }
         }
     }
 
-    private static async Task<MemoryStream> BufferAsync(Stream stream, long maxPartBytes, CancellationToken cancellationToken)
+    // Buffers the whole part into an IMMUTABLE byte[] (bounded by maxPartBytes). Returning a byte[] rather than
+    // a MemoryStream is deliberate: the bounded decode opens its OWN read-only MemoryStream over these bytes so
+    // a stranded decode never shares a caller-disposed/pooled stream (isolation contract; see ReadAsync).
+    private static async Task<byte[]> BufferAsync(Stream stream, long maxPartBytes, CancellationToken cancellationToken)
     {
-        var buffer = new MemoryStream();
+        using var buffer = new MemoryStream();
         byte[] chunk = new byte[81920];
         int read;
         while ((read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
         {
             if (buffer.Length + read > maxPartBytes)
             {
-                await buffer.DisposeAsync().ConfigureAwait(false);
                 throw DeltaProtocolException.Malformed(string.Create(
                     CultureInfo.InvariantCulture,
                     $"A Delta checkpoint part exceeds the {maxPartBytes}-byte decode ceiling."));
@@ -163,8 +206,7 @@ internal static class DeltaCheckpointReader
             buffer.Write(chunk, 0, read);
         }
 
-        buffer.Position = 0;
-        return buffer;
+        return buffer.ToArray();
     }
 
     /// <summary>Opens the checkpoint Parquet, classifying a Parquet Modular Encryption checkpoint as
