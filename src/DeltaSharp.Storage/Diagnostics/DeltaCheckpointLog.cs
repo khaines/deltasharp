@@ -108,4 +108,24 @@ internal static partial class DeltaCheckpointLog
             + "back to an older checkpoint or full JSON replay this load, and the checkpoint is re-attempted "
             + "when capacity frees (it is not negatively cached).")]
     internal static partial void CheckpointDecoderSaturated(ILogger logger, long version);
+
+    /// <summary>
+    /// A distinct signal (EventId 4404) for a classic checkpoint part that was SKIPPED without decoding because
+    /// its identity is suppressed in the process-wide negative cache (strike-gated, ≥2 proven timeouts, High
+    /// #6) — or because another concurrent snapshot load already holds the single-flight re-probe for it (High
+    /// #7). NO decode ran, so this is categorically distinct from the decode-TIMEOUT at 4402 (where the decode
+    /// actually ran past budget): kept separate so log-based alerting on a decode-DoS trip (4402) is not
+    /// conflated with the far higher-volume steady-state skip of an already-known-bad checkpoint (Medium
+    /// finding). The distinction is carried by this EventId and the sibling <c>reason=negative_cache_skip</c>
+    /// metric label plus the <c>deltasharp.storage.decode.negative_cache_skip{door=checkpoint}</c> counter; it
+    /// deliberately does NOT increment <c>decode.budget_exceeded</c>. Renders only the discarded <b>version</b>
+    /// (an integer, safe) and takes no <see cref="System.Exception"/> object (§7.2.2 redaction-by-omission).
+    /// <para>Logged at <c>Warning</c>: the read still succeeds via fallback, but a persistently-suppressed
+    /// checkpoint is an actionable operator signal — alert on the counter (the steady-state rate instrument).</para>
+    /// </summary>
+    [LoggerMessage(EventId = 4404, EventName = "DeltaCheckpointNegativeCacheSkip", Level = LogLevel.Warning,
+        Message = "Delta checkpoint at version {Version} was skipped without decoding because its part is "
+            + "suppressed in the decode negative cache (a persistently non-terminating checkpoint) or is being "
+            + "re-probed by another load; reconstruction falls back to an older checkpoint or full JSON replay.")]
+    internal static partial void CheckpointNegativeCacheSkip(ILogger logger, long version);
 }

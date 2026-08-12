@@ -1314,4 +1314,58 @@ public sealed class DeltaCheckpointReaderTests
 
         Assert.Equal(1, reader.DisposeCount);
     }
+
+    [Fact]
+    public void DeriveSizeAwareBudget_ClampsToFloorForSmallParts_AndIsMonotonicNonDecreasing()
+    {
+        // High #6 — direct proof the per-part budget derives from a DECODED-bytes estimate (compressed ×
+        // bounded expansion), NOT the arithmetically-inert compressed÷decoded the Round-5 code used (which
+        // always collapsed to the floor). This test pins THREE properties of the pure derivation:
+        //   (1) FLOOR CLAMP — a tiny part still gets at least the default budget (never zero/negative).
+        //   (2) MONOTONE NON-DECREASING — a larger part never gets a SMALLER budget than a smaller one, so a
+        //       big part is never starved relative to a small one (the decoded-bytes basis is what makes the
+        //       budget actually scale with size instead of collapsing to the floor for every part).
+        //   (3) CEILING CLAMP — an enormous / overflowing compressed length saturates its DECODED estimate to
+        //       the enforced decoded-bytes ceiling (1 GiB) and never overflows to a negative TimeSpan. Because
+        //       that decoded ceiling caps the basis, the LARGEST derivable budget is 1 GiB / 32 MiB/s = 32s
+        //       (the outer MaxBudget clamp is defensive — unreachable while the decoded ceiling stands).
+        var sizes = new long[]
+        {
+            0L,
+            4L * 1024, // 4 KiB
+            1L * 1024 * 1024, // 1 MiB
+            16L * 1024 * 1024, // 16 MiB
+            64L * 1024 * 1024, // 64 MiB
+            256L * 1024 * 1024, // 256 MiB
+            DeltaCheckpointReader.MaxCheckpointPartBytes, // 512 MiB — the enforced per-part buffer ceiling
+            long.MaxValue, // overflow guard
+        };
+
+        TimeSpan previous = TimeSpan.MinValue;
+        foreach (long size in sizes)
+        {
+            TimeSpan budget = DeltaCheckpointReader.DeriveSizeAwareBudget(size);
+
+            // (1) never below the floor and never a non-positive budget.
+            Assert.True(budget >= BoundedDecode.DefaultBudget, $"size={size}: budget {budget} < floor {BoundedDecode.DefaultBudget}");
+            Assert.True(budget > TimeSpan.Zero, $"size={size}: budget {budget} must be positive");
+
+            // (2) monotone non-decreasing in the part's compressed length.
+            Assert.True(budget >= previous, $"size={size}: budget {budget} decreased below previous {previous}");
+            previous = budget;
+
+            // (3) never above the ceiling.
+            Assert.True(budget <= BoundedDecode.MaxBudget, $"size={size}: budget {budget} > ceiling {BoundedDecode.MaxBudget}");
+        }
+
+        // A small part collapses to the FLOOR exactly (the decoded estimate is well under the throughput floor).
+        Assert.Equal(BoundedDecode.DefaultBudget, DeltaCheckpointReader.DeriveSizeAwareBudget(4L * 1024));
+
+        // An overflowing length SATURATES its decoded basis to the 1 GiB decoded ceiling (no negative TimeSpan
+        // from arithmetic overflow) → the LARGEST budget the derivation can produce: 1 GiB / 32 MiB/s = 32s.
+        // This also proves the compressed length itself does NOT drive the budget past the decoded ceiling.
+        Assert.Equal(TimeSpan.FromSeconds(32), DeltaCheckpointReader.DeriveSizeAwareBudget(long.MaxValue));
+        Assert.True(DeltaCheckpointReader.DeriveSizeAwareBudget(long.MaxValue) < BoundedDecode.MaxBudget,
+            "the decoded ceiling caps the budget well below the defensive MaxBudget clamp.");
+    }
 }

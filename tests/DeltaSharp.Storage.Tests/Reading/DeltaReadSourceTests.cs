@@ -449,6 +449,70 @@ public sealed class DeltaReadSourceTests : IDisposable
     }
 
     [Fact]
+    public async Task ReadBatches_WhenDataFileDoorSaturated_MapsDecoderSaturatedToDeltaReadException_WithoutPathEcho()
+    {
+        // C1-gap (facade branch) — the DeltaReadSource I8 mapping: when the data-file decode door is at strand
+        // capacity, the row-group/open decode is rejected fail-fast (DecoderSaturated). The PUBLIC read facade
+        // must translate that INTERNAL storage kind into a public, RETRYABLE DeltaReadException (never leak the
+        // raw untyped DeltaStorageException out of the facade) and must NOT echo the untrusted add.Path into the
+        // human-facing Message (#653). Driven through the REAL read path via the injected dataFileDecoder seam
+        // with a cap=1 PRE-SATURATED decoder — the same seam the ParquetFileReader stage tests use, no test-only
+        // widening. This is the fifth capacity branch (facade), complementing the three ParquetFileReader stage
+        // branches and the checkpoint door.
+        using (DeltaWriteTarget target = WriteTarget())
+        {
+            await target.AppendAsync(FlatSchema, Array.Empty<string>(), new[] { FlatBatch((1, "a"), (2, "b")) });
+        }
+
+        var decoder = new BoundedDecoder(strandCountCap: 1, execution: DecodeExecution.Pool);
+        using var strandGate = new ManualResetEventSlim(initialState: false);
+
+        // Fill the single strand slot with a gated, never-terminating strand so the NEXT admit is rejected
+        // fail-fast (the door is genuinely full of a permanent strand — the only condition that rejects).
+        await Assert.ThrowsAsync<DeltaStorageException>(() => decoder.RunAsync<int>(
+            _ => { strandGate.Wait(); return Task.FromResult(0); },
+            TimeSpan.FromMilliseconds(80),
+            static _ => DeltaStorageException.DecodeBudgetExceeded("occupying strand"),
+            CancellationToken.None));
+        await WaitUntilAsync(() => decoder.DetachedDecodeCount == 1);
+
+        var reader = new ParquetFileReader(ParquetDecodeLimits.Default, dataFileDecoder: decoder);
+        using DeltaReadSource source = DeltaReadSource.ForLocalPathWithReader(_root, reader);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+
+        // ReadBatchesAsync is an EXACT type match: DeltaReadSchemaEvolutionException is a sibling (not subtype)
+        // of DeltaReadException, so a passing DeltaReadException proves the saturation is mapped, not masked.
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            () => source.ReadBatchesAsync(info.Version));
+
+        DeltaStorageException inner = Assert.IsType<DeltaStorageException>(ex.InnerException);
+        Assert.Equal(StorageErrorKind.DecoderSaturated, inner.Kind); // retryable saturation, NOT a decode-timeout
+        Assert.NotEqual(StorageErrorKind.DecodeBudgetExceeded, inner.Kind);
+        Assert.Contains("saturated", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("retry", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // #653 path hygiene: no untrusted add.Path (a .parquet file name) in the human-facing message.
+        Assert.DoesNotContain(".parquet", ex.Message, StringComparison.OrdinalIgnoreCase);
+
+        // Quiesce the gated strand so it does not linger past the test.
+        strandGate.Set();
+        await WaitUntilAsync(() => decoder.DetachedDecodeCount == 0);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (deadline.Elapsed > TimeSpan.FromSeconds(20))
+            {
+                Assert.Fail("The expected bounded-decode state was not reached within the watchdog.");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
+    [Fact]
     public async Task EvolvedNarrowFile_WithDeletionVector_NullFillsAndAppliesDv_Issue497()
     {
         // The DV × null-fill composition (QueryExec/Delta council ask): a narrow {id} DV-enabled file gets a

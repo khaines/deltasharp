@@ -52,13 +52,18 @@ internal sealed record ParquetDecodeLimits
     /// a higher declared ratio is rejected as a decompression bomb.</summary>
     public long MaxDecompressionRatio { get; }
 
-    /// <summary>The wall-clock deadline for the data-file decode. It is an AGGREGATE per-read deadline: the
-    /// open (<c>ParquetReader.CreateAsync</c> + footer materialization) AND every row-group decode of a single
-    /// <c>ReadAsync</c>/<c>GetRowCountAsync</c> call share this ONE budget measured from the start of the call,
-    /// so the worst-case total decode time is bounded by the single budget regardless of the
-    /// (attacker-controlled) row-group count — not multiplied per step. Parquet.Net 6.0.3 can be driven into
-    /// non-terminating, cancellation-ignoring work by one corrupted byte (#647/#699), so on expiry the reader
-    /// fails closed with <see cref="StorageErrorKind.DecodeBudgetExceeded"/> (a resource fault distinct from
+    /// <summary>The wall-clock deadline for a SINGLE data-file decode OPERATION. It is a PER-OPERATION budget,
+    /// NOT an aggregate per-read one: the open (<c>ParquetReader.CreateAsync</c> + footer materialization), the
+    /// footer row-group-metadata scan (<c>GetRowCountAsync</c>), and EACH row-group decode are bounded
+    /// INDEPENDENTLY, each measured from that one operation's EXECUTION start (never spanning the streaming
+    /// iterator's <c>yield return</c> suspension or the consumer time between <c>MoveNextAsync</c> calls, so
+    /// consumer/back-pressure time is never charged). A slow legitimate consumer therefore never trips it, and
+    /// each operation gets the full budget rather than a shrinking shared remainder. Worst-case retained memory
+    /// is bounded instead by the charge-at-detach stranded-residual model of the data-file
+    /// <see cref="BoundedDecode"/> door (a strand of a non-terminating decode charges its real projected
+    /// footprint against the door's residual budget). Parquet.Net 6.0.3 can be driven into non-terminating,
+    /// cancellation-ignoring work by one corrupted byte (#647/#699), so on expiry the operation fails closed
+    /// with <see cref="StorageErrorKind.DecodeBudgetExceeded"/> (a resource fault distinct from
     /// <see cref="StorageErrorKind.CorruptData"/> — a wall-clock stall is not proof the bytes are corrupt)
     /// rather than hanging. Defaults to <see cref="BoundedDecode.DefaultBudget"/>. NOTE: today this is set only
     /// from tests — the production config seam that would let an operator lower it per latency-sensitive tier is

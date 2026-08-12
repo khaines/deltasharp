@@ -66,32 +66,42 @@ internal static class DeltaCheckpointReader
     /// an OOM on the driver; a legitimately large checkpoint spreads across multiple row groups.</summary>
     internal const long MaxCheckpointRowGroupDecodedBytes = 1L * 1024 * 1024 * 1024;
 
-    /// <summary>The default per-part wall-clock decode budget FLOOR (design §5.4 C-DECODE, #647/#699/#716),
-    /// used when a part's size-aware budget derives smaller (a tiny part) and no operator/test override is
-    /// threaded. Each checkpoint part is decoded under its OWN size-aware budget derived from THAT part's
-    /// buffered bytes (see <see cref="DeriveSizeAwareBudget"/>) — never a shrinking aggregate remainder shared
-    /// across parts, which would hand a later part a starved budget and seed a healthy-but-slow part into the
-    /// negative cache as "known-bad" (Critical #2b). The floor is derived from the enforced DECODED-bytes
-    /// ceiling — <see cref="MaxCheckpointRowGroupDecodedBytes"/> (1&#160;GiB) — divided by a conservative
-    /// documented FLOOR decode throughput, so its UNITS MATCH the ceiling the decode actually enforces (the
-    /// Round-1 budget derived its floor from COMPRESSED bytes while the ceiling is decoded bytes, a units
-    /// mismatch; #802 tracks benchmark-backed calibration of both this and the memory budget). Stated floor
-    /// decode throughput = 32&#160;MiB/s of DECODED output (real Parquet decode is &gt;&gt; that; DeltaSharp
-    /// measures in the hundreds), so 1&#160;GiB ⇒ 32&#160;s. Floored at <see cref="BoundedDecode.DefaultBudget"/>
-    /// and capped at <see cref="BoundedDecode.MaxBudget"/>.</summary>
-    internal static TimeSpan DefaultAggregateBudget { get; } = DeriveSizeAwareBudget(MaxCheckpointRowGroupDecodedBytes);
-
+    /// <summary>The default per-part wall-clock decode budget FLOOR (design §5.4 C-DECODE, #647/#699/#716):
+    /// each checkpoint part is decoded under its OWN size-aware budget derived from THAT part's DECODED-bytes
+    /// estimate (see <see cref="DeriveSizeAwareBudget"/>) — never a shrinking aggregate remainder shared across
+    /// parts, which would hand a later part a starved budget and seed a healthy-but-slow part into the negative
+    /// cache as "known-bad" (Critical #2b). The floor derives from the enforced DECODED-bytes ceiling
+    /// (<see cref="MaxCheckpointRowGroupDecodedBytes"/>, 1&#160;GiB) divided by a conservative documented FLOOR
+    /// decode throughput, so its UNITS MATCH the ceiling the decode actually enforces (the Round-1 budget
+    /// derived its floor from COMPRESSED bytes while the ceiling is decoded bytes, a units mismatch; #802 tracks
+    /// benchmark-backed calibration). Stated floor decode throughput = 32&#160;MiB/s of DECODED output (real
+    /// Parquet decode is &gt;&gt; that; DeltaSharp measures in the hundreds), so 1&#160;GiB ⇒ 32&#160;s. Floored
+    /// at <see cref="BoundedDecode.DefaultBudget"/> and capped at <see cref="BoundedDecode.MaxBudget"/>.</summary>
     private const double FloorDecodedBytesPerSecond = 32.0 * 1024 * 1024;
 
-    // Derives the per-part decode budget from the part's OWN bytes: declaredBytes ÷ the conservative floor
-    // decode throughput, clamped into [DefaultBudget, MaxBudget]. declaredBytes is the part's buffered
-    // (compressed) length; the enforced decoded-bytes ceiling caps the basis so a part cannot claim a budget
-    // larger than the worst-case decoded expansion warrants. I/O transfer is EXCLUDED (this is called after
-    // BufferAsync completes and the decode clock starts at the bounded decode's execution start), so a slow
-    // download never consumes the decode budget.
-    private static TimeSpan DeriveSizeAwareBudget(long declaredBytes)
+    /// <summary>The conservative bounded DECOMPRESSION expansion factor applied to a part's COMPRESSED buffered
+    /// bytes to estimate its DECODED footprint for the size-aware budget (High #6). The Round-5 budget derived
+    /// the budget from the part's COMPRESSED length divided by the DECODED throughput — a units mismatch that,
+    /// because a typical compressed part is far below the throughput×floor product, ALWAYS collapsed to the
+    /// 30&#160;s floor regardless of part size (arithmetically inert). Estimating decoded bytes as
+    /// <c>compressed × factor</c> (clamped to the enforced decoded ceiling) makes the budget genuinely scale
+    /// with the decode work a large healthy part demands, so it is not starved into the negative cache. Eight is
+    /// a conservative upper bound on columnar (snappy/zstd) checkpoint expansion; #802 tracks calibration.</summary>
+    private const double CheckpointDecodedExpansionFactor = 8.0;
+
+    // Derives the per-part decode budget from the part's OWN estimated DECODED bytes (High #6): the part's
+    // buffered COMPRESSED length is scaled by the bounded decompression expansion factor and clamped to the
+    // enforced decoded-bytes ceiling, then divided by the conservative floor decode throughput, clamped into
+    // [DefaultBudget, MaxBudget]. Using a decoded-bytes basis (not the compressed length the Round-5 code used)
+    // makes the budget actually scale with part size instead of collapsing to the floor for every part. I/O
+    // transfer is EXCLUDED (this is called after BufferAsync completes and the decode clock starts at the
+    // bounded decode's execution start), so a slow download never consumes the decode budget.
+    // Exposed internally for a direct monotonicity/clamp table test (High #6). Callers within this class treat
+    // it as private.
+    internal static TimeSpan DeriveSizeAwareBudget(long compressedBytes)
     {
-        long basisBytes = Math.Min(Math.Max(declaredBytes, 0L), MaxCheckpointRowGroupDecodedBytes);
+        long estimatedDecoded = SaturatingScale(Math.Max(compressedBytes, 0L), CheckpointDecodedExpansionFactor);
+        long basisBytes = Math.Min(estimatedDecoded, MaxCheckpointRowGroupDecodedBytes);
         TimeSpan derived = TimeSpan.FromSeconds(basisBytes / FloorDecodedBytesPerSecond);
         if (derived < BoundedDecode.DefaultBudget)
         {
@@ -99,6 +109,14 @@ internal static class DeltaCheckpointReader
         }
 
         return derived > BoundedDecode.MaxBudget ? BoundedDecode.MaxBudget : derived;
+    }
+
+    // Scales a non-negative byte count by a factor without overflowing to a negative long (saturates at
+    // long.MaxValue); the result is always clamped to the decoded ceiling by the caller.
+    private static long SaturatingScale(long value, double factor)
+    {
+        double scaled = value * factor;
+        return scaled >= long.MaxValue ? long.MaxValue : (long)scaled;
     }
 
     /// <summary>
@@ -164,9 +182,10 @@ internal static class DeltaCheckpointReader
         // routes DeltaLog to JSON replay under the DecodeTimeout reason; when the door is at its memory/strand
         // cap the decode is rejected with a DecodeCapacityExhaustedException (never started) which DeltaLog
         // classifies DecoderSaturated (I8); a valid-but-unsupported UnsupportedFeature and cooperative
-        // cancellation both finish inside the budget and propagate unwrapped as the work's own outcome. The
-        // decode reserves its ACTUAL buffered `length` against the checkpoint door's byte-aware memory budget
-        // (the honest isolated-byte-copy footprint a stranded decode pins).
+        // cancellation both finish inside the budget and propagate unwrapped as the work's own outcome. If this
+        // decode STRANDS (detaches past its deadline), it charges its ACTUAL buffered `length` (the honest
+        // isolated-byte-copy footprint the strand pins, clamped by the door to MaxCheckpointPartBytes) against
+        // the checkpoint door's stranded residual — a healthy in-budget decode charges NOTHING (§5.4).
         return await checkpointDecoder.RunAsync(
             decodeToken => DecodeBufferedAsync(bytes, length, maxDecodedBytes, decodeToken),
             partBudget,

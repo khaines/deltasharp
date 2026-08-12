@@ -75,7 +75,9 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
         using var telemetry = new DeltaSharp.Storage.Diagnostics.DeltaStorageTelemetry();
         using var storageMeter = new DeltaSharp.Storage.Tests.Delta.MeterCapture(telemetry.StorageMeter);
         var reader = new ParquetFileReader(
-            new ParquetDecodeLimits(decodeTimeBudget: TestDecodeBudget), telemetry: telemetry);
+            new ParquetDecodeLimits(decodeTimeBudget: TestDecodeBudget),
+            telemetry: telemetry,
+            dataFileDecoder: new BoundedDecoder(strandCountCap: 16, execution: DecodeExecution.Pool));
         var stopwatch = Stopwatch.StartNew();
         Exception? thrown = await RunWatchdoggedAsync(async () =>
         {

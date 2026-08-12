@@ -177,6 +177,7 @@ public sealed class StorageExceptionToStringTests
         "DeltaCheckpointLog.CheckpointDecoderSaturated(ILogger logger, Int64 version)",
         "DeltaCheckpointLog.CheckpointFallback(ILogger logger, Int64 version, String reason)",
         "DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected(ILogger logger, Int64 version)",
+        "DeltaCheckpointLog.CheckpointNegativeCacheSkip(ILogger logger, Int64 version)",
         "DeltaCommitLog.CommitCanceled(ILogger logger, Int64 version, Int32 attempts)",
         "DeltaCommitLog.CommitCompleted(ILogger logger, Int64 version, Int32 attempts, Double durationMs)",
         "DeltaCommitLog.CommitConflict(ILogger logger, Int32 attempt, Int64 targetVersion, String conflictClass)",

@@ -117,36 +117,60 @@ public sealed class CheckpointDecodeNegativeCacheTests : IDisposable
     }
 
     [Fact]
-    public void Seed_ThenIsKnownTimedOut_TrueWithinTtl_FalseAfterTtl_ReProbe()
+    public void StrikeGate_SuppressesOnlyAfterThreshold_ThenReProbesAfterTtl()
     {
-        // Seed → hit within TTL; after the TTL the entry re-probes (miss + eviction) so a repaired/replaced
-        // checkpoint heals without a process restart. Driven by a deterministic manual clock (no wall-clock).
+        // High #6 strike-gate + TTL re-probe: a SINGLE proven timeout does NOT poison an identity (a
+        // healthy-but-slow decode that timed out once under transient CPU oversubscription must still be
+        // re-decoded). Suppression engages only at the SECOND strike; then the entry is a hit within its TTL and
+        // re-probes (single-flight miss) after it, so a repaired checkpoint heals without a restart. Driven by a
+        // deterministic manual clock (no wall-clock).
         var clock = new ManualClock(new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero));
         var ttl = TimeSpan.FromMinutes(10);
         var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: ttl);
         string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
 
-        Assert.False(cache.IsKnownTimedOut(key, clock)); // not seeded yet
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // never seeded → re-decode
+
+        // First proven timeout: strike 1 only — NOT yet suppressed (strike-gate). Still re-decoded next load.
         cache.Seed(key, clock);
-        Assert.True(cache.IsKnownTimedOut(key, clock)); // hit within TTL
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // below threshold → probe window (one caller re-decodes)
+
+        // Second proven timeout: strike 2 == threshold → now SUPPRESSED within TTL.
+        cache.Seed(key, clock);
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // suppressed hit within TTL
 
         clock.Advance(ttl - TimeSpan.FromSeconds(1));
         Assert.True(cache.IsKnownTimedOut(key, clock)); // still within TTL
 
         clock.Advance(TimeSpan.FromSeconds(2)); // now past the TTL
-        Assert.False(cache.IsKnownTimedOut(key, clock)); // re-probe path (expired → evicted → miss)
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // expired → single-flight re-probe (one caller)
+    }
 
-        // After the re-probe evicted it, a fresh lookup is still a miss until it is re-seeded.
-        Assert.False(cache.IsKnownTimedOut(key, clock));
-        cache.Seed(key, clock);
-        Assert.True(cache.IsKnownTimedOut(key, clock));
+    [Fact]
+    public void ClearOnSuccess_ResetsStrikeHistory_SoAOneOffSlowDecodeNeverPoisons()
+    {
+        // High #6 clear-on-success: an identity that timed out ONCE (strike 1) but then decoded cleanly on a
+        // later load must have its strike history cleared, so a subsequent lone timeout starts from strike 1
+        // again and never accumulates to suppression across unrelated transient slowdowns.
+        var clock = new ManualClock(DateTimeOffset.UnixEpoch);
+        var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: TimeSpan.FromMinutes(10));
+        string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
+
+        cache.Seed(key, clock); // strike 1
+        cache.ClearOnSuccess(key); // decoded cleanly on a later load → history cleared
+
+        // A fresh lone timeout is strike 1 again (not strike 2), so it is NOT suppressed.
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // miss, takes probe
+        cache.Seed(key, clock); // strike 1
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // still below threshold → re-decode
     }
 
     [Fact]
     public void Seed_EvictsLeastRecentlyUsed_WhenAtCapacity_NeverGrowsUnbounded()
     {
         // Bounded LRU (not a whole-map wipe): a stream of DISTINCT crafted identities can never grow the cache
-        // beyond capacity, and the least-recently-used entry is the one evicted.
+        // beyond capacity, and the least-recently-used entry is the one evicted. Each identity is driven to the
+        // suppression threshold (two strikes) so IsKnownTimedOut reports presence as a hit.
         var clock = new ManualClock(DateTimeOffset.UnixEpoch);
         var cache = new CheckpointDecodeNegativeCache(capacity: 3, ttl: TimeSpan.FromHours(1));
 
@@ -155,15 +179,15 @@ public sealed class CheckpointDecodeNegativeCacheTests : IDisposable
         string k2 = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 2);
         string k3 = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 3);
 
-        cache.Seed(k0, clock);
-        cache.Seed(k1, clock);
-        cache.Seed(k2, clock);
+        Suppress(cache, k0, clock);
+        Suppress(cache, k1, clock);
+        Suppress(cache, k2, clock);
 
-        // Touch k0 so k1 becomes the least-recently-used (recency refreshed on a hit).
+        // Touch k0 so k1 becomes the least-recently-used (recency refreshed on a suppressed hit).
         Assert.True(cache.IsKnownTimedOut(k0, clock));
 
-        // Seeding a 4th distinct identity evicts the LRU (k1), keeping the cache bounded at capacity.
-        cache.Seed(k3, clock);
+        // Suppressing a 4th distinct identity evicts the LRU (k1) on its first strike, keeping the cache bounded.
+        Suppress(cache, k3, clock);
 
         Assert.True(cache.IsKnownTimedOut(k0, clock));
         Assert.False(cache.IsKnownTimedOut(k1, clock)); // evicted (was LRU)
@@ -174,35 +198,43 @@ public sealed class CheckpointDecodeNegativeCacheTests : IDisposable
     [Fact]
     public void Seed_RepeatedlyOnSameIdentity_ExtendsTtlExponentially_BoundingReProbeFrequency()
     {
-        // High #4 — durably-bad backoff (uptime-OOM fix). A single STATIC crafted checkpoint that is never
-        // rewritten would otherwise spawn a NEW strand on every fixed-TTL re-probe (a 10-min cadence ⇒ an
-        // uptime-driven strand accumulation). Each re-seed of the SAME identity must LENGTHEN the TTL
-        // exponentially (base × 2^strikes), so a repeatedly-timing-out identity is re-probed
-        // logarithmically-rarely. Proven deterministically: after the SECOND seed the entry must still be a HIT
-        // a FULL base-TTL later (where a fixed TTL would already have re-probed) — the window has at least
-        // doubled.
+        // High #4 — durably-bad backoff (uptime-OOM fix), under the strike-gate. Once an identity is suppressed
+        // (two strikes), each further re-poison of the SAME identity LENGTHENS the TTL exponentially
+        // (base × 2^backoffSteps), so a static crafted checkpoint that keeps timing out is re-probed
+        // logarithmically-rarely. Proven deterministically against a fixed-TTL cache (which would re-probe on
+        // every base-TTL boundary, spawning a strand each time).
         var clock = new ManualClock(DateTimeOffset.UnixEpoch);
         var baseTtl = TimeSpan.FromMinutes(10);
         var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: baseTtl, maxTtl: TimeSpan.FromHours(24));
         string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
 
-        // First seed: base TTL. Expire it and re-probe (miss) — the entry is RETAINED so its strike history
-        // carries forward to the next seed's backoff.
-        cache.Seed(key, clock);
+        // Reach suppression (strike 2) → base TTL. Expire it and re-probe (miss) — the entry is RETAINED so its
+        // strike history carries forward to the next seed's backoff.
+        cache.Seed(key, clock); // strike 1 (not suppressed)
+        cache.Seed(key, clock); // strike 2 → suppressed, base TTL
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // suppressed
         clock.Advance(baseTtl + TimeSpan.FromSeconds(1));
         Assert.False(cache.IsKnownTimedOut(key, clock)); // expired → re-probe
 
-        // Second seed (strike 2): the TTL must now be at least 2× the base. Advancing a FULL base TTL keeps it a
+        // Re-poison (strike 3): the TTL must now be at least 2× the base. Advancing a FULL base TTL keeps it a
         // HIT — a fixed-TTL cache would already have re-probed here (spawning another strand).
-        cache.Seed(key, clock);
+        cache.Seed(key, clock); // strike 3 → 2× base
         clock.Advance(baseTtl + TimeSpan.FromSeconds(1));
         Assert.True(cache.IsKnownTimedOut(key, clock)); // still within the EXTENDED (≥ 2×) TTL — no re-probe
 
-        // And a third seed extends it further still (≥ 4× base): advancing 3× base is still a hit.
-        clock.Advance(baseTtl); // now ~2× base since the second seed → re-probe boundary of a fixed cache
-        cache.Seed(key, clock);
+        // And a further strike extends it still more (≥ 4× base): advancing 3× base is still a hit.
+        clock.Advance(baseTtl); // now ~2× base since strike 3 → re-probe boundary of a fixed cache
+        cache.Seed(key, clock); // strike 4 → 4× base
         clock.Advance(baseTtl * 3 + TimeSpan.FromSeconds(1));
         Assert.True(cache.IsKnownTimedOut(key, clock)); // still within the ≥ 4× TTL
+    }
+
+    // Drives an identity to the suppression threshold (two proven timeouts) so IsKnownTimedOut reports it as a
+    // suppressed hit.
+    private static void Suppress(CheckpointDecodeNegativeCache cache, string key, TimeProvider clock)
+    {
+        cache.Seed(key, clock);
+        cache.Seed(key, clock);
     }
 
     [Fact]

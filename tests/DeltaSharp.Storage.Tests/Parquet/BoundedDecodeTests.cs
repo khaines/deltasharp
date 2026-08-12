@@ -33,7 +33,7 @@ public sealed class BoundedDecodeTests
     [Fact]
     public async Task RunAsync_ReturnsResult_WhenWorkFinishesFirst()
     {
-        int result = await new BoundedDecoder(maxDetachedDecodes: 4).RunAsync(
+        int result = await new BoundedDecoder(strandCountCap: 4).RunAsync(
             _ => Task.FromResult(42),
             TimeSpan.FromSeconds(5),
             static _ => new InvalidOperationException("must not time out"),
@@ -48,7 +48,7 @@ public sealed class BoundedDecodeTests
         // A typed fail-closed exception the work itself throws must propagate unwrapped — never remapped to the
         // timeout exception. This is the property that keeps UnsupportedFeature / CorruptData contracts intact.
         DeltaStorageException thrown = await Assert.ThrowsAsync<DeltaStorageException>(() =>
-            new BoundedDecoder(maxDetachedDecodes: 4).RunAsync<int>(
+            new BoundedDecoder(strandCountCap: 4).RunAsync<int>(
                 _ => throw DeltaStorageException.UnsupportedFeature("valid but unsupported"),
                 TimeSpan.FromSeconds(5),
                 static _ => DeltaStorageException.CorruptData("must not be surfaced"),
@@ -66,7 +66,7 @@ public sealed class BoundedDecodeTests
         // the watchdog.
         var stopwatch = Stopwatch.StartNew();
         var thrown = await RunWatchdoggedAsync(() =>
-            new BoundedDecoder(maxDetachedDecodes: 4).RunAsync<int>(
+            new BoundedDecoder(strandCountCap: 4).RunAsync<int>(
                 _ =>
                 {
                     Thread.Sleep(TimeSpan.FromSeconds(3)); // ignores the token entirely
@@ -91,7 +91,7 @@ public sealed class BoundedDecodeTests
         cts.CancelAfter(TimeSpan.FromMilliseconds(100));
 
         var thrown = await RunWatchdoggedAsync(() =>
-            new BoundedDecoder(maxDetachedDecodes: 4).RunAsync<int>(
+            new BoundedDecoder(strandCountCap: 4).RunAsync<int>(
                 _ =>
                 {
                     Thread.Sleep(TimeSpan.FromSeconds(3));
@@ -141,7 +141,9 @@ public sealed class BoundedDecodeTests
         mutated[^9] ^= 1;
 
         var budget = TimeSpan.FromMilliseconds(300);
-        var reader = new ParquetFileReader(new ParquetDecodeLimits(decodeTimeBudget: budget));
+        var reader = new ParquetFileReader(
+            new ParquetDecodeLimits(decodeTimeBudget: budget),
+            dataFileDecoder: IsolatedDataFileDecoder());
         var stopwatch = Stopwatch.StartNew();
         var thrown = await RunWatchdoggedAsync(() => ReadAllAsync(reader, mutated));
         stopwatch.Stop();
@@ -170,7 +172,8 @@ public sealed class BoundedDecodeTests
         var reader = new ParquetFileReader(
             new ParquetDecodeLimits(decodeTimeBudget: TimeSpan.FromMilliseconds(300)),
             timeProvider: null,
-            telemetry: telemetry);
+            telemetry: telemetry,
+            dataFileDecoder: IsolatedDataFileDecoder());
 
         var thrown = await RunWatchdoggedAsync(() => ReadAllAsync(reader, mutated));
 
@@ -186,11 +189,11 @@ public sealed class BoundedDecodeTests
     [Fact]
     public async Task Admission_RejectsBeyondCap_FailFast_OnIsolatedDecoder()
     {
-        // The admission cap (CRITICAL fix #2): once maxDetachedDecodes decodes are stranded past their
+        // The admission cap (CRITICAL fix #2): once strandCountCap decodes are stranded past their
         // deadline, a NEW decode is rejected fail-fast with DecodeCapacityExhaustedException WITHOUT starting,
         // so the stranded-decode residual can never grow without bound. Exercised on an ISOLATED decoder with
         // caps of 1 so the assertion is deterministic and never touches the (widened) shared tier.
-        var decoder = new BoundedDecoder(maxDetachedDecodes: 1);
+        var decoder = new BoundedDecoder(strandCountCap: 1);
         using var gate = new ManualResetEventSlim(initialState: false);
 
         // Strand one decode: it ignores its token and blocks on the gate past a tiny budget, so RunAsync times
@@ -215,12 +218,12 @@ public sealed class BoundedDecodeTests
                 CancellationToken.None));
         Assert.False(started, "a rejected decode must not start its work.");
 
-        // MEDIUM — the rejection message must be TRUTHFUL enough to distinguish "strand-saturated" (a real
-        // detached-strand leak that will not self-heal) from "healthy-concurrency-saturated" (transient
-        // in-flight load): it carries the reserved/cap slots AND the detached-strand count. Here the single
-        // slot is held by a DETACHED strand, so the message must report detachedStrands=1 (not 0).
-        Assert.Contains("reserved=1/1 slots", saturated.Message);
-        Assert.Contains("detachedStrands=1", saturated.Message);
+        // MEDIUM — the rejection message must be TRUTHFUL: it reports the STRANDED residual (bytes + count)
+        // that is full of permanent strands, distinguishing a genuine strand-saturated door from healthy
+        // in-flight load (which is never charged here). Here the single strand slot is full, so the message
+        // reports strandedStrands=1/1.
+        Assert.Contains("strandedStrands=1/1", saturated.Message);
+        Assert.Contains("Healthy in-flight decodes are never charged here", saturated.Message);
 
         // Release the strand so it drains (residual is reclaimed as the work finally terminates), then a fresh
         // decode is admitted again — the cap is a live gate, not a permanent latch.
@@ -241,7 +244,7 @@ public sealed class BoundedDecodeTests
         // deadline (a non-terminating decode that eventually wins), its result — a ParquetReader that owns its
         // input stream — would leak. The onAbandonedResult disposer must dispose it. Exercised on an isolated
         // decoder with a disposable stand-in whose Dispose is observable.
-        var decoder = new BoundedDecoder(maxDetachedDecodes: 4);
+        var decoder = new BoundedDecoder(strandCountCap: 4);
         var disposed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var resource = new ObservableDisposable(disposed);
 
@@ -336,7 +339,7 @@ public sealed class BoundedDecodeTests
         // so a regression is RED, not a stuck job on a narrow host.
         int strandCount = Environment.ProcessorCount + 1;
         int cap = strandCount + 1; // room for the strands PLUS the one healthy decode
-        var decoder = new BoundedDecoder(maxDetachedDecodes: cap);
+        var decoder = new BoundedDecoder(strandCountCap: cap);
         using var gate = new ManualResetEventSlim(initialState: false);
 
         for (int i = 0; i < strandCount; i++)
@@ -377,97 +380,168 @@ public sealed class BoundedDecodeTests
     }
 
     [Fact]
-    public void AtomicCap_ConcurrentBurst_NeverAdmitsMoreThanCap_OnIsolatedDecoder()
+    public void StrandBurst_AllRejectedFailFast_WhenResidualFullOfStrands_CountBranch()
     {
-        // I2 — the atomic hard cap: a concurrent BURST must never admit more than the cap (the Round-1
-        // check-then-act let cap=1 admit N). Reservation is a single Interlocked.Increment that backs out if it
-        // lands over the cap, so EXACTLY `cap` of the burst are admitted (become strands, holding their slot
-        // because the gate never opens) and every other call is rejected fail-fast with the DISTINCT
-        // DecodeCapacityExhaustedException — WITHOUT starting.
-        //
-        // DETERMINISTIC (High #8): the burst rendezvouses on a Barrier across DEDICATED THREADS (not pool
-        // ramp-up, which admitted a nondeterministic subset and made the check-then-act only ~50% red), repeats
-        // N≥20 rounds, requires EXACTLY `cap` admitted each round, and samples the number of threads CONCURRENTLY
-        // INSIDE the work delegate (which — unlike the raw reserved counter, whose atomic increment-then-backout
-        // can transiently read cap+1 for the CORRECT implementation — must never exceed the cap). Against an
-        // injected check-then-act reservation this is red 100% of the time (some round admits > cap into work).
+        // The strand admission gate under the charge-at-DETACH model (Round-6): healthy in-flight is NEVER
+        // throttled, so the cap applies ONLY to STRANDS. Once the door's stranded residual is full (strand COUNT
+        // == cap), a concurrent BURST of NEW admissions must ALL be rejected fail-fast with the DISTINCT
+        // DecodeCapacityExhaustedException — WITHOUT starting the work — and each rejection must fire
+        // onWorkSettled EXACTLY ONCE (the lease-leak fix on the capacity-rejection path). DETERMINISTIC: the
+        // decoder is first pre-filled to its cap with gated strands, then the burst rendezvouses on a Barrier
+        // across DEDICATED THREADS and every call is rejected because the residual is already full.
         const int cap = 4;
         const int burst = 32;
-        const int rounds = 25;
 
-        for (int round = 0; round < rounds; round++)
+        var decoder = new BoundedDecoder(strandCountCap: cap);
+        using var strandGate = new ManualResetEventSlim(initialState: false);
+
+        // Pre-fill the residual to the cap with gated, never-terminating strands.
+        FillStrandsToCap(decoder, cap, strandGate);
+        SpinWaitFor(() => decoder.DetachedDecodeCount == cap);
+
+        using var barrier = new Barrier(burst);
+        int rejected = 0;
+        int started = 0;
+        int settled = 0;
+
+        var threads = new Thread[burst];
+        for (int t = 0; t < burst; t++)
         {
-            var decoder = new BoundedDecoder(maxDetachedDecodes: cap);
-            using var gate = new ManualResetEventSlim(initialState: false);
-            using var barrier = new Barrier(burst);
-            int rejected = 0;
-            int inWork = 0;
-            int admitted = 0;
-            int capViolations = 0;
-
-            var threads = new Thread[burst];
-            for (int t = 0; t < burst; t++)
+            threads[t] = new Thread(() =>
             {
-                threads[t] = new Thread(() =>
+                barrier.SignalAndWait();
+                try
                 {
-                    // Rendezvous so every thread hits the atomic reservation as simultaneously as the OS allows.
-                    barrier.SignalAndWait();
-                    try
-                    {
-                        decoder.RunAsync<int>(
-                            _ =>
-                            {
-                                // Sampled by an ADMITTED strand while it holds its slot: the number of threads
-                                // CONCURRENTLY inside the work delegate must never exceed the cap. Mark admission
-                                // and entry, sample the peak, then hold the slot on the never-opening gate so it
-                                // becomes a strand for the round's accounting.
-                                Interlocked.Increment(ref admitted);
-                                int concurrent = Interlocked.Increment(ref inWork);
-                                if (concurrent > cap)
-                                {
-                                    Interlocked.Increment(ref capViolations);
-                                }
-
-                                gate.Wait();
-                                Interlocked.Decrement(ref inWork);
-                                return Task.FromResult(1);
-                            },
-                            TimeSpan.FromMilliseconds(80),
-                            static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
-                            CancellationToken.None).GetAwaiter().GetResult();
-                    }
-                    catch (DecodeCapacityExhaustedException)
-                    {
-                        Interlocked.Increment(ref rejected);
-                    }
-                    catch (DeltaStorageException)
-                    {
-                        // Admitted then timed out (its budget elapsed while gate-blocked) → it became a strand.
-                    }
-                })
+                    decoder.RunAsync<int>(
+                        _ => { Interlocked.Increment(ref started); return Task.FromResult(1); },
+                        TimeSpan.FromSeconds(30),
+                        static _ => DeltaStorageException.DecodeBudgetExceeded("must not run"),
+                        CancellationToken.None,
+                        onWorkSettled: () => Interlocked.Increment(ref settled)).GetAwaiter().GetResult();
+                }
+                catch (DecodeCapacityExhaustedException)
                 {
-                    IsBackground = true,
-                    Name = $"burst-{round}-{t}",
-                };
-                threads[t].Start();
-            }
-
-            // Wait for the admission decisions to settle: exactly `cap` admitted strands, the rest rejected.
-            SpinWaitFor(() => decoder.DetachedDecodeCount == cap && Volatile.Read(ref rejected) == burst - cap);
-
-            Assert.Equal(0, capViolations); // more than `cap` threads never ran the work delegate concurrently
-            Assert.Equal(cap, admitted); // EXACTLY cap admitted this round
-            Assert.Equal(burst - cap, rejected); // the rest rejected fail-fast, WITHOUT starting
-            Assert.Equal(cap, decoder.DetachedDecodeCount);
-
-            // Drain the round's strands before the next round so accounting is independent.
-            gate.Set();
-            foreach (Thread thread in threads)
+                    Interlocked.Increment(ref rejected);
+                }
+            })
             {
-                Assert.True(thread.Join(Watchdog), "a burst thread did not settle within the watchdog.");
-            }
+                IsBackground = true,
+                Name = $"burst-count-{t}",
+            };
+            threads[t].Start();
+        }
 
-            SpinWaitFor(() => decoder.DetachedDecodeCount == 0);
+        foreach (Thread thread in threads)
+        {
+            Assert.True(thread.Join(Watchdog), "a burst thread did not settle within the watchdog.");
+        }
+
+        Assert.Equal(burst, rejected); // ALL rejected fail-fast (residual full of strands)
+        Assert.Equal(0, started); // no rejected decode started its work
+        Assert.Equal(burst, settled); // onWorkSettled fired EXACTLY once per rejected call (no lease leak)
+        Assert.Equal(cap, decoder.DetachedDecodeCount); // still exactly `cap` strands (the burst added none)
+
+        strandGate.Set();
+        SpinWaitFor(() => decoder.DetachedDecodeCount == 0);
+    }
+
+    [Fact]
+    public async Task StrandBurst_AllRejectedFailFast_WhenResidualFullOfStrands_ByteBranch()
+    {
+        // The BYTE branch of the strand admission gate (Round-6 charge-at-detach): the load-bearing memory bound
+        // is the stranded-residual BYTES. With a generous count cap but a residual budget that fits only two
+        // maximal-footprint strands, once two byte-charging strands detach (strandedBytes >= budget) a
+        // concurrent BURST of new admissions must ALL be rejected fail-fast by the BYTE branch — even though the
+        // count cap is nowhere near reached — each firing onWorkSettled exactly once.
+        const long footprint = 64L * 1024 * 1024;
+        const long budget = footprint * 2; // fits exactly two maximal strands
+        const int burst = 24;
+
+        var decoder = new BoundedDecoder(
+            strandCountCap: 1000, // count cap deliberately far from binding
+            residualBudgetBytes: budget,
+            maxFootprintBytes: footprint);
+        using var strandGate = new ManualResetEventSlim(initialState: false);
+
+        // Two byte-charging strands fill the residual budget (each charges its full footprint at detach).
+        for (int i = 0; i < 2; i++)
+        {
+            await RunWatchdoggedThrowsAsync(() => decoder.RunAsync<int>(
+                _ => { strandGate.Wait(); return Task.FromResult(0); },
+                TimeSpan.FromMilliseconds(60),
+                static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
+                CancellationToken.None,
+                estimatedRetainedBytes: footprint));
+        }
+
+        SpinWaitFor(() => decoder.StrandedDecodeBytes == budget && decoder.DetachedDecodeCount == 2);
+
+        using var barrier = new Barrier(burst);
+        int rejected = 0;
+        int started = 0;
+        int settled = 0;
+
+        var threads = new Thread[burst];
+        for (int t = 0; t < burst; t++)
+        {
+            threads[t] = new Thread(() =>
+            {
+                barrier.SignalAndWait();
+                try
+                {
+                    decoder.RunAsync<int>(
+                        _ => { Interlocked.Increment(ref started); return Task.FromResult(1); },
+                        TimeSpan.FromSeconds(30),
+                        static _ => DeltaStorageException.DecodeBudgetExceeded("must not run"),
+                        CancellationToken.None,
+                        onWorkSettled: () => Interlocked.Increment(ref settled),
+                        estimatedRetainedBytes: footprint).GetAwaiter().GetResult();
+                }
+                catch (DecodeCapacityExhaustedException)
+                {
+                    Interlocked.Increment(ref rejected);
+                }
+            })
+            {
+                IsBackground = true,
+                Name = $"burst-byte-{t}",
+            };
+            threads[t].Start();
+        }
+
+        foreach (Thread thread in threads)
+        {
+            Assert.True(thread.Join(Watchdog), "a burst thread did not settle within the watchdog.");
+        }
+
+        Assert.Equal(burst, rejected); // ALL rejected by the BYTE branch
+        Assert.Equal(0, started); // none started
+        Assert.Equal(burst, settled); // onWorkSettled once per rejected call
+        Assert.True(decoder.DetachedDecodeCount < decoder.StrandCountCap,
+            "the COUNT cap must NOT be the binding constraint here — the byte residual is.");
+
+        strandGate.Set();
+        SpinWaitFor(() => decoder.DetachedDecodeCount == 0);
+    }
+
+    // Serially strands `count` gated, never-terminating decodes so the door's stranded residual is at its
+    // count cap; each drains when `gate` is released.
+    private static void FillStrandsToCap(BoundedDecoder decoder, int count, ManualResetEventSlim gate)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            try
+            {
+                decoder.RunAsync<int>(
+                    _ => { gate.Wait(); return Task.FromResult(0); },
+                    TimeSpan.FromMilliseconds(60),
+                    static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
+                    CancellationToken.None).GetAwaiter().GetResult();
+            }
+            catch (DeltaStorageException)
+            {
+                // Expected: the gated decode timed out and detached into a strand.
+            }
         }
     }
 
@@ -484,7 +558,7 @@ public sealed class BoundedDecodeTests
             // advancing the clock by less than that budget must not trip it. If the budget were armed at admission
             // or measured from an absolute epoch, the 5-hour advance would have already blown it.
             var clock = new ControllableClock(TimeSpan.FromHours(1).Ticks);
-            var decoder = new BoundedDecoder(maxDetachedDecodes: 4);
+            var decoder = new BoundedDecoder(strandCountCap: 4);
             using var strandGate = new ManualResetEventSlim(initialState: false);
             var strandStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -495,7 +569,11 @@ public sealed class BoundedDecodeTests
                 CancellationToken.None,
                 timeProvider: clock);
 
-            await strandStarted.Task; // strand executing; its delay armed at clock=T0, fires at T0+1s
+            await strandStarted.Task; // strand executing; RunAsync will arm its Task.Delay after started fires
+            // DETERMINISM: wait until RunAsync has actually CREATED+ARMED the strand's deadline timer before
+            // advancing. Advancing before the timer is armed would re-anchor its due instant past the advance and
+            // it would never fire (the MEDIUM clock race). This replaces the old symptom-patch.
+            await WaitForAsync(() => clock.ArmedTimerCount() == 1);
             clock.Advance(TimeSpan.FromSeconds(1)); // trip the strand → detaches; work stays gate-blocked
             DeltaStorageException stranded = await Assert.ThrowsAsync<DeltaStorageException>(() => strandTask);
             Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, stranded.Kind);
@@ -513,7 +591,11 @@ public sealed class BoundedDecodeTests
                 CancellationToken.None,
                 timeProvider: clock);
 
-            await healthyStarted.Task; // healthy executing; its delay armed at NOW (its own start), fires at NOW+1s
+            await healthyStarted.Task; // healthy executing; RunAsync arms its delay at NOW (its own start)
+            // DETERMINISM: the strand's timer has fired+disarmed (and its Task.Delay disposed on completion), so
+            // once the healthy decode's fresh deadline timer is armed there is exactly ONE armed timer. Wait for
+            // it before advancing so the advance is measured against an ALREADY-armed budget.
+            await WaitForAsync(() => clock.ArmedTimerCount() == 1);
             clock.Advance(TimeSpan.FromMilliseconds(500)); // < the healthy budget FROM ITS OWN START → must not trip
             proceed.Set();
             int result = await healthyTask;
@@ -522,6 +604,77 @@ public sealed class BoundedDecodeTests
             strandGate.Set();
             await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
         });
+    }
+
+    public enum DataFileEntryPoint
+    {
+        Open, // ReadDataSchemaAsync — footer open door
+        Metadata, // GetRowCountAsync — metadata scan door (its OWN open is the first RunAsync)
+        RowGroupEntry, // ReadAsync — the streaming read (its open is the first RunAsync)
+    }
+
+    [Theory]
+    [InlineData(DataFileEntryPoint.Open)]
+    [InlineData(DataFileEntryPoint.Metadata)]
+    [InlineData(DataFileEntryPoint.RowGroupEntry)]
+    public async Task DataFileDoor_Saturation_MapsToDecoderSaturated_ThroughTheInjectedDecoderSeam(DataFileEntryPoint entry)
+    {
+        // C1-gap #1 — drive the data-file capacity branch through the REAL read path via the injected
+        // dataFileDecoder seam (no test-only widening). A cap=1 decoder whose single strand slot is already
+        // filled by a gated strand rejects the NEXT decode fail-fast WITHOUT starting. Every data-file entry
+        // point (open, metadata, row-group read) admits its FIRST bounded decode through this door, so each maps
+        // the rejection through the shared DataFileDecoderSaturated helper. Asserts: (1) the DISTINCT retryable
+        // DecoderSaturated kind (never a decode-timeout); (2) exactly one decode.capacity_exhausted{door=
+        // data_file}; (3) decode.budget_exceeded EMPTY (a saturation is not a timeout — the de-conflation
+        // contract); (4) no untrusted byte content on the message.
+        var decoder = new BoundedDecoder(strandCountCap: 1, execution: DecodeExecution.Pool);
+        using var strandGate = new ManualResetEventSlim(initialState: false);
+
+        // Fill the single strand slot with a gated, never-terminating strand.
+        await RunWatchdoggedThrowsAsync(() => decoder.RunAsync<int>(
+            _ => { strandGate.Wait(); return Task.FromResult(0); },
+            TimeSpan.FromMilliseconds(80),
+            static _ => DeltaStorageException.DecodeBudgetExceeded("occupying strand"),
+            CancellationToken.None));
+        await WaitForAsync(() => decoder.DetachedDecodeCount == 1);
+
+        using var telemetry = new DeltaSharp.Storage.Diagnostics.DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.StorageMeter);
+        var reader = new ParquetFileReader(ParquetDecodeLimits.Default, telemetry: telemetry, dataFileDecoder: decoder);
+        byte[] file = await BuildDataFileAsync();
+
+        DeltaStorageException saturated = await Assert.ThrowsAsync<DeltaStorageException>(async () =>
+        {
+            using var stream = new MemoryStream(file, writable: false);
+            switch (entry)
+            {
+                case DataFileEntryPoint.Open:
+                    _ = await reader.ReadDataSchemaAsync(stream, CancellationToken.None);
+                    break;
+                case DataFileEntryPoint.Metadata:
+                    _ = await reader.GetRowCountAsync(stream, CancellationToken.None);
+                    break;
+                default:
+                    await foreach (ColumnBatch batch in reader.ReadAsync(
+                        stream, DataSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
+                    {
+                        _ = batch.LogicalRowCount;
+                    }
+
+                    break;
+            }
+        });
+
+        Assert.Equal(StorageErrorKind.DecoderSaturated, saturated.Kind); // retryable, NOT a decode-timeout
+        Assert.DoesNotContain(".parquet", saturated.Message, StringComparison.OrdinalIgnoreCase); // no byte/path content
+
+        MeterCapture.Measurement capacity = Assert.Single(meters.ForInstrument("deltasharp.storage.decode.capacity_exhausted"));
+        Assert.Equal(1, capacity.Value);
+        Assert.Equal("data_file", capacity.Tags["deltasharp.decode.door"]);
+        Assert.Empty(meters.ForInstrument("deltasharp.storage.decode.budget_exceeded")); // de-conflation
+
+        strandGate.Set();
+        await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
     }
 
     [Fact]
@@ -553,22 +706,116 @@ public sealed class BoundedDecodeTests
         Assert.NotEqual(StorageErrorKind.CorruptData, saturated.Kind);
     }
 
-    [Fact]
-    public async Task ByteAwareCap_RejectsWhenMemoryBudgetExhausted_BeforeCountCap()
+    [Theory]
+    [InlineData(256L * 1024 * 1024)] // tiny pod
+    [InlineData(512L * 1024 * 1024)]
+    [InlineData(1L * 1024 * 1024 * 1024)]
+    [InlineData(4L * 1024 * 1024 * 1024)]
+    [InlineData(64L * 1024 * 1024 * 1024)] // large executor
+    public void DeriveDoorSizing_AlwaysAdmitsOneMaximalDecode_AndTheResidualBoundHolds(long processMemoryBytes)
     {
-        // Critical #1 — the BYTE-AWARE admission cap: a count-only cap admits `cap` strands regardless of their
-        // retained bytes, so a handful of large-footprint decodes OOM-kill the pod long before the count control
-        // engages. Admission must reserve each strand's ESTIMATED RETAINED BYTES against a documented memory
-        // budget and reject with DecodeCapacityExhaustedException when the BYTE budget is exhausted — even
-        // though the COUNT cap is nowhere near reached. Proven with a generous count cap (100) but a memory
-        // budget that fits only 2 strands of 64 MiB each: the 3rd is rejected by the BYTE bound.
-        const long strandBytes = 64L * 1024 * 1024;
+        // THE decisive fix (Round-6), pinned as a PURE table test across pod sizes: the residual budget is
+        // FLOORED so at least one maximal legitimate decode/part is ALWAYS admissible (no derivation to a cap of
+        // 1 that lets one crafted input deny every tenant), AND the honest residual bound holds — a single
+        // maximal strand can push the residual to at most residualBudget + maxFootprint (one strand can cross the
+        // line, never an unbounded pile). Verified for BOTH doors' real max-footprints.
+        foreach (long maxFootprint in new[]
+                 {
+                     BoundedDecode.DataFileMaxFootprintBytes,
+                     BoundedDecode.CheckpointMaxFootprintBytes,
+                 })
+        {
+            DoorSizing sizing = BoundedDecode.DeriveDoorSizing(processMemoryBytes, maxFootprint);
+
+            // (1) One maximal legitimate decode is always admissible: the residual budget is at least one
+            // footprint (so an empty door admits it) and the count cap is at least the floor multiple (≥ 2 ≥ 1).
+            Assert.True(sizing.ResidualBudgetBytes >= maxFootprint,
+                $"pod={processMemoryBytes}, footprint={maxFootprint}: residual budget must fit one maximal decode.");
+            Assert.True(sizing.StrandCountCap >= 1,
+                $"pod={processMemoryBytes}, footprint={maxFootprint}: count cap must admit at least one strand.");
+
+            // (2) The count cap is derived from residualBudget/maxFootprint and clamped to the documented
+            // ceiling, so the two gates saturate together for maximal strands and neither is degenerate.
+            Assert.True(sizing.StrandCountCap <= BoundedDecode.StrandCountCeiling,
+                $"pod={processMemoryBytes}, footprint={maxFootprint}: count cap must not exceed the ceiling.");
+
+            // (3) The honest residual bound: the worst-case retained bytes when a single new strand crosses the
+            // budget is residualBudget + one maxFootprint — a REAL, finite bound (not the false
+            // "byte-bounded ≤ memory budget" claim the old design made).
+            long worstCaseResidual = sizing.ResidualBudgetBytes + sizing.MaxFootprintBytes;
+            Assert.True(worstCaseResidual > sizing.ResidualBudgetBytes,
+                "the residual bound must be residualBudget + one footprint (finite, non-degenerate).");
+            Assert.Equal(maxFootprint, sizing.MaxFootprintBytes);
+        }
+    }
+
+    [Fact]
+    public void DeriveDoorSizing_IsMonotonicInProcessMemory_AndConstructionRejectsAnUnadmittableBudget()
+    {
+        // The residual budget is monotonic non-decreasing in process memory (a bigger pod never gets a SMALLER
+        // residual), and the constructor refuses a door that cannot even admit one maximal part (residualBudget
+        // < maxFootprint) — documenting the small-pod contract instead of silently deriving a cap of 1.
+        long footprint = BoundedDecode.CheckpointMaxFootprintBytes;
+        long previous = 0;
+        foreach (long pod in new[]
+                 {
+                     128L * 1024 * 1024, 256L * 1024 * 1024, 1L * 1024 * 1024 * 1024, 32L * 1024 * 1024 * 1024,
+                 })
+        {
+            long residual = BoundedDecode.DeriveDoorSizing(pod, footprint).ResidualBudgetBytes;
+            Assert.True(residual >= previous, $"residual budget must be monotonic in pod memory (pod={pod}).");
+            previous = residual;
+        }
+
+        // A budget below one footprint is unadmittable and must be rejected at construction (fail fast, not a
+        // cap-of-1 that denies every tenant).
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new BoundedDecoder(strandCountCap: 4, residualBudgetBytes: footprint - 1, maxFootprintBytes: footprint));
+    }
+
+    [Fact]
+    public void PerDoorIsolation_DataFileAndCheckpointDoors_HaveIndependentSizingAndExecution()
+    {
+        // I5 per-door isolation, pinned: the two production doors are DISTINCT instances with independent
+        // residual budgets (a flood on one cannot consume the other's), the data-file door runs strands on the
+        // Pool while the checkpoint door uses a DedicatedThread, and each door's sizing is exactly what
+        // DeriveDoorSizing produces for its documented max footprint.
+        Assert.NotSame(BoundedDecode.DataFileDecoder, BoundedDecode.CheckpointDecoder);
+
+        Assert.Equal(DecodeExecution.Pool, BoundedDecode.DataFileDecoder.Execution);
+        Assert.Equal(DecodeExecution.DedicatedThread, BoundedDecode.CheckpointDecoder.Execution);
+
+        Assert.Equal(BoundedDecode.DataFileMaxFootprintBytes, BoundedDecode.DataFileDecoder.MaxFootprintBytes);
+        Assert.Equal(BoundedDecode.CheckpointMaxFootprintBytes, BoundedDecode.CheckpointDecoder.MaxFootprintBytes);
+
+        DoorSizing dataSizing = BoundedDecode.DeriveDoorSizing(
+            BoundedDecode.ProcessMemoryBytes, BoundedDecode.DataFileMaxFootprintBytes);
+        DoorSizing checkpointSizing = BoundedDecode.DeriveDoorSizing(
+            BoundedDecode.ProcessMemoryBytes, BoundedDecode.CheckpointMaxFootprintBytes);
+
+        Assert.Equal(dataSizing.ResidualBudgetBytes, BoundedDecode.DataFileDecoder.ResidualBudgetBytes);
+        Assert.Equal(dataSizing.StrandCountCap, BoundedDecode.DataFileDecoder.StrandCountCap);
+        Assert.Equal(checkpointSizing.ResidualBudgetBytes, BoundedDecode.CheckpointDecoder.ResidualBudgetBytes);
+        Assert.Equal(checkpointSizing.StrandCountCap, BoundedDecode.CheckpointDecoder.StrandCountCap);
+    }
+
+    [Fact]
+    public async Task ByteAwareCap_RejectsWhenResidualBudgetExhausted_BeforeCountCap()
+    {
+        // Critical #1 (Round-6 charge-at-DETACH model) — the load-bearing memory bound is the STRANDED-residual
+        // BYTES, charged at detach on the strand's REAL retained footprint (clamped to the door's max footprint),
+        // NOT a fictional fixed representative. Healthy in-flight is never charged; only strands consume the
+        // residual. Admission of a NEW untrusted decode is rejected when the CURRENT stranded residual is already
+        // at budget — even though the COUNT cap (100) is nowhere near reached. Proven with a residual budget that
+        // fits exactly two maximal 64 MiB strands: the 3rd admission is rejected by the BYTE branch.
+        const long footprint = 64L * 1024 * 1024;
         var decoder = new BoundedDecoder(
-            maxDetachedDecodes: 100, // count cap is deliberately far from binding
-            memoryBudgetBytes: strandBytes * 2 + (strandBytes / 2)); // fits exactly 2 such strands
+            strandCountCap: 100, // count cap is deliberately far from binding
+            residualBudgetBytes: footprint * 2, // fits exactly 2 maximal strands
+            maxFootprintBytes: footprint);
         using var gate = new ManualResetEventSlim(initialState: false);
 
-        // Two strands consume the byte budget (each times out and holds its bytes).
+        // Two strands consume the residual budget (each times out and charges its real footprint at detach).
         for (int i = 0; i < 2; i++)
         {
             await RunWatchdoggedThrowsAsync(() => decoder.RunAsync<int>(
@@ -576,27 +823,40 @@ public sealed class BoundedDecodeTests
                 TimeSpan.FromMilliseconds(80),
                 static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
                 CancellationToken.None,
-                estimatedRetainedBytes: strandBytes));
+                estimatedRetainedBytes: footprint));
         }
 
         await WaitForAsync(() => decoder.DetachedDecodeCount == 2);
-        Assert.Equal(strandBytes * 2, decoder.ReservedDecodeBytes);
+        Assert.Equal(footprint * 2, decoder.StrandedDecodeBytes);
 
-        // The 3rd decode is rejected by the BYTE budget though the COUNT cap (100) is nowhere near reached.
+        // The 3rd decode is rejected by the BYTE branch though the COUNT cap (100) is nowhere near reached.
         DecodeCapacityExhaustedException rejected = await Assert.ThrowsAsync<DecodeCapacityExhaustedException>(() =>
             decoder.RunAsync<int>(
                 _ => Task.FromResult(1),
                 TimeSpan.FromSeconds(5),
                 static _ => DeltaStorageException.DecodeBudgetExceeded("must not run"),
                 CancellationToken.None,
-                estimatedRetainedBytes: strandBytes));
-        // The truthful saturation message distinguishes byte-saturation (reservedBytes near budget) from count.
-        Assert.Contains("reservedBytes", rejected.Message, StringComparison.Ordinal);
-        Assert.True(decoder.DetachedDecodeCount < decoder.MaxDetachedDecodes,
-            "the count cap must NOT be the binding constraint here — the byte budget is.");
+                estimatedRetainedBytes: footprint));
+        // The truthful saturation message reports the STRANDED bytes (not a healthy-in-flight or reserved gauge).
+        Assert.Contains("strandedBytes", rejected.Message, StringComparison.Ordinal);
+        Assert.True(decoder.DetachedDecodeCount < decoder.StrandCountCap,
+            "the count cap must NOT be the binding constraint here — the byte residual is.");
 
+        // BYTE-BRANCH BACK-OUT (Round-6): a rejected admission charges NOTHING (the residual is unchanged), and
+        // once a strand drains the residual frees so a later decode admits again.
+        Assert.Equal(footprint * 2, decoder.StrandedDecodeBytes); // rejection did not charge
         gate.Set();
         await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
+        Assert.Equal(0, decoder.StrandedDecodeBytes); // residual fully released as strands drained
+
+        // A later healthy decode admits and completes now that the residual is free.
+        int ok = await decoder.RunAsync<int>(
+            _ => Task.FromResult(7),
+            TimeSpan.FromSeconds(5),
+            static _ => DeltaStorageException.DecodeBudgetExceeded("must not run"),
+            CancellationToken.None,
+            estimatedRetainedBytes: footprint);
+        Assert.Equal(7, ok);
     }
 
     [Fact]
@@ -606,7 +866,7 @@ public sealed class BoundedDecodeTests
         // onWorkSettled EXACTLY ONCE so a caller-held lease is released (no leak), and (b) NOT inflate the
         // detached-strand gauge (a cancelled healthy decode is not a strand). Proven directly: a decode is
         // cancelled mid-flight; the onWorkSettled callback fires exactly once and the detached count stays 0.
-        var decoder = new BoundedDecoder(maxDetachedDecodes: 4);
+        var decoder = new BoundedDecoder(strandCountCap: 4);
         using var cts = new CancellationTokenSource();
         using var started = new ManualResetEventSlim(initialState: false);
         int settledCount = 0;
@@ -636,7 +896,7 @@ public sealed class BoundedDecodeTests
         // entered (the Retain→RunAsync window closed with a cancel), so the FIRST act is a pre-start
         // ThrowIfCancellationRequested BEFORE any work task exists. onWorkSettled must still fire exactly once
         // (releasing the caller's lease), and no strand is created.
-        var decoder = new BoundedDecoder(maxDetachedDecodes: 4);
+        var decoder = new BoundedDecoder(strandCountCap: 4);
         using var cts = new CancellationTokenSource();
         cts.Cancel();
         int settledCount = 0;
@@ -650,7 +910,7 @@ public sealed class BoundedDecodeTests
 
         Assert.Equal(1, Volatile.Read(ref settledCount)); // released exactly once on the pre-start throw
         Assert.Equal(0, decoder.DetachedDecodeCount); // never a strand
-        Assert.Equal(0, decoder.ReservedDecodeCount); // the reservation was fully backed out
+        Assert.Equal(0L, decoder.StrandedDecodeBytes); // no residual charged (nothing ran, nothing detached)
     }
 
     [Fact]
@@ -871,6 +1131,27 @@ public sealed class BoundedDecodeTests
 
         public override long TimestampFrequency => TimeSpan.TicksPerSecond;
 
+        // The number of currently ARMED (not disarmed, not yet fired) one-shot timers. A test uses this to
+        // deterministically wait until a bounded decode's Task.Delay(budget, this) has actually been created and
+        // armed BEFORE advancing the clock — closing the race (the MEDIUM flake) where an Advance that lands
+        // before the timer is armed would re-anchor the due instant past the advance and never fire.
+        internal int ArmedTimerCount()
+        {
+            lock (_gate)
+            {
+                int n = 0;
+                foreach (FakeTimer t in _timers)
+                {
+                    if (t.DueTicksSnapshot() != FakeTimer.Disarmed)
+                    {
+                        n++;
+                    }
+                }
+
+                return n;
+            }
+        }
+
         public override long GetTimestamp()
         {
             lock (_gate)
@@ -976,6 +1257,15 @@ public sealed class BoundedDecodeTests
             }
         }
     }
+
+    // A fresh, ISOLATED data-file BoundedDecoder for a DoS test that STRANDS a decode permanently (a
+    // never-terminating footer-flip open). Routing such a test through its own decoder keeps the process-wide
+    // BoundedDecode.DataFileDecoder — whose PRODUCTION strand-count cap is deliberately small (residualBudget /
+    // the real 4 GiB max footprint) — from being saturated by a test's permanent strand and poisoning every
+    // later test that shares it. The door tag on telemetry is stamped by ParquetFileReader, not the decoder, so
+    // the REAL door path is still exercised.
+    private static BoundedDecoder IsolatedDataFileDecoder() =>
+        new(strandCountCap: 16, execution: DecodeExecution.Pool);
 
     private static async Task<byte[]> BuildMultiRowGroupFileAsync(int rows, int rowsPerGroup)
     {

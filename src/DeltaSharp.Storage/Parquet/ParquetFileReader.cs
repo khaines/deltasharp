@@ -76,9 +76,10 @@ internal sealed class ParquetFileReader
     // (midnight-of-date epoch-micros). #533.
     private const long MicrosPerDay = 86_400L * 1_000_000L;
 
-    // The estimated retained bytes charged to the data-file door's byte-aware admission cap for an OPEN /
-    // footer metadata decode (a reader + a footer's worth of buffers). Small and fixed; the row-group decode
-    // charges the larger representative figure (BoundedDecode.DataFileRepresentativeStrandBytes).
+    // The estimated retained bytes a STRAND of an OPEN / footer metadata decode would pin (a reader + a footer's
+    // worth of buffers) — charged against the data-file door's stranded residual only if that open/metadata
+    // decode detaches. Small and fixed (the open footprint is a reader + footer, not a decoded row group); the
+    // row-group decode charges the row group's REAL projected footprint (EstimateRowGroupRetainedBytes).
     private const long OpenEstimatedRetainedBytes = 16L * 1024 * 1024;
 
     /// <summary>Creates a reader whose eager-decode guard uses <paramref name="limits"/> (or the safe
@@ -774,6 +775,50 @@ internal sealed class ParquetFileReader
 
     private static long SaturatingAdd(long a, long b) => b > long.MaxValue - a ? long.MaxValue : a + b;
 
+    // The row group's REAL projected retained footprint — the sum, over its projected column chunks, of each
+    // chunk's declared decompressed bytes PLUS the bytes its declared row count would eagerly materialize at the
+    // chunk's element width — clamped to the enforced eager-decode ceiling. Used as the charge a STRAND of this
+    // decode books against the data-file door's stranded residual at detach (the honest per-row-group footprint,
+    // hoisted out of the bounded decode so it is known BEFORE the decode runs). It reads the already-parsed
+    // footer metadata (the open was bounded), so it is a cheap in-memory read; on ANY metadata fault it falls
+    // back to the enforced ceiling (conservative — a strand's charge must never UNDER-count).
+    private static long EstimateRowGroupRetainedBytes(
+        ParquetReader reader, int group, StructType requested, ResolvedColumn[] fileFields, ParquetDecodeLimits limits)
+    {
+        try
+        {
+            using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+            long rowCount = Math.Max(rowGroup.RowCount, 0);
+            long total = 0;
+            foreach (ColumnChunkFootprint chunk in ProjectedFootprints(rowGroup, requested, fileFields))
+            {
+                total = SaturatingAdd(total, Math.Max(chunk.UncompressedBytes, 0));
+                if (chunk.ElementBytes > 0)
+                {
+                    total = SaturatingAdd(total, SaturatingMul(rowCount, chunk.ElementBytes));
+                }
+            }
+
+            return Math.Clamp(total, 0, limits.MaxRowGroupDecodedBytes);
+        }
+        catch
+        {
+            // A crafted/undecodable footer can fault the estimate; the bounded decode itself fails closed on the
+            // same fault, but the residual charge must not under-count — charge the enforced ceiling.
+            return limits.MaxRowGroupDecodedBytes;
+        }
+    }
+
+    private static long SaturatingMul(long a, long b)
+    {
+        if (a <= 0 || b <= 0)
+        {
+            return 0;
+        }
+
+        return a > long.MaxValue / b ? long.MaxValue : a * b;
+    }
+
     // The declared footprint the reader will decode/materialize for each projected column, pulled from
     // the row group's Parquet metadata (CF-1). A PRESENT chunk with missing/encrypted chunk metadata
     // contributes a zero decompressed footprint, which EnsureDecodeCeiling rejects fail-closed for a
@@ -1360,21 +1405,29 @@ internal sealed class ParquetFileReader
         // async reads that resume on the pool anyway, where the non-terminating CPU loop then runs (the
         // dedicated thread would merely sit blocked in GetResult), at 68–74× the per-decode cost. An abandoned
         // non-terminating decode therefore holds ~1 pool thread + its retained bytes until process restart; the
-        // ThreadPool injects replacement threads so it never queue-starves new work, and the residual is bounded
-        // by the door's BYTE-AWARE admission cap (count × representative-bytes ≤ the door's memory budget). The
-        // now-working negative cache stops self-renewal. When the door is at its memory/strand cap the decode is
-        // rejected fail-fast with a DecodeCapacityExhaustedException (NEVER started) mapped to the public
-        // retryable DecoderSaturated below (I8), NOT a decode-timeout. The reader is kept alive for a stranded
+        // ThreadPool injects replacement threads so it never queue-starves new work. The residual is charged
+        // ONLY at DETACH (when this decode strands past its deadline) with the ROW GROUP'S REAL projected
+        // footprint (hoisted below, clamped to MaxRowGroupDecodedBytes) — a healthy in-flight decode is never
+        // charged nor throttled. The now-working negative cache stops self-renewal. When the door's stranded
+        // residual is already full of PERMANENT strands the decode is rejected fail-fast with a
+        // DecodeCapacityExhaustedException (NEVER started) mapped to the public retryable DecoderSaturated below
+        // (I8), NOT a decode-timeout. The reader is kept alive for a stranded
         // decode via an extra lease on `shared` (I6) released when the decode settles.
         try
         {
             // I6 — take an extra reader lease BEFORE the decode starts; release it when the (possibly stranded)
             // decode settles via onWorkSettled (which fires on EVERY exit path, including the pre-start
             // capacity-rejection throw). A never-terminating strand holds the lease forever, keeping the
-            // reader/stream alive so the strand never touches disposed state (residual ≤ the door's byte cap).
+            // reader/stream alive so the strand never touches disposed state (residual ≤ the door's residual).
             shared.Retain();
             try
             {
+                // Hoist the row group's REAL projected footprint (ProjectedFootprints + declared row count,
+                // clamped to the enforced ceiling) so a strand of THIS decode charges the actual bytes it would
+                // pin at detach — never a fictional fixed representative. Computed from the already-parsed footer
+                // metadata (the open was bounded), so it is a cheap in-memory read; any metadata fault during
+                // the estimate falls back to the enforced ceiling (conservative — never under-counts).
+                long strandFootprint = EstimateRowGroupRetainedBytes(reader, group, requested, fileFields, limits);
                 return await decoder.RunAsync(
                     DecodeGroupAsync,
                     decodeBudget,
@@ -1389,7 +1442,7 @@ internal sealed class ParquetFileReader
                     onAbandonedResult: DisposeAbandonedBatch,
                     onWorkSettled: shared.Release,
                     timeProvider: timeProvider,
-                    estimatedRetainedBytes: BoundedDecode.DataFileRepresentativeStrandBytes).ConfigureAwait(false);
+                    estimatedRetainedBytes: strandFootprint).ConfigureAwait(false);
             }
             catch (DecodeCapacityExhaustedException capacity)
             {

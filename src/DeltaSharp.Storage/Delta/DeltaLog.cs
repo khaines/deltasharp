@@ -54,6 +54,21 @@ internal sealed class DeltaLog
     /// bound under a stream of distinct crafted checkpoint identities.</summary>
     private const int NegativeCacheCapacity = 1024;
 
+    /// <summary>The maximum number of complete checkpoint CANDIDATES the reconstruction loop attempts to seed
+    /// from before abandoning checkpoint seeding and replaying JSON from version 0 (High #10). Snapshot load is
+    /// otherwise O(K_candidates × N_parts × per-part-budget) — a crafted log with many corrupt/timing-out
+    /// checkpoints could drive an unbounded seed walk. Trying only the newest few checkpoints bounds K; a
+    /// log-cleaned table remains readable because a genuinely usable recent checkpoint is within this window
+    /// (older ones would require JSON that was already VACUUMed anyway).</summary>
+    private const int MaxCheckpointCandidatesToTry = 4;
+
+    /// <summary>The cumulative DECODE-TIMEOUT wall-clock ceiling across a single reconstruction's candidate walk
+    /// (High #10). Only the elapsed time of parts that actually TIMED OUT is charged (a healthy part decodes in
+    /// milliseconds and charges nothing, so slow storage never trips it); once the sum crosses this ceiling the
+    /// candidate walk aborts to JSON replay so a flood of timing-out checkpoint parts cannot stall a load
+    /// unboundedly. Bounds total checkpoint decode-timeout time to roughly this ceiling + one part budget.</summary>
+    private static readonly TimeSpan AggregateCheckpointDecodeCeiling = TimeSpan.FromTicks(BoundedDecode.DefaultBudget.Ticks * 4);
+
     /// <summary>The per-entry TTL after which a negatively-cached checkpoint identity is re-probed (re-decoded
     /// once) so a repaired/replaced checkpoint heals without a process restart. Declared <b>before</b>
     /// <see cref="TimedOutCheckpointParts"/> so it is initialized first — static field initializers run in
@@ -438,9 +453,22 @@ internal sealed class DeltaLog
 
         var state = new SnapshotState();
         long? checkpointVersion = null;
+        // High #10 — bound the seed walk: try only the newest few candidates AND stop once cumulative
+        // decode-TIMEOUT time crosses the aggregate ceiling (charged inside TrySeedFromCheckpointAsync), so a
+        // crafted log full of timing-out checkpoints cannot drive an O(K × N × budget) stall before JSON replay.
+        var decodeCeiling = new CheckpointDecodeCeiling(AggregateCheckpointDecodeCeiling);
+        int attempted = 0;
         foreach (CheckpointSelection candidate in checkpoints)
         {
-            long? seeded = await TrySeedFromCheckpointAsync(state, candidate, cancellationToken).ConfigureAwait(false);
+            if (attempted >= MaxCheckpointCandidatesToTry || decodeCeiling.Exceeded)
+            {
+                // Candidate budget or the cumulative decode-timeout ceiling is spent: abandon checkpoint seeding
+                // and replay JSON from 0 (WITHOUT seeding the untried candidates — no decode ran for them).
+                break;
+            }
+
+            attempted++;
+            long? seeded = await TrySeedFromCheckpointAsync(state, candidate, decodeCeiling, cancellationToken).ConfigureAwait(false);
             if (seeded is not null)
             {
                 checkpointVersion = seeded;
@@ -804,9 +832,11 @@ internal sealed class DeltaLog
             + $"rather than risk emitting mismapped change data."));
 
     /// <summary>Seeds <paramref name="state"/> from the selected checkpoint's parts, returning its version,
-    /// or <see langword="null"/> if the checkpoint is corrupt/partial (the caller then replays from 0).</summary>
+    /// or <see langword="null"/> if the checkpoint is corrupt/partial (the caller then replays from 0). Charges
+    /// the elapsed time of any part that TIMES OUT to <paramref name="decodeCeiling"/> (High #10).</summary>
     private async Task<long?> TrySeedFromCheckpointAsync(
-        SnapshotState state, CheckpointSelection checkpoint, CancellationToken cancellationToken)
+        SnapshotState state, CheckpointSelection checkpoint, CheckpointDecodeCeiling decodeCeiling,
+        CancellationToken cancellationToken)
     {
         try
         {
@@ -836,100 +866,134 @@ internal sealed class DeltaLog
             TimeSpan? perPartBudget = _checkpointDecodeBudget;
             foreach (string partPath in checkpoint.PartPaths)
             {
+                string partKey = CheckpointDecodeNegativeCache.Key(_backend.TableIdentity, partPath, checkpoint.Version);
+
                 // Negative-cache short-circuit (CRITICAL fix): a checkpoint part that already tripped the
-                // bounded decode ceiling on a prior snapshot load is known non-terminating. Re-decoding it here
-                // would spawn ANOTHER detached decode on every load — self-renewing strands that the admission
-                // cap alone would eventually reject with visible read failures. Skip the read entirely and fall
-                // back to JSON replay, emitting the DISTINCT negative-cache-skip signal (NOT a decode-timeout —
-                // no decode ran) so a persistently bad checkpoint stays observable without re-incurring the
-                // decode and without conflating the skip into the budget-exceeded counter.
-                if (IsCheckpointPartKnownTimedOut(partPath, checkpoint.Version))
+                // bounded decode ceiling on prior loads (strike-gated, High #6) — or is being single-flight
+                // re-probed by another concurrent load (High #7) — is skipped rather than re-decoded (which
+                // would spawn ANOTHER detached decode). IsKnownTimedOut takes the single-flight probe marker for
+                // the ONE caller it returns false to; that caller MUST report Seed/ClearOnSuccess/ReleaseProbe
+                // below (the `finally` guarantees the marker is released on every path). Skip the read entirely
+                // and fall back to JSON replay, emitting the DISTINCT negative-cache-skip signal (EventId 4404 —
+                // no decode ran, so it is neither a decode-timeout nor conflated into that counter).
+                if (TimedOutCheckpointParts.IsKnownTimedOut(partKey, _timeProvider))
                 {
                     RecordCheckpointNegativeCacheSkip(checkpoint.Version);
                     return null;
                 }
 
-                Stream stream = await _backend.OpenReadAsync(partPath, cancellationToken).ConfigureAwait(false);
-                await using (stream.ConfigureAwait(false))
+                // This caller now HOLDS the single-flight probe for partKey. Guarantee its release on every exit
+                // path: Seed (timeout, High #6 strike) and ClearOnSuccess (clean decode) release it; any other
+                // terminal outcome (unsupported/forged/saturated/corrupt) releases it via ReleaseProbe in the
+                // finally without recording a strike.
+                bool probeReported = false;
+                try
                 {
-                    IReadOnlyList<DeltaAction> actions;
-                    try
+                    Stream stream = await _backend.OpenReadAsync(partPath, cancellationToken).ConfigureAwait(false);
+                    await using (stream.ConfigureAwait(false))
                     {
-                        actions = await DeltaCheckpointReader.ReadAsync(
-                            stream, cancellationToken,
-                            decodeBudget: perPartBudget,
-                            timeProvider: _timeProvider,
-                            decoder: _checkpointDecoder).ConfigureAwait(false);
-                    }
-                    catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
-                    {
-                        // Same non-authoritative rule as the DeltaProtocolException catch below, for a
-                        // checkpoint that is a VALID Parquet file DeltaSharp cannot read (Parquet Modular
-                        // Encryption, #681): that door's DIAGNOSIS was upgraded (malformed →
-                        // UnsupportedFeature) and must NOT change snapshot availability, so reconstruction
-                        // still falls back to JSON replay instead of failing the table read. (The data-file
-                        // door's UnsupportedFeature is NOT swallowed anywhere: there the data IS
-                        // authoritative.)
-                        //
-                        // Scoped to THIS call — not the enclosing try — deliberately: the checkpoint READER
-                        // is the only component whose UnsupportedFeature means "unusable derived artifact".
-                        // The same kind raised by _backend.OpenReadAsync above would mean the TABLE itself is
-                        // unreadable, and swallowing that would mask it behind a silent full JSON replay, so
-                        // it must keep propagating (PR #698 security review, FIX 1).
-                        RecordCheckpointFallback(CheckpointFallbackReason.UnsupportedFeature, checkpoint.Version);
-                        return null;
-                    }
-                    catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeBudgetExceeded)
-                    {
-                        // The checkpoint decode tripped the bounded wall-clock ceiling (a non-terminating
-                        // crafted decode, #647/#699/#716). This is a RESOURCE fault, NOT proven corruption
-                        // (classification contract, #649/#655/#681): route it to JSON replay under the distinct
-                        // DecodeTimeout reason (EventId 4402), and SEED the negative cache so this known-bad
-                        // part is never re-decoded on a later snapshot load (stopping the self-renewing strand).
-                        // Seeding is correct HERE (and only here): this part's decode PROVABLY ran past its
-                        // budget (I4). Scoped to THIS call so an OpenReadAsync-origin DecodeBudgetExceeded
-                        // (there is none today) could not be silently swallowed as a checkpoint miss.
-                        SeedTimedOutCheckpointPart(partPath, checkpoint.Version);
-                        RecordCheckpointDecodeTimeout(checkpoint.Version);
-                        return null;
-                    }
-                    catch (DecodeCapacityExhaustedException)
-                    {
-                        // The bounded-decode worker's checkpoint door is at capacity (too many strands already
-                        // detached): the decode was rejected fail-fast WITHOUT starting. This is transient — the
-                        // checkpoint may be perfectly healthy — so DO NOT seed the negative cache (that would
-                        // wrongly poison a good checkpoint), and DO NOT label it a decode-timeout (the decode
-                        // never ran). Fall back to JSON replay under the DISTINCT DecoderSaturated reason +
-                        // capacity_exhausted{checkpoint} counter so the saturation is observable without metric
-                        // conflation (I8).
-                        RecordCheckpointDecoderSaturated(checkpoint.Version);
-                        return null;
-                    }
-
-                    foreach (DeltaAction action in actions)
-                    {
-                        if (action is MetadataAction)
+                        IReadOnlyList<DeltaAction> actions;
+                        long decodeStart = _timeProvider.GetTimestamp();
+                        try
                         {
-                            metadataActions++;
+                            actions = await DeltaCheckpointReader.ReadAsync(
+                                stream, cancellationToken,
+                                decodeBudget: perPartBudget,
+                                timeProvider: _timeProvider,
+                                decoder: _checkpointDecoder).ConfigureAwait(false);
                         }
-                    }
+                        catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
+                        {
+                            // Same non-authoritative rule as the DeltaProtocolException catch below, for a
+                            // checkpoint that is a VALID Parquet file DeltaSharp cannot read (Parquet Modular
+                            // Encryption, #681): that door's DIAGNOSIS was upgraded (malformed →
+                            // UnsupportedFeature) and must NOT change snapshot availability, so reconstruction
+                            // still falls back to JSON replay instead of failing the table read. (The data-file
+                            // door's UnsupportedFeature is NOT swallowed anywhere: there the data IS
+                            // authoritative.)
+                            //
+                            // Scoped to THIS call — not the enclosing try — deliberately: the checkpoint READER
+                            // is the only component whose UnsupportedFeature means "unusable derived artifact".
+                            // The same kind raised by _backend.OpenReadAsync above would mean the TABLE itself is
+                            // unreadable, and swallowing that would mask it behind a silent full JSON replay, so
+                            // it must keep propagating (PR #698 security review, FIX 1).
+                            RecordCheckpointFallback(CheckpointFallbackReason.UnsupportedFeature, checkpoint.Version);
+                            return null;
+                        }
+                        catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeBudgetExceeded)
+                        {
+                            // The checkpoint decode tripped the bounded wall-clock ceiling (a non-terminating
+                            // crafted decode, #647/#699/#716). This is a RESOURCE fault, NOT proven corruption
+                            // (classification contract, #649/#655/#681): route it to JSON replay under the
+                            // distinct DecodeTimeout reason (EventId 4402), and SEED the negative cache (High #6:
+                            // strike-gated — the first timeout only records a strike; suppression needs a second
+                            // proven timeout of the same identity) so a persistently-bad part is eventually not
+                            // re-decoded. Seeding is correct HERE (and only here): this part's decode PROVABLY
+                            // ran past its ADEQUATE budget (I4). Charge the elapsed decode-timeout time to the
+                            // aggregate ceiling (High #10) so a flood of timing-out parts aborts the seed walk.
+                            decodeCeiling.Charge(_timeProvider.GetElapsedTime(decodeStart));
+                            TimedOutCheckpointParts.Seed(partKey, _timeProvider);
+                            probeReported = true;
+                            RecordCheckpointDecodeTimeout(checkpoint.Version);
+                            return null;
+                        }
+                        catch (DecodeCapacityExhaustedException)
+                        {
+                            // The bounded-decode worker's checkpoint door is at capacity (its stranded residual
+                            // is full of permanent strands): the decode was rejected fail-fast WITHOUT starting.
+                            // This is transient — the checkpoint may be perfectly healthy — so DO NOT seed the
+                            // negative cache (that would wrongly poison a good checkpoint), and DO NOT label it a
+                            // decode-timeout (the decode never ran). Fall back to JSON replay under the DISTINCT
+                            // DecoderSaturated reason + capacity_exhausted{checkpoint} counter so the saturation
+                            // is observable without metric conflation (I8). The probe marker is released by the
+                            // finally (ReleaseProbe — no strike).
+                            RecordCheckpointDecoderSaturated(checkpoint.Version);
+                            return null;
+                        }
 
-                    if (metadataActions > 1)
+                        foreach (DeltaAction action in actions)
+                        {
+                            if (action is MetadataAction)
+                            {
+                                metadataActions++;
+                            }
+                        }
+
+                        if (metadataActions > 1)
+                        {
+                            // Forged multi-metaData checkpoint (#671 cross-part identity forgery). Distinguish it
+                            // HERE, at the guard, not in the catch below: a corrupt-Parquet decode and this
+                            // reject both surface as a DeltaProtocolException with MalformedAction, so the catch
+                            // cannot tell them apart by introspection (PR #786 council). Emit the distinguished
+                            // forged-reject signal and return null directly — the checkpoint is non-authoritative
+                            // (design §2.10.3), so the partial seed is discarded and the read falls back to JSON
+                            // replay exactly as the catch would, but the forged case is now attributed to
+                            // `forged_multi_metadata` instead of the generic `malformed`. Returning here (rather
+                            // than throwing to the catch) keeps the emission exactly-once. The attacker-chosen
+                            // metaData count/content is never rendered.
+                            RecordForgedCheckpoint(checkpoint.Version);
+                            return null;
+                        }
+
+                        // This part decoded cleanly: clear any accumulated strike history for its identity
+                        // (High #6 clear-on-success — a one-off slow decode never poisons) and release the
+                        // single-flight probe marker.
+                        TimedOutCheckpointParts.ClearOnSuccess(partKey);
+                        probeReported = true;
+
+                        state.ApplyAll(actions);
+                    }
+                }
+                finally
+                {
+                    if (!probeReported)
                     {
-                        // Forged multi-metaData checkpoint (#671 cross-part identity forgery). Distinguish it
-                        // HERE, at the guard, not in the catch below: a corrupt-Parquet decode and this reject
-                        // both surface as a DeltaProtocolException with MalformedAction, so the catch cannot tell
-                        // them apart by introspection (PR #786 council). Emit the distinguished forged-reject
-                        // signal and return null directly — the checkpoint is non-authoritative (design §2.10.3),
-                        // so the partial seed is discarded and the read falls back to JSON replay exactly as the
-                        // catch would, but the forged case is now attributed to `forged_multi_metadata` instead of
-                        // the generic `malformed`. Returning here (rather than throwing to the catch) keeps the
-                        // emission exactly-once. The attacker-chosen metaData count/content is never rendered.
-                        RecordForgedCheckpoint(checkpoint.Version);
-                        return null;
+                        // A terminal outcome that is neither a proven timeout nor a clean decode (saturation, an
+                        // unsupported/encrypted part, a forged reject, a corrupt part, or cancellation): release
+                        // the single-flight probe without recording a strike, so a later window is not skipped
+                        // by a stale in-flight marker.
+                        TimedOutCheckpointParts.ReleaseProbe(partKey);
                     }
-
-                    state.ApplyAll(actions);
                 }
             }
 
@@ -1015,35 +1079,39 @@ internal sealed class DeltaLog
     }
 
     /// <summary>Emits the distinct <b>negative-cache-skip</b> fallback signal for the checkpoint door: a part
-    /// already in the process-wide negative cache is skipped WITHOUT decoding (it provably tripped its budget on
-    /// a prior load). No decode ran, so this is categorically distinct from a decode-timeout: it emits the
-    /// <c>NegativeCacheSkip</c> checkpoint-fallback label + the door-dimensioned
-    /// <c>decode.negative_cache_skip</c> counter, and deliberately does NOT increment <c>decode.budget_exceeded</c>
-    /// (the de-conflation fix). Renders only the discarded version.</summary>
+    /// already suppressed in the process-wide negative cache (strike-gated, High #6) — or being single-flight
+    /// re-probed by another concurrent load (High #7) — is skipped WITHOUT decoding. No decode ran, so this is
+    /// categorically distinct from a decode-timeout: it emits the <c>NegativeCacheSkip</c> checkpoint-fallback
+    /// label + the door-dimensioned <c>decode.negative_cache_skip</c> counter, paired with its OWN Warning log
+    /// (<see cref="DeltaCheckpointLog.CheckpointNegativeCacheSkip"/>, EventId 4404 — NOT the decode-timeout
+    /// EventId 4402, so log-based alerting is not conflated), and deliberately does NOT increment
+    /// <c>decode.budget_exceeded</c> (the de-conflation fix). Renders only the discarded version.</summary>
     private void RecordCheckpointNegativeCacheSkip(long version)
     {
         _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.NegativeCacheSkip);
         _telemetry.RecordDecodeNegativeCacheSkip(DecodeDoor.Checkpoint);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
-        DeltaCheckpointLog.CheckpointDecodeTimeout(_logger, version);
+        DeltaCheckpointLog.CheckpointNegativeCacheSkip(_logger, version);
     }
 
-    /// <summary>Whether a checkpoint part is in the process-wide negative cache (already tripped the bounded
-    /// decode ceiling on a prior load and still within its TTL) — so it is skipped rather than re-decoded
-    /// (which would spawn another detached strand). Keyed on stable table identity + part path + version, so a
-    /// fresh backend per load still hits, and an unrelated table never collides.</summary>
-    private bool IsCheckpointPartKnownTimedOut(string partPath, long version) =>
-        TimedOutCheckpointParts.IsKnownTimedOut(
-            CheckpointDecodeNegativeCache.Key(_backend.TableIdentity, partPath, version), _timeProvider);
+    /// <summary>A cumulative DECODE-TIMEOUT wall-clock accumulator for a single reconstruction's candidate walk
+    /// (High #10). Only parts that actually time out charge their elapsed time here; a healthy part decodes in
+    /// milliseconds and charges nothing (so slow storage never trips it). Once the sum crosses the ceiling the
+    /// reconstruction abandons checkpoint seeding and replays JSON, bounding the O(K × N × budget) worst case.
+    /// Not thread-safe: a single reconstruction seeds its candidates sequentially.</summary>
+    private sealed class CheckpointDecodeCeiling(TimeSpan ceiling)
+    {
+        private readonly long _ceilingTicks = ceiling.Ticks;
+        private long _consumedTicks;
 
-    /// <summary>Records a checkpoint part identity that tripped the bounded decode ceiling so it is not
-    /// re-decoded on a later snapshot load. Seeded ONLY after the decode provably ran past budget (a
-    /// <see cref="StorageErrorKind.DecodeBudgetExceeded"/>), never on saturation. Bounded LRU + TTL: on
-    /// capacity the least-recently-used entry is evicted (never a whole-map wipe), and the entry re-probes
-    /// after its TTL.</summary>
-    private void SeedTimedOutCheckpointPart(string partPath, long version) =>
-        TimedOutCheckpointParts.Seed(
-            CheckpointDecodeNegativeCache.Key(_backend.TableIdentity, partPath, version), _timeProvider);
+        internal bool Exceeded => _consumedTicks >= _ceilingTicks;
+
+        internal void Charge(TimeSpan elapsed)
+        {
+            long add = Math.Max(elapsed.Ticks, 0L);
+            _consumedTicks = add > long.MaxValue - _consumedTicks ? long.MaxValue : _consumedTicks + add;
+        }
+    }
 
     /// <summary>Replays JSON commits <c>[start, target]</c> in ascending order into <paramref name="state"/>,
     /// requiring a contiguous chain (a missing version is a gap → fail closed). Each replayed version is

@@ -168,7 +168,15 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     /// instances rooted at the SAME table therefore share negative-cache entries — so a persistently
     /// non-terminating checkpoint decoded through a fresh backend per load is NOT re-decoded every time — while
     /// two different table roots never collide. Uses <see cref="TableRootId"/> (the canonicalized real root,
-    /// the same identity <see cref="Reading.ChangeFeedReader"/> binds its resume tokens to).</summary>
+    /// the same identity <see cref="Reading.ChangeFeedReader"/> binds its resume tokens to).
+    /// <para><b>Case-sensitivity residual (noted, not canonicalized).</b> The identity is the case-PRESERVING
+    /// real root. On a case-insensitive host (default macOS/Windows) two different-case paths to the SAME table
+    /// (<c>/Tbl</c> vs <c>/tbl</c>) therefore yield DISTINCT identities, so a fresh backend opened via a
+    /// different-case path would MISS the negative-cache entry the other seeded — costing at most an extra
+    /// (safe) JSON replay / re-decode, never a wrong read or a cross-table suppression. Case is deliberately
+    /// NOT folded here: a case-insensitive OS can still host a case-SENSITIVE volume (a case-mounted APFS
+    /// volume, a Linux bind mount), where folding case would WRONGLY collide two genuinely distinct tables — a
+    /// worse failure than the benign extra replay. The residual is accepted.</para></summary>
     public string TableIdentity =>
         string.Create(CultureInfo.InvariantCulture, $"{Kind}:{TableRootId}");
 
