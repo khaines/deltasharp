@@ -80,40 +80,67 @@ internal static class DeltaCheckpointReader
     /// replay).</exception>
     public static async Task<IReadOnlyList<DeltaAction>> ReadAsync(
         Stream stream, CancellationToken cancellationToken,
-        long maxPartBytes = MaxCheckpointPartBytes, long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes)
+        long maxPartBytes = MaxCheckpointPartBytes, long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes,
+        TimeSpan? decodeBudget = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
         MemoryStream buffer = await BufferAsync(stream, maxPartBytes, cancellationToken).ConfigureAwait(false);
         await using (buffer.ConfigureAwait(false))
         {
-            ParquetReader reader = await OpenAsync(buffer, cancellationToken).ConfigureAwait(false);
-            await using (reader.ConfigureAwait(false))
-            {
-                try
-                {
-                    var schema = CheckpointSchema.Resolve(reader.Schema);
-                    var actions = new List<DeltaAction>();
-                    for (int group = 0; group < reader.RowGroupCount; group++)
-                    {
-                        cancellationToken.ThrowIfCancellationRequested();
-                        using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                        await ReadRowGroupAsync(rowGroup, schema, actions, group, maxDecodedBytes, cancellationToken).ConfigureAwait(false);
-                    }
+            // Bounded-time decode (#716/#699/#647). A single corrupted byte (the terminal footer STOP flipped,
+            // #699; the byte at index 5595 in the #716 minimized repro; a corrupt data-page header, #647) can
+            // drive Parquet.Net 6.0.3 into effectively UNBOUNDED work — inside ParquetReader.CreateAsync at
+            // open, or inside the synchronous column/page decode — that IGNORES the CancellationToken. A hang is
+            // not an exception, so the fail-closed catch inside DecodeBufferedAsync cannot intercept it. Race the
+            // WHOLE open+decode against a wall-clock deadline via the shared BoundedDecode policy so a corrupt
+            // checkpoint fails closed deterministically (→ the non-authoritative checkpoint is discarded and
+            // DeltaLog falls back to JSON replay) rather than stalling the table read indefinitely. On expiry
+            // the fixed-message DeltaProtocolException.Malformed matches this door's existing corrupt-checkpoint
+            // contract (so the JSON-replay fallback path is unchanged); a valid-but-unsupported
+            // UnsupportedFeature and cooperative cancellation both finish inside the budget and propagate
+            // unwrapped as the work's own outcome.
+            return await BoundedDecode.RunAsync(
+                decodeToken => DecodeBufferedAsync(buffer, maxDecodedBytes, decodeToken),
+                decodeBudget ?? BoundedDecode.DefaultBudget,
+                static _ => DeltaProtocolException.Malformed(
+                    "The Delta checkpoint Parquet could not be decoded within the bounded-decode time budget."),
+                cancellationToken).ConfigureAwait(false);
+        }
+    }
 
-                    return actions;
-                }
-                catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException))
+    // The open + full row-group decode of one buffered checkpoint part (bounded in time by the caller's
+    // BoundedDecode.RunAsync). Kept as its own method so the bounded-decode policy wraps a single unit of work
+    // whose CancellationToken is the linked (deadline + caller) token.
+    private static async Task<IReadOnlyList<DeltaAction>> DecodeBufferedAsync(
+        MemoryStream buffer, long maxDecodedBytes, CancellationToken cancellationToken)
+    {
+        ParquetReader reader = await OpenAsync(buffer, cancellationToken).ConfigureAwait(false);
+        await using (reader.ConfigureAwait(false))
+        {
+            try
+            {
+                var schema = CheckpointSchema.Resolve(reader.Schema);
+                var actions = new List<DeltaAction>();
+                for (int group = 0; group < reader.RowGroupCount; group++)
                 {
-                    // Any lower-level decode failure (a page-level defect a byte-flip introduced past the
-                    // footer) is a corrupt checkpoint: fail closed so the caller falls back to JSON replay.
-                    // Fixed message (no ex.Message interpolation): an attacker-controlled checkpoint footer
-                    // field name must never echo into the surfaced error text (info-leak parity with the
-                    // ParquetFileReader fail-closed boundaries, #651). The cause is preserved as the inner
-                    // exception for logs/diagnostics.
-                    throw DeltaProtocolException.Malformed(
-                        "The Delta checkpoint Parquet is malformed.", ex);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                    await ReadRowGroupAsync(rowGroup, schema, actions, group, maxDecodedBytes, cancellationToken).ConfigureAwait(false);
                 }
+
+                return actions;
+            }
+            catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException))
+            {
+                // Any lower-level decode failure (a page-level defect a byte-flip introduced past the
+                // footer) is a corrupt checkpoint: fail closed so the caller falls back to JSON replay.
+                // Fixed message (no ex.Message interpolation): an attacker-controlled checkpoint footer
+                // field name must never echo into the surfaced error text (info-leak parity with the
+                // ParquetFileReader fail-closed boundaries, #651). The cause is preserved as the inner
+                // exception for logs/diagnostics.
+                throw DeltaProtocolException.Malformed(
+                    "The Delta checkpoint Parquet is malformed.", ex);
             }
         }
     }

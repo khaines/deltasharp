@@ -177,7 +177,7 @@ internal sealed class ParquetFileReader
             ParquetTypeMapping.EnsureReadSupported(requested[c]);
         }
 
-        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
@@ -251,7 +251,7 @@ internal sealed class ParquetFileReader
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             // Fail-closed row-group-count boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
@@ -315,7 +315,7 @@ internal sealed class ParquetFileReader
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             return MapFooterSchemaFailClosed(reader);
@@ -380,7 +380,7 @@ internal sealed class ParquetFileReader
     {
         ArgumentNullException.ThrowIfNull(input);
 
-        ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
+        ParquetReader reader = await OpenAsync(input, _limits.DecodeTimeBudget, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
             StructType schema = MapFooterSchemaFailClosed(reader);
@@ -651,22 +651,41 @@ internal sealed class ParquetFileReader
         _ => IntPtr.Size,
     };
 
-    private static async Task<ParquetReader> OpenAsync(Stream input, CancellationToken cancellationToken)
+    private static async Task<ParquetReader> OpenAsync(Stream input, TimeSpan decodeBudget, CancellationToken cancellationToken)
     {
         ParquetReader? reader = null;
         try
         {
-            reader = await ParquetReader.CreateAsync(input, null, false, cancellationToken).ConfigureAwait(false);
+            // Bounded-time open (#699). Parquet.Net 6.0.3 can be driven by a single flipped terminal footer
+            // byte into effectively UNBOUNDED work inside CreateAsync (and the forced lazy Schema
+            // materialization) that IGNORES the CancellationToken. Race the open against a wall-clock deadline
+            // via the shared BoundedDecode policy so a crafted footer fails closed with a deterministic
+            // CorruptData rather than hanging the caller. The timeout is a DeltaStorageException, which
+            // IsUndecodableParquetInput EXCLUDES, so it propagates UNWRAPPED past the catch below (never
+            // re-masked, and — correctly — never reclassified as encryption). Cooperative caller cancellation
+            // surfaces as OperationCanceledException, also excluded.
+            reader = await BoundedDecode.RunAsync(
+                async innerToken =>
+                {
+                    ParquetReader r = await ParquetReader.CreateAsync(input, null, false, innerToken).ConfigureAwait(false);
 
-            // Parquet.Net parses the footer LAZILY: CreateAsync reads the thrift FileMetaData, but the
-            // high-level ParquetSchema is built ON FIRST ACCESS (ThriftFooter.CreateModelSchema), which raises
-            // raw BCL exceptions (the #193 CDF cdc-file fuzz drove InvalidOperationException, and a byte-flipped
-            // footer drives NullReferenceException from InitRowGroupReaders) on a malformed schema footer.
-            // Every caller (ReadDataSchemaAsync, ReadAsync) reads reader.Schema OUTSIDE this boundary, so force
-            // that materialization HERE — inside the fail-closed footer-parse boundary — so a corrupt footer
-            // cannot escape as a raw BCL exception at a later reader.Schema access
-            // (storage-delta-architecture.md §5.4 C-DECODE).
-            _ = reader.Schema;
+                    // Parquet.Net parses the footer LAZILY: CreateAsync reads the thrift FileMetaData, but the
+                    // high-level ParquetSchema is built ON FIRST ACCESS (ThriftFooter.CreateModelSchema), which
+                    // raises raw BCL exceptions (the #193 CDF cdc-file fuzz drove InvalidOperationException, and a
+                    // byte-flipped footer drives NullReferenceException from InitRowGroupReaders) on a malformed
+                    // schema footer. Every caller (ReadDataSchemaAsync, ReadAsync) reads reader.Schema OUTSIDE
+                    // this boundary, so force that materialization HERE — inside the fail-closed footer-parse
+                    // boundary AND the bounded-time budget — so a corrupt footer can neither escape as a raw BCL
+                    // exception at a later reader.Schema access nor hang there
+                    // (storage-delta-architecture.md §5.4 C-DECODE).
+                    _ = r.Schema;
+                    return r;
+                },
+                decodeBudget,
+                static _ => DeltaStorageException.CorruptData(
+                    "The Parquet stream could not be decoded within the bounded-decode time budget "
+                    + "(possible malformed footer driving a non-terminating decode)."),
+                cancellationToken).ConfigureAwait(false);
 
             // Plaintext-footer Parquet Modular Encryption — SUCCESS-path arm (#655). A plaintext-footer
             // encrypted file keeps the ordinary PAR1 magic; when its encrypted columns RETAIN their plaintext
@@ -1056,83 +1075,107 @@ internal sealed class ParquetFileReader
         // attacker-controlled column-statistics blobs on the predicate-pushdown path the CDF door
         // (keepRowGroup:null) never reaches; EnsureDecodeCeiling / ProjectedFootprints (column-chunk sizes);
         // and the per-column page/level decode. Any raw fault maps to the deterministic CorruptData contract.
+        //
+        // Bounded-time decode (#647). A corrupt data-page header can drive Parquet.Net 6.0.3's SYNCHRONOUS
+        // page/level decode into a non-terminating CPU loop that observes NO CancellationToken mid-page — a
+        // hang is not an exception, so the catches below cannot intercept it. Race the whole decode against a
+        // wall-clock deadline via the shared BoundedDecode policy: on expiry it fails closed with a
+        // deterministic CorruptData (a DeltaStorageException the catches EXCLUDE, so it propagates unwrapped),
+        // never hanging the caller. The decode runs on a threadpool thread; its own library faults surface as
+        // the work's outcome and are mapped by the catches below exactly as before.
+        ParquetDecodeLimits effectiveLimits = limits ?? ParquetDecodeLimits.Default;
         try
         {
-            using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+            return await BoundedDecode.RunAsync(
+                DecodeGroupAsync,
+                effectiveLimits.DecodeTimeBudget,
+                static _ => DeltaStorageException.CorruptData(
+                    "A Parquet row group could not be decoded within the bounded-decode time budget "
+                    + "(possible corrupt data-page header driving a non-terminating decode)."),
+                cancellationToken).ConfigureAwait(false);
 
-            if (keepRowGroup is not null)
+            async Task<ColumnBatch?> DecodeGroupAsync(CancellationToken decodeToken)
             {
-                // RowGroupStatistics's constructor eagerly calls rowGroup.GetStatistics(fileField), decoding
-                // the footer statistics blob for every projected column. A corrupt stats blob throws here (e.g.
-                // ArgumentException / InvalidDataException); the enclosing boundary maps it to CorruptData rather
-                // than let it escape raw to a predicate-pushdown caller (the CDF door passes keepRowGroup:null).
-                var statistics = new RowGroupStatistics(rowGroup, requested, fileFields);
-                if (!keepRowGroup(statistics))
-                {
-                    // Pruned: return without reading any column chunk for this group.
-                    return null;
-                }
-            }
+                using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
 
-            // CF-1/H4/L3: reject an implausible or out-of-range row group BEFORE the eager allocation below,
-            // so a crafted footer (inflated decompressed size or row count) surfaces as a deterministic
-            // CorruptData error rather than an OOM or a raw OverflowException escaping the codec contract.
-            long declaredRows = rowGroup.RowCount;
-            EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group, limits);
-            int rowCount;
-            try
-            {
-                rowCount = checked((int)declaredRows);
-            }
-            catch (OverflowException ex)
-            {
-                // Kept as a distinct, informative CorruptData (a DeltaStorageException the boundary excludes and
-                // lets propagate) so the "exceeds Int32.MaxValue" cause is not flattened into the generic map.
-                throw DeltaStorageException.CorruptData(
-                    $"Row group {group} declares {declaredRows} rows, exceeding Int32.MaxValue.", ex);
-            }
-
-            var columns = new ColumnVector[requested.Count];
-            // One eager-decode budget for THIS row group's nested reconstruction, shared across every nested
-            // column (and every leaf + container structure within each), so their COMBINED peak — not each
-            // column independently — stays under the ceiling. The flat EnsureDecodeCeiling above already bounds
-            // the raw declared bytes cumulatively; this bounds reconstruction overhead that aggregate misses.
-            var nestedBudget = new NestedParquetColumnReader.NestedDecodeBudget(
-                (limits ?? ParquetDecodeLimits.Default).MaxRowGroupDecodedBytes);
-            for (int c = 0; c < requested.Count; c++)
-            {
-                ResolvedColumn resolved = fileFields[c];
-                if (resolved.Nested is { } nestedField)
+                if (keepRowGroup is not null)
                 {
-                    // Nested column (#571): reconstruct an immutable nested vector from the raw Dremel levels.
-                    // NestedParquetColumnReader owns its own allocation ceiling and null-correct reassembly.
-                    columns[c] = await NestedParquetColumnReader.ReadAsync(
-                        rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, nestedBudget, cancellationToken)
-                        .ConfigureAwait(false);
-                    continue;
-                }
-
-                MutableColumnVector vector = ColumnVectors.Create(requested[c].DataType, Math.Max(rowCount, 1));
-                if (resolved.Scalar is { } fileField)
-                {
-                    await ReadColumnAsync(rowGroup, fileField, requested[c], vector, rowCount, allowTypeWideningPromotion, cancellationToken)
-                        .ConfigureAwait(false);
-                }
-                else
-                {
-                    // The requested column is absent from this (older, narrower) file: materialize it as an
-                    // all-null column (evolved-column read null-fill, #497). Only nullable columns reach here
-                    // (ResolveFileFields fails closed on an absent non-nullable column).
-                    for (int r = 0; r < rowCount; r++)
+                    // RowGroupStatistics's constructor eagerly calls rowGroup.GetStatistics(fileField), decoding
+                    // the footer statistics blob for every projected column. A corrupt stats blob throws here
+                    // (e.g. ArgumentException / InvalidDataException); the enclosing boundary maps it to
+                    // CorruptData rather than let it escape raw to a predicate-pushdown caller (the CDF door
+                    // passes keepRowGroup:null).
+                    var statistics = new RowGroupStatistics(rowGroup, requested, fileFields);
+                    if (!keepRowGroup(statistics))
                     {
-                        vector.AppendNull();
+                        // Pruned: return without reading any column chunk for this group.
+                        return null;
                     }
                 }
 
-                columns[c] = vector;
-            }
+                // CF-1/H4/L3: reject an implausible or out-of-range row group BEFORE the eager allocation below,
+                // so a crafted footer (inflated decompressed size or row count) surfaces as a deterministic
+                // CorruptData error rather than an OOM or a raw OverflowException escaping the codec contract.
+                long declaredRows = rowGroup.RowCount;
+                EnsureDecodeCeiling(declaredRows, ProjectedFootprints(rowGroup, requested, fileFields), group, effectiveLimits);
+                int rowCount;
+                try
+                {
+                    rowCount = checked((int)declaredRows);
+                }
+                catch (OverflowException ex)
+                {
+                    // Kept as a distinct, informative CorruptData (a DeltaStorageException the boundary excludes
+                    // and lets propagate) so the "exceeds Int32.MaxValue" cause is not flattened into the generic
+                    // map.
+                    throw DeltaStorageException.CorruptData(
+                        $"Row group {group} declares {declaredRows} rows, exceeding Int32.MaxValue.", ex);
+                }
 
-            return new ManagedColumnBatch(requested, columns, rowCount);
+                var columns = new ColumnVector[requested.Count];
+                // One eager-decode budget for THIS row group's nested reconstruction, shared across every nested
+                // column (and every leaf + container structure within each), so their COMBINED peak — not each
+                // column independently — stays under the ceiling. The flat EnsureDecodeCeiling above already
+                // bounds the raw declared bytes cumulatively; this bounds reconstruction overhead that aggregate
+                // misses.
+                var nestedBudget = new NestedParquetColumnReader.NestedDecodeBudget(
+                    effectiveLimits.MaxRowGroupDecodedBytes);
+                for (int c = 0; c < requested.Count; c++)
+                {
+                    ResolvedColumn resolved = fileFields[c];
+                    if (resolved.Nested is { } nestedField)
+                    {
+                        // Nested column (#571): reconstruct an immutable nested vector from the raw Dremel
+                        // levels. NestedParquetColumnReader owns its own allocation ceiling and null-correct
+                        // reassembly.
+                        columns[c] = await NestedParquetColumnReader.ReadAsync(
+                            rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, nestedBudget, decodeToken)
+                            .ConfigureAwait(false);
+                        continue;
+                    }
+
+                    MutableColumnVector vector = ColumnVectors.Create(requested[c].DataType, Math.Max(rowCount, 1));
+                    if (resolved.Scalar is { } fileField)
+                    {
+                        await ReadColumnAsync(rowGroup, fileField, requested[c], vector, rowCount, allowTypeWideningPromotion, decodeToken)
+                            .ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        // The requested column is absent from this (older, narrower) file: materialize it as an
+                        // all-null column (evolved-column read null-fill, #497). Only nullable columns reach here
+                        // (ResolveFileFields fails closed on an absent non-nullable column).
+                        for (int r = 0; r < rowCount; r++)
+                        {
+                            vector.AppendNull();
+                        }
+                    }
+
+                    columns[c] = vector;
+                }
+
+                return new ManagedColumnBatch(requested, columns, rowCount);
+            }
         }
         catch (Exception ex) when (IsParquetDefect(ex))
         {
