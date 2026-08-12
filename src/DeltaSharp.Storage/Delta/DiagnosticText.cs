@@ -159,7 +159,13 @@ internal static class DiagnosticText
     /// (rather than <c>part-*.parquet</c>) could surface that name — bounded and sanitized, but not dropped.
     /// Both are documented residuals, not the value-in-a-partition-segment disclosure this method closes.</para>
     /// </summary>
-    internal static string DescribePath(string? path)
+    internal static PathDescription DescribePath(string? path) => new(DescribePathCore(path));
+
+    // #700: the body is unchanged; only DescribePath's PUBLIC signature moved to PathDescription. Keeping the
+    // renderer as a string-returning core (rather than wrapping every return) preserves this method's surface
+    // byte-for-byte, which minimizes the merge-conflict blast radius with the concurrent SanitizeAndJoin work
+    // on the sibling Abstractions primitive.
+    private static string DescribePathCore(string? path)
     {
         if (string.IsNullOrEmpty(path))
         {

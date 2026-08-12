@@ -1,14 +1,17 @@
 using System;
 using System.Linq;
 using System.Text;
-using DeltaSharp.Storage.Delta;
+using DeltaSharp.Diagnostics;
 using Xunit;
-using SharedDiagnosticText = DeltaSharp.Diagnostics.DiagnosticText;
 
-namespace DeltaSharp.Storage.Tests;
+namespace DeltaSharp.Abstractions.Tests;
 
 /// <summary>
-/// #687 council round 3, item 1 — the <b>astral half</b> of the injection-unsafe rule.
+/// #687 council round 3, item 1 — the <b>astral half</b> of the injection-unsafe rule. This is the PRIMARY
+/// guard for the shared <see cref="DiagnosticText"/> hygiene primitive, and #706 relocated it into
+/// <c>DeltaSharp.Abstractions.Tests</c> — the assembly that OWNS the primitive — so it runs on both
+/// <c>net8.0</c> and <c>net10.0</c> (the primitive multi-targets) and calls the primitive DIRECTLY rather
+/// than through the Storage forwarder.
 /// <para>The <c>Cf</c> (format) category was added to the neutralization set in round 2, but
 /// <c>IsInjectionUnsafe</c> takes a <c>char</c> and so only decides BMP code points. <c>Cc</c>, <c>Zl</c> and
 /// <c>Zp</c> are entirely BMP, so for those that was the whole rule — but <c>Cf</c> is not. The surrogate-pair
@@ -19,10 +22,10 @@ namespace DeltaSharp.Storage.Tests;
 /// invisibly — the canonical invisible-text smuggling vector, and a stronger form of "make the log lie" than
 /// the U+202E that was already neutralized. A hostile <c>_delta_log</c> JSON string can carry any UTF-16, so
 /// this is reachable on the same path as the rest of #687.</para>
-/// <para>These tests are the standing guard for that corner. They live beside — not inside —
-/// <c>StorageMessageHygieneTests.Sanitize_NeutralizesLoneSurrogates_ButKeepsValidPairs</c>, which covers lone
-/// surrogates and pins U+1F600 (category <c>So</c>) as a pair that must SURVIVE. Read the two together: that
-/// test proves the branch is not over-broad, these prove it is not under-broad.</para>
+/// <para>These tests are the standing guard for that corner. They are the counterpart to
+/// <c>DeltaSharp.Storage.Tests</c>'s <c>StorageMessageHygieneTests.Sanitize_NeutralizesLoneSurrogates_ButKeepsValidPairs</c>,
+/// which covers lone surrogates and pins U+1F600 (category <c>So</c>) as a pair that must SURVIVE. Read the
+/// two together: that test proves the branch is not over-broad, these prove it is not under-broad.</para>
 /// </summary>
 public sealed class DiagnosticTextAstralHygieneTests
 {
@@ -53,7 +56,7 @@ public sealed class DiagnosticTextAstralHygieneTests
             System.Globalization.UnicodeCategory.Format,
             Rune.GetUnicodeCategory(new Rune(codePoint)));
 
-        string sanitized = SharedDiagnosticText.Sanitize(raw);
+        string sanitized = DiagnosticText.Sanitize(raw);
 
         Assert.DoesNotContain(payload, sanitized, StringComparison.Ordinal);
         Assert.Equal("col\uFFFDname", sanitized);
@@ -61,9 +64,6 @@ public sealed class DiagnosticTextAstralHygieneTests
         // The whole surrogate PAIR collapses to one replacement char, not two — the neutralization operates on
         // the code point, not on the UTF-16 code units.
         Assert.Equal(1, sanitized.Count(c => c == '\uFFFD'));
-
-        // And the Storage forwarder inherits it, because there is one implementation.
-        Assert.Equal(sanitized, DiagnosticText.Sanitize(raw));
 
         _ = name;
     }
@@ -85,7 +85,7 @@ public sealed class DiagnosticTextAstralHygieneTests
         // Non-vacuity: the payload really is present and really is invisible in the INPUT.
         Assert.Equal(4, smuggled.EnumerateRunes().Count(r => r.Value is >= 0xE0020 and <= 0xE007F));
 
-        string sanitized = SharedDiagnosticText.Sanitize(smuggled);
+        string sanitized = DiagnosticText.Sanitize(smuggled);
 
         Assert.DoesNotContain(sanitized.EnumerateRunes(), r => r.Value is >= 0xE0020 and <= 0xE007F);
         Assert.Equal("safe_column\uFFFD\uFFFD\uFFFD\uFFFD", sanitized);
@@ -105,8 +105,8 @@ public sealed class DiagnosticTextAstralHygieneTests
             "\U0001F1FA\U0001F1F8", // REGIONAL INDICATOR pair (So, So)
         })
         {
-            Assert.Equal(legitimate, SharedDiagnosticText.Sanitize(legitimate));
-            Assert.DoesNotContain('\uFFFD', SharedDiagnosticText.Sanitize(legitimate));
+            Assert.Equal(legitimate, DiagnosticText.Sanitize(legitimate));
+            Assert.DoesNotContain('\uFFFD', DiagnosticText.Sanitize(legitimate));
         }
     }
 
@@ -116,7 +116,7 @@ public sealed class DiagnosticTextAstralHygieneTests
         // maxLength < 0 disables truncation entirely; the category check must be independent of the cap.
         string raw = "col" + char.ConvertFromUtf32(0xE0041) + "name";
 
-        Assert.Equal("col\uFFFDname", SharedDiagnosticText.Sanitize(raw, maxLength: -1));
+        Assert.Equal("col\uFFFDname", DiagnosticText.Sanitize(raw, maxLength: -1));
     }
 
     [Fact]
@@ -129,7 +129,7 @@ public sealed class DiagnosticTextAstralHygieneTests
 
         for (int cap = 1; cap <= raw.Length + 2; cap++)
         {
-            string sanitized = SharedDiagnosticText.Sanitize(raw, cap);
+            string sanitized = DiagnosticText.Sanitize(raw, cap);
 
             Assert.DoesNotContain(sanitized, c => char.IsSurrogate(c));
             Assert.DoesNotContain(
@@ -146,16 +146,15 @@ public sealed class DiagnosticTextAstralHygieneTests
         // slow path returns a character-identical string for the exact-cap case — but an unguarded boundary
         // means a future edit silently sends the commonest in-budget input down the allocating path, which is
         // precisely what the fast path was added (#696 council item 9) to avoid.
-        string atBound = new('c', SharedDiagnosticText.DefaultMaxLength);
-        string oneUnder = new('c', SharedDiagnosticText.DefaultMaxLength - 1);
+        string atBound = new('c', DiagnosticText.DefaultMaxLength);
+        string oneUnder = new('c', DiagnosticText.DefaultMaxLength - 1);
 
-        Assert.Same(atBound, SharedDiagnosticText.Sanitize(atBound));
-        Assert.Same(oneUnder, SharedDiagnosticText.Sanitize(oneUnder));
         Assert.Same(atBound, DiagnosticText.Sanitize(atBound));
+        Assert.Same(oneUnder, DiagnosticText.Sanitize(oneUnder));
 
         // One over the bound necessarily allocates (it is elided), so the boundary is crisp on both sides.
-        string oneOver = new('c', SharedDiagnosticText.DefaultMaxLength + 1);
-        string elided = SharedDiagnosticText.Sanitize(oneOver);
+        string oneOver = new('c', DiagnosticText.DefaultMaxLength + 1);
+        string elided = DiagnosticText.Sanitize(oneOver);
 
         Assert.NotSame(oneOver, elided);
         Assert.EndsWith("\u2026", elided, StringComparison.Ordinal);
@@ -170,10 +169,10 @@ public sealed class DiagnosticTextAstralHygieneTests
         {
             string atBound = new('c', cap);
 
-            Assert.Same(atBound, SharedDiagnosticText.Sanitize(atBound, cap));
+            Assert.Same(atBound, DiagnosticText.Sanitize(atBound, cap));
             Assert.NotSame(
                 atBound,
-                SharedDiagnosticText.Sanitize(atBound, cap - 1));
+                DiagnosticText.Sanitize(atBound, cap - 1));
         }
     }
 
@@ -182,15 +181,15 @@ public sealed class DiagnosticTextAstralHygieneTests
     {
         // The correctness statement behind the perf boundary: whichever path runs, the RESULT is identical.
         // Driven through a deliberately larger cap so the same input provably takes the slow path too.
-        string atBound = new('c', SharedDiagnosticText.DefaultMaxLength);
-        string withPair = new string('c', SharedDiagnosticText.DefaultMaxLength - 2) + "\U0001F600";
+        string atBound = new('c', DiagnosticText.DefaultMaxLength);
+        string withPair = new string('c', DiagnosticText.DefaultMaxLength - 2) + "\U0001F600";
 
-        Assert.Equal(atBound, SharedDiagnosticText.Sanitize(atBound, SharedDiagnosticText.DefaultMaxLength));
+        Assert.Equal(atBound, DiagnosticText.Sanitize(atBound, DiagnosticText.DefaultMaxLength));
         Assert.Equal(
             withPair,
-            SharedDiagnosticText.Sanitize(withPair, SharedDiagnosticText.DefaultMaxLength));
+            DiagnosticText.Sanitize(withPair, DiagnosticText.DefaultMaxLength));
         Assert.NotSame(
             withPair,
-            SharedDiagnosticText.Sanitize(withPair, SharedDiagnosticText.DefaultMaxLength));
+            DiagnosticText.Sanitize(withPair, DiagnosticText.DefaultMaxLength));
     }
 }

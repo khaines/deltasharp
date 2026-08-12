@@ -1,3 +1,4 @@
+using DeltaSharp.Storage.Delta;
 using Microsoft.Extensions.Logging;
 
 namespace DeltaSharp.Storage.Diagnostics;
@@ -59,8 +60,21 @@ internal static partial class DeltaVacuumLog
     /// </remarks>
     [LoggerMessage(EventId = 4102, EventName = "DeltaVacuumCandidateDecision", Level = LogLevel.Debug,
         Message = "Delta VACUUM candidate {CandidateDescription}: {Decision} (deleted={Deleted}).")]
-    internal static partial void VacuumCandidateDecision(
+    private static partial void VacuumCandidateDecisionCore(
         ILogger logger, string candidateDescription, string decision, bool deleted);
+
+    /// <summary>
+    /// #700: the candidate is accepted as a <see cref="PathDescription"/>, NOT a bare <c>string</c>, so this
+    /// unconditionally-emitting sink CANNOT be handed an undescribed (Hive-encoded, partition-value-bearing)
+    /// path — the "render via <c>DescribePath</c>" control is now compiler-enforced rather than a documented
+    /// convention. The already-sanitized <see cref="PathDescription.Value"/> is forwarded to the
+    /// source-generated <see cref="VacuumCandidateDecisionCore"/> so the structured <c>CandidateDescription</c>
+    /// field stays a <c>string</c> and the emitted log line is byte-identical; the forward is a field read,
+    /// so no allocation is added on this per-candidate path.
+    /// </summary>
+    internal static void VacuumCandidateDecision(
+        ILogger logger, PathDescription candidate, string decision, bool deleted) =>
+        VacuumCandidateDecisionCore(logger, candidate.Value, decision, deleted);
 
     [LoggerMessage(EventId = 4103, EventName = "DeltaVacuumCompleted", Level = LogLevel.Information,
         Message = "Delta VACUUM completed on snapshot version {Version}: {CandidateCount} candidate(s) examined, {DeletableCount} deletion-eligible, {DeletedCount} deleted (dryRun={DryRun}) in {DurationMs} ms.")]
