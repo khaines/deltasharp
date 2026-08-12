@@ -17,7 +17,7 @@
 > recommends is the deploying host's to instantiate and operate, so this page's 07 obligation is to
 > *define, require, name owners for, and ratify defaults for* the retention, audited access, ownership,
 > collection, review, failure-signal, residency, and erasure governance below — which it now does. The
-> `privacy-compliance-grc-lead` sign-off ratifying those default recommendations landed in #744; the host —
+> `privacy-compliance-grc-lead` sign-off ratifying those default recommendations landed in [#744](https://github.com/khaines/deltasharp/issues/744) <!-- issue-state:closed -->; the host —
 > not DeltaSharp — is the accountable party for the sink it deploys (controller or processor per the Owner
 > row). See
 > [What a storage `.Message` still retains](#what-a-storage-message-still-retains). Read with
@@ -380,7 +380,7 @@ Use the **table-id → tenant + storage-location/region mapping** (Collection pa
 
 Treat the provider as a **processor / sub-processor** (per the Owner determination) receiving **unsanitized** tenant personal data. Before use, pin and bind: sub-processor status disclosed; the primary region; **and its cross-region DR/replication regions, lifecycle-tiering regions, and the provider's own sub-processors (fourth parties)** — a region pin that does not bind backup and DR is not a residency commitment. Document the transfer basis where data crosses borders: **DPA executed, SCCs in place, TIA completed, support-access geography reviewed.**
 
-`privacy-compliance-grc-lead` has ratified these default recommendations (#744). With them, **this page
+`privacy-compliance-grc-lead` has ratified these default recommendations ([#744](https://github.com/khaines/deltasharp/issues/744) <!-- issue-state:closed -->). With them, **this page
 satisfies checklist 07 for the guidance it provides** — you still own instantiating and operating a sink
 that meets them, and, per the Access scope obligation, your sink is compliant only once its access path passes
 checklists 05 and 14.
