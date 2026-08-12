@@ -3646,6 +3646,8 @@ public sealed class ChangeFeedReadTests : IDisposable
 
         public StorageBackendKind Kind => _inner.Kind;
 
+        public string TableIdentity => _inner.TableIdentity;
+
         public ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
         {
             if (path.Contains(ChangeDataWriter.ChangeDataDirectory, StringComparison.Ordinal))

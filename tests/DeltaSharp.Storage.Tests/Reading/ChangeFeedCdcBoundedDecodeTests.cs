@@ -72,7 +72,10 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
             schema = await new ParquetFileReader().ReadDataSchemaAsync(original, CancellationToken.None);
         }
 
-        var reader = new ParquetFileReader(new ParquetDecodeLimits(decodeTimeBudget: TestDecodeBudget));
+        using var telemetry = new DeltaSharp.Storage.Diagnostics.DeltaStorageTelemetry();
+        using var storageMeter = new DeltaSharp.Storage.Tests.Delta.MeterCapture(telemetry.StorageMeter);
+        var reader = new ParquetFileReader(
+            new ParquetDecodeLimits(decodeTimeBudget: TestDecodeBudget), telemetry: telemetry);
         var stopwatch = Stopwatch.StartNew();
         Exception? thrown = await RunWatchdoggedAsync(async () =>
         {
@@ -94,6 +97,15 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
         Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
         Assert.True(stopwatch.Elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {stopwatch.Elapsed}.");
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(5), $"expected a fast fail-closed, took {stopwatch.Elapsed}.");
+
+        // The #647 door + STAGE discriminator on the REAL read path (this real, fuzzer-found input drives the
+        // forced footer/row-group-reader init inside the OPEN into the non-terminating loop): the emitted
+        // decode.budget_exceeded counter must carry door=data_file AND stage=open. Asserted on the REAL read
+        // path (not a stepping-clock fake), so it is red if the door/stage labels regress.
+        DeltaSharp.Storage.Tests.Delta.MeterCapture.Measurement metric =
+            Assert.Single(storageMeter.ForInstrument("deltasharp.storage.decode.budget_exceeded"));
+        Assert.Equal("data_file", metric.Tags["deltasharp.decode.door"]);
+        Assert.Equal("open", metric.Tags["deltasharp.decode.stage"]);
     }
 
     private static string Sha256Hex(byte[] bytes) =>

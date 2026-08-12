@@ -48,6 +48,7 @@ internal sealed class DeltaLog
     private readonly DeltaStorageTelemetry _telemetry;
     private readonly TimeProvider _timeProvider;
     private readonly TimeSpan? _checkpointDecodeBudget;
+    private readonly BoundedDecoder _checkpointDecoder;
 
     /// <summary>The cap on <see cref="TimedOutCheckpointParts"/> so the negative cache can never grow without
     /// bound under a stream of distinct crafted checkpoint identities.</summary>
@@ -103,7 +104,8 @@ internal sealed class DeltaLog
         ILogger<DeltaLog>? logger = null,
         DeltaStorageTelemetry? telemetry = null,
         TimeSpan? checkpointDecodeBudget = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        BoundedDecoder? checkpointDecoder = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         if (checkpointDecodeBudget is { } budget)
@@ -120,6 +122,7 @@ internal sealed class DeltaLog
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
         _checkpointDecodeBudget = checkpointDecodeBudget;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _checkpointDecoder = checkpointDecoder ?? BoundedDecode.CheckpointDecoder;
         _checkpointLogScope = new KeyValuePair<string, object?>[]
         {
             new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),
@@ -821,35 +824,28 @@ internal sealed class DeltaLog
             // aged-out gap rather than serving a forged identity.
             int metadataActions = 0;
 
-            // I7 — a SINGLE aggregate wall-clock decode deadline threaded across ALL parts of this checkpoint,
-            // so the total snapshot-load decode is O(budget), not O(N_parts) × budget. Without it a crafted
-            // multi-part checkpoint (or one part declaring many row groups) could multiply the per-part budget.
-            // The budget is decoded-bytes-derived (the checkpoint reader's DefaultAggregateBudget) or the
-            // operator/test override; the clock is the injected TimeProvider so it is deterministically driven.
-            TimeSpan aggregateBudget = _checkpointDecodeBudget ?? DeltaCheckpointReader.DefaultAggregateBudget;
-            long aggregateStart = _timeProvider.GetTimestamp();
+            // Each checkpoint part is decoded under its OWN size-aware budget (Critical #2b), NOT a shrinking
+            // aggregate remainder shared across parts. The Round-2 aggregate deadline spanned every part's
+            // storage I/O (OpenReadAsync + BufferAsync download) as well as decode, so a healthy multi-part
+            // checkpoint on slow storage handed later parts a starved budget → they timed out and got seeded
+            // into the negative cache as "known-bad" → permanent JSON replay → an unreadable table once the
+            // commits were log-cleaned. Now: pass the operator/test budget override (or null), and the reader
+            // derives a per-part budget from THAT part's buffered bytes with the decode clock starting AFTER
+            // buffering (I/O excluded). Any timeout is therefore provably past an ADEQUATE budget, so seeding
+            // the negative cache below is always safe (I4).
+            TimeSpan? perPartBudget = _checkpointDecodeBudget;
             foreach (string partPath in checkpoint.PartPaths)
             {
                 // Negative-cache short-circuit (CRITICAL fix): a checkpoint part that already tripped the
                 // bounded decode ceiling on a prior snapshot load is known non-terminating. Re-decoding it here
                 // would spawn ANOTHER detached decode on every load — self-renewing strands that the admission
                 // cap alone would eventually reject with visible read failures. Skip the read entirely and fall
-                // back to JSON replay, re-emitting the (rate-alertable) decode-timeout signal so a persistently
-                // bad checkpoint stays observable without re-incurring the decode.
+                // back to JSON replay, emitting the DISTINCT negative-cache-skip signal (NOT a decode-timeout —
+                // no decode ran) so a persistently bad checkpoint stays observable without re-incurring the
+                // decode and without conflating the skip into the budget-exceeded counter.
                 if (IsCheckpointPartKnownTimedOut(partPath, checkpoint.Version))
                 {
-                    RecordCheckpointDecodeTimeout(checkpoint.Version);
-                    return null;
-                }
-
-                // The budget REMAINING on the aggregate deadline for this part. Non-positive means an earlier
-                // part already consumed the whole checkpoint's decode budget — fail closed to JSON replay
-                // (DecodeTimeout) WITHOUT seeding the negative cache: this part's own decode never ran past
-                // budget, so seeding it could wrongly poison a healthy part (I4 — seed only on a proven timeout).
-                TimeSpan remaining = aggregateBudget - _timeProvider.GetElapsedTime(aggregateStart);
-                if (remaining <= TimeSpan.Zero)
-                {
-                    RecordCheckpointDecodeTimeout(checkpoint.Version);
+                    RecordCheckpointNegativeCacheSkip(checkpoint.Version);
                     return null;
                 }
 
@@ -861,8 +857,9 @@ internal sealed class DeltaLog
                     {
                         actions = await DeltaCheckpointReader.ReadAsync(
                             stream, cancellationToken,
-                            decodeBudget: remaining,
-                            timeProvider: _timeProvider).ConfigureAwait(false);
+                            decodeBudget: perPartBudget,
+                            timeProvider: _timeProvider,
+                            decoder: _checkpointDecoder).ConfigureAwait(false);
                     }
                     catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
                     {
@@ -1015,6 +1012,20 @@ internal sealed class DeltaLog
         _telemetry.RecordDecodeCapacityExhausted(DecodeDoor.Checkpoint);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointDecoderSaturated(_logger, version);
+    }
+
+    /// <summary>Emits the distinct <b>negative-cache-skip</b> fallback signal for the checkpoint door: a part
+    /// already in the process-wide negative cache is skipped WITHOUT decoding (it provably tripped its budget on
+    /// a prior load). No decode ran, so this is categorically distinct from a decode-timeout: it emits the
+    /// <c>NegativeCacheSkip</c> checkpoint-fallback label + the door-dimensioned
+    /// <c>decode.negative_cache_skip</c> counter, and deliberately does NOT increment <c>decode.budget_exceeded</c>
+    /// (the de-conflation fix). Renders only the discarded version.</summary>
+    private void RecordCheckpointNegativeCacheSkip(long version)
+    {
+        _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.NegativeCacheSkip);
+        _telemetry.RecordDecodeNegativeCacheSkip(DecodeDoor.Checkpoint);
+        using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
+        DeltaCheckpointLog.CheckpointDecodeTimeout(_logger, version);
     }
 
     /// <summary>Whether a checkpoint part is in the process-wide negative cache (already tripped the bounded

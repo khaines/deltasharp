@@ -1234,52 +1234,96 @@ All Parquet/JSON/checkpoint bytes are **untrusted input**:
     that ignores the `CancellationToken`** — a fail-closed *memory* guard never fires because no ceiling
     is exceeded. Every decode of untrusted bytes at the three doors (**data-file** row-group/page decode +
     footer/schema open; **checkpoint** column decode; **CDC/change-feed** decode) therefore runs under a
-    **single per-read aggregate wall-clock deadline** (`BoundedDecode`): the decode races a
+    **per-operation wall-clock deadline** (`BoundedDecode`): each individual decode operation races a
     `Task.Delay(budget)`; on expiry the caller is released with a typed
     **`StorageErrorKind.DecodeBudgetExceeded`** (a `DeltaStorageException`, *not* `CorruptData`/`Malformed`
-    — a stall is a resource/throttling fault, never proven corruption). The deadline is **aggregate per
-    call**, so worst-case wall-clock is **O(budget)** regardless of row-group/part count: it does not
-    reset per row group, and — because the checkpoint door threads one aggregate `DecodeDeadline` through
-    the whole `SeedFromCheckpointAsync` multi-part loop — total snapshot-load decode is **O(budget)**, not
-    **O(N_parts) × budget** (it does not reset per checkpoint part). Defaults: **30 s** for the data-file
-    door; the checkpoint door derives its aggregate budget from the enforced **decoded-bytes** ceiling
-    (`MaxCheckpointRowGroupDecodedBytes`, 1 GiB) ÷ a stated **decoded** floor throughput (32 MiB/s),
-    floored at 30 s and capped at 24 h — deliberately derived from the *same decoded-bytes unit the
-    ceiling enforces* (the earlier 8 MiB/s figure mixed a compressed-bytes numerator against a
-    decoded-bytes ceiling; #802 tracks benchmark-backed recalibration). A checkpoint-door timeout — raised
-    **only when a part's decode provably ran past its budget** — degrades to **JSON-replay fallback** in
+    — a stall is a resource/throttling fault, never proven corruption). The deadline bounds **only the
+    decode operations themselves**, never the surrounding streaming/consumer time:
+    - **Data-file door.** The decode runs via `Task.Run` on the shared `ThreadPool` (see the residual note
+      below for why a dedicated thread would provide *no* isolation here). Each **decode operation** — the
+      footer/schema open (`stage=open`), the DV footer row-group scan (`stage=metadata`), and each
+      per-row-group column decode (`stage=row_group`) — is bounded by its **own** per-operation deadline.
+      The budget is emphatically **not** an aggregate per-`ReadAsync` deadline: the async-iterator's
+      `yield return` suspensions between `MoveNextAsync` pumps (downstream shuffle write, spill, join build,
+      sink backpressure) are **never** charged to the decode budget, so a healthy long-running scan cannot
+      fail mid-stream with a spurious `DecodeBudgetExceeded`. Worst-case wall-clock is therefore
+      **O(budget) per row-group operation**, not O(budget) per whole scan. Default: **30 s** per operation.
+    - **Checkpoint door.** The decode is **synchronous over a pre-buffered `byte[]`** on a dedicated
+      background thread, so the thread genuinely contains it. The storage **I/O transfer**
+      (`OpenReadAsync` + `BufferAsync` download) is **excluded** from the decode clock — the per-part clock
+      starts **after** the part is fully buffered — so a healthy multi-part checkpoint on slow storage is
+      never charged its own download time. Each part is given its **own size-aware budget** derived from
+      **that part's declared bytes** ÷ a stated **decoded** floor throughput (32 MiB/s), floored at 30 s
+      and capped at 24 h — *not* a per-row-group constant, and *not* an aggregate remainder shared across
+      parts (which would hand later parts a starved budget). Consequently total snapshot-load decode is
+      **O(N_parts) × budget** (each part gets its full size-aware budget), and — because the first
+      snapshot load may probe several candidate checkpoint versions — the first-load candidate loop is
+      **O(K_candidates × budget)**; the earlier "aggregate O(budget) for the whole load" claim was wrong
+      and is corrected here (#802 tracks benchmark-backed recalibration of the throughput floor). A
+      checkpoint-door timeout — raised **only when a part's decode provably ran past its *own adequate*
+      size-aware budget** (never a part starved by an earlier part's consumption of a shared remainder) —
+      degrades to **JSON-replay fallback** in
     `DeltaLog` under the distinct `CheckpointFallbackReason.DecodeTimeout` (its own EventId), and *that*
     part is recorded in a bounded **negative cache** so a known-bad checkpoint is not re-decoded on
     **every** snapshot load (else the strand is self-renewing). The negative cache is keyed on **stable
     table identity** — `backend.TableIdentity` (`Kind` + canonical table root) + part path + checkpoint
     version — **process-wide**, so it survives the fresh `LocalFileSystemBackend` instance production
     builds per scan/resolve (an earlier instance-keyed cache never hit). It is a **bounded LRU with a
-    per-entry TTL + re-probe** (an expired entry is evicted and the part re-decoded once, so a
-    transiently-slow-but-recoverable part is not blacklisted forever), and it is seeded **only after the
-    decode provably ran past budget** — never on saturation or admission/queue wait.
-  - **Accepted detached-decode residual.** Because the underlying decoder ignores cancellation, the
-    abandoned CPU-bound work cannot be *stopped* — only *contained*. Each untrusted decode runs on its
-    **own dedicated background `Thread` (`IsBackground = true`)** created only after **atomically
-    reserving** a strand slot (a single `Interlocked` increment that backs out if it lands over the cap —
-    no check-then-act TOCTOU). A stranded (non-terminating) thread then holds *its own* slot forever but
-    **never occupies `ThreadPool`/scheduling capacity that healthy work needs** — so a healthy decode
-    submitted while N strands exist still starts immediately on a fresh thread and succeeds (no starvation;
-    the earlier shared `LimitedConcurrencyLevelTaskScheduler` was pinned by strands, causing a permanent
-    process-wide outage from as little as one crafted file on a small pod). The strand-count cap is
-    **per-door** (data-file vs checkpoint) so a poisoned data file cannot exhaust checkpoint capacity, and
-    it is a **hard cap on the strand COUNT only** — healthy scan concurrency is **not** throttled.
-    Over-cap admission fails fast with a **distinct, retryable** `DecodeCapacityExhaustedException` →
-    `StorageErrorKind.DecoderSaturated` (never a decode-timeout, never negatively cached). The **bounded
-    residual is therefore ≤ (per-door strand cap) stranded decodes, each pinning exactly one dedicated
-    background thread** — a known, non-multiplying ceiling that leaves the shared pool healthy. A
-    late-completing abandoned result (an `IDisposable`/`ParquetReader`) is disposed via an
-    `onAbandonedResult` hook and strand counters are decremented in `finally`. **Ownership contract for
-    caller-owned readers/streams (both doors):** the **checkpoint** door hands the detached decode an
-    **isolated copy of the bytes**; the **data-file** door instead holds a **ref-counted lease** over the
-    caller-owned `ParquetReader`/stream (the strand retains its lease, so the reader is not disposed until
-    the strand quiesces) — so a strand never touches a caller-owned resource after the caller is released,
-    without copying an already-open data-file reader. `UnsupportedFeature` (a valid-but-unsupported input)
-    and caller cancellation propagate **unwrapped** — never remapped to the timeout.
+    per-entry TTL + backoff re-probe** (an expired entry re-probes and the part is re-decoded once, so a
+    transiently-slow-but-recoverable part is not blacklisted forever; but each re-seed of the *same*
+    still-bad identity **lengthens the TTL exponentially** — base × 2^strikes, capped — so a single static
+    crafted checkpoint that is never rewritten cannot accumulate a new strand on every fixed-cadence
+    re-probe over uptime), and it is seeded **only after the decode provably ran past an adequate budget**
+    — never on saturation or admission/queue wait.
+  - **Accepted detached-decode residual (byte-bounded).** Because the underlying decoder ignores
+    cancellation, the abandoned CPU-bound work cannot be *stopped* — only *contained* — and the two doors
+    contain it differently:
+    - **Data-file door — no dedicated thread (it would give zero isolation).** The decode is run via
+      `Task.Run` on the shared `ThreadPool`. A dedicated thread was **deliberately dropped** here: the
+      data-file decode path (`OpenAsync`/`DecodeGroupAsync`) `await`s async reads that **resume on the
+      `ThreadPool`**, so the non-terminating CPU loop runs on the pool regardless — a dedicated thread
+      would merely sit blocked in `GetResult()` (wasted) while the hang is on the pool anyway, providing
+      **no isolation** yet costing ~68–74× per decode (measured ≈33.5 µs vs ≈0.5 µs; a thread per row
+      group on the scan hot path; #802). Since the custom `LimitedConcurrencyLevelTaskScheduler` is gone,
+      an abandoned pool decode no longer queue-starves new work — the `ThreadPool` injects fresh threads.
+      **Honest residual:** an abandoned non-terminating data-file decode holds **~1 pool thread + its
+      retained bytes until process restart**, bounded by the byte-aware cap below.
+    - **Checkpoint door — dedicated background thread.** The checkpoint decode is **synchronous over a
+      pre-buffered `byte[]`**, so a dedicated background `Thread` (`IsBackground = true`) genuinely
+      *contains* it: the strand runs the whole non-terminating loop on its own thread, off the pool. A
+      stranded checkpoint decode holds **one dedicated background thread + its buffered bytes** until
+      process restart.
+    - **Byte-aware admission cap (the load-bearing bound).** A count-only cap is unsafe: 64 checkpoint
+      strands × ≤512 MiB + 128 data-file strands × up to multi-GiB retained ≈ **tens of GiB** would
+      **OOM-kill the pod at ~15–30 strands**, so a count-only control never engages and converts an
+      un-abortable hang into an *undiagnosed* pod kill. Admission is therefore **byte-aware**: each strand
+      **atomically reserves both a slot AND its estimated retained bytes** (a single `Interlocked`
+      increment on each, backing out if either lands over its bound — no check-then-act TOCTOU) against a
+      documented **per-door memory budget** (a fraction of process/GC memory). The count cap is chosen so
+      **`cap × per-strand-representative-bytes` is provably under the memory budget**. The budget/cap are
+      **per-door** (data-file vs checkpoint) so a poisoned data file cannot exhaust checkpoint capacity.
+      Over-cap **or** over-budget admission fails fast with a **distinct, retryable**
+      `DecodeCapacityExhaustedException` → `StorageErrorKind.DecoderSaturated` (never a decode-timeout,
+      never negatively cached); the rejection message carries `reserved/cap` slots **and** the
+      detached-strand count so a genuine strand leak is distinguishable from healthy in-flight concurrency.
+      **`DecoderSaturated` is a fail-closed condition a caller may retry once capacity frees; there is no
+      automatic backoff-retry today** (tracked by #804). The reservation is released **exactly once on
+      every path** — success, timeout-detach, caller-cancellation, and *all* pre-start throws — so a
+      routine query cancellation never leaks the reservation (and a cancelled *healthy* decode is **not**
+      counted as a strand, so the detached gauge is not inflated by normal cancellation). The budgets, caps,
+      and per-door memory-budget fraction are compiled-in constants today; threading them from a
+      storage-options record to the read/write facades is deferred to **#803**.
+    - **Bounded residual.** The residual is therefore **byte-bounded** (≤ the per-door memory budget),
+      *not* merely count-bounded — a known ceiling that keeps the pod alive and the shared pool healthy.
+      A late-completing abandoned result (an `IDisposable`/`ParquetReader`) is disposed via an
+      `onAbandonedResult` hook and the slot/byte reservation is released in the settle path.
+    **Ownership contract for caller-owned readers/streams.** The **checkpoint** door hands the detached
+    decode an **isolated copy of the bytes** (the pre-buffered `byte[]`); the **data-file** door instead
+    holds a **ref-counted lease** over the caller-owned `ParquetReader`/stream (the strand retains its
+    lease, so the reader is not disposed until the strand quiesces) — so a strand never touches a
+    caller-owned resource after the caller is released, without copying an already-open data-file reader.
+    `UnsupportedFeature` (a valid-but-unsupported input) and caller cancellation propagate **unwrapped** —
+    never remapped to the timeout.
 - **C-PROTO — protocol negotiation fails closed.** Reader/writer protocol + table-feature negotiation
   (§2.14) validates support **before** any scan or publish; an unsupported feature errors precisely and
   never proceeds (checklist 17; ADR-0011).
@@ -1433,11 +1477,11 @@ STRIDE letters: **S**poofing · **T**ampering · **R**epudiation · **I**nfo-dis
 | **LOG-T** | `_delta_log` tampering · T | Writer with prefix access forges/rewrites/reorders commits or tombstones live files → table corruption / rollback / hidden data (log = source of truth) | Object-store write authz scoped to workload identity (C-IDENT); C-COMMIT conditional-put single-winner so a forged concurrent version-N write **loses**; snapshot from committed versions not listing (17); C-PROTO validate before publish | An actor holding **legitimate** writer creds to the prefix can still tamper; **no per-commit cryptographic signature in v1** <!-- TBD: content/commit signing --> — detection = object-store versioning + access logs → **SRE / privacy** |
 | **LOG-R** | `_delta_log` · R | Dispute over who committed/deleted what | C-AUDIT: tenant-safe `commitInfo` + maintenance audit records | Authoritative non-repudiation needs cloud server access logs → **SRE** |
 | **LOG-E** | `_delta_log`-resolved path · E,I (confused deputy) | A forged/hostile-writer commit embeds an absolute or `..`-escaping `add.path`/`remove.path`/DV/sidecar reference → snapshot reconstruction follows the pod's ambient identity to a co-tenant/attacker resource (cross-tenant read) or reads attacker-controlled bytes into results (integrity poisoning). **Not** covered by LOG-T's OCC/`snapshot-from-committed-versions` (a malicious path commits atomically then is trusted as truth). | C-SCOPE extended to **every log-resolved path**: canonicalize-then-confine-to-root — reject an **escaping** absolute/`..` reference **fail-closed at snapshot-reconstruction** (an in-prefix absolute form, e.g. shallow-clone, is allowed) (§5.5) | An authorized writer can still reference an in-prefix path; content integrity of in-scope files still rests on write authz + C-SSE (as PDX-T) → **delta-storage / security** |
-| **PDX-D** | Parquet decoder · D | Decompression bomb / huge row-group / absurd page-dict / deep nesting → OOM / CPU exhaustion of pod; **or a single crafted byte drives the managed decoder into unbounded, cancellation-ignoring CPU-bound work** (no memory ceiling fires) | **Primary:** explicit decompressed-size + ratio ceiling checked during streaming decode; codec allocation routed through the accounted memory manager (else rejected under C-SCA). **Plus** a per-read **wall-clock decode budget** (C-DECODE) that releases the caller with a typed `DecodeBudgetExceeded` and contains the abandoned decode on its own dedicated background thread behind a per-door atomic strand-count cap (bounded residual; over-cap ⇒ retryable `DecoderSaturated`, not a false timeout). **Defense-in-depth:** memory-reservation ceiling (§4.3). Plus bounded depth + codec allowlist + deterministic fail-closed (17; STORY-05.1.1 AC4) | Ceilings need tuning; a within-limit-but-costly file still costs — bounded by pod limits + per-query memory budget (`operator-spill.md` §7.1) and now the wall-clock budget; the abandoned-decode residual (≤ per-door strand cap of stranded threads) is accepted because the decoder ignores cancellation, and a healthy decode is never starved because each strand pins only its own thread, never shared scheduling capacity; an unmanaged codec bypassing the accounted manager is the residual PDX-E prefer-managed-lib driver → **operator / query-execution** |
+| **PDX-D** | Parquet decoder · D | Decompression bomb / huge row-group / absurd page-dict / deep nesting → OOM / CPU exhaustion of pod; **or a single crafted byte drives the managed decoder into unbounded, cancellation-ignoring CPU-bound work** (no memory ceiling fires) | **Primary:** explicit decompressed-size + ratio ceiling checked during streaming decode; codec allocation routed through the accounted memory manager (else rejected under C-SCA). **Plus** a **per-operation** wall-clock decode budget (C-DECODE) that releases the caller with a typed `DecodeBudgetExceeded` and contains the abandoned decode behind a **byte-aware** per-door atomic admission cap (data-file: `Task.Run` on the pool + per-row-group deadline; checkpoint: dedicated thread over a pre-buffered `byte[]`); over-cap/over-budget ⇒ retryable `DecoderSaturated`, not a false timeout. **Defense-in-depth:** memory-reservation ceiling (§4.3). Plus bounded depth + codec allowlist + deterministic fail-closed (17; STORY-05.1.1 AC4) | Ceilings need tuning; a within-limit-but-costly file still costs — bounded by pod limits + per-query memory budget (`operator-spill.md` §7.1) and the per-operation wall-clock budget; the **byte-bounded** abandoned-decode residual (≤ per-door memory budget; a data-file strand holds ~1 pool thread + its retained bytes, a checkpoint strand one dedicated thread + its buffered bytes, until process restart) is accepted because the decoder ignores cancellation — the `ThreadPool` injects fresh threads so healthy work is not queue-starved. Per-tenant/per-query decode sub-quotas are deferred (the current bound is process-wide per-door; #805); benchmark-backed budget/cap/memory-budget calibration and the thread-per-decode hot-path cost are #802. An unmanaged codec bypassing the accounted manager is the residual PDX-E prefer-managed-lib driver → **operator / query-execution** |
 | **PDX-E** | Parquet decoder · E | Memory-safety bug → RCE → abuse of pod's ambient identity | Managed/bounds-checked .NET; BannedSymbols (no `Reflection.Emit`/dynamic code, ADR-0014); least-privilege C-IDENT (blast radius = cred scope); NativeAOT minimal base | A native/unmanaged codec dep could reintroduce memory-unsafety → prefer managed lib <!-- TBD: codec choice -->; C-SCA limits known-CVE exposure |
 | **PDX-T** | Parquet decoder · T | Crafted metadata (bad offsets, lying `stats`) yields wrong/dropped rows | C-DECODE offset/magic/checksum validation; statistics are **pruning hints only** — residual predicates always evaluated (17 "Statistics, skipping"; STORY-05.2.3 AC2) | Parquet CRC is not cryptographic / not always present → content integrity relies on write authz + C-SSE |
 | **CMT-D1** | Commit-path DoS · D | Small-file flooding: many tiny commits/files → log bloat, replay blowup, listing-cost amplification | Bounded log replay + checkpoints (17; STORY-05.2.2); OPTIMIZE/compaction + small-file thresholds (17); per-tenant object-store request + PVC budgets (14 "Resource budgets") | Budget enforcement is partly EPIC-08/scheduler; in-budget pressure detection → **operator / SRE** |
-| **CMT-D2** | Commit-path DoS · D | Checkpoint bomb: oversized/mis-sized checkpoint Parquet → OOM on load; **or a crafted checkpoint byte drives an unbounded, cancellation-ignoring decode re-attempted on every snapshot load** | C-DECODE applied to the checkpoint reader — including the **size-aware wall-clock budget** (declared bytes ÷ floor throughput) that fails a stalled decode to a typed `DecodeBudgetExceeded`, degrades to **JSON-replay fallback** under `CheckpointFallbackReason.DecodeTimeout`, and records the bad part in a bounded **negative cache** so it is not re-decoded every load; corrupt/partial checkpoint → safe fallback or fail without inventing state (STORY-05.2.2 AC2) | As PDX-D; a cross-table negative-cache key collision only forces a safe extra JSON replay, never a wrong read |
+| **CMT-D2** | Commit-path DoS · D | Checkpoint bomb: oversized/mis-sized checkpoint Parquet → OOM on load; **or a crafted checkpoint byte drives an unbounded, cancellation-ignoring decode re-attempted on every snapshot load** | C-DECODE applied to the checkpoint reader — including the **per-part size-aware wall-clock budget** (that part's declared bytes ÷ decoded floor throughput, computed **after** buffering so storage I/O transfer is excluded) that fails a stalled decode to a typed `DecodeBudgetExceeded`, degrades to **JSON-replay fallback** under `CheckpointFallbackReason.DecodeTimeout`, and records the bad part in a bounded **negative cache with exponential-backoff TTL** so it is not re-decoded every load and a static crafted part cannot accumulate a strand on each fixed-cadence re-probe; seeded **only when a part provably ran past its own adequate budget** (never a part starved by an earlier part's consumption of a shared remainder); corrupt/partial checkpoint → safe fallback or fail without inventing state (STORY-05.2.2 AC2) | As PDX-D; a cross-table negative-cache key collision only forces a safe extra JSON replay, never a wrong read |
 | **CMT-T** | Commit-path race · T,D | Concurrent/ambiguous commits → duplicate or lost version (split-brain) | C-COMMIT conditional-put single-winner; ambiguous-ack → determine committed or precise unknown-state error (STORY-05.3.1 AC4); idempotent txn ids (STORY-05.3.2); adapters that cannot prove the atomic primitive are rejected (17) | Per-backend conditional-write primitive is an open question <!-- TBD: mandatory primitives per S3/ADLS/GCS (EPIC-05 open Q) --> → **delta-storage-format-engineer** |
 | **CRD-I1** | Credential disclosure · I | SAS `?sig=` / presigned / `userinfo` / account-key surfaces in a rendered path, `Explain`, log, metric, or exception | C-REDACT: storage paths via `DiagnosticText.DescribePath` (Core/Executor plan paths via `SecretRedaction.RedactPath`); option values never rendered (keys only); connection strings never rendered | **Credential-bearing URIs are OUT OF SCOPE of `DescribePath`/`RedactPath` today** (neither parses URIs; §5.3 "OUT OF SCOPE — credential-bearing URIs"): a SAS/presigned/`userinfo` URI reaching a describer is redacted only incidentally and unreliably (a `?sig=` may even render as a fake partition segment) — an object-store backend MUST redact it with a dedicated URL renderer FIRST. `RedactPath` (Core/Executor) is likewise best-effort textual; options are safe by never-render; add redaction tests (09a) |
 | **CRD-I2** | Stats disclosure · I | min/max stats disclose literal column values to another tenant or shared telemetry | Stats inherit classification, never a telemetry label/attribute; privacy-sensitive stats omitted/bounded (STORY-05.6.3 AC2); tenant-scoped read authz on the log | Stats in the log are visible to **any authorized log reader** (inherent to Delta) — the control is read authz + tenant scope, not hiding from authorized readers |

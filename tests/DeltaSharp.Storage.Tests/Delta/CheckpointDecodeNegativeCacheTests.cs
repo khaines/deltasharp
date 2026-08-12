@@ -44,6 +44,37 @@ public sealed class CheckpointDecodeNegativeCacheTests : IDisposable
     }
 
     [Fact]
+    public void TableIdentity_IsAbstractInterfaceMember_WithNoDefaultImplementation_AndEveryProductionBackendProvidesIt()
+    {
+        // High #5 — the instance-hash-default reinstatement guard. The Round-1 Critical was a
+        // `RuntimeHelpers.GetHashCode(this)` identity that made the negative cache never hit (and could
+        // cross-suppress two tables on a recycled hash). This test locks the fix at the type level: the
+        // interface member MUST be abstract (NO default interface implementation), so a future backend that
+        // forgets to override it fails to COMPILE rather than silently inheriting an instance-hashed default —
+        // and every concrete production backend must supply its own implementation.
+        System.Reflection.PropertyInfo? property = typeof(IStorageBackend).GetProperty(nameof(IStorageBackend.TableIdentity));
+        Assert.NotNull(property);
+        System.Reflection.MethodInfo getter = property!.GetMethod!;
+        Assert.True(getter.IsAbstract, "IStorageBackend.TableIdentity must be an ABSTRACT interface member (no default implementation).");
+
+        System.Reflection.Assembly production = typeof(IStorageBackend).Assembly;
+        List<Type> implementers = production.GetTypes()
+            .Where(t => t is { IsClass: true, IsAbstract: false } && typeof(IStorageBackend).IsAssignableFrom(t))
+            .ToList();
+
+        Assert.NotEmpty(implementers); // at least LocalFileSystemBackend
+        foreach (Type implementer in implementers)
+        {
+            System.Reflection.InterfaceMapping map = implementer.GetInterfaceMap(typeof(IStorageBackend));
+            int index = Array.IndexOf(map.InterfaceMethods, getter);
+            Assert.True(index >= 0, $"{implementer.Name} does not map IStorageBackend.TableIdentity.");
+            System.Reflection.MethodInfo target = map.TargetMethods[index];
+            Assert.False(target.IsAbstract, $"{implementer.Name} does not concretely implement TableIdentity.");
+            Assert.Equal(implementer, target.DeclaringType);
+        }
+    }
+
+    [Fact]
     public void TableIdentity_IsStableAcrossFreshInstances_SameRoot_AndDistinctAcrossRoots()
     {
         // THE re-keying fix (I4): two INDEPENDENT backend instances rooted at the SAME table must expose the
@@ -138,6 +169,65 @@ public sealed class CheckpointDecodeNegativeCacheTests : IDisposable
         Assert.False(cache.IsKnownTimedOut(k1, clock)); // evicted (was LRU)
         Assert.True(cache.IsKnownTimedOut(k2, clock));
         Assert.True(cache.IsKnownTimedOut(k3, clock));
+    }
+
+    [Fact]
+    public void Seed_RepeatedlyOnSameIdentity_ExtendsTtlExponentially_BoundingReProbeFrequency()
+    {
+        // High #4 — durably-bad backoff (uptime-OOM fix). A single STATIC crafted checkpoint that is never
+        // rewritten would otherwise spawn a NEW strand on every fixed-TTL re-probe (a 10-min cadence ⇒ an
+        // uptime-driven strand accumulation). Each re-seed of the SAME identity must LENGTHEN the TTL
+        // exponentially (base × 2^strikes), so a repeatedly-timing-out identity is re-probed
+        // logarithmically-rarely. Proven deterministically: after the SECOND seed the entry must still be a HIT
+        // a FULL base-TTL later (where a fixed TTL would already have re-probed) — the window has at least
+        // doubled.
+        var clock = new ManualClock(DateTimeOffset.UnixEpoch);
+        var baseTtl = TimeSpan.FromMinutes(10);
+        var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: baseTtl, maxTtl: TimeSpan.FromHours(24));
+        string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
+
+        // First seed: base TTL. Expire it and re-probe (miss) — the entry is RETAINED so its strike history
+        // carries forward to the next seed's backoff.
+        cache.Seed(key, clock);
+        clock.Advance(baseTtl + TimeSpan.FromSeconds(1));
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // expired → re-probe
+
+        // Second seed (strike 2): the TTL must now be at least 2× the base. Advancing a FULL base TTL keeps it a
+        // HIT — a fixed-TTL cache would already have re-probed here (spawning another strand).
+        cache.Seed(key, clock);
+        clock.Advance(baseTtl + TimeSpan.FromSeconds(1));
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // still within the EXTENDED (≥ 2×) TTL — no re-probe
+
+        // And a third seed extends it further still (≥ 4× base): advancing 3× base is still a hit.
+        clock.Advance(baseTtl); // now ~2× base since the second seed → re-probe boundary of a fixed cache
+        cache.Seed(key, clock);
+        clock.Advance(baseTtl * 3 + TimeSpan.FromSeconds(1));
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // still within the ≥ 4× TTL
+    }
+
+    [Fact]
+    public void BackoffTtl_IsCappedAtMaxTtl_NeverOverflows()
+    {
+        // The exponential backoff must saturate at maxTtl (never overflow to a negative/huge TimeSpan): after
+        // MANY strikes on the same identity the effective TTL is clamped at maxTtl, so the entry stays a hit for
+        // exactly maxTtl and no longer.
+        var clock = new ManualClock(DateTimeOffset.UnixEpoch);
+        var baseTtl = TimeSpan.FromMinutes(10);
+        var maxTtl = TimeSpan.FromHours(2);
+        var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: baseTtl, maxTtl: maxTtl);
+        string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
+
+        // Drive ~40 strikes (2^40 × 10 min would overflow ticks if unclamped).
+        for (int i = 0; i < 40; i++)
+        {
+            cache.Seed(key, clock);
+        }
+
+        // Just under maxTtl: still a hit. Just over: re-probe. Proves the clamp holds and did not overflow.
+        clock.Advance(maxTtl - TimeSpan.FromSeconds(1));
+        Assert.True(cache.IsKnownTimedOut(key, clock));
+        clock.Advance(TimeSpan.FromSeconds(2));
+        Assert.False(cache.IsKnownTimedOut(key, clock));
     }
 
     // A deterministic, settable clock so the TTL re-probe is exercised without any real wall-clock wait. Only

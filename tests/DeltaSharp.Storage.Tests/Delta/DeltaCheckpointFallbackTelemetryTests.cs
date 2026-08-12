@@ -295,9 +295,12 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             Assert.Equal(4402, log.EventId.Id);
             Assert.Equal(1L, log.Field("Version"));
 
-            // The door-dimensioned decode.budget_exceeded counter fired for the checkpoint door.
+            // The door-dimensioned decode.budget_exceeded counter fired for the checkpoint door with the
+            // stage=whole discriminator (a checkpoint decodes the WHOLE pre-buffered part in one shot, unlike the
+            // data-file door's open/metadata/row_group sub-stages) — MEDIUM stage-label assertion.
             MeterCapture.Measurement door = Assert.Single(storageMeter.ForInstrument(DecodeBudgetInstrument));
             Assert.Equal("checkpoint", door.Tags[DecodeDoorKey]);
+            Assert.Equal("whole", door.Tags["deltasharp.decode.stage"]);
 
             // The decode actually ran the budget on the first (uncached) load.
             Assert.True(stopwatch.Elapsed >= budget, $"expected the first load to run the budget, took {stopwatch.Elapsed}.");
@@ -306,14 +309,15 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         // SECOND load through a FRESH backend instance rooted at the SAME table (production builds a new
         // LocalFileSystemBackend per scan/resolve): the negative cache — now keyed on STABLE table identity,
         // not the backend instance — short-circuits the read, so the known-bad checkpoint is NOT re-decoded.
-        // Proven by the load returning WELL under the decode budget (no decode ran) while still re-emitting the
-        // decode_timeout signal so a persistently bad checkpoint stays observable. Under the Round-1
-        // instance-keyed cache this fresh backend would MISS and re-run the full budget — so this assertion is
-        // red if the re-keying is reverted.
+        // Proven by the load returning WELL under the decode budget (no decode ran) while re-emitting the
+        // DISTINCT negative_cache_skip signal (NOT decode_timeout — no decode ran, the de-conflation fix) so a
+        // persistently bad checkpoint stays observable. Under the Round-1 instance-keyed cache this fresh
+        // backend would MISS and re-run the full budget — so this assertion is red if the re-keying is reverted.
         LocalFileSystemBackend freshBackend = FreshBackendAtSameRoot(backend);
         var logger2 = new RecordingLogger<DeltaLog>();
         using (var telemetry2 = new DeltaStorageTelemetry())
         using (var deltaMeter2 = new MeterCapture(telemetry2.DeltaMeter))
+        using (var storageMeter2 = new MeterCapture(telemetry2.StorageMeter))
         {
             var stopwatch2 = System.Diagnostics.Stopwatch.StartNew();
             Snapshot snapshot2 = await new DeltaLog(
@@ -324,9 +328,165 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             Assert.Null(snapshot2.Metrics.CheckpointVersion);
             Assert.Equal(2, snapshot2.Metrics.ReplayedCommitCount);
             MeterCapture.Measurement fallback2 = Assert.Single(deltaMeter2.ForInstrument(FallbackInstrument));
-            Assert.Equal("decode_timeout", fallback2.Tags[ReasonKey]);
+            Assert.Equal("negative_cache_skip", fallback2.Tags[ReasonKey]);
+
+            // The de-conflation fix: the SKIP path increments the DISTINCT negative_cache_skip counter, NEVER
+            // the decode.budget_exceeded counter (no decode ran on this load).
+            MeterCapture.Measurement skip = Assert.Single(storageMeter2.ForInstrument("deltasharp.storage.decode.negative_cache_skip"));
+            Assert.Equal("checkpoint", skip.Tags[DecodeDoorKey]);
+            Assert.Empty(storageMeter2.ForInstrument(DecodeBudgetInstrument));
+
             Assert.True(stopwatch2.Elapsed < budget,
                 $"expected the negative cache to skip the re-decode through a FRESH backend (fast), took {stopwatch2.Elapsed}.");
+        }
+    }
+
+    [Fact]
+    public async Task NegativeCache_OpenCountOracle_PartOpenedOncePerTtlWindow_TwiceAfterTtlAdvance()
+    {
+        // High #10 — the MECHANICAL open-count oracle that replaces the flaky wall-clock (2% margin) oracle. A
+        // CountingStorageBackend records every OpenReadAsync of the checkpoint part; the injectable TimeProvider
+        // on DeltaLog drives the negative cache's TTL clock (WITHOUT touching the decode's real-time budget
+        // timer — see OffsetUtcTimeProvider). The invariant: the crafted part is opened EXACTLY ONCE across two
+        // in-TTL loads (the second is a negative-cache skip), and a THIRD time only after the TTL advances (the
+        // re-probe). No sleeps, no timing margins.
+        LocalFileSystemBackend inner = NewBackend();
+        await WriteHistoryAsync(inner);
+        byte[] hanging = await CheckpointAtV1().ToParquetAsync();
+        hanging[^9] ^= 1; // terminal Thrift STOP flip → non-terminating decode (as in the decode-timeout test)
+        await DeltaTestHarness.WriteRawCheckpointAsync(inner, 1, hanging);
+        await DeltaTestHarness.WriteLastCheckpointAsync(inner, 1);
+
+        var counting = new CountingStorageBackend(inner);
+        var budget = TimeSpan.FromMilliseconds(300);
+        string checkpointPart = "_delta_log/" + 1L.ToString("D20", System.Globalization.CultureInfo.InvariantCulture)
+            + ".checkpoint.parquet";
+
+        // Load 1 (T0): the decode times out on its OWN adequate budget → the part is seeded into the negative
+        // cache. The part was opened once.
+        Snapshot s1 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget)
+            .LoadSnapshotAsync();
+        Assert.Null(s1.Metrics.CheckpointVersion);
+        Assert.Equal(1, CountOpensOf(counting, checkpointPart));
+
+        // Load 2 (still T0, within the 10-min TTL): the negative cache short-circuits the read — the part is
+        // NOT opened again, so the open-count stays at exactly 1 across BOTH loads.
+        Snapshot s2 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget)
+            .LoadSnapshotAsync();
+        Assert.Null(s2.Metrics.CheckpointVersion);
+        Assert.Equal(1, CountOpensOf(counting, checkpointPart));
+
+        // Load 3, with the TTL clock advanced 11 minutes (> the 10-min negative-cache TTL): the entry re-probes,
+        // so the part is decoded ONCE MORE (opened a second time) — proving the cache is a TTL re-probe, not a
+        // permanent blacklist. The decode budget still fires on REAL time (OffsetUtcTimeProvider delegates its
+        // timer to the system clock), so this load still times out and falls back.
+        var advancedClock = new OffsetUtcTimeProvider(TimeSpan.FromMinutes(11));
+        Snapshot s3 = await new DeltaLog(
+            counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget, timeProvider: advancedClock)
+            .LoadSnapshotAsync();
+        Assert.Null(s3.Metrics.CheckpointVersion);
+        Assert.Equal(2, CountOpensOf(counting, checkpointPart));
+    }
+
+    private static int CountOpensOf(CountingStorageBackend backend, string suffix) =>
+        backend.Opens.Count(p => p.EndsWith(suffix, StringComparison.Ordinal));
+
+    // A TimeProvider whose WALL CLOCK (GetUtcNow — the only thing the negative cache consults) is shifted by a
+    // fixed offset, but whose TIMER/timestamp primitives delegate to the system clock so a bounded decode's
+    // Task.Delay(budget, this) still fires on REAL time. This decouples the negative-cache TTL (which we want to
+    // advance deterministically) from the decode budget (which must keep timing out the crafted part).
+    private sealed class OffsetUtcTimeProvider(TimeSpan offset) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => TimeProvider.System.GetUtcNow() + offset;
+
+        public override long GetTimestamp() => TimeProvider.System.GetTimestamp();
+
+        public override long TimestampFrequency => TimeProvider.System.TimestampFrequency;
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period) =>
+            TimeProvider.System.CreateTimer(callback, state, dueTime, period);
+    }
+
+    [Fact]
+    public async Task DecoderSaturatedCheckpoint_EmitsSaturatedSignal_NotSeeded_DrivenByInjectedCapOneDecoder()
+    {
+        // High #7 — the injectable-decoder seam driving the REAL checkpoint read path through ALL capacity
+        // branches with a cap=1 decoder and a releasable gated strand. A VALID (decodable) checkpoint is used,
+        // so the ONLY reason the load falls back is the injected door saturation — proving the capacity path in
+        // isolation from corruption/timeout. Asserts: (1) the DecoderSaturated fallback reason; (2) exactly one
+        // decode.capacity_exhausted{door=checkpoint}; (3) decode.budget_exceeded EMPTY (a saturation is not a
+        // timeout — the de-conflation contract); (4) the negative cache is NOT seeded (mechanically, via
+        // open-count: a SUBSEQUENT load with a free decoder still DECODES and SEEDS the checkpoint — if the
+        // saturation had poisoned the negative cache, the second load would skip it → CheckpointVersion null).
+        LocalFileSystemBackend backend = NewBackend();
+        await WriteHistoryAsync(backend);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        // A cap=1 checkpoint decoder whose single slot is occupied by a gated strand (it times out and detaches,
+        // holding the only slot), so the REAL checkpoint decode is rejected fail-fast WITHOUT starting.
+        var saturatedDecoder = new BoundedDecoder(maxDetachedDecodes: 1, execution: DecodeExecution.DedicatedThread);
+        using var strandGate = new ManualResetEventSlim(initialState: false);
+        DeltaStorageException strandTimeout = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            saturatedDecoder.RunAsync<int>(
+                _ => { strandGate.Wait(); return Task.FromResult(0); },
+                TimeSpan.FromMilliseconds(80),
+                static _ => DeltaStorageException.DecodeBudgetExceeded("occupying strand"),
+                CancellationToken.None));
+        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, strandTimeout.Kind);
+        await WaitUntilAsync(() => saturatedDecoder.DetachedDecodeCount == 1);
+
+        var logger = new RecordingLogger<DeltaLog>();
+        using (var telemetry = new DeltaStorageTelemetry())
+        using (var deltaMeter = new MeterCapture(telemetry.DeltaMeter))
+        using (var storageMeter = new MeterCapture(telemetry.StorageMeter))
+        {
+            Snapshot snapshot = await new DeltaLog(
+                backend, DeltaLog.MaxLogObjectBytes, logger, telemetry, checkpointDecoder: saturatedDecoder)
+                .LoadSnapshotAsync();
+
+            // Fell back to JSON replay (checkpoint not seeded).
+            Assert.Null(snapshot.Metrics.CheckpointVersion);
+            Assert.Equal(2, snapshot.Metrics.ReplayedCommitCount);
+
+            // (1) The DecoderSaturated fallback reason (never decode_timeout / malformed).
+            MeterCapture.Measurement fallback = Assert.Single(deltaMeter.ForInstrument(FallbackInstrument));
+            Assert.Equal("decoder_saturated", fallback.Tags[ReasonKey]);
+
+            // (2) exactly one decode.capacity_exhausted{door=checkpoint}.
+            MeterCapture.Measurement capacity = Assert.Single(storageMeter.ForInstrument("deltasharp.storage.decode.capacity_exhausted"));
+            Assert.Equal(1, capacity.Value);
+            Assert.Equal("checkpoint", capacity.Tags[DecodeDoorKey]);
+
+            // (3) decode.budget_exceeded EMPTY — a saturation is NOT a timeout (de-conflation, I8).
+            Assert.Empty(storageMeter.ForInstrument(DecodeBudgetInstrument));
+        }
+
+        // Release the occupying strand and drain, then load AGAIN with a FRESH, unoccupied decoder.
+        strandGate.Set();
+        await WaitUntilAsync(() => saturatedDecoder.DetachedDecodeCount == 0);
+
+        Snapshot healthy = await new DeltaLog(backend, DeltaLog.MaxLogObjectBytes)
+            .LoadSnapshotAsync();
+
+        // (4) NOT seeded on capacity: the valid checkpoint is decoded and SEEDS the snapshot this time
+        // (CheckpointVersion == 1). Had the saturation poisoned the negative cache, this load would skip the
+        // part and fall back to JSON replay (CheckpointVersion null) — so this assertion is red if a saturation
+        // is ever wrongly cached.
+        Assert.Equal(1, healthy.Metrics.CheckpointVersion);
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition)
+    {
+        var deadline = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (deadline.Elapsed > TimeSpan.FromSeconds(20))
+            {
+                Assert.Fail("The expected bounded-decode state was not reached within the watchdog.");
+            }
+
+            await Task.Delay(10);
         }
     }
 

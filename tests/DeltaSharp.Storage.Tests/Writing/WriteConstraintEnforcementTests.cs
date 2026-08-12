@@ -452,6 +452,8 @@ public sealed class WriteConstraintEnforcementTests : IDisposable
 
         public StorageBackendKind Kind => _inner.Kind;
 
+        public string TableIdentity => _inner.TableIdentity;
+
         public ValueTask<System.IO.Stream> ReadRangeAsync(string path, long offset, long length, CancellationToken cancellationToken) =>
             _inner.ReadRangeAsync(path, offset, length, cancellationToken);
 

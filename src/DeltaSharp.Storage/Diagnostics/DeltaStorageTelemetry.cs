@@ -108,6 +108,15 @@ internal enum CheckpointFallbackReason
     /// <c>deltasharp.storage.decode.capacity_exhausted{door=checkpoint}</c> counter keep the saturation
     /// observable.</summary>
     DecoderSaturated,
+
+    /// <summary>The checkpoint part was SKIPPED entirely because it is already in the process-wide negative
+    /// cache (it provably tripped the bounded decode budget on a PRIOR load and is still within its — possibly
+    /// backoff-extended — TTL). No decode ran on this load, so this is categorically distinct from
+    /// <see cref="DecodeTimeout"/> (a decode ran past budget): it must NOT increment the
+    /// <c>decode.budget_exceeded</c> counter (the PR's de-conflation fix), and instead pairs with the dedicated
+    /// <c>deltasharp.storage.decode.negative_cache_skip{door=checkpoint}</c> counter so a persistently bad
+    /// checkpoint stays observable without re-incurring the decode or inflating the timeout signal.</summary>
+    NegativeCacheSkip,
 }
 
 /// <summary>
@@ -393,6 +402,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _checkpointFallback;
     private readonly Counter<long> _decodeBudgetExceeded;
     private readonly Counter<long> _decodeCapacityExhausted;
+    private readonly Counter<long> _decodeNegativeCacheSkip;
 #pragma warning disable IDE0052 // Held so the ObservableGauge callback stays subscribed for the meter's lifetime.
     private readonly ObservableGauge<int> _decodeDetached;
 #pragma warning restore IDE0052
@@ -464,6 +474,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _decodeCapacityExhausted = _storageMeter.CreateCounter<long>(
             "deltasharp.storage.decode.capacity_exhausted", unit: "{rejection}",
             description: "Untrusted Parquet decodes REJECTED fail-fast because the bounded-decode worker's door was at capacity (too many decodes already stranded past their deadline), by door (data_file / checkpoint). A retryable saturation signal — DISTINCT from decode.budget_exceeded (this decode never started), so it is never conflated with a non-terminating decode or negatively cached.");
+        _decodeNegativeCacheSkip = _storageMeter.CreateCounter<long>(
+            "deltasharp.storage.decode.negative_cache_skip", unit: "{skip}",
+            description: "Checkpoint decodes SKIPPED because the part is already in the process-wide negative cache (it provably tripped its decode budget on a prior load and is still within its TTL), by door. DISTINCT from decode.budget_exceeded (no decode ran on this load) so a persistently bad checkpoint stays observable without inflating the decode-timeout signal.");
         _decodeDetached = _storageMeter.CreateObservableGauge(
             "deltasharp.storage.decode.detached",
             static () => new[]
@@ -687,6 +700,14 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     internal void RecordDecodeCapacityExhausted(DecodeDoor door) =>
         _decodeCapacityExhausted.Add(1, new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(door)));
 
+    /// <summary>Increments the negative-cache-skip counter for one checkpoint part that was SKIPPED (not
+    /// re-decoded) because it is already in the process-wide negative cache, tagged with the bounded
+    /// <see cref="DecodeDoorKey"/> door dimension. DISTINCT from <see cref="RecordDecodeBudgetExceeded"/>: no
+    /// decode ran on this load, so this must NOT increment the decode-timeout counter (the de-conflation fix).
+    /// The input is a bounded <see cref="DecodeDoor"/>; no untrusted content ever becomes a tag.</summary>
+    internal void RecordDecodeNegativeCacheSkip(DecodeDoor door) =>
+        _decodeNegativeCacheSkip.Add(1, new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(door)));
+
     /// <summary>The bounded <c>deltasharp.outcome</c> string for an <see cref="OptimizeOutcome"/>.</summary>
     internal static string ToLabel(OptimizeOutcome outcome) => outcome switch
     {
@@ -772,6 +793,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CheckpointFallbackReason.ForgedMultiMetadata => "forged_multi_metadata",
         CheckpointFallbackReason.DecodeTimeout => "decode_timeout",
         CheckpointFallbackReason.DecoderSaturated => "decoder_saturated",
+        CheckpointFallbackReason.NegativeCacheSkip => "negative_cache_skip",
         _ => "malformed",
     };
 

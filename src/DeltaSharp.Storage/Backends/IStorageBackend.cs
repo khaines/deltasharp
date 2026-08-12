@@ -25,14 +25,13 @@ internal interface IStorageBackend
     /// cross-instance cache key (the checkpoint decode negative cache, #647/#699/#716). Because a fresh backend
     /// is constructed per scan/resolve, this MUST be stable across instances that target the SAME table root
     /// (so the negative cache actually hits) yet distinct across different tables (so a poisoned checkpoint in
-    /// one table never suppresses a healthy checkpoint in another). The default is instance-scoped (never
-    /// cross-instance stable) — a backend that participates in the negative cache (the local filesystem
-    /// backend) overrides it with its canonical table root; a test backend that does not need cross-instance
-    /// dedup can keep the default.</summary>
-    string TableIdentity =>
-        string.Create(
-            System.Globalization.CultureInfo.InvariantCulture,
-            $"{Kind}:{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(this):x}");
+    /// one table never suppresses a healthy checkpoint in another). It is a <b>required</b> member with <b>no
+    /// default</b> (a default <c>RuntimeHelpers.GetHashCode(this)</c> would silently reinstate the
+    /// "cache never hits" Critical for any future backend that forgot to override it, and a recycled instance
+    /// hash could cross-suppress two tables): every backend — including a decorator, which must forward its
+    /// inner backend's identity — states it explicitly. A test backend that does not participate in
+    /// cross-instance dedup may return any stable, per-root-distinct string.</summary>
+    string TableIdentity { get; }
 
     /// <summary>Opens a read stream over <c>[offset, offset + length)</c> of <paramref name="path"/> —
     /// the range GET used for Parquet footers and selective row-group reads (design §2.9.1).</summary>
