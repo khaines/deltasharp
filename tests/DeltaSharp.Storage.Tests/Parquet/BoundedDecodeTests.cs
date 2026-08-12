@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Linq;
 using System.Threading;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
@@ -32,7 +33,7 @@ public sealed class BoundedDecodeTests
     [Fact]
     public async Task RunAsync_ReturnsResult_WhenWorkFinishesFirst()
     {
-        int result = await BoundedDecode.RunAsync(
+        int result = await new BoundedDecoder(maxDetachedDecodes: 4).RunAsync(
             _ => Task.FromResult(42),
             TimeSpan.FromSeconds(5),
             static _ => new InvalidOperationException("must not time out"),
@@ -47,7 +48,7 @@ public sealed class BoundedDecodeTests
         // A typed fail-closed exception the work itself throws must propagate unwrapped — never remapped to the
         // timeout exception. This is the property that keeps UnsupportedFeature / CorruptData contracts intact.
         DeltaStorageException thrown = await Assert.ThrowsAsync<DeltaStorageException>(() =>
-            BoundedDecode.RunAsync<int>(
+            new BoundedDecoder(maxDetachedDecodes: 4).RunAsync<int>(
                 _ => throw DeltaStorageException.UnsupportedFeature("valid but unsupported"),
                 TimeSpan.FromSeconds(5),
                 static _ => DeltaStorageException.CorruptData("must not be surfaced"),
@@ -65,7 +66,7 @@ public sealed class BoundedDecodeTests
         // the watchdog.
         var stopwatch = Stopwatch.StartNew();
         var thrown = await RunWatchdoggedAsync(() =>
-            BoundedDecode.RunAsync<int>(
+            new BoundedDecoder(maxDetachedDecodes: 4).RunAsync<int>(
                 _ =>
                 {
                     Thread.Sleep(TimeSpan.FromSeconds(3)); // ignores the token entirely
@@ -90,7 +91,7 @@ public sealed class BoundedDecodeTests
         cts.CancelAfter(TimeSpan.FromMilliseconds(100));
 
         var thrown = await RunWatchdoggedAsync(() =>
-            BoundedDecode.RunAsync<int>(
+            new BoundedDecoder(maxDetachedDecodes: 4).RunAsync<int>(
                 _ =>
                 {
                     Thread.Sleep(TimeSpan.FromSeconds(3));
@@ -177,6 +178,9 @@ public sealed class BoundedDecodeTests
         MeterCapture.Measurement metric = Assert.Single(meters.ForInstrument("deltasharp.storage.decode.budget_exceeded"));
         Assert.Equal(1, metric.Value);
         Assert.Equal("data_file", metric.Tags["deltasharp.decode.door"]);
+        // The byte-flip is a footer/open defect, so the OPEN-stage discriminator distinguishes it from a
+        // non-terminating row-group page decode (both otherwise land on door=data_file).
+        Assert.Equal("open", metric.Tags["deltasharp.decode.stage"]);
     }
 
     [Fact]
@@ -186,7 +190,7 @@ public sealed class BoundedDecodeTests
         // deadline, a NEW decode is rejected fail-fast with DecodeCapacityExhaustedException WITHOUT starting,
         // so the stranded-decode residual can never grow without bound. Exercised on an ISOLATED decoder with
         // caps of 1 so the assertion is deterministic and never touches the (widened) shared tier.
-        var decoder = new BoundedDecoder(maxConcurrentDecodes: 1, maxDetachedDecodes: 1);
+        var decoder = new BoundedDecoder(maxDetachedDecodes: 1);
         using var gate = new ManualResetEventSlim(initialState: false);
 
         // Strand one decode: it ignores its token and blocks on the gate past a tiny budget, so RunAsync times
@@ -230,7 +234,7 @@ public sealed class BoundedDecodeTests
         // deadline (a non-terminating decode that eventually wins), its result — a ParquetReader that owns its
         // input stream — would leak. The onAbandonedResult disposer must dispose it. Exercised on an isolated
         // decoder with a disposable stand-in whose Dispose is observable.
-        var decoder = new BoundedDecoder(maxConcurrentDecodes: 2, maxDetachedDecodes: 4);
+        var decoder = new BoundedDecoder(maxDetachedDecodes: 4);
         var disposed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var resource = new ObservableDisposable(disposed);
 
@@ -290,6 +294,227 @@ public sealed class BoundedDecodeTests
         // deadline did NOT reset per group (which would have read all 5 vs all 50 before finishing).
         Assert.Equal(batchesA, batchesB);
         Assert.True(batchesA < 5, $"expected fewer batches than the 5-group file's groups, got {batchesA}.");
+    }
+
+    [Fact]
+    public async Task Starvation_HealthyDecodeStillSucceeds_WhileStrandsExist_OnIsolatedDecoder()
+    {
+        // I1 — THE headline Critical: with the Round-1 shared, count-capped scheduler, a handful of
+        // non-terminating strands pinned every execution slot, so a QUEUED healthy decode never ran — a
+        // permanent process-wide outage from as little as ONE crafted file on a small pod. The redesign runs
+        // every decode on its OWN dedicated thread behind only a strand-COUNT cap, so a healthy decode submitted
+        // while N strands exist still executes immediately (any free slot) and SUCCEEDS. Proven on an isolated
+        // decoder with a generous cap and several strands: the healthy decode returns its value well under the
+        // watchdog. Reverting to a shared execution queue that strands can fill would hang here (watchdog fires).
+        const int cap = 8;
+        const int strandCount = 5; // more than a small pod's ProcessorCount/4 — the Round-1 scheduler width
+        var decoder = new BoundedDecoder(maxDetachedDecodes: cap);
+        using var gate = new ManualResetEventSlim(initialState: false);
+
+        for (int i = 0; i < strandCount; i++)
+        {
+            DeltaStorageException timedOut = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+                decoder.RunAsync<int>(
+                    _ => { gate.Wait(); return Task.FromResult(0); },
+                    TimeSpan.FromMilliseconds(100),
+                    static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
+                    CancellationToken.None));
+            Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, timedOut.Kind);
+        }
+
+        await WaitForAsync(() => decoder.DetachedDecodeCount == strandCount);
+
+        // The invariant: a healthy decode submitted while 5 strands exist STILL executes and succeeds.
+        int healthy = await RunHealthyAsync(decoder);
+        Assert.Equal(42, healthy);
+
+        gate.Set();
+        await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
+
+        static async Task<int> RunHealthyAsync(BoundedDecoder decoder)
+        {
+            Task<int> run = decoder.RunAsync(
+                _ => Task.FromResult(42),
+                TimeSpan.FromSeconds(5),
+                static _ => DeltaStorageException.DecodeBudgetExceeded("healthy decode must not time out"),
+                CancellationToken.None);
+            if (await Task.WhenAny(run, Task.Delay(Watchdog)) != run)
+            {
+                Assert.Fail("A healthy decode did not run while strands existed (I1 starvation regression).");
+            }
+
+            return await run;
+        }
+    }
+
+    [Fact]
+    public async Task AtomicCap_ConcurrentBurst_NeverAdmitsMoreThanCap_OnIsolatedDecoder()
+    {
+        // I2 — the atomic hard cap: a concurrent BURST must never admit more than the cap (the Round-1
+        // check-then-act let cap=1 admit 8). Reservation is a single Interlocked.Increment that backs out if it
+        // lands over the cap, so exactly `cap` of the burst are admitted (become strands, holding their slot
+        // because the gate never opens) and every other call is rejected fail-fast with the DISTINCT
+        // DecodeCapacityExhaustedException — WITHOUT starting. The detached count converges to EXACTLY the cap
+        // and never exceeds it.
+        const int cap = 4;
+        const int burst = 40;
+        var decoder = new BoundedDecoder(maxDetachedDecodes: cap);
+        using var gate = new ManualResetEventSlim(initialState: false);
+        int rejected = 0;
+        int peakReserved = 0;
+
+        Task[] tasks = Enumerable.Range(0, burst).Select(_ => Task.Run(async () =>
+        {
+            try
+            {
+                await decoder.RunAsync<int>(
+                    _ => { gate.Wait(); return Task.FromResult(1); },
+                    TimeSpan.FromMilliseconds(100),
+                    static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
+                    CancellationToken.None);
+            }
+            catch (DecodeCapacityExhaustedException)
+            {
+                Interlocked.Increment(ref rejected);
+            }
+            catch (DeltaStorageException)
+            {
+                // Admitted then timed out → this call became a strand (holds its slot).
+            }
+
+            // Sample the reserved count concurrently; it must never exceed the cap.
+            int seen = decoder.ReservedDecodeCount;
+            InterlockedMax(ref peakReserved, seen);
+        })).ToArray();
+
+        await Task.WhenAll(tasks);
+
+        Assert.True(peakReserved <= cap, $"reserved slots exceeded the cap ({peakReserved} > {cap}) — TOCTOU race.");
+        Assert.True(decoder.DetachedDecodeCount <= cap, "detached strands exceeded the cap.");
+        await WaitForAsync(() => decoder.DetachedDecodeCount == cap);
+        Assert.Equal(burst - cap, rejected); // exactly `cap` admitted, the rest rejected fail-fast
+
+        gate.Set();
+        await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
+
+        static void InterlockedMax(ref int target, int value)
+        {
+            int seen;
+            do
+            {
+                seen = Volatile.Read(ref target);
+                if (value <= seen)
+                {
+                    return;
+                }
+            }
+            while (Interlocked.CompareExchange(ref target, value, seen) != seen);
+        }
+    }
+
+    [Fact]
+    public async Task ExecutionStartDeadline_BudgetMeasuredFromWorkStart_NotAdmissionOrStrandAge()
+    {
+        // I3 — the deadline starts at EXECUTION start, not at admission/enqueue, and admission/queue wait (here
+        // modelled as a long-lived pre-existing strand's age) is NEVER charged to a later healthy decode's
+        // budget. Driven by a deterministic controllable clock whose timers fire only on Advance, so there is
+        // no wall-clock flake. A strand is created and then the virtual clock is advanced FIVE HOURS to age it;
+        // a healthy decode submitted afterwards must still get its FULL budget measured from ITS OWN start —
+        // advancing the clock by less than that budget must not trip it. If the budget were armed at admission
+        // or measured from an absolute epoch, the 5-hour advance would have already blown it.
+        var clock = new ControllableClock(TimeSpan.FromHours(1).Ticks);
+        var decoder = new BoundedDecoder(maxDetachedDecodes: 4);
+        using var strandGate = new ManualResetEventSlim(initialState: false);
+        var strandStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        Task<int> strandTask = decoder.RunAsync<int>(
+            _ => { strandStarted.TrySetResult(); strandGate.Wait(); return Task.FromResult(0); },
+            TimeSpan.FromSeconds(1),
+            static _ => DeltaStorageException.DecodeBudgetExceeded("strand"),
+            CancellationToken.None,
+            timeProvider: clock);
+
+        await strandStarted.Task; // strand executing; its delay armed at clock=T0, fires at T0+1s
+        clock.Advance(TimeSpan.FromSeconds(1)); // trip the strand → detaches; work stays gate-blocked
+        DeltaStorageException stranded = await Assert.ThrowsAsync<DeltaStorageException>(() => strandTask);
+        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, stranded.Kind);
+        await WaitForAsync(() => decoder.DetachedDecodeCount == 1);
+
+        // Age the strand a LOT. This elapsed virtual time must NOT be charged to the healthy decode below.
+        clock.Advance(TimeSpan.FromHours(5));
+
+        using var proceed = new ManualResetEventSlim(initialState: false);
+        var healthyStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        Task<int> healthyTask = decoder.RunAsync<int>(
+            _ => { healthyStarted.TrySetResult(); proceed.Wait(); return Task.FromResult(42); },
+            TimeSpan.FromSeconds(1),
+            static _ => DeltaStorageException.DecodeBudgetExceeded("healthy decode must not time out"),
+            CancellationToken.None,
+            timeProvider: clock);
+
+        await healthyStarted.Task; // healthy executing; its delay armed at NOW (its own start), fires at NOW+1s
+        clock.Advance(TimeSpan.FromMilliseconds(500)); // < the healthy budget FROM ITS OWN START → must not trip
+        proceed.Set();
+        int result = await healthyTask;
+        Assert.Equal(42, result); // succeeded on its own full budget, unaffected by the aged strand
+
+        strandGate.Set();
+        await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
+    }
+
+    [Fact]
+    public async Task RowGroupDoor_Timeout_CarriesRowGroupStageDiscriminator_DistinctFromOpen()
+    {
+        // The #647 row-group door discriminator: a decode-budget trip during a ROW-GROUP decode must carry the
+        // stage=row_group signal, DISTINCT from the stage=open signal a footer/open trip carries — both
+        // otherwise land on door=data_file. Driven by the deterministic stepping clock: the OPEN completes in
+        // budget (its per-step race wins), then the shared aggregate deadline trips at a row-group pre-check,
+        // emitting exactly the row_group stage and never the open stage.
+        byte[] file = await BuildMultiRowGroupFileAsync(rows: 50, rowsPerGroup: 1);
+        var budget = TimeSpan.FromSeconds(10);
+        long step = (long)(budget.Ticks * 0.35);
+        var clock = new SteppingTimeProvider(step);
+
+        using var telemetry = new DeltaSharp.Storage.Diagnostics.DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.StorageMeter);
+        var reader = new ParquetFileReader(
+            new ParquetDecodeLimits(decodeTimeBudget: budget), timeProvider: clock, telemetry: telemetry);
+
+        var thrown = await RunWatchdoggedAsync(() => ReadAllAsync(reader, file));
+        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, Assert.IsType<DeltaStorageException>(thrown).Kind);
+
+        MeterCapture.Measurement metric = Assert.Single(meters.ForInstrument("deltasharp.storage.decode.budget_exceeded"));
+        Assert.Equal("data_file", metric.Tags["deltasharp.decode.door"]);
+        Assert.Equal("row_group", metric.Tags["deltasharp.decode.stage"]);
+    }
+
+    [Fact]
+    public void CapacityExhausted_Telemetry_IsDistinctCounter_NotConflatedWithBudgetExceeded()
+    {
+        // I8 — the metric-conflation fix: a door saturation (capacity exhaustion — the decode never started)
+        // increments ONLY the door-dimensioned decode.capacity_exhausted counter and must NOT increment
+        // decode.budget_exceeded (which means a decode RAN past budget). They are categorically distinct.
+        using var telemetry = new DeltaSharp.Storage.Diagnostics.DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.StorageMeter);
+
+        telemetry.RecordDecodeCapacityExhausted(DeltaSharp.Storage.Diagnostics.DecodeDoor.DataFile);
+
+        MeterCapture.Measurement capacity = Assert.Single(meters.ForInstrument("deltasharp.storage.decode.capacity_exhausted"));
+        Assert.Equal(1, capacity.Value);
+        Assert.Equal("data_file", capacity.Tags["deltasharp.decode.door"]);
+        Assert.Empty(meters.ForInstrument("deltasharp.storage.decode.budget_exceeded"));
+    }
+
+    [Fact]
+    public void DecoderSaturated_IsADistinctRetryableStorageErrorKind()
+    {
+        // I8 — the typed retryable classification: door saturation maps to a PUBLIC DecoderSaturated storage
+        // error, a distinct kind from a decode-timeout (DecodeBudgetExceeded) and from corruption (CorruptData),
+        // so a caller/engine can back off and retry rather than treat it as a permanent failure.
+        DeltaStorageException saturated = DeltaStorageException.DecoderSaturated("at capacity");
+        Assert.Equal(StorageErrorKind.DecoderSaturated, saturated.Kind);
+        Assert.NotEqual(StorageErrorKind.DecodeBudgetExceeded, saturated.Kind);
+        Assert.NotEqual(StorageErrorKind.CorruptData, saturated.Kind);
     }
 
     private static async Task<(Exception? Thrown, int Batches)> ReadUnderSteppingClockAsync(byte[] bytes)
@@ -410,6 +635,116 @@ public sealed class BoundedDecodeTests
             }
 
             public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+        }
+    }
+
+    // A fully controllable virtual clock: GetTimestamp/GetUtcNow read a settable tick counter, and CreateTimer
+    // returns a one-shot timer that fires ONLY when Advance pushes the clock past its due instant. This lets a
+    // bounded decode's Task.Delay(budget, this) trip deterministically at an exact virtual instant — used to
+    // prove the deadline is measured from EXECUTION start and not charged for admission/strand age (I3), with
+    // no real wall-clock wait or flake.
+    private sealed class ControllableClock(long startTicks) : TimeProvider
+    {
+        private readonly object _gate = new();
+        private readonly List<FakeTimer> _timers = new();
+        private long _ticks = startTicks;
+
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+        public override long GetTimestamp()
+        {
+            lock (_gate)
+            {
+                return _ticks;
+            }
+        }
+
+        public override DateTimeOffset GetUtcNow()
+        {
+            lock (_gate)
+            {
+                return new DateTimeOffset(_ticks, TimeSpan.Zero);
+            }
+        }
+
+        public override ITimer CreateTimer(TimerCallback callback, object? state, TimeSpan dueTime, TimeSpan period)
+        {
+            var timer = new FakeTimer(this, callback, state);
+            timer.Change(dueTime, period);
+            lock (_gate)
+            {
+                _timers.Add(timer);
+            }
+
+            return timer;
+        }
+
+        internal void Advance(TimeSpan by)
+        {
+            var due = new List<FakeTimer>();
+            lock (_gate)
+            {
+                _ticks += by.Ticks;
+                foreach (FakeTimer t in _timers)
+                {
+                    if (t.DueTicks is long d && d <= _ticks)
+                    {
+                        due.Add(t);
+                    }
+                }
+            }
+
+            foreach (FakeTimer t in due)
+            {
+                t.Fire();
+            }
+        }
+
+        private long NowTicks()
+        {
+            lock (_gate)
+            {
+                return _ticks;
+            }
+        }
+
+        private void Remove(FakeTimer timer)
+        {
+            lock (_gate)
+            {
+                _timers.Remove(timer);
+            }
+        }
+
+        private sealed class FakeTimer(ControllableClock clock, TimerCallback callback, object? state) : ITimer
+        {
+            internal long? DueTicks { get; private set; }
+
+            public bool Change(TimeSpan dueTime, TimeSpan period)
+            {
+                // One-shot (period ignored): schedule a due instant, or disarm on an infinite/negative due.
+                DueTicks = dueTime < TimeSpan.Zero ? null : clock.NowTicks() + dueTime.Ticks;
+                return true;
+            }
+
+            internal void Fire()
+            {
+                if (DueTicks is null)
+                {
+                    return;
+                }
+
+                DueTicks = null; // one-shot
+                callback(state);
+            }
+
+            public void Dispose() => clock.Remove(this);
+
+            public ValueTask DisposeAsync()
+            {
+                clock.Remove(this);
+                return ValueTask.CompletedTask;
+            }
         }
     }
 

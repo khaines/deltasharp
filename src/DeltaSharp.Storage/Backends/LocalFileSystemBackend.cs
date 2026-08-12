@@ -163,6 +163,15 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     /// <summary>The PVC/POSIX backend family — the <c>deltasharp.backend=pvc</c> telemetry identity.</summary>
     public StorageBackendKind Kind => StorageBackendKind.Pvc;
 
+    /// <summary>The stable cross-instance table identity (backend kind + canonical real table root) the
+    /// checkpoint decode negative cache keys on (#647/#699/#716). Two <see cref="LocalFileSystemBackend"/>
+    /// instances rooted at the SAME table therefore share negative-cache entries — so a persistently
+    /// non-terminating checkpoint decoded through a fresh backend per load is NOT re-decoded every time — while
+    /// two different table roots never collide. Uses <see cref="TableRootId"/> (the canonicalized real root,
+    /// the same identity <see cref="Reading.ChangeFeedReader"/> binds its resume tokens to).</summary>
+    public string TableIdentity =>
+        string.Create(CultureInfo.InvariantCulture, $"{Kind}:{TableRootId}");
+
     /// <inheritdoc/>
     public async ValueTask<Stream> ReadRangeAsync(
         string path, long offset, long length, CancellationToken cancellationToken)

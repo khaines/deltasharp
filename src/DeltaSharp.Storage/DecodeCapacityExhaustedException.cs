@@ -14,9 +14,12 @@ namespace DeltaSharp.Storage;
 /// never enters a negative cache (a bad-input marker); a caller may retry once capacity frees.</para>
 /// <para>This is the bounded ceiling that makes an attacker-crafted, non-terminating decode a <b>known,
 /// finite</b> resource cost instead of an unbounded, self-renewing leak: the number of concurrently stranded
-/// decodes can never exceed the bounded-decoder's <c>maxDetachedDecodes</c> admission cap, and the shared
-/// ThreadPool stays healthy because at most <c>maxConcurrentDecodes</c> of them run at once on a dedicated,
-/// hard-capped scheduler.</para>
+/// decodes on a door can never exceed that door's <c>maxDetachedDecodes</c> strand cap (atomically reserved
+/// BEFORE the decode starts). Each untrusted decode runs on its OWN dedicated background <c>Thread</c>
+/// (not the shared ThreadPool and not a shared, count-capped scheduler), so a stranded decode holds only its
+/// own thread + reserved slot and NEVER occupies scheduling capacity a healthy decode needs — a healthy decode
+/// submitted while N strands exist still starts immediately (up to the cap). At most one crafted door can be
+/// saturated at a time because the data-file and checkpoint doors have independent caps.</para>
 /// </remarks>
 internal sealed class DecodeCapacityExhaustedException : Exception
 {

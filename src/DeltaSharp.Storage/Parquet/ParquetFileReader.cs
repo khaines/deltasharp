@@ -121,13 +121,28 @@ internal sealed class ParquetFileReader
         internal TimeSpan Remaining() => Budget - _timeProvider.GetElapsedTime(_start);
     }
 
-    // Records the data-file decode-budget timeout on the storage meter (door=data_file) and returns the typed
-    // DecodeBudgetExceeded fail-closed exception. Called both as the BoundedDecode onTimeout factory and by the
-    // aggregate-deadline pre-check, so a timeout is observable exactly once per read.
-    private Exception DataFileDecodeTimeout(string message)
+    // Records the data-file decode-budget timeout on the storage meter (door=data_file, tagged with the read
+    // STAGE so a non-terminating row-group page decode is distinguishable from a non-terminating open, #647)
+    // and returns the typed DecodeBudgetExceeded fail-closed exception. Called both as the BoundedDecode
+    // onTimeout factory and by the aggregate-deadline pre-check, so a timeout is observable exactly once per
+    // read.
+    private Exception DataFileDecodeTimeout(string message, DecodeStage stage)
     {
-        _telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile);
+        _telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile, stage);
         return DeltaStorageException.DecodeBudgetExceeded(message);
+    }
+
+    // Maps the bounded-decode worker's fail-fast admission rejection (the data-file door is at its strand cap —
+    // too many untrusted decodes already detached past their deadline, #647/#699/#716) to the PUBLIC retryable
+    // DecoderSaturated storage error, and records the door-dimensioned decode.capacity_exhausted counter (I8).
+    // DISTINCT from a decode timeout: the decode NEVER STARTED, so it must never be labeled a decode-timeout,
+    // never be negatively cached, and must surface as a retryable saturation the engine can back off on.
+    private DeltaStorageException DataFileDecoderSaturated(DecodeCapacityExhaustedException ex)
+    {
+        _telemetry.RecordDecodeCapacityExhausted(DecodeDoor.DataFile);
+        return DeltaStorageException.DecoderSaturated(
+            "The Parquet data-file decode was rejected because the bounded-decode worker is at strand capacity "
+            + "(too many untrusted decodes are already running past their deadline). Retry after backoff.", ex);
     }
 
     // Best-effort disposal of a ParquetReader whose (non-terminating) open completed AFTER the deadline — the
@@ -147,6 +162,99 @@ internal sealed class ParquetFileReader
             try
             {
                 await r.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort cleanup on a detached, abandoned decode — nothing to observe it.
+            }
+        }
+    }
+
+    // A ref-counted lease over a caller-shared ParquetReader (I6 — data-file strand isolation). The row-group
+    // decode (#647) and the row-count metadata scan run the untrusted ParquetReader on a dedicated background
+    // thread that CANNOT be reclaimed if it never terminates (Parquet.Net ignores cancellation). If the caller
+    // disposed the reader — and, via leaveStreamOpen:false, its input stream — while such a strand were still
+    // reading it, the strand would touch a disposed reader/stream (a use-after-free-class fault). This lease
+    // makes disposal happen ONLY when the LAST holder releases: the caller holds the base lease for the whole
+    // read; each bounded decode Retain()s an extra lease before starting and Release()s it when the (possibly
+    // stranded) decode settles (via BoundedDecode.onWorkSettled). A non-terminating strand therefore keeps the
+    // reader alive for its whole lifetime — a bounded residual (≤ the door's strand cap, exactly as the
+    // checkpoint door pins ≤ maxPartBytes of isolated bytes per strand) — and the reader is disposed only once
+    // no strand holds it. This is the SAME ownership contract for both data-file strand doors.
+    private sealed class SharedParquetReader
+    {
+        private readonly ParquetReader _reader;
+        private int _leases; // starts at 1 (the caller's base lease); disposal fires when it reaches 0
+
+        private SharedParquetReader(ParquetReader reader)
+        {
+            _reader = reader;
+            _leases = 1;
+        }
+
+        internal static SharedParquetReader Wrap(ParquetReader reader) => new(reader);
+
+        internal ParquetReader Reader => _reader;
+
+        // Take an extra lease for a bounded decode about to start. The base lease is held for the whole read, so
+        // the count is always ≥ 1 here and can never resurrect a disposed reader.
+        internal void Retain() => Interlocked.Increment(ref _leases);
+
+        // Release a bounded decode's lease (called from BoundedDecode.onWorkSettled when the — possibly
+        // stranded — decode settles). Sync + fire-and-forget disposal because onWorkSettled is synchronous; only
+        // the holder that drives the count to 0 disposes.
+        internal void Release()
+        {
+            if (Interlocked.Decrement(ref _leases) == 0)
+            {
+                DisposeAbandonedReader(_reader);
+            }
+        }
+
+        // Release the caller's base lease at the end of the read, awaiting disposal WHEN this is the last holder
+        // (the common, no-strand case: deterministic stream close). If a strand still holds a lease the count
+        // stays ≥ 1 and the reader is kept alive for the strand; the strand's later Release disposes it.
+        internal async ValueTask ReleaseCallerAsync()
+        {
+            if (Interlocked.Decrement(ref _leases) == 0)
+            {
+                await _reader.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    // Best-effort disposal of a row-group ColumnBatch whose (non-terminating) decode completed AFTER the
+    // deadline (a late win the caller has already stopped awaiting). Today the row-group decode yields a
+    // ManagedColumnBatch backed purely by managed arrays (GC-reclaimed, nothing to release), but a batch type
+    // MAY hold an unmanaged/pooled resource (e.g. an Arrow-backed batch is IDisposable), so dispose it if it is
+    // disposable — a late result must never leak. Fire-and-forget on the detached path; any fault is swallowed.
+    private static void DisposeAbandonedBatch(ColumnBatch? batch)
+    {
+        switch (batch)
+        {
+            case IAsyncDisposable asyncDisposable:
+                _ = SafeDisposeAsync(asyncDisposable);
+                break;
+            case IDisposable disposable:
+                try
+                {
+                    disposable.Dispose();
+                }
+                catch
+                {
+                    // Best-effort cleanup on a detached, abandoned decode — nothing to observe it.
+                }
+
+                break;
+            default:
+                break;
+        }
+
+        static async Task SafeDisposeAsync(IAsyncDisposable d)
+        {
+            try
+            {
+                await d.DisposeAsync().ConfigureAwait(false);
             }
             catch
             {
@@ -257,9 +365,15 @@ internal sealed class ParquetFileReader
         }
 
         var deadline = new DecodeDeadline(_timeProvider, _limits.DecodeTimeBudget);
-        ParquetReader reader = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
-        await using (reader.ConfigureAwait(false))
+        ParquetReader opened = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
+        // I6 — hold a ref-counted lease over the reader for the whole read so a stranded row-group decode never
+        // touches a reader/stream the caller has disposed. The base lease is released in the finally; each
+        // bounded row-group decode takes its own extra lease released when that (possibly stranded) decode
+        // settles. The reader is disposed only once no strand holds it.
+        var shared = SharedParquetReader.Wrap(opened);
+        try
         {
+            ParquetReader reader = shared.Reader;
             // Structural validation happens here (footer read at open) — schema/type mismatches fail
             // before any batch is yielded (H3). An Absent slot marks a requested column not present in the
             // file that will be null-filled (nullFillMissingColumns; #497); a Nested slot carries the
@@ -274,7 +388,7 @@ internal sealed class ParquetFileReader
                 // worst-case total read time is one budget regardless of the (attacker-controlled)
                 // RowGroupCount — the door trips the whole read on the first group that runs past it.
                 ColumnBatch? batch = await ReadRowGroupAsync(
-                    reader, group, requested, fileFields, keepRowGroup, _limits, deadline, _telemetry,
+                    shared, group, requested, fileFields, keepRowGroup, _limits, deadline, _telemetry,
                     allowTypeWideningPromotion, cancellationToken)
                     .ConfigureAwait(false);
                 if (batch is not null)
@@ -282,6 +396,10 @@ internal sealed class ParquetFileReader
                     yield return batch;
                 }
             }
+        }
+        finally
+        {
+            await shared.ReleaseCallerAsync().ConfigureAwait(false);
         }
     }
 
@@ -336,9 +454,14 @@ internal sealed class ParquetFileReader
         ArgumentNullException.ThrowIfNull(input);
 
         var deadline = new DecodeDeadline(_timeProvider, _limits.DecodeTimeBudget);
-        ParquetReader reader = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
-        await using (reader.ConfigureAwait(false))
+        ParquetReader opened = await OpenAsync(input, deadline, cancellationToken).ConfigureAwait(false);
+        // I6 — the metadata scan below runs the caller-owned reader on a dedicated background thread that cannot
+        // be reclaimed if it strands. Hold a ref-counted lease so a stranded scan never touches a reader/stream
+        // the caller disposed; the reader is disposed only once no strand holds it.
+        var shared = SharedParquetReader.Wrap(opened);
+        try
         {
+            ParquetReader reader = shared.Reader;
             // Fail-closed row-group-count boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013).
             // The summation reads attacker-controlled footer NumRows fields, so a crafted file whose per-group
             // row counts sum past long.MaxValue raises a raw OverflowException from checked(total + rows). This
@@ -353,9 +476,10 @@ internal sealed class ParquetFileReader
             // into non-terminating, cancellation-ignoring work over. This DV-bounding door (used to bound a
             // deletion vector's decoded positions by the truth on disk) must therefore be bounded under the SAME
             // aggregate wall-clock deadline as the data-page decode: race the whole summation against the shared
-            // BoundedDecode policy so a crafted footer fails closed with a DISTINCT DecodeBudgetExceeded rather
-            // than hanging here. The eventual-fault/late-result of an abandoned metadata scan is bounded exactly
-            // as any other detached decode (it holds only the reader, already owned by the caller).
+            // BoundedDecode policy (the data-file door, stage=metadata) so a crafted footer fails closed with a
+            // DISTINCT DecodeBudgetExceeded rather than hanging here. A stranded scan keeps the reader alive via
+            // an extra lease on `shared` (I6), released when it settles; door saturation surfaces the retryable
+            // DecoderSaturated (I8), never a decode-timeout.
             try
             {
                 TimeSpan remaining = deadline.Remaining();
@@ -363,35 +487,50 @@ internal sealed class ParquetFileReader
                 {
                     throw DataFileDecodeTimeout(
                         "The Parquet footer row-group metadata could not be read within the bounded-decode time "
-                        + "budget (the aggregate per-read wall-clock deadline elapsed).");
+                        + "budget (the aggregate per-read wall-clock deadline elapsed).", DecodeStage.Metadata);
                 }
 
-                return await BoundedDecode.RunAsync(
-                    decodeToken =>
-                    {
-                        long total = 0;
-                        for (int group = 0; group < reader.RowGroupCount; group++)
+                shared.Retain();
+                try
+                {
+                    return await BoundedDecode.RunAsync(
+                        DecodeDoor.DataFile,
+                        decodeToken =>
                         {
-                            decodeToken.ThrowIfCancellationRequested();
-                            using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                            long rows = rowGroup.RowCount;
-                            if (rows < 0)
+                            long total = 0;
+                            for (int group = 0; group < reader.RowGroupCount; group++)
                             {
-                                throw DeltaStorageException.CorruptData(
-                                    $"Row group {group} declares a negative row count ({rows}).");
+                                decodeToken.ThrowIfCancellationRequested();
+                                using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
+                                long rows = rowGroup.RowCount;
+                                if (rows < 0)
+                                {
+                                    throw DeltaStorageException.CorruptData(
+                                        $"Row group {group} declares a negative row count ({rows}).");
+                                }
+
+                                total = checked(total + rows);
                             }
 
-                            total = checked(total + rows);
-                        }
-
-                        return Task.FromResult(total);
-                    },
-                    remaining,
-                    _ => DataFileDecodeTimeout(
-                        "The Parquet footer row-group metadata could not be summed within the bounded-decode "
-                        + "time budget (possible crafted footer driving a non-terminating metadata scan)."),
-                    cancellationToken,
-                    timeProvider: deadline.TimeProvider).ConfigureAwait(false);
+                            return Task.FromResult(total);
+                        },
+                        remaining,
+                        _ => DataFileDecodeTimeout(
+                            "The Parquet footer row-group metadata could not be summed within the bounded-decode "
+                            + "time budget (possible crafted footer driving a non-terminating metadata scan).",
+                            DecodeStage.Metadata),
+                        cancellationToken,
+                        onAbandonedResult: null,
+                        onWorkSettled: shared.Release,
+                        timeProvider: deadline.TimeProvider).ConfigureAwait(false);
+                }
+                catch (DecodeCapacityExhaustedException capacity)
+                {
+                    // Rejected without starting: release the lease we took (onWorkSettled never fires here) and
+                    // surface the retryable saturation (never a decode-timeout).
+                    shared.Release();
+                    throw DataFileDecoderSaturated(capacity);
+                }
             }
             catch (Exception ex) when (IsParquetDefect(ex))
             {
@@ -408,6 +547,10 @@ internal sealed class ParquetFileReader
                 throw DeltaStorageException.CorruptData(
                     "Parquet footer row-group metadata is malformed.", ex);
             }
+        }
+        finally
+        {
+            await shared.ReleaseCallerAsync().ConfigureAwait(false);
         }
     }
 
@@ -790,10 +933,11 @@ internal sealed class ParquetFileReader
             {
                 throw DataFileDecodeTimeout(
                     "The Parquet stream could not be opened within the bounded-decode time budget "
-                    + "(the aggregate per-read wall-clock deadline elapsed).");
+                    + "(the aggregate per-read wall-clock deadline elapsed).", DecodeStage.Open);
             }
 
             reader = await BoundedDecode.RunAsync(
+                DecodeDoor.DataFile,
                 async innerToken =>
                 {
                     ParquetReader r = await ParquetReader.CreateAsync(input, null, false, innerToken).ConfigureAwait(false);
@@ -826,7 +970,7 @@ internal sealed class ParquetFileReader
                 remaining,
                 _ => DataFileDecodeTimeout(
                     "The Parquet stream could not be decoded within the bounded-decode time budget "
-                    + "(possible malformed footer driving a non-terminating decode)."),
+                    + "(possible malformed footer driving a non-terminating decode).", DecodeStage.Open),
                 cancellationToken,
                 onAbandonedResult: DisposeAbandonedReader,
                 timeProvider: deadline.TimeProvider).ConfigureAwait(false);
@@ -865,6 +1009,14 @@ internal sealed class ParquetFileReader
             }
 
             return reader;
+        }
+        catch (DecodeCapacityExhaustedException ex)
+        {
+            // The data-file door is at strand capacity: the OPEN was rejected fail-fast WITHOUT starting (I8).
+            // Map it to the public retryable DecoderSaturated (never a decode-timeout, never CorruptData) so a
+            // caller/engine can back off and retry. It is excluded by IsUndecodableParquetInput, so this
+            // explicit catch is the only mapping site.
+            throw DataFileDecoderSaturated(ex);
         }
         catch (Exception ex) when (IsUndecodableParquetInput(ex))
         {
@@ -1195,7 +1347,7 @@ internal sealed class ParquetFileReader
     }
 
     private static async Task<ColumnBatch?> ReadRowGroupAsync(
-        ParquetReader reader,
+        SharedParquetReader shared,
         int group,
         StructType requested,
         ResolvedColumn[] fileFields,
@@ -1206,6 +1358,8 @@ internal sealed class ParquetFileReader
         bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
+        ParquetReader reader = shared.Reader;
+
         // Fail-closed row-group decode boundary (storage-delta-architecture.md §5.4 C-DECODE / ADR-0013). It
         // encloses EVERY step that consumes untrusted footer/stats/page bytes so none can escape a raw BCL
         // exception (PDX-T covers crafted/lying stats): OpenRowGroupReader (row-group metadata); the
@@ -1221,32 +1375,58 @@ internal sealed class ParquetFileReader
         // time is bounded by one budget regardless of RowGroupCount) via the shared BoundedDecode policy: on
         // expiry it fails closed with a DISTINCT DecodeBudgetExceeded (NOT CorruptData — a wall-clock timeout is
         // a resource fault, not proof the page is corrupt; a DeltaStorageException the catches EXCLUDE, so it
-        // propagates unwrapped), never hanging the caller. The decode runs on the dedicated, hard-capped decode
-        // scheduler; its own library faults surface as the work's outcome and are mapped by the catches below
-        // exactly as before.
+        // propagates unwrapped), never hanging the caller. The decode runs on the data-file door's dedicated,
+        // hard-capped strand thread (each on its OWN Thread, so a stranded decode never occupies scheduling
+        // capacity a healthy decode needs — I1); its own library faults surface as the work's outcome and are
+        // mapped by the catches below exactly as before. When the door is at strand capacity the decode is
+        // rejected fail-fast with a DecodeCapacityExhaustedException (NEVER started) which is mapped to the
+        // public retryable DecoderSaturated below (I8), NOT a decode-timeout. The reader is kept alive for a
+        // stranded decode via an extra lease on `shared` (I6) released when the decode settles.
         try
         {
             TimeSpan remaining = deadline.Remaining();
             if (remaining <= TimeSpan.Zero)
             {
-                telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile);
+                telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile, DecodeStage.RowGroup);
                 throw DeltaStorageException.DecodeBudgetExceeded(
                     "A Parquet row group could not be decoded within the bounded-decode time budget "
                     + "(the aggregate per-read wall-clock deadline elapsed before this row group).");
             }
 
-            return await BoundedDecode.RunAsync(
-                DecodeGroupAsync,
-                remaining,
-                _ =>
-                {
-                    telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile);
-                    return DeltaStorageException.DecodeBudgetExceeded(
-                        "A Parquet row group could not be decoded within the bounded-decode time budget "
-                        + "(possible corrupt data-page header driving a non-terminating decode).");
-                },
-                cancellationToken,
-                timeProvider: deadline.TimeProvider).ConfigureAwait(false);
+            // I6 — take an extra reader lease BEFORE the decode starts; release it when the (possibly stranded)
+            // decode settles. A never-terminating strand holds the lease forever, keeping the reader/stream
+            // alive so the strand never touches disposed state (bounded residual ≤ the door's strand cap).
+            shared.Retain();
+            try
+            {
+                return await BoundedDecode.RunAsync(
+                    DecodeDoor.DataFile,
+                    DecodeGroupAsync,
+                    remaining,
+                    _ =>
+                    {
+                        telemetry.RecordDecodeBudgetExceeded(DecodeDoor.DataFile, DecodeStage.RowGroup);
+                        return DeltaStorageException.DecodeBudgetExceeded(
+                            "A Parquet row group could not be decoded within the bounded-decode time budget "
+                            + "(possible corrupt data-page header driving a non-terminating decode).");
+                    },
+                    cancellationToken,
+                    onAbandonedResult: DisposeAbandonedBatch,
+                    onWorkSettled: shared.Release,
+                    timeProvider: deadline.TimeProvider).ConfigureAwait(false);
+            }
+            catch (DecodeCapacityExhaustedException capacity)
+            {
+                // The data-file door is at strand capacity: the decode was rejected WITHOUT starting, so its
+                // lease was never consumed by a running decode — but onWorkSettled never fires on this path
+                // (no work task), so release the extra lease we took above here to avoid pinning the reader.
+                shared.Release();
+                telemetry.RecordDecodeCapacityExhausted(DecodeDoor.DataFile);
+                throw DeltaStorageException.DecoderSaturated(
+                    "The Parquet data-file row-group decode was rejected because the bounded-decode worker is at "
+                    + "strand capacity (too many untrusted decodes are already running past their deadline). "
+                    + "Retry after backoff.", capacity);
+            }
 
             async Task<ColumnBatch?> DecodeGroupAsync(CancellationToken decodeToken)
             {

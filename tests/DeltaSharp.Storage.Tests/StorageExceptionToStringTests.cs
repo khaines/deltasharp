@@ -174,6 +174,7 @@ public sealed class StorageExceptionToStringTests
     private static readonly string[] StorageLogSiteSignatures =
     [
         "DeltaCheckpointLog.CheckpointDecodeTimeout(ILogger logger, Int64 version)",
+        "DeltaCheckpointLog.CheckpointDecoderSaturated(ILogger logger, Int64 version)",
         "DeltaCheckpointLog.CheckpointFallback(ILogger logger, Int64 version, String reason)",
         "DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected(ILogger logger, Int64 version)",
         "DeltaCommitLog.CommitCanceled(ILogger logger, Int64 version, Int32 attempts)",

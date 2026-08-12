@@ -98,6 +98,16 @@ internal enum CheckpointFallbackReason
     /// <see cref="StorageErrorKind.DecodeBudgetExceeded"/>), pairs with its own EventId, and seeds the
     /// checkpoint-layer negative cache so a known-timing-out checkpoint is not re-decoded on every load.</summary>
     DecodeTimeout,
+
+    /// <summary>The checkpoint decode was rejected because the bounded-decode worker's checkpoint door was at
+    /// capacity — too many untrusted decodes already stranded (<see cref="DecodeCapacityExhaustedException"/> →
+    /// <see cref="StorageErrorKind.DecoderSaturated"/>). Distinguished from <see cref="DecodeTimeout"/> because
+    /// the decode NEVER STARTED (a resource/saturation condition, transient), so — unlike a timeout — it is NOT
+    /// negatively cached (the checkpoint may be perfectly healthy) and does NOT increment the decode-timeout
+    /// counter. Reconstruction still degrades to JSON replay, and this reason plus the sibling
+    /// <c>deltasharp.storage.decode.capacity_exhausted{door=checkpoint}</c> counter keep the saturation
+    /// observable.</summary>
+    DecoderSaturated,
 }
 
 /// <summary>
@@ -113,6 +123,29 @@ internal enum DecodeDoor
 
     /// <summary>The classic-checkpoint Parquet reader.</summary>
     Checkpoint,
+}
+
+/// <summary>
+/// Which STAGE of a data-file read tripped its wall-clock decode budget (design §5.4 C-DECODE): the footer/
+/// schema <see cref="Open"/>, a per-row-group column-page/level <see cref="RowGroup"/> decode, or the
+/// row-count footer <see cref="Metadata"/> scan. A closed value set, safe as the
+/// <see cref="DeltaStorageTelemetry.DecodeStageKey"/> metric label so the #647 non-terminating row-group
+/// decode is distinguishable from a #699 non-terminating open (both otherwise land on
+/// <c>door=data_file</c>). The checkpoint door decodes a whole part as one unit and uses <see cref="Whole"/>.
+/// </summary>
+internal enum DecodeStage
+{
+    /// <summary>The Parquet footer parse + schema materialization (open, #699).</summary>
+    Open,
+
+    /// <summary>A row group's column-page/level decode (#647).</summary>
+    RowGroup,
+
+    /// <summary>The row-count footer metadata scan (GetRowCountAsync).</summary>
+    Metadata,
+
+    /// <summary>The whole checkpoint part decode (a single unit; the checkpoint door).</summary>
+    Whole,
 }
 
 /// <summary>
@@ -323,6 +356,15 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// value set (metric-label-safe); no untrusted byte content or path ever becomes a tag.</summary>
     internal const string DecodeDoorKey = "deltasharp.decode.door";
 
+    /// <summary>The bounded <c>deltasharp.decode.stage</c> metric label key sub-classifying a data-file
+    /// decode-budget timeout by WHICH stage of the read tripped it (<c>open</c> = the footer/schema open,
+    /// <c>row_group</c> = a column-page/level decode of a row group, <c>metadata</c> = the row-count footer
+    /// scan). A closed value set (metric-label-safe): it lets an operator (and the #647 row-group test)
+    /// distinguish a non-terminating page decode from a non-terminating open, which both land on
+    /// <c>door=data_file</c> otherwise. The checkpoint door is a single decode unit and uses
+    /// <c>whole</c>.</summary>
+    internal const string DecodeStageKey = "deltasharp.decode.stage";
+
     private static readonly string AssemblyVersion =
         typeof(DeltaStorageTelemetry).Assembly.GetName().Version?.ToString() ?? "0.0.0";
 
@@ -350,6 +392,10 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _deleteRows;
     private readonly Counter<long> _checkpointFallback;
     private readonly Counter<long> _decodeBudgetExceeded;
+    private readonly Counter<long> _decodeCapacityExhausted;
+#pragma warning disable IDE0052 // Held so the ObservableGauge callback stays subscribed for the meter's lifetime.
+    private readonly ObservableGauge<int> _decodeDetached;
+#pragma warning restore IDE0052
 
     internal DeltaStorageTelemetry()
     {
@@ -415,6 +461,22 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _decodeBudgetExceeded = _storageMeter.CreateCounter<long>(
             "deltasharp.storage.decode.budget_exceeded", unit: "{timeout}",
             description: "Untrusted Parquet decodes that did NOT terminate within their wall-clock decode budget and were failed closed (a crafted byte driving a non-terminating decode — #647/#699/#716), by door (data_file / checkpoint). The rate instrument to alert on for a decode-DoS attempt.");
+        _decodeCapacityExhausted = _storageMeter.CreateCounter<long>(
+            "deltasharp.storage.decode.capacity_exhausted", unit: "{rejection}",
+            description: "Untrusted Parquet decodes REJECTED fail-fast because the bounded-decode worker's door was at capacity (too many decodes already stranded past their deadline), by door (data_file / checkpoint). A retryable saturation signal — DISTINCT from decode.budget_exceeded (this decode never started), so it is never conflated with a non-terminating decode or negatively cached.");
+        _decodeDetached = _storageMeter.CreateObservableGauge(
+            "deltasharp.storage.decode.detached",
+            static () => new[]
+            {
+                new Measurement<int>(
+                    BoundedDecode.DataFileDetachedDecodeCount,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.DataFile))),
+                new Measurement<int>(
+                    BoundedDecode.CheckpointDetachedDecodeCount,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+            },
+            unit: "{strand}",
+            description: "Currently-detached (running-past-deadline, un-reclaimable) untrusted Parquet decode strands per door — the bounded residual of the wall-clock decode ceiling (.NET cannot abort a thread). Rises toward the per-door cap under a distinct-crafted-input flood; a sustained non-zero value is the DoS-pressure gauge.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -605,11 +667,25 @@ internal sealed class DeltaStorageTelemetry : IDisposable
 
     /// <summary>Increments the decode-budget-exceeded counter for one untrusted decode that did not terminate
     /// within its wall-clock budget and was failed closed (design §5.4 C-DECODE; #647/#699/#716), tagged with
-    /// the bounded <see cref="DecodeDoorKey"/> door dimension. The input is a bounded <see cref="DecodeDoor"/>
-    /// (never a raw string), and no untrusted byte content, path, or checkpoint version ever becomes a tag —
-    /// this is the rate instrument an operator alerts on for a decode-DoS attempt.</summary>
-    internal void RecordDecodeBudgetExceeded(DecodeDoor door) =>
-        _decodeBudgetExceeded.Add(1, new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(door)));
+    /// the bounded <see cref="DecodeDoorKey"/> door dimension and the bounded <see cref="DecodeStageKey"/>
+    /// stage dimension (so a non-terminating row-group page decode is distinguishable from a non-terminating
+    /// open, #647). The inputs are bounded enums (never a raw string), and no untrusted byte content, path, or
+    /// checkpoint version ever becomes a tag — this is the rate instrument an operator alerts on for a
+    /// decode-DoS attempt.</summary>
+    internal void RecordDecodeBudgetExceeded(DecodeDoor door, DecodeStage stage) =>
+        _decodeBudgetExceeded.Add(
+            1,
+            new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(door)),
+            new KeyValuePair<string, object?>(DecodeStageKey, ToLabel(stage)));
+
+    /// <summary>Increments the decode-capacity-exhausted counter for one untrusted decode that was REJECTED
+    /// fail-fast because the bounded-decode worker's door was already at its strand cap (design §5.4 C-DECODE),
+    /// tagged with the bounded <see cref="DecodeDoorKey"/> door dimension. DISTINCT from
+    /// <see cref="RecordDecodeBudgetExceeded"/>: the decode never started, so this must not increment the
+    /// decode-timeout counter (metric-conflation fix). The input is a bounded <see cref="DecodeDoor"/>; no
+    /// untrusted content ever becomes a tag.</summary>
+    internal void RecordDecodeCapacityExhausted(DecodeDoor door) =>
+        _decodeCapacityExhausted.Add(1, new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(door)));
 
     /// <summary>The bounded <c>deltasharp.outcome</c> string for an <see cref="OptimizeOutcome"/>.</summary>
     internal static string ToLabel(OptimizeOutcome outcome) => outcome switch
@@ -695,6 +771,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CheckpointFallbackReason.Malformed => "malformed",
         CheckpointFallbackReason.ForgedMultiMetadata => "forged_multi_metadata",
         CheckpointFallbackReason.DecodeTimeout => "decode_timeout",
+        CheckpointFallbackReason.DecoderSaturated => "decoder_saturated",
         _ => "malformed",
     };
 
@@ -706,6 +783,18 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         DecodeDoor.DataFile => "data_file",
         DecodeDoor.Checkpoint => "checkpoint",
         _ => "data_file",
+    };
+
+    /// <summary>The bounded <c>deltasharp.decode.stage</c> string for a <see cref="DecodeStage"/> (design §7.3
+    /// closed value set). An unrecognized value maps to <c>row_group</c> — the fail-safe generic stage — so no
+    /// free-text value can reach the metric tag.</summary>
+    internal static string ToLabel(DecodeStage stage) => stage switch
+    {
+        DecodeStage.Open => "open",
+        DecodeStage.RowGroup => "row_group",
+        DecodeStage.Metadata => "metadata",
+        DecodeStage.Whole => "whole",
+        _ => "row_group",
     };
 
     public void Dispose()

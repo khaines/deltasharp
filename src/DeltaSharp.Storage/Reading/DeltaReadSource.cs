@@ -396,6 +396,18 @@ public sealed class DeltaReadSource : IDisposable
                 // corruption message.
                 throw new DeltaReadSchemaEvolutionException(add.Path, ex);
             }
+            catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecoderSaturated)
+            {
+                // I8 — the data-file decode door is at strand capacity (too many untrusted decodes already
+                // running past their deadline): the decode was rejected fail-fast WITHOUT starting. This is a
+                // TRANSIENT, RETRYABLE saturation, NOT proven corruption and NOT a decode-timeout — surface it
+                // as a public DeltaReadException the engine can back off and retry on, rather than letting a
+                // raw internal DeltaStorageException escape the facade untyped. Message hygiene (#653): name
+                // only the bounded storage-error KIND, never add.Path; the cause stays on the inner exception.
+                throw new DeltaReadException(
+                    $"An active data file could not be decoded because the bounded-decode worker is saturated "
+                    + $"(storage fault: {ex.Kind}); retry after backoff.", ex);
+            }
         }
 
         if (deletionVector is not null)

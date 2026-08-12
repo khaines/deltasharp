@@ -62,6 +62,14 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         return new LocalFileSystemBackend(root);
     }
 
+    // A SECOND, independent backend instance rooted at the SAME table root — modelling production, which
+    // constructs a fresh LocalFileSystemBackend per scan/resolve (DeltaScanSource/DeltaFileRelationResolver/
+    // DeltaReadSource). The checkpoint decode negative cache must key on the STABLE table identity so this
+    // fresh instance still hits the cache the first instance seeded (I4/#647-Round2); an instance-keyed cache
+    // (the Round-1 bug) would miss here and re-decode the known-bad checkpoint on every load.
+    private static LocalFileSystemBackend FreshBackendAtSameRoot(LocalFileSystemBackend original) =>
+        new(original.TableRootId);
+
     /// <summary>A 2-version JSON history (v0: protocol+metadata+add(a); v1: add(b)) so a discarded checkpoint
     /// at v1 falls back to a fully replayable log.</summary>
     private static async Task WriteHistoryAsync(IStorageBackend backend)
@@ -246,9 +254,9 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     }
 
     [Fact]
-    public async Task DecodeTimeoutCheckpoint_EmitsDecodeTimeoutSignal_AndNegativeCacheSkipsReDecode()
+    public async Task DecodeTimeoutCheckpoint_EmitsDecodeTimeoutSignal_AndNegativeCacheSkipsReDecode_ThroughAFreshBackendPerLoad()
     {
-        IStorageBackend backend = NewBackend();
+        LocalFileSystemBackend backend = NewBackend();
         await WriteHistoryAsync(backend);
 
         // A hanging checkpoint: a single bit flip in the LAST footer byte (the terminal Thrift STOP of
@@ -295,18 +303,21 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             Assert.True(stopwatch.Elapsed >= budget, $"expected the first load to run the budget, took {stopwatch.Elapsed}.");
         }
 
-        // SECOND load (same table / same part path): the negative cache short-circuits the read, so the
-        // known-bad checkpoint is NOT re-decoded — proven by the load returning WELL under the decode budget
-        // (no decode ran) while still re-emitting the decode_timeout signal so a persistently bad checkpoint
-        // stays observable. If the negative cache were reverted, this second load would again run the full
-        // budget (elapsed >= budget) and this assertion would go red.
+        // SECOND load through a FRESH backend instance rooted at the SAME table (production builds a new
+        // LocalFileSystemBackend per scan/resolve): the negative cache — now keyed on STABLE table identity,
+        // not the backend instance — short-circuits the read, so the known-bad checkpoint is NOT re-decoded.
+        // Proven by the load returning WELL under the decode budget (no decode ran) while still re-emitting the
+        // decode_timeout signal so a persistently bad checkpoint stays observable. Under the Round-1
+        // instance-keyed cache this fresh backend would MISS and re-run the full budget — so this assertion is
+        // red if the re-keying is reverted.
+        LocalFileSystemBackend freshBackend = FreshBackendAtSameRoot(backend);
         var logger2 = new RecordingLogger<DeltaLog>();
         using (var telemetry2 = new DeltaStorageTelemetry())
         using (var deltaMeter2 = new MeterCapture(telemetry2.DeltaMeter))
         {
             var stopwatch2 = System.Diagnostics.Stopwatch.StartNew();
             Snapshot snapshot2 = await new DeltaLog(
-                backend, DeltaLog.MaxLogObjectBytes, logger2, telemetry2, checkpointDecodeBudget: budget)
+                freshBackend, DeltaLog.MaxLogObjectBytes, logger2, telemetry2, checkpointDecodeBudget: budget)
                 .LoadSnapshotAsync();
             stopwatch2.Stop();
 
@@ -315,7 +326,7 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             MeterCapture.Measurement fallback2 = Assert.Single(deltaMeter2.ForInstrument(FallbackInstrument));
             Assert.Equal("decode_timeout", fallback2.Tags[ReasonKey]);
             Assert.True(stopwatch2.Elapsed < budget,
-                $"expected the negative cache to skip the re-decode (fast), took {stopwatch2.Elapsed}.");
+                $"expected the negative cache to skip the re-decode through a FRESH backend (fast), took {stopwatch2.Elapsed}.");
         }
     }
 

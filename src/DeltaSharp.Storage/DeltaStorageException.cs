@@ -26,6 +26,15 @@ internal enum StorageErrorKind
     /// is fixed/sanitized (no untrusted byte content).</summary>
     DecodeBudgetExceeded,
 
+    /// <summary>The bounded-decode worker for a door is at capacity — too many untrusted decodes are already
+    /// running past their deadline (stranded on their own dedicated threads) for a new one to be admitted
+    /// safely (design §5.4 C-DECODE; the per-door <c>maxDetachedDecodes</c> admission cap). Deliberately
+    /// DISTINCT from <see cref="DecodeBudgetExceeded"/>: a timeout means <b>this</b> input's decode did not
+    /// terminate; saturation means <b>other</b> non-terminating decodes fill the door and this call was
+    /// rejected WITHOUT starting. It is a transient/resource condition — a caller may <b>retry</b> once
+    /// capacity frees — never proof the bytes are corrupt, and it is never negatively cached.</summary>
+    DecoderSaturated,
+
     /// <summary>A structurally valid file whose column physical type or nullability does not match the
     /// requested engine type (design §2.9.1). Distinct from <see cref="CorruptData"/> so a schema/type
     /// disagreement is not conflated with byte-level corruption; the message names the mismatch.</summary>
@@ -143,6 +152,14 @@ internal sealed class DeltaStorageException : Exception
     /// corruption. The <paramref name="message"/> MUST be fixed/sanitized — no untrusted byte content.</summary>
     public static DeltaStorageException DecodeBudgetExceeded(string message) =>
         new(StorageErrorKind.DecodeBudgetExceeded, message);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.DecoderSaturated"/> error: the bounded-decode worker for
+    /// this door is at capacity (too many untrusted decodes are already stranded past their deadline), so the
+    /// decode was rejected WITHOUT starting (<see cref="BoundedDecode"/>). A retryable resource condition,
+    /// distinct from <see cref="DecodeBudgetExceeded"/> and never conflated with corruption. The
+    /// <paramref name="message"/> MUST be fixed/sanitized — no untrusted byte content.</summary>
+    public static DeltaStorageException DecoderSaturated(string message, Exception? innerException = null) =>
+        new(StorageErrorKind.DecoderSaturated, message, innerException);
 
     /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.
     /// <para><b>Message hygiene obligation (#747):</b> same contract as

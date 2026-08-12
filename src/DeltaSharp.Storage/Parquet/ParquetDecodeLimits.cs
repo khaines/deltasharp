@@ -52,11 +52,17 @@ internal sealed record ParquetDecodeLimits
     /// a higher declared ratio is rejected as a decompression bomb.</summary>
     public long MaxDecompressionRatio { get; }
 
-    /// <summary>The wall-clock deadline for a single bounded decode — the open (<c>ParquetReader.CreateAsync</c>
-    /// + footer materialization) and each row-group decode are each bounded by it, since Parquet.Net 6.0.3 can
-    /// be driven into non-terminating, cancellation-ignoring work by one corrupted byte (#647/#699). On expiry
-    /// the reader fails closed with <see cref="StorageErrorKind.CorruptData"/> rather than hanging. Defaults to
-    /// <see cref="BoundedDecode.DefaultBudget"/>; lower it on a latency-sensitive tier or in tests.</summary>
+    /// <summary>The wall-clock deadline for the data-file decode. It is an AGGREGATE per-read deadline: the
+    /// open (<c>ParquetReader.CreateAsync</c> + footer materialization) AND every row-group decode of a single
+    /// <c>ReadAsync</c>/<c>GetRowCountAsync</c> call share this ONE budget measured from the start of the call,
+    /// so the worst-case total decode time is bounded by the single budget regardless of the
+    /// (attacker-controlled) row-group count — not multiplied per step. Parquet.Net 6.0.3 can be driven into
+    /// non-terminating, cancellation-ignoring work by one corrupted byte (#647/#699), so on expiry the reader
+    /// fails closed with <see cref="StorageErrorKind.DecodeBudgetExceeded"/> (a resource fault distinct from
+    /// <see cref="StorageErrorKind.CorruptData"/> — a wall-clock stall is not proof the bytes are corrupt)
+    /// rather than hanging. Defaults to <see cref="BoundedDecode.DefaultBudget"/>. NOTE: today this is set only
+    /// from tests — the production config seam that would let an operator lower it per latency-sensitive tier is
+    /// tracked in #803; do not rely on a per-tier override until that lands.</summary>
     public TimeSpan DecodeTimeBudget { get; }
 
     /// <summary>The safe defaults used when no limits are supplied.</summary>

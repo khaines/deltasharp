@@ -85,4 +85,27 @@ internal static partial class DeltaCheckpointLog
             + "falls back to an older checkpoint or full JSON replay, and the timed-out checkpoint is negatively "
             + "cached so it is not re-decoded.")]
     internal static partial void CheckpointDecodeTimeout(ILogger logger, long version);
+
+    /// <summary>
+    /// A distinct signal (EventId 4403) for a classic checkpoint whose decode was rejected fail-fast because the
+    /// checkpoint bounded-decode door's strand cap was already full (too many non-terminating decodes already
+    /// detached, <c>BoundedDecode</c>, #647/#699/#716) — the decode NEVER RAN. This is a transient CAPACITY
+    /// fault, categorically distinct from the decode-TIMEOUT at 4402 (where the decode ran past budget): kept
+    /// separate so an operator can alert on decoder saturation (sustained crafted-input pressure exhausting the
+    /// strand budget) independently of both routine bit-rot (4400) and a single non-terminating decode (4402).
+    /// The distinction is carried by this EventId and the sibling <c>reason=decoder_saturated</c> metric label
+    /// plus the <c>deltasharp.storage.decode.capacity_exhausted{door=checkpoint}</c> counter; it deliberately
+    /// does NOT increment <c>decode.budget_exceeded</c>. The checkpoint may be perfectly healthy, so its
+    /// identity is NOT negatively cached — the read simply falls back to JSON replay this time and the decode is
+    /// re-attempted once capacity frees. Renders only the discarded <b>version</b> (an integer, safe) and takes
+    /// no <see cref="System.Exception"/> object (§7.2.2 redaction-by-omission).
+    /// <para>Logged at <c>Warning</c>: the read still succeeds via fallback, but sustained saturation is an
+    /// actionable operator signal — alert on the counter.</para>
+    /// </summary>
+    [LoggerMessage(EventId = 4403, EventName = "DeltaCheckpointDecoderSaturated", Level = LogLevel.Warning,
+        Message = "Delta checkpoint at version {Version} was not decoded because the bounded-decode checkpoint "
+            + "door was at strand capacity (sustained non-terminating-decode pressure); reconstruction falls "
+            + "back to an older checkpoint or full JSON replay this load, and the checkpoint is re-attempted "
+            + "when capacity frees (it is not negatively cached).")]
+    internal static partial void CheckpointDecoderSaturated(ILogger logger, long version);
 }

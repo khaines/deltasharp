@@ -62,6 +62,7 @@ public sealed class DeltaStorageTelemetryMappingTests
             [CheckpointFallbackReason.Malformed] = "malformed",
             [CheckpointFallbackReason.ForgedMultiMetadata] = "forged_multi_metadata",
             [CheckpointFallbackReason.DecodeTimeout] = "decode_timeout",
+            [CheckpointFallbackReason.DecoderSaturated] = "decoder_saturated",
         };
 
         foreach (CheckpointFallbackReason reason in Enum.GetValues<CheckpointFallbackReason>())

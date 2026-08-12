@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
 using Parquet;
 using Parquet.Data;
@@ -65,6 +66,32 @@ internal static class DeltaCheckpointReader
     /// an OOM on the driver; a legitimately large checkpoint spreads across multiple row groups.</summary>
     internal const long MaxCheckpointRowGroupDecodedBytes = 1L * 1024 * 1024 * 1024;
 
+    /// <summary>The default AGGREGATE wall-clock decode budget for a whole checkpoint (all parts combined),
+    /// used when the caller (<see cref="DeltaLog"/>) does not thread a smaller per-part remainder or an
+    /// operator/test override (design §5.4 C-DECODE, #647/#699/#716). It is derived from the <b>enforced
+    /// DECODED-bytes ceiling</b> — <see cref="MaxCheckpointRowGroupDecodedBytes"/> (1&#160;GiB) — divided by a
+    /// conservative documented FLOOR decode throughput, so its UNITS MATCH the ceiling the decode actually
+    /// enforces (the Round-1 budget derived its floor from COMPRESSED bytes while the ceiling is decoded bytes,
+    /// a units mismatch; #802 tracks benchmark-backed calibration). Stated floor decode throughput =
+    /// 32&#160;MiB/s of DECODED output (real Parquet decode is &gt;&gt; that; DeltaSharp measures in the
+    /// hundreds), so 1&#160;GiB ⇒ 32&#160;s. Floored at <see cref="BoundedDecode.DefaultBudget"/> and capped at
+    /// <see cref="BoundedDecode.MaxBudget"/>. A per-part decode never gets LONGER than this because
+    /// <see cref="DeltaLog"/> threads the shrinking aggregate remainder as each part's budget (I7), so the total
+    /// snapshot-load decode is O(budget), not O(N_parts) × budget.</summary>
+    internal static TimeSpan DefaultAggregateBudget { get; } = DeriveDefaultAggregateBudget();
+
+    private static TimeSpan DeriveDefaultAggregateBudget()
+    {
+        const double FloorDecodedBytesPerSecond = 32.0 * 1024 * 1024;
+        TimeSpan derived = TimeSpan.FromSeconds(MaxCheckpointRowGroupDecodedBytes / FloorDecodedBytesPerSecond);
+        if (derived < BoundedDecode.DefaultBudget)
+        {
+            derived = BoundedDecode.DefaultBudget;
+        }
+
+        return derived > BoundedDecode.MaxBudget ? BoundedDecode.MaxBudget : derived;
+    }
+
     /// <summary>
     /// Reads one classic checkpoint Parquet part from <paramref name="stream"/> into its surviving actions,
     /// in row order. The stream is buffered (bounded by <see cref="MaxCheckpointPartBytes"/>) so Parquet's
@@ -95,13 +122,14 @@ internal static class DeltaCheckpointReader
             ArgumentOutOfRangeException.ThrowIfGreaterThan(configured, BoundedDecode.MaxBudget, nameof(decodeBudget));
         }
 
-        // Buffer to an IMMUTABLE byte[] (not a MemoryStream the caller then disposes). Isolation contract: the
-        // bounded decode below opens its OWN MemoryStream over these bytes INSIDE the work delegate, so a
-        // stranded (detached-past-deadline) decode never touches a caller-owned/pooled stream — it can never
-        // observe a disposed buffer nor a rewound position, eliminating the wrong-result race on timeout. The
-        // bytes are read-only and shared; only a stranded decode's own MemoryStream pins them (≤ maxPartBytes,
-        // the accepted residual).
-        byte[] bytes = await BufferAsync(stream, maxPartBytes, cancellationToken).ConfigureAwait(false);
+        // Buffer to a bounded byte[] region (not a MemoryStream the caller then disposes). Isolation contract:
+        // the bounded decode below opens its OWN read-only MemoryStream over these bytes INSIDE the work
+        // delegate, so a stranded (detached-past-deadline) decode never touches a caller-owned/pooled stream —
+        // it can never observe a disposed buffer nor a rewound position, eliminating the wrong-result race on
+        // timeout. The bytes are read-only and shared; only a stranded decode's own MemoryStream pins them
+        // (≤ maxPartBytes, the accepted residual). BufferAsync returns the backing array plus the valid length
+        // (avoiding the ToArray doubling copy); the length-limited MemoryStream never exposes the slack tail.
+        (byte[] bytes, int length) = await BufferAsync(stream, maxPartBytes, cancellationToken).ConfigureAwait(false);
 
         // Bounded-time decode (#716/#699/#647). A single corrupted byte (the terminal footer STOP flipped,
         // #699; the byte at index 5595 in the #716 minimized repro; a corrupt data-page header, #647) can
@@ -110,48 +138,35 @@ internal static class DeltaCheckpointReader
         // not an exception, so the fail-closed catch inside DecodeBufferedAsync cannot intercept it. Race the
         // WHOLE open+decode against a wall-clock deadline via the shared BoundedDecode policy so a corrupt
         // checkpoint fails closed deterministically (→ the non-authoritative checkpoint is discarded and
-        // DeltaLog falls back to JSON replay) rather than stalling the table read indefinitely. On expiry a
+        // DeltaLog falls back to JSON replay) rather than stalling the table read indefinitely. The decode runs
+        // on the CHECKPOINT door (its own strand cap, isolated from data-file strands; I5). On expiry a
         // DecodeBudgetExceeded DeltaStorageException (NOT Malformed: a wall-clock stall is a resource fault,
         // not proven corruption — #649/#655/#681 classification contract) routes DeltaLog to JSON replay under
-        // the DecodeTimeout reason; a valid-but-unsupported UnsupportedFeature and cooperative cancellation
-        // both finish inside the budget and propagate unwrapped as the work's own outcome.
+        // the DecodeTimeout reason; when the door is at strand capacity the decode is rejected with a
+        // DecodeCapacityExhaustedException (never started) which DeltaLog classifies DecoderSaturated (I8);
+        // a valid-but-unsupported UnsupportedFeature and cooperative cancellation both finish inside the budget
+        // and propagate unwrapped as the work's own outcome.
         return await BoundedDecode.RunAsync(
-            decodeToken => DecodeBufferedAsync(bytes, maxDecodedBytes, decodeToken),
-            decodeBudget ?? SizeAwareBudget(bytes.Length),
+            DecodeDoor.Checkpoint,
+            decodeToken => DecodeBufferedAsync(bytes, length, maxDecodedBytes, decodeToken),
+            decodeBudget ?? DefaultAggregateBudget,
             static _ => DeltaStorageException.DecodeBudgetExceeded(
                 "The Delta checkpoint Parquet could not be decoded within the bounded-decode time budget."),
             cancellationToken,
             onAbandonedResult: null,
+            onWorkSettled: null,
             timeProvider).ConfigureAwait(false);
-    }
-
-    /// <summary>Derives the checkpoint decode budget from the buffered (compressed) part size so a HEALTHY
-    /// large part the byte ceilings admit (up to <see cref="MaxCheckpointPartBytes"/> = 512&#160;MiB) is never
-    /// discarded merely for taking longer than a flat default, while a crafted part that stalls indefinitely
-    /// still trips. Stated FLOOR decode throughput = 8&#160;MiB/s: a legitimate part decodes at least this fast
-    /// (real Parquet decode is &gt;&gt; 100&#160;MiB/s), so 512&#160;MiB ⇒ 64&#160;s ≥ the worst case the byte
-    /// ceilings permit. The budget is floored at <see cref="BoundedDecode.DefaultBudget"/> (small parts still
-    /// get the full default) and capped at <see cref="BoundedDecode.MaxBudget"/>.</summary>
-    private static TimeSpan SizeAwareBudget(long compressedBytes)
-    {
-        const double FloorBytesPerSecond = 8.0 * 1024 * 1024;
-        TimeSpan derived = TimeSpan.FromSeconds(compressedBytes / FloorBytesPerSecond);
-        if (derived < BoundedDecode.DefaultBudget)
-        {
-            derived = BoundedDecode.DefaultBudget;
-        }
-
-        return derived > BoundedDecode.MaxBudget ? BoundedDecode.MaxBudget : derived;
     }
 
     // The open + full row-group decode of one buffered checkpoint part (bounded in time by the caller's
     // BoundedDecode.RunAsync). Kept as its own method so the bounded-decode policy wraps a single unit of work
-    // whose CancellationToken is the linked (deadline + caller) token. Opens an ISOLATED MemoryStream over the
-    // caller-supplied immutable bytes so a stranded decode never shares a caller-owned stream (see ReadAsync).
+    // whose CancellationToken is the linked (deadline + caller) token. Opens an ISOLATED read-only MemoryStream
+    // over the caller-supplied bytes (length-limited) so a stranded decode never shares a caller-owned stream
+    // (see ReadAsync).
     private static async Task<IReadOnlyList<DeltaAction>> DecodeBufferedAsync(
-        byte[] bytes, long maxDecodedBytes, CancellationToken cancellationToken)
+        byte[] bytes, int length, long maxDecodedBytes, CancellationToken cancellationToken)
     {
-        var buffer = new MemoryStream(bytes, writable: false);
+        var buffer = new MemoryStream(bytes, 0, length, writable: false);
         await using (buffer.ConfigureAwait(false))
         {
             ParquetReader reader = await OpenAsync(buffer, cancellationToken).ConfigureAwait(false);
@@ -186,12 +201,28 @@ internal static class DeltaCheckpointReader
         }
     }
 
-    // Buffers the whole part into an IMMUTABLE byte[] (bounded by maxPartBytes). Returning a byte[] rather than
-    // a MemoryStream is deliberate: the bounded decode opens its OWN read-only MemoryStream over these bytes so
-    // a stranded decode never shares a caller-disposed/pooled stream (isolation contract; see ReadAsync).
-    private static async Task<byte[]> BufferAsync(Stream stream, long maxPartBytes, CancellationToken cancellationToken)
+    // Buffers the whole part into a byte[] region (bounded by maxPartBytes) and returns the backing array plus
+    // the valid prefix length. Returning (array, length) rather than a trimmed copy avoids the ToArray doubling
+    // copy (a 512-MiB part would otherwise transiently hold two full buffers). The bounded decode opens its OWN
+    // length-limited read-only MemoryStream over the returned array so a stranded decode never shares a
+    // caller-disposed/pooled stream (isolation contract; see ReadAsync) and never sees the slack tail past
+    // length. The pre-sized initial capacity keeps growth doublings bounded for large healthy parts.
+    private static async Task<(byte[] Buffer, int Length)> BufferAsync(
+        Stream stream, long maxPartBytes, CancellationToken cancellationToken)
     {
-        using var buffer = new MemoryStream();
+        // Pre-size to the declared length when the backend stream exposes one (capped at the ceiling so a
+        // crafted Length can't force an oversized allocation); otherwise start small and let it grow.
+        int initialCapacity = 81920;
+        if (stream.CanSeek)
+        {
+            long length = stream.Length;
+            if (length > 0 && length <= maxPartBytes)
+            {
+                initialCapacity = (int)Math.Min(length, int.MaxValue);
+            }
+        }
+
+        using var buffer = new MemoryStream(initialCapacity);
         byte[] chunk = new byte[81920];
         int read;
         while ((read = await stream.ReadAsync(chunk, cancellationToken).ConfigureAwait(false)) > 0)
@@ -206,7 +237,16 @@ internal static class DeltaCheckpointReader
             buffer.Write(chunk, 0, read);
         }
 
-        return buffer.ToArray();
+        // A MemoryStream constructed with a capacity exposes its backing buffer via TryGetBuffer, so we hand
+        // back the array + the valid length with NO extra copy. (Falls back to ToArray only if a future change
+        // makes the buffer non-visible — defensive, not expected on this path.)
+        if (buffer.TryGetBuffer(out ArraySegment<byte> segment) && segment.Offset == 0)
+        {
+            return (segment.Array!, segment.Count);
+        }
+
+        byte[] copy = buffer.ToArray();
+        return (copy, copy.Length);
     }
 
     /// <summary>Opens the checkpoint Parquet, classifying a Parquet Modular Encryption checkpoint as
