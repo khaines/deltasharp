@@ -70,7 +70,10 @@ internal sealed class ParquetFileWriter
         var fields = new DataField[columnCount];
         for (int c = 0; c < columnCount; c++)
         {
-            fields[c] = ParquetTypeMapping.CreateField(schema[c]);
+            // honorReferenceNullability: the WRITTEN footer's physical repetition must match the
+            // declared schemaString, so a "nullable":false string/binary column is emitted REQUIRED
+            // rather than Parquet.Net's reference-type always-nullable default (#730).
+            fields[c] = ParquetTypeMapping.CreateField(schema[c], honorReferenceNullability: true);
         }
 
         // Apply any selection once and record each batch's logical row count, so row groups can be sized

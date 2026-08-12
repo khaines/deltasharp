@@ -38,15 +38,31 @@ internal static class ParquetTypeMapping
     /// Builds the Parquet <see cref="DataField"/> for <paramref name="field"/>, choosing the nullable
     /// Parquet field when <see cref="StructField.Nullable"/> is set.
     /// </summary>
+    /// <param name="field">The engine field to map.</param>
+    /// <param name="honorReferenceNullability">
+    /// When <see langword="true"/>, string/binary (reference-typed) columns follow the declared
+    /// <see cref="StructField.Nullable"/> flag rather than Parquet.Net's reference-type default of
+    /// always-nullable (#730). The WRITE path sets this so the footer's physical repetition matches
+    /// the declared <c>schemaString</c>; the READ path leaves it <see langword="false"/> because its
+    /// physical-vs-requested nullability guard is written around the always-nullable default (a
+    /// required string request legitimately maps to a nullable physical column and must not trip it).
+    /// </param>
     /// <exception cref="DeltaStorageException">
     /// The field's type has no supported Parquet mapping
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>): a nested type, the void type, or a decimal
     /// with precision &gt; 28.
     /// </exception>
-    public static DataField CreateField(StructField field)
+    public static DataField CreateField(StructField field, bool honorReferenceNullability = false)
     {
         ArgumentNullException.ThrowIfNull(field);
         bool nullable = field.Nullable;
+
+        // #730: for reference-typed columns, DataField<T>(name) defaults IsNullable=true regardless
+        // of the declared schema. On the WRITE path we pass the declared flag so a "nullable":false
+        // string/binary column is emitted as a REQUIRED Parquet column (its footer repetition then
+        // matches the log). Passing null keeps Parquet.Net's always-nullable default, which the READ
+        // path's nullability guard is deliberately written around.
+        bool? referenceNullable = honorReferenceNullability ? nullable : null;
         DataField dataField = field.DataType switch
         {
             BooleanType => Value<bool>(field.Name, nullable),
@@ -56,8 +72,13 @@ internal static class ParquetTypeMapping
             LongType => Value<long>(field.Name, nullable),
             FloatType => Value<float>(field.Name, nullable),
             DoubleType => Value<double>(field.Name, nullable),
-            StringType => new DataField<string>(field.Name),
-            BinaryType => new DataField<byte[]>(field.Name),
+            // #730: string/binary are reference-typed in Parquet.Net, whose DataField<T>(name)
+            // ctor defaults IsNullable=true regardless of the declared schema. On the write path
+            // `referenceNullable` carries the declared flag so a "nullable":false column is emitted
+            // REQUIRED (its footer repetition then matches the log); on the read path it is null,
+            // preserving the always-nullable default the read guard is written around.
+            StringType => new DataField<string>(field.Name, referenceNullable),
+            BinaryType => new DataField<byte[]>(field.Name, referenceNullable),
             DateType => new DateTimeDataField(field.Name, DateTimeFormat.Date, isNullable: nullable),
             // Both timestamp lanes use DateTimeFormat.Timestamp + Micros, which emits the modern
             // LogicalType.TIMESTAMP{isAdjustedToUTC, unit=MICROS} (Parquet.Net's Timestamp format writes ONLY

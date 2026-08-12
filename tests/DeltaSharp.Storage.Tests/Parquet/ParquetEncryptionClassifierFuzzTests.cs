@@ -66,10 +66,19 @@ public sealed class ParquetEncryptionClassifierFuzzTests
         // Structural mutation class 2: overwrite the 4-byte little-endian footer_length with boundary/hostile
         // values (negative, zero, off-by-one, whole-file, int overflow). The bound check must reject each
         // without reading out of range, throwing, or classifying a non-encrypted file as encrypted.
+        //
+        // #717 survivor (3): the upper bound `footerLength > length - 8`. The OPEN WINDOW (length-8, length]
+        // gives it bite — a weaker bound (e.g. `> length`) that admits any of these values then seeks to
+        // `length - 8 - footerLength`, which is NEGATIVE, and throws ArgumentOutOfRangeException (NOT in the
+        // probe's IO-fault catch filter) instead of failing closed. The correct bound rejects the whole window
+        // and returns null with no throw, so asserting null-and-no-throw across (length-8, length) kills every
+        // fail-open relaxation of the bound.
         byte[] file = await ValidPlaintextFileAsync();
         int[] hostileLengths =
         {
-            int.MinValue, -1, 0, 1, 7, 8, file.Length - 8, file.Length, file.Length + 1, int.MaxValue,
+            int.MinValue, -1, 0, 1, 7, 8, file.Length - 8,
+            file.Length - 7, file.Length - 5, file.Length - 3, file.Length - 2, file.Length - 1,
+            file.Length, file.Length + 1, int.MaxValue,
         };
 
         foreach (int hostile in hostileLengths)
@@ -157,6 +166,166 @@ public sealed class ParquetEncryptionClassifierFuzzTests
 
         Assert.Null(verdict);
         Assert.False(stream.SeekSurfaceTouched, "the !CanSeek guard must short-circuit before touching Length/Position/Seek");
+    }
+
+    [Fact]
+    public void ClassifyUnreadableInput_ModelFooter_EmptyEncryptionUnion_FailsClosed()
+    {
+        // #717 survivor (1): the NON-EMPTY-union requirement `footer[pos] != 0` at the field-8 arm.
+        // A model FileMetaData footer that is otherwise a perfectly plausible encrypted file — all four
+        // required fields present WITH their correct Thrift types — but whose field-8 (encryption_algorithm)
+        // struct body is an IMMEDIATE STOP (an EMPTY union, which no valid EncryptionAlgorithm ever is) must
+        // stay fail-closed (null). Deleting `footer[pos] != 0` flips this to an encryption false-positive, so
+        // this is a RED-on-revert pin on that survivor. (The whole-file structural fuzz above never constructs
+        // a footer this close to valid, which is why the survivor lived.)
+        byte[] footer = BuildFileMetaDataFooter(
+            version: ThriftFieldType.I32,
+            schema: ThriftFieldType.List,
+            numRows: ThriftFieldType.I64,
+            rowGroups: ThriftFieldType.List,
+            encryptionUnion: EncryptionUnionShape.EmptyStop);
+        AssertModelFooterClassifiedNull(footer, "an empty field-8 union must not read as encrypted");
+    }
+
+    [Fact]
+    public void ClassifyUnreadableInput_ModelFooter_WrongTypedRequiredField_FailsClosed()
+    {
+        // #717 survivor (2): the TYPE-MATCH gate `if (typeMatches)` on the required fields. A model footer that
+        // carries all four required field IDS *and* a non-empty field-8 union — but declares field 1 (version)
+        // as an i64 instead of the spec's i32 — is NOT a FileMetaData and must stay fail-closed (null). Deleting
+        // the `if (typeMatches)` gate (counting required fields by id alone) flips this to an encryption
+        // false-positive, so this pins that survivor RED-on-revert.
+        byte[] footer = BuildFileMetaDataFooter(
+            version: ThriftFieldType.I64, // WRONG: spec requires i32.
+            schema: ThriftFieldType.List,
+            numRows: ThriftFieldType.I64,
+            rowGroups: ThriftFieldType.List,
+            encryptionUnion: EncryptionUnionShape.NonEmpty);
+        AssertModelFooterClassifiedNull(footer, "a wrong-typed required field must not read as encrypted");
+    }
+
+    [Fact]
+    public void ClassifyUnreadableInput_ModelFooter_PlausibleEncrypted_IsPositiveControl()
+    {
+        // Not-vacuous control for the two model-footer pins above: the SAME builder, given all four required
+        // fields with correct Thrift types AND a non-empty field-8 union, IS classified as the encryption
+        // sentinel. Without this, the null assertions above could pass because the model machinery can never
+        // produce a positive at all.
+        byte[] footer = BuildFileMetaDataFooter(
+            version: ThriftFieldType.I32,
+            schema: ThriftFieldType.List,
+            numRows: ThriftFieldType.I64,
+            rowGroups: ThriftFieldType.List,
+            encryptionUnion: EncryptionUnionShape.NonEmpty);
+        using var stream = new MemoryStream(FileFromFooter(footer), writable: false);
+
+        string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
+
+        Assert.NotNull(verdict);
+        Assert.Contains("ncrypt", verdict, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static void AssertModelFooterClassifiedNull(byte[] footer, string because)
+    {
+        using var stream = new MemoryStream(FileFromFooter(footer), writable: false);
+        string? verdict = ParquetEncryption.ClassifyUnreadableInput(stream);
+        Assert.True(verdict is null, $"{because}: {verdict}");
+    }
+
+    // ---- Model-derived Thrift-compact FileMetaData footer builder (for the field-shape survivors) ----
+    // These bytes are the FOOTER STRUCT only; FileFromFooter appends the [footer_length int32 LE][PAR1] trailer
+    // the probe reads from the tail. The builder derives each footer from a small parameter space (required
+    // field types x union shape) instead of hand-listing corpora, so a shape that would classify as encrypted
+    // is one parameter flip away from one that must not.
+
+    private enum ThriftFieldType
+    {
+        I32,
+        I64,
+        List,
+    }
+
+    private enum EncryptionUnionShape
+    {
+        // Field-8 struct body = immediate STOP => EMPTY union (no valid EncryptionAlgorithm is empty).
+        EmptyStop,
+
+        // Field-8 struct body = one member (field 1, an AES_GCM_V1 struct terminated by STOP) => non-empty.
+        NonEmpty,
+    }
+
+    private const int ThriftStop = 0x00;
+    private const int ThriftI32Code = 5;
+    private const int ThriftI64Code = 6;
+    private const int ThriftListCode = 9;
+    private const int ThriftStructCode = 12;
+
+    private static int TypeCode(ThriftFieldType t) => t switch
+    {
+        ThriftFieldType.I32 => ThriftI32Code,
+        ThriftFieldType.I64 => ThriftI64Code,
+        ThriftFieldType.List => ThriftListCode,
+        _ => throw new ArgumentOutOfRangeException(nameof(t)),
+    };
+
+    private static void EmitScalarOrList(List<byte> footer, int fieldDelta, ThriftFieldType t)
+    {
+        // Compact short-form field header: (delta << 4) | type.
+        footer.Add((byte)((fieldDelta << 4) | TypeCode(t)));
+        if (t == ThriftFieldType.List)
+        {
+            // Empty list header: (size=0 << 4) | element-type (struct). Zero elements => no element bytes.
+            footer.Add((byte)ThriftStructCode);
+        }
+        else
+        {
+            // i32/i64 value is a single-byte varint (0). The probe skips the value; its content is irrelevant.
+            footer.Add(0x00);
+        }
+    }
+
+    private static byte[] BuildFileMetaDataFooter(
+        ThriftFieldType version,
+        ThriftFieldType schema,
+        ThriftFieldType numRows,
+        ThriftFieldType rowGroups,
+        EncryptionUnionShape encryptionUnion)
+    {
+        var footer = new List<byte>();
+
+        // Fields 1..4 (deltas 1,1,1,1 from a starting id of 0).
+        EmitScalarOrList(footer, fieldDelta: 1, version);   // field 1: version
+        EmitScalarOrList(footer, fieldDelta: 1, schema);    // field 2: schema
+        EmitScalarOrList(footer, fieldDelta: 1, numRows);   // field 3: num_rows
+        EmitScalarOrList(footer, fieldDelta: 1, rowGroups); // field 4: row_groups
+
+        // Field 8: encryption_algorithm struct (delta 4 from field 4).
+        footer.Add((byte)((4 << 4) | ThriftStructCode));
+        if (encryptionUnion == EncryptionUnionShape.NonEmpty)
+        {
+            footer.Add((byte)((1 << 4) | ThriftStructCode)); // union member: field 1 (AES_GCM_V1), a struct
+            footer.Add((byte)ThriftStop);                    // AES_GCM_V1 body STOP
+        }
+
+        footer.Add((byte)ThriftStop); // field-8 union struct STOP (immediate STOP => empty when NonEmpty absent)
+        footer.Add((byte)ThriftStop); // top-level FileMetaData STOP
+
+        return footer.ToArray();
+    }
+
+    private static byte[] FileFromFooter(byte[] footer)
+    {
+        // [footer struct][footer_length int32 LE][PAR1] — the tail framing IsPlaintextFooterEncryptedByFooterProbe
+        // reads. No leading magic is needed: the plaintext-footer probe does not check head magic, and the
+        // footer's first byte is a Thrift header (never 'PARE'), so the encrypted-footer-magic arm passes over it.
+        byte[] file = new byte[footer.Length + 8];
+        footer.CopyTo(file, 0);
+        BinaryPrimitives.WriteInt32LittleEndian(file.AsSpan(footer.Length, 4), footer.Length);
+        file[footer.Length + 4] = (byte)'P';
+        file[footer.Length + 5] = (byte)'A';
+        file[footer.Length + 6] = (byte)'R';
+        file[footer.Length + 7] = (byte)'1';
+        return file;
     }
 
     /// <summary>A seekable stream whose reads always throw <see cref="IOException"/>, to drive the probe's

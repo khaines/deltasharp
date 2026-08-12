@@ -55,6 +55,26 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// OUTSIDE both the prober and the probed; a helper that re-derives one of the two artifacts being
 /// compared sits BETWEEN them. Only the second is a tautology.
 /// </para>
+/// <para>
+/// VERDICT (#724, closed-as-documented): the tempting collapse -- "serialize the schema ONCE and
+/// pass that one <c>schemaString</c> down so footer and log are a single computation, not two that
+/// must agree" -- is NOT implementable, and this is measured, not asserted. The footer schema and
+/// the log schema are DIFFERENT schemas by design: (1) partition columns live in the log's
+/// <c>add.partitionValues</c> and are stripped from the data-file footer, so the footer schema is
+/// the table schema MINUS the partition columns (see
+/// <see cref="Partitioned_FooterOmitsExactlyThePartitionColumns_AndNothingElse"/>); (2) in name/id
+/// column-mapping mode the footer carries PHYSICAL names while the log carries LOGICAL names (see
+/// <see cref="ColumnMappingEvolution_PreservesEveryMetadataEntryTheCallerDeclared"/>); and (3) the
+/// log <c>schemaString</c> is produced at commit time AFTER the data files (and their footers) are
+/// already written. There is no single string to pass. The weaker variant -- have
+/// <c>ParquetFileWriter</c> take a pre-serialized <c>string schemaJson</c> -- does not close the
+/// class either: the caller then serializes at a NEW call site, so the rogue site MOVES rather than
+/// vanishes, and the public API is made worse (every caller must know the Delta footer JSON dialect).
+/// The strongest IMPLEMENTABLE guard is therefore not deduplication but this end-to-end suite plus
+/// the artifact guards: the two real artifacts are read back off disk and compared where they must be
+/// equal, and checked against a caller-derived (never write-path-derived) expectation where they must
+/// differ.
+/// </para>
 /// </remarks>
 public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 {
@@ -568,6 +588,16 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             committed.Count >= 2 && committed[^1].Version > committed[0].Version,
             "the staged-file overload produced no new schema-carrying commit; versions seen: "
             + string.Join(", ", committed.Select(c => c.Version)));
+
+        // #741: BYTE PARITY, not only metadata-survival. These overloads emit NO footer, so the
+        // metadata-survival oracle below cannot see field-ORDERING drift, whitespace/separator/
+        // key-order drift in the JSON envelope, or type-name spelling drift -- every one a genuine
+        // #679-class divergence that the footer-writing overloads ARE pinned against by byte parity
+        // (EveryCommit... asserts SchemaJson.ToJson(replaced) == the committed string). This table
+        // is unpartitioned and unmapped, so the committed schemaString must be BYTE-IDENTICAL to the
+        // shared serializer's output for the schema the caller handed -- the same strength every
+        // other member of the required set carries, so "driven" is now uniform across it.
+        Assert.Equal(SchemaJson.ToJson(evolved), committed[^1].Declared);
 
         AssertDeclaredPreservesCallerMetadata(evolved, committed[^1].Declared);
     }

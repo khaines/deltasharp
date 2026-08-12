@@ -20,6 +20,15 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/DeltaSharp.Storage/DeltaSharp.Storage.csproj" />
+    <!--
+      DeltaSharp.Core is referenced only so DeltaFooterLogParityCoverageTests can LOAD it and scan
+      it for SchemaJson.ToJson call sites (#743). SchemaJson is IVT-visible to DeltaSharp.Core as
+      well as Storage/Engine, so a schemaString-producing seam added in Core would otherwise be
+      outside the required-side scan entirely while the guard stayed green. Storage itself does not
+      depend on Core; this reference exists purely to make Core's assembly present in this test
+      context so the coverage guard's cross-assembly scan is not silently vacuous over it.
+    -->
+    <ProjectReference Include="../../src/DeltaSharp.Core/DeltaSharp.Core.csproj" />
   </ItemGroup>
 
   <!--
