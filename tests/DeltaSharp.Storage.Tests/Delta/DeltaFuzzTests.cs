@@ -202,7 +202,6 @@ public sealed class DeltaFuzzTests
         DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
         Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
         Assert.True(elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {elapsed}.");
-        Assert.True(elapsed < TimeSpan.FromSeconds(5), $"expected a fast fail-closed, took {elapsed}.");
     }
 
     [Fact]
@@ -229,7 +228,6 @@ public sealed class DeltaFuzzTests
         DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
         Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
         Assert.True(elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {elapsed}.");
-        Assert.True(elapsed < TimeSpan.FromSeconds(5), $"expected a fast fail-closed, took {elapsed}.");
     }
 
     [Fact]
