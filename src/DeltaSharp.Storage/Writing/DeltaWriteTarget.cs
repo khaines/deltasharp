@@ -251,13 +251,16 @@ public sealed class DeltaWriteTarget : IDisposable
     /// <param name="cancellationToken">Cancels staging and the commit.</param>
     /// <exception cref="DeltaStorageException">The declared <paramref name="writeSchema"/> declares a column
     /// DeltaSharp cannot persist — today a <c>NullType</c> (<c>void</c>) column anywhere in the type tree
-    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #702) — or a staged column's type has no supported
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #702) — or declares a schema nesting deeper than
+    /// the supported declared type-tree depth (the same <c>NullType</c> eligibility / depth walk, which runs
+    /// BEFORE the schemaString is serialized) — or a staged column's type has no supported
     /// Parquet mapping. Refused fail-closed before any <c>_delta_log</c> write, INCLUDING on a zero-file
     /// (empty) create, so no version is committed.</exception>
     /// <exception cref="SchemaValidationException">The <paramref name="writeSchema"/> cannot be serialized
     /// into a <c>metaData.schemaString</c>: a field name / metadata key / metadata string value carries
     /// invalid UTF-16 (#710) or the type tree exceeds the shared read/write JSON container depth bound
-    /// (#711).</exception>
+    /// (#711) — the band the serializer rejects but the (type-level) eligibility walk admits, i.e. structs
+    /// nested from ~21 levels and array chains at 62-63 levels.</exception>
     public async Task<DeltaWriteResult> AppendAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,
@@ -343,13 +346,16 @@ public sealed class DeltaWriteTarget : IDisposable
     /// <see cref="DeltaPartitionOverwriteMode.Dynamic"/> (only a full/Static overwrite may replace the schema).</exception>
     /// <exception cref="DeltaStorageException">The declared <paramref name="writeSchema"/> declares a column
     /// DeltaSharp cannot persist — today a <c>NullType</c> (<c>void</c>) column anywhere in the type tree
-    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #702) — or a staged column's type has no supported
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>, #702) — or declares a schema nesting deeper than
+    /// the supported declared type-tree depth (the same <c>NullType</c> eligibility / depth walk, which runs
+    /// BEFORE the schemaString is serialized) — or a staged column's type has no supported
     /// Parquet mapping. Refused fail-closed before any <c>_delta_log</c> write, INCLUDING on a zero-file
     /// (empty) create/replacement, so no version is committed.</exception>
     /// <exception cref="SchemaValidationException">The <paramref name="writeSchema"/> cannot be serialized
     /// into a <c>metaData.schemaString</c>: a field name / metadata key / metadata string value carries
     /// invalid UTF-16 (#710) or the type tree exceeds the shared read/write JSON container depth bound
-    /// (#711).</exception>
+    /// (#711) — the band the serializer rejects but the (type-level) eligibility walk admits, i.e. structs
+    /// nested from ~21 levels and array chains at 62-63 levels.</exception>
     public async Task<DeltaWriteResult> OverwriteAsync(
         StructType writeSchema,
         IReadOnlyList<string> partitionColumns,

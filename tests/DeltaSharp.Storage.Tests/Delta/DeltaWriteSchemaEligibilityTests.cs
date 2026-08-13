@@ -55,8 +55,10 @@ public sealed class DeltaWriteSchemaEligibilityTests : IDisposable
     private static StructType Struct(params StructField[] fields) => new(fields);
 
     // The declared write schemas that carry a void leaf: top level, then one per nested position the walk
-    // has to cover (array element, map VALUE, nested struct field). A map KEY cannot be built at all —
-    // MapType's constructor already rejects a NullType key — so that position is closed upstream.
+    // has to cover (array element, map VALUE, nested struct field). A BARE void map key (`map<void,string>`)
+    // cannot be built at all — MapType's constructor rejects it — so it has no row here; a void nested
+    // INSIDE a key IS constructible and is pinned separately below
+    // (ZeroFileCreate_WithVoidInsideAMapKey_CommitsNothing).
     public static TheoryData<string> VoidShapes
     {
         get
@@ -166,6 +168,47 @@ public sealed class DeltaWriteSchemaEligibilityTests : IDisposable
         Assert.True(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000000.json")));
     }
 
+    // ---- the map-KEY arm (Round-3 review, C1: unpinned live control) -----------------------------------
+
+    // MapType's constructor bans a BARE void key, but only the key's OUTERMOST type: `map<array<void>,string>`
+    // and `map<struct<k:void>,string>` are perfectly constructible and still declare a leaf with no physical
+    // layout. The walk's map-KEY push is therefore load-bearing, yet deleting it left the ENTIRE Storage suite
+    // green — no test descended into a key. These rows are that missing control: they fail iff the key push is
+    // dropped, and they name the exact leaf INSIDE the key, so the arm cannot pass by rejecting some other
+    // position (the map VALUE row above shares the same column shape).
+    [Theory]
+    [InlineData("key-array-element", "'m.key.element'")]
+    [InlineData("key-struct-field", "'m.key.k'")]
+    public async Task ZeroFileCreate_WithVoidInsideAMapKey_CommitsNothing(string shape, string expectedPath)
+    {
+        using var target = DeltaWriteTarget.ForLocalPath(_root);
+
+        // Same zero-file create as the repro above: no staged file, so only the write-schema door can stop it.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => target.AppendAsync(VoidInsideMapKeySchema(shape), Array.Empty<string>(), Array.Empty<ColumnBatch>()));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        Assert.Contains("NullType column", ex.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedPath, ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no physical layout", ex.Message, StringComparison.Ordinal);
+        AssertNothingWasWritten();
+    }
+
+    // The two constructible shapes that hide a void UNDER a map key. The map VALUE is a plain string in both,
+    // so the only ineligible leaf in the schema sits on the key side.
+    private static StructType VoidInsideMapKeySchema(string shape) => shape switch
+    {
+        "key-array-element" => Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("m", DataTypes.CreateMapType(
+                DataTypes.CreateArrayType(DataTypes.NullType, containsNull: true),
+                DataTypes.StringType))),
+        "key-struct-field" => Struct(
+            F("id", DataTypes.LongType, nullable: false),
+            F("m", DataTypes.CreateMapType(Struct(F("k", DataTypes.NullType)), DataTypes.StringType))),
+        _ => throw new ArgumentOutOfRangeException(nameof(shape)),
+    };
+
     // ---- the evolution / replacement paths (also independent of staged-file count) ----------------------
 
     [Fact]
@@ -258,20 +301,41 @@ public sealed class DeltaWriteSchemaEligibilityTests : IDisposable
         AssertNothingWasWritten();
     }
 
-    [Fact]
-    public async Task DeclaredSchema_NestedWithinTheBound_IsStillAccepted()
+    // The bound must not swallow a legitimately (if unusually) nested schema: a depth the schemaString
+    // serializer itself accepts still creates the table. This is the other side of the depth pin — a guard
+    // that rejected everything would also make the deep-schema test above pass.
+    //
+    // The rows are the ordinary case (8) and the REAL EDGE (61). 61 is the deepest array chain
+    // SchemaJson.ToJson will serialize inside a struct schema: the schema costs 3 JSON containers (struct
+    // object + `fields` array + field object) before the column's type opens, then one container per array
+    // level, so level 62 trips the serializer's MaxDepth = 64 and level 61 is the last one that commits.
+    // Without this row the accept side pinned only depth 8, so an eligibility MaxDepth regressed anywhere
+    // into 21..61 — every value of which OVER-REJECTS a schema ToJson is willing to write — stayed green
+    // (a MaxDepth = 20 mutant survived the whole suite). Pinning at 61 makes any such regression RED.
+    [Theory]
+    [InlineData(8)]
+    [InlineData(61)]
+    public async Task DeclaredSchema_NestedWithinTheBound_IsStillAccepted(int levels)
     {
-        // The bound must not swallow a legitimately (if unusually) nested schema: a depth the schemaString
-        // serializer itself accepts still creates the table. This is the other side of the depth pin — a
-        // guard that rejected everything would also make the deep-schema test above pass.
-        using var target = DeltaWriteTarget.ForLocalPath(_root);
+        using (var target = DeltaWriteTarget.ForLocalPath(_root))
+        {
+            DeltaWriteResult result = await target.AppendAsync(
+                Struct(F("id", DataTypes.LongType, nullable: false), F("deep", DeepArray(levels))),
+                Array.Empty<string>(),
+                Array.Empty<ColumnBatch>());
 
-        DeltaWriteResult result = await target.AppendAsync(
-            Struct(F("id", DataTypes.LongType, nullable: false), F("deep", DeepArray(8))),
-            Array.Empty<string>(),
-            Array.Empty<ColumnBatch>());
+            Assert.Equal(0L, result.Version);
+        }
 
-        Assert.Equal(0L, result.Version);
+        // ...and the committed schemaString round-trips: the accepted depth is not merely committed, it is
+        // re-readable (the write-side door and the serializer's shared read/write bound agree at the edge).
+        using var backend = new LocalFileSystemBackend(_root);
+        Snapshot snapshot = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+
+        Assert.Equal(0L, snapshot.Version);
+        Assert.Equal(2, snapshot.Schema.Count);
+        Assert.Equal("deep", snapshot.Schema[1].Name);
+        Assert.True(DeepArray(levels).Equals(snapshot.Schema[1].DataType));
     }
 
     // An `array<array<...<long>>>` chain `levels` deep, built ITERATIVELY (building it recursively would
