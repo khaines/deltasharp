@@ -76,11 +76,37 @@ internal sealed class ParquetFileReader
     // (midnight-of-date epoch-micros). #533.
     private const long MicrosPerDay = 86_400L * 1_000_000L;
 
-    // The estimated retained bytes a STRAND of an OPEN / footer metadata decode would pin (a reader + a footer's
-    // worth of buffers) — charged against the data-file door's stranded residual only if that open/metadata
-    // decode detaches. Small and fixed (the open footprint is a reader + footer, not a decoded row group); the
-    // row-group decode charges the row group's REAL projected footprint (EstimateRowGroupRetainedBytes).
-    private const long OpenEstimatedRetainedBytes = 16L * 1024 * 1024;
+    // The estimated retained bytes a STRAND of an OPEN / footer metadata decode would pin (a reader + its parsed
+    // Thrift FileMetaData + footer buffers) — charged against the data-file door's stranded residual only if that
+    // open/metadata decode detaches. Derived per-open from the input length (see EstimateOpenRetainedBytes, High
+    // #7 — the fixed 16-MiB fiction under-counted an attacker-scaled footer); the row-group decode charges the
+    // row group's REAL projected footprint (EstimateRowGroupRetainedBytes).
+
+    // The retained footprint a stranded OPEN / metadata-scan strand pins: the already-parsed Thrift FileMetaData
+    // (attacker-scaled, but bounded by the file size) plus the reader's footer buffers. Derived from the input
+    // length when seekable (the footer cannot exceed the file) — the previous FIXED 16-MiB charge under-counted
+    // a crafted footer with NO ceiling (High #7). Floored at BoundedDecode.MinStrandChargeBytes so a cheap strand
+    // still consumes the byte residual (High #1b), then clamped to the door footprint by RunAsync. When the input
+    // is not seekable the length is unknown, so charge the door footprint conservatively — an over-charge is safe
+    // on the rare open strand (§5.4).
+    private static long EstimateOpenRetainedBytes(Stream input)
+    {
+        long length = -1;
+        try
+        {
+            if (input.CanSeek)
+            {
+                length = input.Length;
+            }
+        }
+        catch
+        {
+            length = -1;
+        }
+
+        long basis = length > 0 ? length : BoundedDecode.DataFileMaxFootprintBytes;
+        return Math.Max(basis, BoundedDecode.MinStrandChargeBytes);
+    }
 
     /// <summary>Creates a reader whose eager-decode guard uses <paramref name="limits"/> (or the safe
     /// <see cref="ParquetDecodeLimits.Default"/> when unset).</summary>
@@ -510,7 +536,7 @@ internal sealed class ParquetFileReader
                     onAbandonedResult: null,
                     onWorkSettled: shared.Release,
                     timeProvider: _timeProvider,
-                    estimatedRetainedBytes: OpenEstimatedRetainedBytes).ConfigureAwait(false);
+                    estimatedRetainedBytes: EstimateOpenRetainedBytes(input)).ConfigureAwait(false);
             }
             catch (DecodeCapacityExhaustedException capacity)
             {
@@ -689,6 +715,13 @@ internal sealed class ParquetFileReader
         }
 
         long totalDecompressedBytes = 0;
+        // (iv) Running TOTAL of the bytes the projected columns would EAGERLY MATERIALIZE simultaneously
+        // (Round-8 #2). The decode allocates ColumnVector[requested.Count] and holds every projected column's
+        // decoded vector at once, so the retained materialization is Σ(rows × elementWidth) ACROSS columns — not
+        // the per-column bound (iii) alone. Bounding the SUM to the ceiling makes the door's max footprint a
+        // TRUE ceiling (decompressed ceiling + materialization ceiling = 2× the row-group ceiling) rather than a
+        // truncation that under-counts the strand charge by the column count.
+        long totalMaterializedBytes = 0;
         for (int c = 0; c < projectedChunks.Count; c++)
         {
             ColumnChunkFootprint chunk = projectedChunks[c];
@@ -706,6 +739,7 @@ internal sealed class ParquetFileReader
                         + $"ceiling for a {chunk.ElementBytes}-byte column.");
                 }
 
+                totalMaterializedBytes = SaturatingAdd(totalMaterializedBytes, SaturatingMul(rowCount, chunk.ElementBytes));
                 continue;
             }
 
@@ -762,6 +796,7 @@ internal sealed class ParquetFileReader
             }
 
             totalDecompressedBytes = SaturatingAdd(totalDecompressedBytes, chunk.UncompressedBytes);
+            totalMaterializedBytes = SaturatingAdd(totalMaterializedBytes, SaturatingMul(rowCount, chunk.ElementBytes));
         }
 
         // (ii) Absolute decompressed-size ceiling over the row group's projected chunks.
@@ -771,18 +806,34 @@ internal sealed class ParquetFileReader
                 $"Row group {group} declares {totalDecompressedBytes} decompressed bytes across its "
                 + $"projected columns, exceeding the {limits.MaxRowGroupDecodedBytes}-byte eager-decode ceiling.");
         }
+
+        // (iv) Absolute TOTAL-materialization ceiling (Round-8 #2): the SUM of the bytes every projected column
+        // would eagerly materialize simultaneously must not exceed the same ceiling, so the actual retained
+        // footprint of a whole-row-group decode is bounded to (decompressed ceiling + materialization ceiling) =
+        // 2× the per-row-group ceiling — the door's max footprint. Without this, N projected columns each within
+        // the per-column bound could retain up to N× the ceiling while the strand charge clamped to one ceiling.
+        if (totalMaterializedBytes > limits.MaxRowGroupDecodedBytes)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Row group {group} declares {rowCount} rows whose projected columns would eagerly materialize "
+                + $"{totalMaterializedBytes} bytes in total, exceeding the {limits.MaxRowGroupDecodedBytes}-byte "
+                + "eager-decode ceiling.");
+        }
     }
 
     private static long SaturatingAdd(long a, long b) => b > long.MaxValue - a ? long.MaxValue : a + b;
 
     // The row group's REAL projected retained footprint — the sum, over its projected column chunks, of each
     // chunk's declared decompressed bytes PLUS the bytes its declared row count would eagerly materialize at the
-    // chunk's element width — clamped to the enforced eager-decode ceiling. Used as the charge a STRAND of this
-    // decode books against the data-file door's stranded residual at detach (the honest per-row-group footprint,
-    // hoisted out of the bounded decode so it is known BEFORE the decode runs). It reads the already-parsed
+    // chunk's element width — clamped to the door's max footprint (2× the per-row-group ceiling: the decompressed
+    // ceiling PLUS the total-materialization ceiling, both enforced by EnsureDecodeCeiling, Round-8 #2). Used as
+    // the charge a STRAND of this decode books against the data-file door's stranded residual at detach (the
+    // honest per-row-group footprint, hoisted out of the bounded decode so it is known BEFORE the decode runs; it
+    // is NOT clamped to ONE ceiling, which would UNDER-count by the column count). It reads the already-parsed
     // footer metadata (the open was bounded), so it is a cheap in-memory read; on ANY metadata fault it falls
-    // back to the enforced ceiling (conservative — a strand's charge must never UNDER-count).
-    private static long EstimateRowGroupRetainedBytes(
+    // back to the door's max footprint (conservative — a strand's charge must never UNDER-count). Exposed
+    // internally for a direct Σ-footprint / clamp / fault-fallback / overflow-saturation test (Round-8 test charge).
+    internal static long EstimateRowGroupRetainedBytes(
         ParquetReader reader, int group, StructType requested, ResolvedColumn[] fileFields, ParquetDecodeLimits limits)
     {
         try
@@ -799,13 +850,16 @@ internal sealed class ParquetFileReader
                 }
             }
 
-            return Math.Clamp(total, 0, limits.MaxRowGroupDecodedBytes);
+            // Charge the HONEST total (Σ decompressed + Σ materialized), clamped to the door's max footprint —
+            // NOT to ONE row-group ceiling (which truncated the charge to a single column's worth). RunAsync
+            // re-clamps to the door footprint too; clamping here keeps the estimate a plausible byte count.
+            return Math.Clamp(total, 0, BoundedDecode.DataFileMaxFootprintBytes);
         }
         catch
         {
             // A crafted/undecodable footer can fault the estimate; the bounded decode itself fails closed on the
-            // same fault, but the residual charge must not under-count — charge the enforced ceiling.
-            return limits.MaxRowGroupDecodedBytes;
+            // same fault, but the residual charge must not under-count — charge the door's max footprint.
+            return BoundedDecode.DataFileMaxFootprintBytes;
         }
     }
 
@@ -993,7 +1047,7 @@ internal sealed class ParquetFileReader
                 cancellationToken,
                 onAbandonedResult: DisposeAbandonedReader,
                 timeProvider: _timeProvider,
-                estimatedRetainedBytes: OpenEstimatedRetainedBytes).ConfigureAwait(false);
+                estimatedRetainedBytes: EstimateOpenRetainedBytes(input)).ConfigureAwait(false);
 
             // Plaintext-footer Parquet Modular Encryption — SUCCESS-path arm (#655). A plaintext-footer
             // encrypted file keeps the ordinary PAR1 magic; when its encrypted columns RETAIN their plaintext
@@ -1138,7 +1192,7 @@ internal sealed class ParquetFileReader
     // column resolves to its container Field. For a flat file the top-level fields ARE the leaf DataFields, so
     // the scalar path is unchanged. Nested columns are not (yet) supported under column-mapping id mode or
     // null-fill: both fail closed rather than risk a wrong read.
-    private static ResolvedColumn[] ResolveFileFields(
+    internal static ResolvedColumn[] ResolveFileFields(
         ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion,
         IReadOnlyDictionary<int, DataField>? byFieldId)
     {
@@ -1423,11 +1477,15 @@ internal sealed class ParquetFileReader
             try
             {
                 // Hoist the row group's REAL projected footprint (ProjectedFootprints + declared row count,
-                // clamped to the enforced ceiling) so a strand of THIS decode charges the actual bytes it would
-                // pin at detach — never a fictional fixed representative. Computed from the already-parsed footer
-                // metadata (the open was bounded), so it is a cheap in-memory read; any metadata fault during
-                // the estimate falls back to the enforced ceiling (conservative — never under-counts).
-                long strandFootprint = EstimateRowGroupRetainedBytes(reader, group, requested, fileFields, limits);
+                // Σ decompressed + Σ materialized across ALL projected columns, clamped to the door's max
+                // footprint — Round-8 #2) so a strand of THIS decode charges the actual bytes it would pin at
+                // detach — never a fictional fixed representative nor a single-column truncation. Floored at
+                // BoundedDecode.MinStrandChargeBytes (High #1b) so a CHEAP row group still consumes the byte
+                // residual. Computed from the already-parsed footer metadata (the open was bounded), so it is a
+                // cheap in-memory read; any metadata fault falls back to the door footprint (never under-counts).
+                long strandFootprint = Math.Max(
+                    EstimateRowGroupRetainedBytes(reader, group, requested, fileFields, limits),
+                    BoundedDecode.MinStrandChargeBytes);
                 return await decoder.RunAsync(
                     DecodeGroupAsync,
                     decodeBudget,

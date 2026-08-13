@@ -231,6 +231,75 @@ public sealed class CheckpointDecodeNegativeCacheTests : IDisposable
 
     // Drives an identity to the suppression threshold (two proven timeouts) so IsKnownTimedOut reports it as a
     // suppressed hit.
+    [Fact]
+    public void SingleFlight_ConcurrentReProbeOfAKnownIdentity_LetsOnlyOneCallerReDecode_AndReleaseProbeReopensIt()
+    {
+        // Round-8 #11 (the KNOWN-identity single-flight path that IS kept) — once an identity is KNOWN (here,
+        // accumulating strikes below the suppression threshold), a probe window is single-flighted: the FIRST
+        // IsKnownTimedOut takes the probe (returns false → this caller re-decodes) and every CONCURRENT caller
+        // observes ProbeInFlight and SKIPS (returns true), so N concurrent loads spawn ONE decode, not N strands.
+        // ReleaseProbe (a non-timeout terminal — saturation/unsupported/corrupt) reopens the window so a later
+        // load is not permanently skipped by a stale marker.
+        var clock = new ManualClock(DateTimeOffset.UnixEpoch);
+        var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: TimeSpan.FromMinutes(10));
+        string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
+
+        cache.Seed(key, clock); // strike 1 — the identity is now KNOWN but below the threshold (a probe window)
+
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // first caller TAKES the probe → re-decodes
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // concurrent second caller SKIPS (probe in flight)
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // and any further concurrent caller also skips
+
+        cache.ReleaseProbe(key); // the prober terminated on a non-timeout, non-clean outcome → reopen the window
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // the window is open again → the next caller re-probes
+    }
+
+    [Fact]
+    public void FirstEncounter_IsNotSingleFlighted_ReturnsFalseWithoutCreatingAnEntry()
+    {
+        // Round-8 #11 (the DELIBERATE non-single-flighted first-encounter) — an UNKNOWN identity returns false
+        // WITHOUT creating a zero-strike probe entry, so concurrent first-loads of a healthy checkpoint all take
+        // the fast decode path rather than being forced onto SKIP → JSON replay (which would hit a gap when the
+        // log floor is above 0). Proven: repeated first-encounter lookups all return false and NONE is
+        // suppressed, and a subsequent lone timeout still starts from strike 1 (no pre-existing entry inflated it).
+        var clock = new ManualClock(DateTimeOffset.UnixEpoch);
+        var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: TimeSpan.FromMinutes(10));
+        string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
+
+        Assert.False(cache.IsKnownTimedOut(key, clock)); // concurrent first-loads all re-decode — no probe taken
+        Assert.False(cache.IsKnownTimedOut(key, clock));
+        Assert.False(cache.IsKnownTimedOut(key, clock));
+
+        // No entry was created, so a first proven timeout is strike 1 (not strike 2) → still not suppressed.
+        cache.Seed(key, clock);
+        Assert.False(cache.IsKnownTimedOut(key, clock));
+    }
+
+    [Fact]
+    public void ClearOnSuccess_DecrementsNotWipes_SoAMostlyFailingIdentityKeepsItsAccumulatedSuspicion()
+    {
+        // Round-8 #12 — ClearOnSuccess DECREMENTS the strike history by one (floored at zero) and RETAINS the
+        // entry, instead of removing it. Pre-fix it wiped the entry, so an input that alternates timeout/success
+        // never accumulated toward suppression and re-stranded indefinitely. Proven: 3 timeouts (suppressed at
+        // ≥ threshold) then 1 success leaves the identity STILL suppressed (strikes 3 → 2 ≥ threshold), not
+        // wiped to a fresh re-decoding state.
+        var clock = new ManualClock(DateTimeOffset.UnixEpoch);
+        var cache = new CheckpointDecodeNegativeCache(capacity: 8, ttl: TimeSpan.FromMinutes(10));
+        string key = CheckpointDecodeNegativeCache.Key("pvc:/t", "cp.parquet", 1);
+
+        cache.Seed(key, clock); // strike 1
+        cache.Seed(key, clock); // strike 2 → suppressed
+        cache.Seed(key, clock); // strike 3
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // suppressed
+
+        cache.ClearOnSuccess(key); // one clean decode → strikes 3 → 2 (NOT wiped)
+        Assert.True(cache.IsKnownTimedOut(key, clock)); // STILL suppressed (2 ≥ threshold) — retains suspicion
+
+        // A second success drops it below the threshold → re-decoded (graceful decay, not an abrupt wipe).
+        cache.ClearOnSuccess(key); // strikes 2 → 1
+        Assert.False(cache.IsKnownTimedOut(key, clock));
+    }
+
     private static void Suppress(CheckpointDecodeNegativeCache cache, string key, TimeProvider clock)
     {
         cache.Seed(key, clock);

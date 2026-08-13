@@ -894,6 +894,12 @@ internal sealed class DeltaLog
                     {
                         IReadOnlyList<DeltaAction> actions;
                         long decodeStart = _timeProvider.GetTimestamp();
+
+                        // Sustained-pressure poisoning guard (Round-8 #9): snapshot the PRE-EXISTING strand
+                        // pressure BEFORE this decode runs. Captured here (not read in the catch) so THIS decode's
+                        // OWN strand — which RunAsync books at detach, BEFORE the DecodeBudgetExceeded propagates
+                        // — is excluded; otherwise every timeout would see its own fresh strand and never seed.
+                        int strandsBeforeDecode = BoundedDecode.DetachedDecodeCount;
                         try
                         {
                             actions = await DeltaCheckpointReader.ReadAsync(
@@ -925,15 +931,27 @@ internal sealed class DeltaLog
                             // The checkpoint decode tripped the bounded wall-clock ceiling (a non-terminating
                             // crafted decode, #647/#699/#716). This is a RESOURCE fault, NOT proven corruption
                             // (classification contract, #649/#655/#681): route it to JSON replay under the
-                            // distinct DecodeTimeout reason (EventId 4402), and SEED the negative cache (High #6:
-                            // strike-gated — the first timeout only records a strike; suppression needs a second
-                            // proven timeout of the same identity) so a persistently-bad part is eventually not
-                            // re-decoded. Seeding is correct HERE (and only here): this part's decode PROVABLY
-                            // ran past its ADEQUATE budget (I4). Charge the elapsed decode-timeout time to the
-                            // aggregate ceiling (High #10) so a flood of timing-out parts aborts the seed walk.
+                            // distinct DecodeTimeout reason (EventId 4402), and charge the elapsed decode-timeout
+                            // time to the aggregate ceiling (High #10) so a flood of timing-out parts aborts the
+                            // seed walk.
                             decodeCeiling.Charge(_timeProvider.GetElapsedTime(decodeStart));
-                            TimedOutCheckpointParts.Seed(partKey, _timeProvider);
-                            probeReported = true;
+
+                            // Sustained-pressure poisoning guard (Round-8 #9). A timeout while OTHER bounded-decode
+                            // strands were ALREADY live (captured in strandsBeforeDecode, above) is NOT proof of a
+                            // bad input: detached strands hold threads/bytes and can starve a HEALTHY part's decode
+                            // into a false timeout, which — seeded — would poison a good checkpoint into up-to-24h
+                            // suppression (an unreadable table). Only SEED (record a strike, High #6 strike-gated)
+                            // when NO strand pre-existed this decode, so the timeout is attributable to THIS part's
+                            // own decode. Under pre-existing pressure, fall back to JSON replay WITHOUT a strike
+                            // (the finally releases the probe) so a later, unpressured load can re-probe cleanly. A
+                            // persistently-hanging input under sustained strand pressure is bounded instead by the
+                            // door's stranded-residual + wedged-door signal (High #1), not the negative cache.
+                            if (strandsBeforeDecode == 0)
+                            {
+                                TimedOutCheckpointParts.Seed(partKey, _timeProvider);
+                                probeReported = true;
+                            }
+
                             RecordCheckpointDecodeTimeout(checkpoint.Version);
                             return null;
                         }

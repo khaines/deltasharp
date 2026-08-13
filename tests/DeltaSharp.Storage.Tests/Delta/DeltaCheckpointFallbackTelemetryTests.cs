@@ -70,6 +70,19 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     private static LocalFileSystemBackend FreshBackendAtSameRoot(LocalFileSystemBackend original) =>
         new(original.TableRootId);
 
+    // A PER-LOAD isolated checkpoint decoder for the hanging-decode telemetry tests (Round-8 test isolation).
+    // These tests deliberately drive a NON-TERMINATING checkpoint decode that DETACHES and strands its door
+    // FOREVER, across multiple loads. With the honest per-part strand charge (Round-8 #3, GiB-scale) a stranded
+    // decode on the PROCESS-GLOBAL static BoundedDecode.CheckpointDecoder would permanently consume its residual
+    // and saturate it for every other test (pre-Round-8 the charge was ~KB, so pollution was harmless). It also
+    // keeps BoundedDecode.DetachedDecodeCount (the static doors) at ZERO so the Round-8 #9 sustained-pressure
+    // guard does not see a PRIOR load's permanent strand and refuse to seed strike 2 — the strike accumulation
+    // these tests assert. Each load gets a FRESH decoder so its permanent strand is confined to a GC'd instance;
+    // the shared static negative CACHE (keyed on stable table identity, not the decoder) still accumulates
+    // strikes across loads exactly as production does.
+    private static BoundedDecoder IsolatedCheckpointDecoder() =>
+        new(strandCountCap: 8, execution: DecodeExecution.DedicatedThread);
+
     /// <summary>A 2-version JSON history (v0: protocol+metadata+add(a); v1: add(b)) so a discarded checkpoint
     /// at v1 falls back to a fully replayable log.</summary>
     private static async Task WriteHistoryAsync(IStorageBackend backend)
@@ -280,7 +293,8 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         {
             var stopwatch = System.Diagnostics.Stopwatch.StartNew();
             Snapshot snapshot = await new DeltaLog(
-                backend, DeltaLog.MaxLogObjectBytes, logger, telemetry, checkpointDecodeBudget: budget)
+                backend, DeltaLog.MaxLogObjectBytes, logger, telemetry, checkpointDecodeBudget: budget,
+                checkpointDecoder: IsolatedCheckpointDecoder())
                 .LoadSnapshotAsync();
             stopwatch.Stop();
 
@@ -317,7 +331,8 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         {
             var stopwatchS2 = System.Diagnostics.Stopwatch.StartNew();
             Snapshot snapshotS2 = await new DeltaLog(
-                strikeTwoBackend, DeltaLog.MaxLogObjectBytes, new RecordingLogger<DeltaLog>(), telemetryS2, checkpointDecodeBudget: budget)
+                strikeTwoBackend, DeltaLog.MaxLogObjectBytes, new RecordingLogger<DeltaLog>(), telemetryS2, checkpointDecodeBudget: budget,
+                checkpointDecoder: IsolatedCheckpointDecoder())
                 .LoadSnapshotAsync();
             stopwatchS2.Stop();
 
@@ -386,7 +401,8 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
 
         // Load 1 (T0): the decode times out on its OWN adequate budget → the identity records STRIKE 1 (not yet
         // suppressed). The part was opened once.
-        Snapshot s1 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget)
+        Snapshot s1 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+            checkpointDecoder: IsolatedCheckpointDecoder())
             .LoadSnapshotAsync();
         Assert.Null(s1.Metrics.CheckpointVersion);
         Assert.Equal(1, CountOpensOf(counting, checkpointPart));
@@ -394,7 +410,8 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         // Load 2 (still T0, within the 10-min TTL): the strike-gate has NOT yet suppressed the identity (only
         // one strike so far), so this load RE-DECODES — opening the part a second time — times out again, and
         // now records STRIKE 2, crossing the suppression threshold.
-        Snapshot s2 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget)
+        Snapshot s2 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+            checkpointDecoder: IsolatedCheckpointDecoder())
             .LoadSnapshotAsync();
         Assert.Null(s2.Metrics.CheckpointVersion);
         Assert.Equal(2, CountOpensOf(counting, checkpointPart));
@@ -412,7 +429,8 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         // timer to the system clock), so this load still times out and falls back.
         var advancedClock = new OffsetUtcTimeProvider(TimeSpan.FromMinutes(11));
         Snapshot s4 = await new DeltaLog(
-            counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget, timeProvider: advancedClock)
+            counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget, timeProvider: advancedClock,
+            checkpointDecoder: IsolatedCheckpointDecoder())
             .LoadSnapshotAsync();
         Assert.Null(s4.Metrics.CheckpointVersion);
         Assert.Equal(3, CountOpensOf(counting, checkpointPart));

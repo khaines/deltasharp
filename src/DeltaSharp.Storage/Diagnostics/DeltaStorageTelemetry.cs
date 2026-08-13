@@ -405,6 +405,8 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _decodeNegativeCacheSkip;
 #pragma warning disable IDE0052 // Held so the ObservableGauge callback stays subscribed for the meter's lifetime.
     private readonly ObservableGauge<int> _decodeDetached;
+    private readonly ObservableGauge<int> _decodeDetachedCancelled;
+    private readonly ObservableGauge<int> _decodeWedged;
 #pragma warning restore IDE0052
 
     internal DeltaStorageTelemetry()
@@ -490,6 +492,32 @@ internal sealed class DeltaStorageTelemetry : IDisposable
             },
             unit: "{strand}",
             description: "Currently-detached (running-past-deadline, un-reclaimable) untrusted Parquet decode strands per door — the bounded residual of the wall-clock decode ceiling (.NET cannot abort a thread). Rises toward the per-door cap under a distinct-crafted-input flood; a sustained non-zero value is the DoS-pressure gauge.");
+        _decodeDetachedCancelled = _storageMeter.CreateObservableGauge(
+            "deltasharp.storage.decode.detached_cancelled",
+            static () => new[]
+            {
+                new Measurement<int>(
+                    BoundedDecode.DataFileDecoder.CancelledDetachedDecodeCount,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.DataFile))),
+                new Measurement<int>(
+                    BoundedDecode.CheckpointDecoder.CancelledDetachedDecodeCount,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+            },
+            unit: "{strand}",
+            description: "The CANCELLED-flavour sub-count of decode.detached per door (Round-8 #5): strands abandoned via caller-cancellation while still non-terminating (a cancellation-laundered strand still holds a thread+bytes+lease and is charged/counted). A HEALTHY cancelled decode settles in ms and releases immediately, so this gauge is ~0 in healthy operation; a sustained non-zero value is a token-ignoring/non-terminating decode masked as a cancellation.");
+        _decodeWedged = _storageMeter.CreateObservableGauge(
+            "deltasharp.storage.decode.wedged",
+            static () => new[]
+            {
+                new Measurement<int>(
+                    BoundedDecode.DataFileWedged,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.DataFile))),
+                new Measurement<int>(
+                    BoundedDecode.CheckpointWedged,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+            },
+            unit: "{door}",
+            description: "1 when a decode door is WEDGED (strandedCount == cap with no strand drain over the stall window), else 0, per door (Round-8 #1). A wedged door admits no further decodes and never recovers (.NET cannot abort the stranded threads); a sustained 1 is the liveness-probe signal to recycle the pod — DecoderSaturated on a wedged door is NOT retryable-after-backoff.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity

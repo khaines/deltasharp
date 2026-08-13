@@ -35,6 +35,17 @@ public sealed class DeltaFuzzTests
     // regression of #647/#699/#716). It converts such a hang into a deterministic TEST FAILURE, not a stuck CI.
     private static readonly TimeSpan OracleWatchdog = TimeSpan.FromSeconds(20);
 
+    // A PER-TEST isolated checkpoint decoder for the hanging-decode fuzz cases (Round-8 test isolation). These
+    // tests deliberately drive a NON-TERMINATING decode that DETACHES and strands its door FOREVER. With the
+    // honest per-part strand charge (Round-8 #3, GiB-scale), a stranded decode on the PROCESS-GLOBAL static
+    // BoundedDecode.CheckpointDecoder would permanently consume its residual and saturate it for every other
+    // test in the process (pre-Round-8 the charge was ~KB, so pollution was harmless). Routing each hanging
+    // case through its OWN decoder confines the permanent strand to a garbage-collected per-test instance; the
+    // shared static door only ever sees healthy (never-stranding) decodes. A DedicatedThread execution mirrors
+    // the real checkpoint door (a synchronous decode over pre-buffered bytes).
+    private static BoundedDecoder IsolatedCheckpointDecoder() =>
+        new(strandCountCap: 8, execution: DecodeExecution.DedicatedThread);
+
     [Fact]
     public void JsonActionReader_OnlyFailsClosed_OnRandomBytes()
     {
@@ -172,7 +183,8 @@ public sealed class DeltaFuzzTests
             Sha256Hex(valid));
 
         (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(
-            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(valid), default, decodeBudget: TestDecodeBudget));
+            () => DeltaCheckpointReader.ReadAsync(
+                new MemoryStream(valid), default, decodeBudget: TestDecodeBudget, decoder: IsolatedCheckpointDecoder()));
 
         // (a) the DISTINCT typed DecodeBudgetExceeded (a DeltaStorageException, NOT DeltaProtocolException: a
         // wall-clock stall is a resource fault, not proven corruption — #649/#655/#681 classification), which
@@ -201,7 +213,8 @@ public sealed class DeltaFuzzTests
         valid[^9] ^= 1;
 
         (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(
-            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(valid), default, decodeBudget: TestDecodeBudget));
+            () => DeltaCheckpointReader.ReadAsync(
+                new MemoryStream(valid), default, decodeBudget: TestDecodeBudget, decoder: IsolatedCheckpointDecoder()));
 
         // A wall-clock stall on the checkpoint door — the DISTINCT DecodeBudgetExceeded kind (a
         // DeltaStorageException), NOT DeltaProtocolException; DeltaLog routes it to JSON replay all the same.
@@ -266,7 +279,8 @@ public sealed class DeltaFuzzTests
             try
             {
                 _ = await DeltaCheckpointReader.ReadAsync(
-                    new MemoryStream(bytes), default, decodeBudget: TestDecodeBudget);
+                    new MemoryStream(bytes), default, decodeBudget: TestDecodeBudget,
+                    decoder: IsolatedCheckpointDecoder());
             }
             catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeBudgetExceeded)
             {

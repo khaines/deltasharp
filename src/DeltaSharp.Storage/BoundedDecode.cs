@@ -122,28 +122,90 @@ internal static class BoundedDecode
     /// silently letting a non-terminating decode run effectively forever.</summary>
     internal static readonly TimeSpan MaxBudget = TimeSpan.FromHours(24);
 
-    /// <summary>The maximum retained footprint a single <b>data-file</b> strand can pin — the reader's enforced
-    /// per-row-group eager-decode ceiling (4&#160;GiB, mirrors <c>ParquetFileReader.MaxRowGroupDecodedBytes</c>
-    /// / <c>ParquetDecodeLimits.DefaultMaxRowGroupDecodedBytes</c>). Held locally (rather than referencing that
-    /// constant) so the two doors' <c>static readonly</c> field init cannot depend on cross-type init order.
-    /// It floors the residual budget and clamps the charge a data-file strand books at detach.</summary>
-    internal const long DataFileMaxFootprintBytes = 4L * 1024 * 1024 * 1024;
+    /// <summary>The maximum retained footprint a single <b>data-file</b> strand can pin — <b>2×</b> the reader's
+    /// enforced per-row-group eager-decode ceiling (8&#160;GiB = 2 × 4&#160;GiB, where 4&#160;GiB mirrors
+    /// <c>ParquetFileReader.MaxRowGroupDecodedBytes</c> / <c>ParquetDecodeLimits.DefaultMaxRowGroupDecodedBytes</c>).
+    /// A whole-row-group decode retains up to the decompressed ceiling PLUS the total-materialization ceiling
+    /// (<c>EnsureDecodeCeiling</c> guards (ii) and (iv) each bound one 4&#160;GiB ceiling, Round-8 #2), so the
+    /// real per-row-group retained footprint is up to 2× the ceiling; the door footprint is set to that so the
+    /// strand charge is a TRUE ceiling, not a single-column truncation. Held locally (rather than referencing
+    /// the reader constant) so the two doors' <c>static readonly</c> field init cannot depend on cross-type init
+    /// order. It floors the residual budget and clamps the charge a data-file strand books at detach.</summary>
+    internal const long DataFileMaxFootprintBytes = 2L * 4 * 1024 * 1024 * 1024;
 
-    /// <summary>The maximum retained footprint a single <b>checkpoint</b> strand can pin — the isolated
-    /// buffered part copy it holds (512&#160;MiB, mirrors <c>DeltaCheckpointReader.MaxCheckpointPartBytes</c>).
-    /// It floors the residual budget and clamps the charge a checkpoint strand books at detach.</summary>
-    internal const long CheckpointMaxFootprintBytes = 512L * 1024 * 1024;
+    /// <summary>The maximum retained footprint a single <b>checkpoint</b> strand can pin — the isolated buffered
+    /// part copy it holds (≤512&#160;MiB, mirrors <c>DeltaCheckpointReader.MaxCheckpointPartBytes</c>) PLUS the
+    /// cumulative per-part decoded arrays + <c>List&lt;DeltaAction&gt;</c> across its row groups (≤4&#160;GiB,
+    /// <c>DeltaCheckpointReader.MaxCheckpointPartDecodedBytes</c>, enforced in <c>DecodeBufferedAsync</c>) —
+    /// 4.5&#160;GiB total (Round-8 #3). Pre-fix the door charged only the compressed buffer, under-stating the
+    /// decoded arrays a stranded checkpoint retains; the door footprint is raised to cover buffer + cumulative
+    /// decoded so the strand charge is a TRUE clamp, not an under-statement. The 4.5&#160;GiB literal is held
+    /// locally (rather than referencing the reader constants) so the two doors' <c>static readonly</c> field
+    /// init cannot depend on cross-type init order. It floors the residual budget and clamps the charge a
+    /// checkpoint strand books at detach.</summary>
+    internal const long CheckpointMaxFootprintBytes = (4L * 1024 * 1024 * 1024) + (512L * 1024 * 1024);
 
     /// <summary>The floor multiple <c>k</c> applied to the max footprint when flooring a door's residual budget
     /// (<c>k × maxFootprint</c>, k≥2): at least one maximal legitimate decode is always admissible against an
-    /// empty residual, AND a single strand can never instantly saturate the door.</summary>
+    /// empty residual, AND a single strand can never instantly saturate the door. Calibration is tracked in #802.</summary>
     internal const int ResidualFloorMultiple = 2;
+
+    /// <summary>The divisor of process memory that sets the residual budget's TARGET fraction (<c>1/8</c>): the
+    /// residual budget aims for <c>processMem/8</c>, floored at <see cref="ResidualFloorMultiple"/>×maxFootprint
+    /// and capped at <see cref="ResidualBudgetMemoryCapDivisor"/> (High #10). Calibration is tracked in #802.</summary>
+    internal const long ResidualBudgetMemoryDivisor = 8;
+
+    /// <summary>The divisor bounding the residual budget's UPPER limit against process memory (<c>1/2</c>): the
+    /// residual budget is capped at <c>processMem/2</c> so on a small pod the byte gate stays reachable rather
+    /// than flooring above pod memory (where a strand pile would OOM before the byte gate ever fired — the
+    /// Round-8 High #10 fix). The budget is never dropped below one maximal footprint (construction still needs
+    /// to admit one legit part); a door whose one-footprint floor exceeds this cap is flagged
+    /// under-provisioned (a startup Warning). The max footprint (row-group / checkpoint-part class) is
+    /// pod-independent, so a tiny pod can be structurally unable to admit one legit maximal part.</summary>
+    internal const long ResidualBudgetMemoryCapDivisor = 2;
+
+    /// <summary>The FLOOR on a door's strand-count cap (Round-8 High #1a — the count cap is decoupled from the
+    /// byte budget). The old cap was <c>residualBudget/maxFootprint</c> = <b>2</b> on every pod ≤ 64&#160;GiB;
+    /// with honest (small) charges that COUNT gate fired at 2 strands while <c>strandedBytes ≈ 0</c>, letting 2
+    /// crafted decodes wedge a door process-wide. The count cap is now sized from the thread/fd budget
+    /// (<c>k × ProcessorCount</c>) and floored here so it never binds under the byte budget — the BYTE residual
+    /// (with a floored per-strand charge) stays the load-bearing gate. Calibration is tracked in #802.</summary>
+    internal const int StrandCountFloor = 64;
 
     /// <summary>A generous ceiling on the STRAND count a door tolerates before fail-fast rejection (each strand
     /// also pins a thread/pool slot, so the count is bounded independently of the byte residual). The count cap
     /// applies to <b>strands only</b> — never to healthy in-flight decodes — so it does not throttle healthy
     /// scan concurrency. Calibration is tracked in #802.</summary>
     internal const int StrandCountCeiling = 256;
+
+    /// <summary>The multiple of <see cref="Environment.ProcessorCount"/> the strand-count cap is sized from
+    /// (thread/fd-budget proxy), clamped into <c>[<see cref="StrandCountFloor"/>, <see cref="StrandCountCeiling"/>]</c>.
+    /// Sized so the count never binds before the byte residual for maximal strands, yet still bounds the thread
+    /// pile a tiny-footprint-strand flood would create. Calibration is tracked in #802.</summary>
+    internal const int StrandCountThreadMultiple = 8;
+
+    /// <summary>The multiple of <see cref="Environment.ProcessorCount"/> a door's in-flight admission ceiling
+    /// (<c>C_max</c>) is sized from (Round-8 High #6 — bounding the number of concurrently-admitted untrusted
+    /// decodes). It is deliberately GENEROUS (far above any healthy scan width) so healthy in-flight work is
+    /// never throttled, yet C is finite so the stranded residual is provably bounded to
+    /// <c>residualBudget + C_max × maxFootprint</c>. Calibration is tracked in #802.</summary>
+    internal const int InFlightCeilingThreadMultiple = 64;
+
+    /// <summary>The FLOOR on the per-strand byte charge (64&#160;MiB, Round-8 High #1b). A strand's charge is
+    /// <c>clamp(max(estimate, this), 0, maxFootprint)</c> so even a CHEAP strand (a small crafted part) consumes
+    /// a meaningful slice of the byte residual — otherwise, with the count cap now decoupled/raised, a flood of
+    /// tiny-footprint strands could pile up under the byte gate toward an OOM. Applied at the production call
+    /// sites (the data-file open/row-group and the checkpoint part) so the byte budget stays the load-bearing
+    /// gate; the door's <see cref="RunAsync"/> charges exactly what it is passed (clamped to the max footprint),
+    /// keeping the count-cap-in-isolation unit tests (which pass a zero estimate) literal. Calibration is
+    /// tracked in #802.</summary>
+    internal const long MinStrandChargeBytes = 64L * 1024 * 1024;
+
+    /// <summary>The wall-clock window (5&#160;min) with ZERO strand drain, while a door is saturated, after which
+    /// the door is reported <b>wedged</b> (Round-8 High #1 wedged-door signal): its strands are not draining, so
+    /// <see cref="StorageErrorKind.DecoderSaturated"/> is NOT genuinely "retry after backoff" — a liveness probe
+    /// should recycle the pod. Surfaced as the <c>deltasharp.storage.decode.wedged</c> gauge (per door).</summary>
+    internal static readonly TimeSpan WedgedDrainStallWindow = TimeSpan.FromMinutes(5);
 
     /// <summary>The process/GC memory the doors size their budgets against —
     /// <see cref="GCMemoryInfo.TotalAvailableMemoryBytes"/> (container-cgroup-aware), with a conservative
@@ -157,19 +219,40 @@ internal static class BoundedDecode
     }
 
     /// <summary>The residual budget + strand-count cap a door of a given max-footprint uses, given the process
-    /// memory. PURE (no shared state) so it is table-testable across pod sizes: the residual budget is a
-    /// fraction of process memory floored at <c>k × maxFootprint</c> (so one legit part is always admissible and
-    /// a single strand can never instantly saturate the door); the strand-count cap is
-    /// <c>residualBudget / maxFootprint</c> (so both gates saturate together for maximal strands) floored at
-    /// <c>k</c> and capped at <see cref="StrandCountCeiling"/>.</summary>
-    internal static DoorSizing DeriveDoorSizing(long processMemoryBytes, long maxFootprintBytes)
+    /// memory. PURE (no shared state — <paramref name="processorCount"/> is passed in, defaulting to
+    /// <see cref="Environment.ProcessorCount"/>) so it is table-testable across pod sizes.
+    /// <para><b>Residual budget (the load-bearing byte gate).</b> It targets <c>processMem/8</c>
+    /// (<see cref="ResidualBudgetMemoryDivisor"/>), floored at <c>k × maxFootprint</c>
+    /// (<see cref="ResidualFloorMultiple"/>, so one legit part is admissible and a single strand can never
+    /// instantly saturate the door), then capped at <c>processMem/2</c>
+    /// (<see cref="ResidualBudgetMemoryCapDivisor"/>, High #10 — so on a small pod the budget cannot floor
+    /// ABOVE pod memory and render the byte gate unreachable). The budget is never dropped below ONE maximal
+    /// footprint (construction needs to admit one legit part); a door whose one-footprint floor exceeds the
+    /// memory cap is <see cref="DoorSizing.UnderProvisioned"/> (a startup Warning), because a
+    /// pod-independent maximal footprint cannot fit a tiny pod.</para>
+    /// <para><b>Strand-count cap (decoupled from the byte budget, High #1a).</b> Sized from the thread/fd
+    /// budget as <c>StrandCountThreadMultiple × processorCount</c>, clamped to
+    /// <c>[<see cref="StrandCountFloor"/>, <see cref="StrandCountCeiling"/>]</c> — NOT
+    /// <c>residualBudget/maxFootprint</c> (which was 2 on every pod ≤ 64&#160;GiB and wedged a door at 2 cheap
+    /// strands). It never binds before the byte residual for maximal strands, while still bounding the thread
+    /// pile a tiny-footprint-strand flood would create.</para></summary>
+    internal static DoorSizing DeriveDoorSizing(long processMemoryBytes, long maxFootprintBytes, int processorCount = 0)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxFootprintBytes);
-        long floor = SaturatingMul(ResidualFloorMultiple, maxFootprintBytes);
-        long residualBudget = Math.Max(Math.Max(processMemoryBytes, 0L) / 8, floor);
-        long derivedCount = residualBudget / maxFootprintBytes;
-        int countCap = (int)Math.Clamp(derivedCount, ResidualFloorMultiple, StrandCountCeiling);
-        return new DoorSizing(residualBudget, countCap, maxFootprintBytes);
+        long mem = Math.Max(processMemoryBytes, 0L);
+        long oneFootprint = maxFootprintBytes;
+        long preferredFloor = SaturatingMul(ResidualFloorMultiple, maxFootprintBytes);
+        long target = Math.Max(mem / ResidualBudgetMemoryDivisor, preferredFloor);
+        // High #10 cap: never let the residual budget floor ABOVE a fraction of pod memory (the byte gate must
+        // stay reachable), but never below ONE maximal footprint (construction must admit one legit part).
+        long memCap = Math.Max(mem / ResidualBudgetMemoryCapDivisor, oneFootprint);
+        long residualBudget = Math.Max(Math.Min(target, memCap), oneFootprint);
+        bool underProvisioned = preferredFloor > memCap; // can't fit the preferred k-part floor in the mem cap
+
+        int cores = processorCount > 0 ? processorCount : Math.Max(Environment.ProcessorCount, 1);
+        long threadBudget = SaturatingMul(StrandCountThreadMultiple, cores);
+        int countCap = (int)Math.Clamp(threadBudget, StrandCountFloor, StrandCountCeiling);
+        return new DoorSizing(residualBudget, countCap, maxFootprintBytes, underProvisioned);
     }
 
     private static long SaturatingMul(long a, long b)
@@ -202,11 +285,23 @@ internal static class BoundedDecode
 
     /// <summary>The detached-strand count on the checkpoint door (observability gauge dimension).</summary>
     internal static int CheckpointDetachedDecodeCount => CheckpointDecoder.DetachedDecodeCount;
+
+    /// <summary>Whether the data-file door is <b>wedged</b> — saturated with ZERO strand drain for
+    /// <see cref="WedgedDrainStallWindow"/> (Round-8 High #1). Surfaced as <c>deltasharp.storage.decode.wedged</c>
+    /// (0/1) so a liveness probe can recycle the pod (its strands never drain, so <c>DecoderSaturated</c> is not
+    /// genuinely retryable).</summary>
+    internal static int DataFileWedged => DataFileDecoder.IsWedged ? 1 : 0;
+
+    /// <summary>Whether the checkpoint door is wedged (see <see cref="DataFileWedged"/>).</summary>
+    internal static int CheckpointWedged => CheckpointDecoder.IsWedged ? 1 : 0;
 }
 
-/// <summary>A door's derived sizing: its stranded-residual byte budget, its strand-count cap, and the max
-/// single-strand footprint the budget was floored against — see <see cref="BoundedDecode.DeriveDoorSizing"/>.</summary>
-internal readonly record struct DoorSizing(long ResidualBudgetBytes, int StrandCountCap, long MaxFootprintBytes);
+/// <summary>A door's derived sizing: its stranded-residual byte budget, its strand-count cap, the max
+/// single-strand footprint the budget was floored against, and whether the door is under-provisioned (its
+/// one-footprint floor exceeds the process-memory cap, so it cannot comfortably admit one legit maximal part —
+/// a startup Warning, High #10) — see <see cref="BoundedDecode.DeriveDoorSizing"/>.</summary>
+internal readonly record struct DoorSizing(
+    long ResidualBudgetBytes, int StrandCountCap, long MaxFootprintBytes, bool UnderProvisioned = false);
 
 /// <summary>
 /// One bounded-decode execution surface: a charge-at-DETACH stranded-residual budget (healthy in-flight is
@@ -222,24 +317,49 @@ internal sealed class BoundedDecoder
     private readonly long _residualBudgetBytes;
     private readonly long _maxFootprintBytes;
     private readonly DecodeExecution _execution;
+    private readonly int _inFlightCeiling;
 
-    // The STRANDED residual (the load-bearing bound). Charged ONLY at DETACH (a genuine deadline expiry, when
-    // the caller is released but the un-abortable decode keeps running) with the decode's actual retained
+    // The STRANDED residual (the load-bearing bound). Charged ONLY at DETACH (a genuine deadline expiry OR a
+    // caller-cancellation that abandons a non-terminating decode, High #5) with the decode's actual retained
     // footprint clamped to _maxFootprintBytes; un-charged only if a strand eventually terminates. A healthy
     // in-flight decode is NEVER charged here, so it can never be throttled by this control. A genuine
     // non-terminating strand holds its charge forever — the bounded residual.
     private long _strandedBytes;
 
-    // Detached strands only (abandoned past their deadline, still running or never-terminating) — the COUNT
-    // companion to _strandedBytes. Incremented at DETACH (never by a routine caller cancellation); decremented
-    // when (if) that abandoned work finally settles. Exposed as the observability gauge.
+    // Detached strands only (abandoned past their deadline OR abandoned by caller-cancellation and still
+    // running) — the COUNT companion to _strandedBytes. Incremented at DETACH; decremented when (if) that
+    // abandoned work finally settles. A HEALTHY cancelled decode settles in ms so it drains immediately (costing
+    // healthy cancellation nothing); only a token-IGNORING non-terminating cancelled decode holds its slot
+    // (High #5). Exposed as the observability gauge.
     private int _detached;
+
+    // The cancelled-flavour sub-count of _detached (a telemetry gauge DIMENSION only, High #5): strands abandoned
+    // via caller-cancellation rather than a deadline expiry. Both flavours charge the residual identically; this
+    // only distinguishes them for observability.
+    private int _cancelledDetached;
+
+    // In-flight admission counter (High #6 — bounding C, the number of concurrently-admitted untrusted decodes).
+    // Incremented at admission, decremented when the decode terminally settles (healthy completion, strand drain,
+    // or cancellation drain). A never-terminating strand holds its slot forever (as it holds a strand slot). The
+    // ceiling (_inFlightCeiling) is GENEROUS (k × ProcessorCount, far above healthy scan width) so healthy work
+    // is never throttled, yet C is finite — the residual is bounded to residualBudget + C_max × maxFootprint.
+    private int _inFlight;
+
+    // Timestamp (from _clock) of the last strand ACTIVITY (a charge or a drain), for the wedged-door signal
+    // (High #1). While the door is saturated and there has been NO strand activity within WedgedDrainStallWindow,
+    // the door is reported wedged so a liveness probe can recycle the pod. Seeded at construction (a
+    // never-saturated door is never "wedged"). Uses the injected _clock so it is deterministically testable.
+    private long _lastStrandActivityTimestamp;
+
+    private readonly TimeProvider _clock;
 
     internal BoundedDecoder(
         int strandCountCap,
         long residualBudgetBytes = long.MaxValue,
         long maxFootprintBytes = 1,
-        DecodeExecution execution = DecodeExecution.Pool)
+        DecodeExecution execution = DecodeExecution.Pool,
+        int inFlightCeiling = 0,
+        TimeProvider? clock = null)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(strandCountCap, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(residualBudgetBytes, 1);
@@ -261,6 +381,18 @@ internal sealed class BoundedDecoder
         _residualBudgetBytes = residualBudgetBytes;
         _maxFootprintBytes = maxFootprintBytes;
         _execution = execution;
+        _clock = clock ?? TimeProvider.System;
+        _lastStrandActivityTimestamp = _clock.GetTimestamp();
+        // The generous in-flight ceiling (High #6). Default (0) derives k × ProcessorCount, floored well above
+        // the strand-count cap so it never binds before the strand gates for a genuine strand pile — it only
+        // bounds C (concurrently-admitted decodes) for the memory-bound proof. Tests may pin it explicitly.
+        _inFlightCeiling = inFlightCeiling > 0
+            ? inFlightCeiling
+            : Math.Max(
+                strandCountCap,
+                (int)Math.Min(
+                    (long)BoundedDecode.InFlightCeilingThreadMultiple * Math.Max(Environment.ProcessorCount, 1),
+                    int.MaxValue));
     }
 
     /// <summary>Builds a decoder from a derived <see cref="DoorSizing"/> (the production path).</summary>
@@ -280,13 +412,46 @@ internal sealed class BoundedDecoder
     /// checkpoint door) — exposed for the per-door isolation test.</summary>
     internal DecodeExecution Execution => _execution;
 
+    /// <summary>The generous ceiling (<c>C_max</c>) on concurrently-admitted untrusted decodes (High #6), far
+    /// above healthy scan width so healthy work is never throttled; it makes C finite so the residual is bounded
+    /// to <c>residualBudget + C_max × maxFootprint</c>.</summary>
+    internal int InFlightCeiling => _inFlightCeiling;
+
+    /// <summary>The current count of admitted-but-not-yet-settled decodes (healthy in-flight + live strands) —
+    /// exposed for the High #6 in-flight-ceiling behavioral test.</summary>
+    internal int InFlightCount => Volatile.Read(ref _inFlight);
+
     /// <summary>The current count of detached (running-past-deadline) strands — exposed for the observability
     /// gauge and for tests that assert the strand cap and that strands drain.</summary>
     internal int DetachedDecodeCount => Volatile.Read(ref _detached);
 
+    /// <summary>The cancelled-flavour sub-count of <see cref="DetachedDecodeCount"/> (a telemetry gauge
+    /// dimension, High #5) — strands abandoned by caller-cancellation rather than a deadline expiry.</summary>
+    internal int CancelledDetachedDecodeCount => Volatile.Read(ref _cancelledDetached);
+
     /// <summary>The current stranded-residual bytes (charged at detach, un-charged when a strand terminates) —
     /// exposed for tests that assert the byte-aware residual bound.</summary>
     internal long StrandedDecodeBytes => Volatile.Read(ref _strandedBytes);
+
+    /// <summary>Whether this door is <b>wedged</b> (High #1): currently saturated (byte OR count gate) with NO
+    /// strand drain for <see cref="BoundedDecode.WedgedDrainStallWindow"/>. A wedged door's strands are not
+    /// draining, so <see cref="DecodeCapacityExhaustedException"/> is not genuinely retryable — a liveness probe
+    /// should recycle the pod. Surfaced as the <c>deltasharp.storage.decode.wedged</c> gauge.</summary>
+    internal bool IsWedged
+    {
+        get
+        {
+            bool saturated = Volatile.Read(ref _strandedBytes) >= _residualBudgetBytes
+                || Volatile.Read(ref _detached) >= _strandCountCap;
+            if (!saturated)
+            {
+                return false;
+            }
+
+            long stalled = _clock.GetElapsedTime(Volatile.Read(ref _lastStrandActivityTimestamp)).Ticks;
+            return stalled >= BoundedDecode.WedgedDrainStallWindow.Ticks;
+        }
+    }
 
     /// <summary>
     /// Runs <paramref name="work"/> under a wall-clock <paramref name="budget"/> (measured from EXECUTION start,
@@ -342,8 +507,11 @@ internal sealed class BoundedDecoder
         ArgumentNullException.ThrowIfNull(work);
         ArgumentNullException.ThrowIfNull(onTimeout);
 
-        // The charge a strand of this decode would book at detach: its real footprint, clamped to the door's
-        // max footprint so a mis-estimate can never over-charge the residual (the bound stays provable).
+        // The charge a strand of this decode would book at detach: exactly the footprint passed in, clamped to
+        // the door's max footprint so a mis-estimate can never over-charge the residual (the bound stays
+        // provable). The production call sites FLOOR their estimate at BoundedDecode.MinStrandChargeBytes (High
+        // #1b) so a cheap strand still consumes the byte residual; this method stays literal (charges exactly
+        // what it is passed) so the count-cap-in-isolation unit tests can pass a zero estimate.
         long strandCharge = Math.Clamp(estimatedRetainedBytes, 0L, _maxFootprintBytes);
 
         // onWorkSettled EXACTLY ONCE on every path. The data-file door releases its ParquetReader lease here, so
@@ -358,27 +526,44 @@ internal sealed class BoundedDecoder
             }
         }
 
+        // Release the in-flight admission slot EXACTLY ONCE (High #6). A never-terminating strand never calls
+        // this (its slot is held for its whole life, as its strand slot is), so C is bounded by the in-flight
+        // ceiling and the residual by residualBudget + C_max × maxFootprint.
+        int inFlightReleased = 0;
+        void ReleaseInFlight()
+        {
+            if (Interlocked.Exchange(ref inFlightReleased, 1) == 0)
+            {
+                Interlocked.Decrement(ref _inFlight);
+            }
+        }
+
         try
         {
             // Validate the budget AFTER the null guards but BEFORE admission so an arg-validation throw still
             // fires Settle (the arg-validation-before-Settle fix): a caller that took a lease before calling with
-            // a bad budget never leaks it.
+            // a bad budget never leaks it. Enforce budget ≤ MaxBudget HERE too (High #8) so a caller cannot
+            // disable the DoS control with an absurd budget even on a path that bypassed ParquetDecodeLimits.
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(budget.Ticks, nameof(budget));
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(budget, BoundedDecode.MaxBudget, nameof(budget));
 
             // Pre-start caller cancellation: never start a decode for an already-cancelled caller.
             cancellationToken.ThrowIfCancellationRequested();
 
             // Admission (fail-fast) against the current STRANDED residual — NOT against healthy in-flight, which
             // is never charged nor counted. A new untrusted decode is admitted unless the door is already
-            // saturated by PERMANENT strands (strandedBytes ≥ budget OR strandedCount ≥ cap); otherwise it is
-            // admitted WITHOUT charging anything. Over-saturation surfaces a DISTINCT fail-closed
-            // DecodeCapacityExhaustedException (never a decode-timeout, never negatively cached).
+            // saturated by PERMANENT strands (strandedBytes ≥ budget OR strandedCount ≥ cap) OR the generous
+            // in-flight ceiling (C_max) is reached; otherwise it is admitted WITHOUT charging anything and takes
+            // an in-flight slot. Over-saturation surfaces a DISTINCT fail-closed DecodeCapacityExhaustedException
+            // (never a decode-timeout, never negatively cached).
             AdmitOrReject();
         }
         catch
         {
             // Pre-start throw (arg-validation, cancellation, or capacity): fire onWorkSettled so the caller's
-            // lease is released exactly once even though no work task will ever settle.
+            // lease is released exactly once even though no work task will ever settle. In-flight was NOT
+            // incremented (AdmitOrReject is the last try statement and self-backs-out on rejection), so there is
+            // no in-flight slot to release here.
             Settle();
             throw;
         }
@@ -396,91 +581,144 @@ internal sealed class BoundedDecoder
         catch (Exception ex)
         {
             // Execution start failed (e.g. thread-resource exhaustion) BEFORE work began. Nothing was charged
-            // (no admission reservation), so just fire Settle (release the lease), dispose the linked source,
-            // and surface the failure to the caller. The unobserved workTcs is never awaited — fault it so a
-            // late set cannot surface as an unobserved task exception.
+            // (no strand), but an in-flight slot WAS taken at admission — release it. Fire Settle (release the
+            // lease), dispose the linked source, and surface the failure. The unobserved workTcs is never awaited
+            // — fault it so a late set cannot surface as an unobserved task exception.
             workTcs.TrySetException(ex);
             _ = workTcs.Task.Exception; // observe
+            ReleaseInFlight();
             Settle();
             linked.Dispose();
             throw;
         }
 
-        // Wait for the work to ACTUALLY START executing before arming the deadline (I3). This is a thread hop,
-        // not an admission/queue wait, so it is negligible and — crucially — never counted against the budget.
-        // Cancellable: if the caller cancels during the start hop, do not block on it — the linked token is
-        // already cancelled, so the work (once it runs) observes cancellation and settles; abandon it without
-        // inflating the strand gauge (not a strand, not charged) and surface the OCE.
+        // Post-start region (High #8). EVERYTHING below (the start hop, arming the delay, the race, the
+        // cancel/detach handling) is guarded so an unexpected throw — e.g. a Task.Delay ObjectDisposedException
+        // or a CancelAsync fault — never skips Settle/Dispose/strand-accounting and never leaves workTcs
+        // unobserved. The three intended throw paths (start-hop cancellation, caller cancellation, deadline
+        // expiry) each register their abandonment and set `abandoned` before throwing, so the guard's fallback
+        // AbandonInBackground fires ONLY for a genuinely unexpected fault (never double-charging a strand).
+        bool abandoned = false;
         try
         {
-            await started.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            // Wait for the work to ACTUALLY START executing before arming the deadline (I3). This is a thread
+            // hop, not an admission/queue wait, so it is negligible and never counted against the budget.
+            // Cancellable: if the caller cancels during the start hop, abandon the (now-running) decode — charge
+            // it as a CANCELLED strand (High #5: a token-ignoring non-terminating decode abandoned by
+            // cancellation still holds thread+bytes+lease, so it MUST be bounded; a healthy cancelled decode
+            // drains in ms and un-charges immediately, costing healthy cancellation nothing) and surface the OCE.
+            try
+            {
+                await started.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                abandoned = true;
+                AbandonInBackground(
+                    workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
+                    countAsStrand: true, cancelled: true);
+                throw;
+            }
+
+            Task delayTask = Task.Delay(budget, timeProvider, linked.Token);
+
+            await Task.WhenAny(workTcs.Task, delayTask).ConfigureAwait(false);
+
+            if (workTcs.Task.IsCompleted)
+            {
+                // Work won the race (success OR a typed/library fault OR its own cancellation) — a HEALTHY
+                // in-budget outcome. Nothing was ever charged, so there is no residual to release. Cancel the
+                // delay timer, release the in-flight slot, then fire Settle SYNCHRONOUSLY (High #8): the caller's
+                // lease is released — and thus its reader/stream deterministically disposed — before RunAsync
+                // returns, closing the race where an async settle continuation could run after the caller had
+                // already returned. CancelAsync completes the delay's cancellation asynchronously (off this
+                // path) so the delay's registrations do not run synchronously on the completion path. Then
+                // surface the work's own outcome UNWRAPPED.
+                await linked.CancelAsync().ConfigureAwait(false);
+                ReleaseInFlight();
+                Settle();
+                linked.Dispose();
+                return await workTcs.Task.ConfigureAwait(false);
+            }
+
+            // The delay won: either the caller cancelled, or the deadline genuinely expired. Distinguish them so
+            // caller cancellation stays control flow (OperationCanceledException) and is NEVER masked as a timeout.
+            if (cancellationToken.IsCancellationRequested)
+            {
+                // Caller cancellation. The linked token is already cancelled, so a cooperative decode terminates
+                // promptly and un-charges in ms. But a token-IGNORING non-terminating decode abandoned here
+                // would otherwise hold thread+bytes+lease FOREVER, invisible to the bound (High #5) — so charge
+                // and count it as a CANCELLED strand (a telemetry sub-dimension); a healthy cancelled decode
+                // drains immediately, so this costs healthy cancellation nothing.
+                await linked.CancelAsync().ConfigureAwait(false);
+                abandoned = true;
+                AbandonInBackground(
+                    workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
+                    countAsStrand: true, cancelled: true);
+                cancellationToken.ThrowIfCancellationRequested();
+            }
+
+            // Genuine deadline expiry — the decode DETACHES. Cancel the linked token (a courtesy, in case the
+            // detached decode observes it), charge the strand's footprint against the stranded residual +
+            // increment the strand gauge (un-charged only if the strand eventually terminates), observe/dispose
+            // its eventual outcome, and fail closed with the caller-supplied typed exception.
+            await linked.CancelAsync().ConfigureAwait(false);
+            abandoned = true;
+            AbandonInBackground(
+                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
+                countAsStrand: true, cancelled: false);
+            throw onTimeout(budget);
         }
-        catch (OperationCanceledException)
+        catch when (!abandoned)
         {
-            AbandonInBackground(workTcs.Task, onAbandonedResult, linked, Settle, strandCharge, countAsStrand: false);
+            // A genuinely unexpected fault in the post-start region (the intended cancel/timeout paths already
+            // set `abandoned` before throwing). Abandon the work so nothing leaks: observe/dispose it, release
+            // the lease + in-flight slot, dispose the linked source; then rethrow unchanged.
+            AbandonInBackground(
+                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
+                countAsStrand: false, cancelled: false);
             throw;
         }
-
-        Task delayTask = Task.Delay(budget, timeProvider, linked.Token);
-
-        await Task.WhenAny(workTcs.Task, delayTask).ConfigureAwait(false);
-
-        if (workTcs.Task.IsCompleted)
-        {
-            // Work won the race (success OR a typed/library fault OR its own cancellation) — a HEALTHY in-budget
-            // outcome. Nothing was ever charged, so there is no residual to release. Cancel the delay timer,
-            // then fire Settle SYNCHRONOUSLY (High #8): the caller's lease is released — and thus its
-            // reader/stream deterministically disposed — before RunAsync returns, closing the race where an
-            // async settle continuation could run after the caller had already returned. CancelAsync (not
-            // Cancel) runs the delay's cancellation callback off this path so an inline callback fault cannot
-            // mask the work's outcome. Then surface the work's own outcome UNWRAPPED.
-            await linked.CancelAsync().ConfigureAwait(false);
-            Settle();
-            linked.Dispose();
-            return await workTcs.Task.ConfigureAwait(false);
-        }
-
-        // The delay won: either the caller cancelled, or the deadline genuinely expired. Distinguish them so
-        // caller cancellation stays control flow (OperationCanceledException) and is NEVER masked as a timeout.
-        if (cancellationToken.IsCancellationRequested)
-        {
-            // Routine caller cancellation of a (likely healthy) decode: do NOT count it as a strand and do NOT
-            // charge it (the detached gauge and the residual are not inflated by cancellation). The linked token
-            // is already cancelled, so a cooperative decode terminates promptly. Observe/dispose the eventual
-            // outcome and fire Settle when it settles (the lease is held until the — possibly still-running —
-            // work stops touching the reader).
-            AbandonInBackground(workTcs.Task, onAbandonedResult, linked, Settle, strandCharge, countAsStrand: false);
-            cancellationToken.ThrowIfCancellationRequested();
-        }
-
-        // Genuine deadline expiry — the decode DETACHES. Cancel the linked token (a courtesy, in case the
-        // detached decode observes it), charge the strand's footprint against the stranded residual + increment
-        // the strand gauge (un-charged only if the strand eventually terminates), observe/dispose its eventual
-        // outcome, and fail closed with the caller-supplied typed exception.
-        await linked.CancelAsync().ConfigureAwait(false);
-        AbandonInBackground(workTcs.Task, onAbandonedResult, linked, Settle, strandCharge, countAsStrand: true);
-        throw onTimeout(budget);
     }
 
-    // Admission gate (fail-fast) against the current STRANDED residual only. A healthy in-flight decode is never
-    // charged and never counted, so it is never rejected here — this rejects only when the door is genuinely
-    // full of PERMANENT strands. Throws a fail-closed DecodeCapacityExhaustedException with a TRUTHFUL message
-    // (strandedBytes/budget + strandedCount/cap) so a byte-saturated vs count-saturated condition is
-    // distinguishable in the surfaced text.
+    // Admission gate (fail-fast). Rejects when the door is genuinely full of PERMANENT strands (byte residual OR
+    // strand count) OR the generous in-flight ceiling (C_max) is reached — never against healthy in-flight for a
+    // byte/count reason below C_max, so healthy scan concurrency is never throttled. On admission it takes an
+    // in-flight slot (High #6). Throws a fail-closed DecodeCapacityExhaustedException with a TRUTHFUL message so
+    // a byte-saturated vs count-saturated vs wedged condition is distinguishable in the surfaced text.
     private void AdmitOrReject()
     {
         long strandedBytes = Volatile.Read(ref _strandedBytes);
         int strandedCount = Volatile.Read(ref _detached);
         if (strandedBytes >= _residualBudgetBytes || strandedCount >= _strandCountCap)
         {
-            throw Saturated(strandedBytes, strandedCount);
+            throw Saturated(strandedBytes, strandedCount, inFlight: Volatile.Read(ref _inFlight));
+        }
+
+        // High #6: bound C (concurrently-admitted untrusted decodes) with a generous ceiling so C is finite (the
+        // residual is bounded to residualBudget + C_max × maxFootprint). Healthy work never reaches this ceiling.
+        int inFlight = Interlocked.Increment(ref _inFlight);
+        if (inFlight > _inFlightCeiling)
+        {
+            Interlocked.Decrement(ref _inFlight);
+            throw Saturated(strandedBytes, strandedCount, inFlight: inFlight - 1);
         }
     }
 
-    private DecodeCapacityExhaustedException Saturated(long strandedBytes, int strandedCount) =>
-        new(string.Create(
+    private DecodeCapacityExhaustedException Saturated(long strandedBytes, int strandedCount, int inFlight)
+    {
+        // When the door is WEDGED (saturated with zero strand drain over the stall window, High #1) the caller
+        // should NOT be told to simply "retry after backoff" — the strands are not draining, so a liveness probe
+        // must recycle the pod. Otherwise the condition is a transient, retryable capacity fault.
+        string tail = IsWedged
+            ? "The door appears WEDGED — its strands have not drained within the stall window, so this is NOT a "
+                + "transient condition a retry clears; a liveness probe should recycle the pod "
+                + "(deltasharp.storage.decode.wedged=1)."
+            : "Healthy in-flight decodes are never charged here; retry after a strand quiesces or capacity frees.";
+        return new DecodeCapacityExhaustedException(string.Create(
             System.Globalization.CultureInfo.InvariantCulture,
-            $"The bounded-decode worker is at capacity and rejected the decode without starting: the door's stranded residual is full of permanent strands — strandedBytes={strandedBytes}/{_residualBudgetBytes}, strandedStrands={strandedCount}/{_strandCountCap}. Healthy in-flight decodes are never charged here; retry after a strand quiesces or capacity frees."));
+            $"The bounded-decode worker is at capacity and rejected the decode without starting: strandedBytes={strandedBytes}/{_residualBudgetBytes}, strandedStrands={strandedCount}/{_strandCountCap}, inFlight={inFlight}/{_inFlightCeiling}. {tail}"));
+    }
 
     private void StartExecution<T>(
         Func<CancellationToken, Task<T>> work,
@@ -532,27 +770,39 @@ internal sealed class BoundedDecoder
         thread.Start();
     }
 
-    // Register an abandoned (detached, running-past-deadline) or a cancelled decode: at DETACH charge the
-    // strand's footprint against the stranded residual and increment the strand gauge; then observe its eventual
-    // fault so it is never re-raised on the finalizer thread as an unobserved task exception, dispose a
-    // late-completing SUCCESSFUL result so a reader/stream that wins after the deadline is not leaked, fire the
-    // caller's Settle (release the lease once the — possibly stranded — work stops), un-charge the strand if it
-    // eventually terminates, and dispose the linked source. When countAsStrand is true (a GENUINE deadline
-    // expiry) the residual/gauge are charged here and released when the work finally terminates; a
-    // never-terminating strand holds exactly its footprint + one gauge slot for its whole lifetime. When
-    // countAsStrand is false (a routine caller cancellation of a healthy decode) nothing is charged.
+    // Register an abandoned decode: a DETACHED (running-past-deadline) strand, a CANCELLED strand (a
+    // caller-cancelled decode still running — High #5), or an unexpected-fault abandonment. When countAsStrand
+    // is true it charges the strand's footprint against the stranded residual and increments the strand gauge
+    // (and, when `cancelled`, the cancelled-flavour sub-gauge — a telemetry DIMENSION only); it then observes the
+    // eventual fault so it is never re-raised on the finalizer thread as an unobserved task exception, disposes a
+    // late-completing SUCCESSFUL result so a reader/stream that wins after abandonment is not leaked, un-charges
+    // the strand + releases the in-flight slot + records a drain WHEN the work finally terminates, fires the
+    // caller's Settle (release the lease), and disposes the linked source. A never-terminating strand holds
+    // exactly its footprint + one strand slot + one in-flight slot for its whole lifetime (the bounded residual).
+    // When countAsStrand is false (an unexpected-fault abandonment) nothing is charged, but the in-flight slot is
+    // still released when the work settles.
     private void AbandonInBackground<T>(
         Task<T> task,
         Action<T>? onAbandonedResult,
         CancellationTokenSource linked,
         Action settle,
+        Action releaseInFlight,
         long strandCharge,
-        bool countAsStrand)
+        bool countAsStrand,
+        bool cancelled)
     {
         if (countAsStrand)
         {
             Interlocked.Add(ref _strandedBytes, strandCharge);
             Interlocked.Increment(ref _detached);
+            if (cancelled)
+            {
+                Interlocked.Increment(ref _cancelledDetached);
+            }
+
+            // A strand just appeared: reset the wedged-door activity clock (High #1) so the "no drain over N
+            // minutes" window is measured from strand activity, not from door construction.
+            Volatile.Write(ref _lastStrandActivityTimestamp, _clock.GetTimestamp());
         }
 
         _ = task.ContinueWith(
@@ -583,7 +833,20 @@ internal sealed class BoundedDecoder
                     {
                         Interlocked.Add(ref _strandedBytes, -strandCharge);
                         Interlocked.Decrement(ref _detached);
+                        if (cancelled)
+                        {
+                            Interlocked.Decrement(ref _cancelledDetached);
+                        }
+
+                        // A strand drained (High #1 wedged-door signal): record the activity so a door that
+                        // KEEPS draining is never reported wedged. A never-terminating strand's continuation
+                        // never runs, so a saturated door with no activity crosses the stall window and reports
+                        // wedged.
+                        Volatile.Write(ref _lastStrandActivityTimestamp, _clock.GetTimestamp());
                     }
+
+                    // Release the in-flight admission slot (High #6) — the decode has finally stopped running.
+                    releaseInFlight();
 
                     // Release the caller's lease now that the (possibly stranded) work has actually stopped
                     // touching the reader. For a never-terminating strand this continuation never runs, so the

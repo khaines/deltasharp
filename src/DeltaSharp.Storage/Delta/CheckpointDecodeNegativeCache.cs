@@ -17,15 +17,17 @@ namespace DeltaSharp.Storage.Delta;
 /// once because data-file strands (on the shared pool) oversubscribed CPU — a transient, not a corrupt input.
 /// Poisoning requires <b>≥ <see cref="PoisonStrikeThreshold"/> proven timeouts of the SAME identity across
 /// SEPARATE loads</b>: the first timeout only records a strike (the checkpoint is still re-decoded next load),
-/// and a subsequent SUCCESSFUL decode <b>clears the strike history</b> (<see cref="ClearOnSuccess"/>) so a
-/// one-off slow decode never accumulates toward suppression. Only an identity that keeps timing out across
-/// loads is suppressed.</para>
-/// <para><b>Single-flight re-probe (High #7).</b> When a suppressed identity's TTL expires (the re-probe
-/// window) — or while an identity is still accumulating strikes below the threshold — exactly ONE caller is let
-/// through to re-decode (it takes the <see cref="Entry.ProbeInFlight"/> marker under the lock); every
-/// concurrent caller takes the SKIP path (reported known-timed-out) so N concurrent snapshot loads do not each
-/// spawn a fresh strand for the same identity. The marker is cleared when the prober reports its outcome
-/// (<see cref="Seed"/> or <see cref="ClearOnSuccess"/>).</para>
+/// and a subsequent SUCCESSFUL decode <b>decrements the strike history</b> (<see cref="ClearOnSuccess"/>, floored
+/// at zero) so a one-off slow decode never accumulates toward suppression, while a mostly-failing identity keeps
+/// its accumulated suspicion. Only an identity that keeps timing out across loads is suppressed.</para>
+/// <para><b>Single-flight probe (High #7 + Round-8 #11).</b> On the FIRST encounter of an unknown identity, and
+/// when a suppressed identity's TTL expires (the re-probe window) — or while an identity is still accumulating
+/// strikes below the threshold — exactly ONE caller is let through to re-decode (it takes the
+/// <see cref="Entry.ProbeInFlight"/> marker under the lock, creating a zero-strike entry on first encounter);
+/// every concurrent caller takes the SKIP path (reported known-timed-out) so N concurrent snapshot loads do not
+/// each spawn a fresh strand for the same identity — including N concurrent FIRST loads. The marker is cleared
+/// when the prober reports its outcome (<see cref="Seed"/>, <see cref="ClearOnSuccess"/>, or
+/// <see cref="ReleaseProbe"/>).</para>
 /// <para><b>Bounded LRU with per-entry TTL + backoff re-probe.</b> The cache holds at most <c>capacity</c>
 /// entries; on overflow the least-recently-used entry is evicted (never a whole-map wipe). A suppressed entry
 /// expires after a (backoff-extended) TTL; a lookup of an expired entry lets one re-probe through so a repaired
@@ -91,6 +93,15 @@ internal sealed class CheckpointDecodeNegativeCache
         {
             if (!_byKey.TryGetValue(key, out LinkedListNode<Entry>? node))
             {
+                // First encounter of an UNKNOWN (presumed-healthy) identity: admit it WITHOUT taking a probe
+                // (Round-8 #11 — the deliberate NON-single-flighted path). Single-flighting a first encounter
+                // would force every CONCURRENT first-load of the SAME healthy checkpoint onto the SKIP path →
+                // JSON replay; when the log floor is above 0 (commits log-cleaned) that replay hits a gap and
+                // the read fails spuriously — a worse outcome than the bounded, rare stranding of concurrent
+                // first-loads of a NON-TERMINATING (crafted) checkpoint (each such strand is already capped by
+                // the door's residual + strand-count cap). Single-flight therefore engages only ONCE an identity
+                // is KNOWN (a re-probe of a suppressed identity or one accumulating strikes below the
+                // threshold), where SKIP → JSON replay is the correct outcome anyway.
                 return false;
             }
 
@@ -147,29 +158,39 @@ internal sealed class CheckpointDecodeNegativeCache
             var node = new LinkedListNode<Entry>(new Entry(key, now + _baseTtl) { Strikes = 1, ProbeInFlight = false });
             _lru.AddFirst(node);
             _byKey[key] = node;
-
-            if (_byKey.Count > _capacity)
-            {
-                LinkedListNode<Entry> lruNode = _lru.Last!;
-                _lru.RemoveLast();
-                _byKey.Remove(lruNode.Value.Key);
-            }
+            EvictIfOverCapacity();
         }
     }
 
-    /// <summary>Clears an identity's strike history after a SUCCESSFUL decode (High #6 clear-on-success) and
-    /// releases the single-flight probe marker. A one-off slow decode that timed out once but then decoded
-    /// cleanly on a later load never accumulates toward suppression. A no-op for an identity that was never
-    /// seeded.</summary>
+    /// <summary>Decrements an identity's strike history by one (floored at zero) after a SUCCESSFUL decode
+    /// (High #6 / Round-8 #12) and releases the single-flight probe marker. Pre-fix this REMOVED the entry
+    /// entirely, so an input that alternates timeout/success never accumulated toward suppression AND lost all
+    /// history each success; a genuinely intermittent input still decays gracefully while a mostly-failing one
+    /// keeps its accumulated suspicion (3 timeouts then 1 success stays suppressed at 2, not wiped to 0). The
+    /// entry is retained (LRU-subject: a consistently-healthy identity drifts to the LRU tail and is evicted).
+    /// A no-op for an identity that was never seeded/encountered.</summary>
     internal void ClearOnSuccess(string key)
     {
         lock (_gate)
         {
             if (_byKey.TryGetValue(key, out LinkedListNode<Entry>? node))
             {
-                _lru.Remove(node);
-                _byKey.Remove(key);
+                Entry entry = node.Value;
+                entry.Strikes = Math.Max(entry.Strikes - 1, 0);
+                entry.ProbeInFlight = false;
             }
+        }
+    }
+
+    // Evicts the least-recently-used entry when the cache is over capacity (never a whole-map wipe). Called
+    // under _gate after any insertion.
+    private void EvictIfOverCapacity()
+    {
+        if (_byKey.Count > _capacity)
+        {
+            LinkedListNode<Entry> lruNode = _lru.Last!;
+            _lru.RemoveLast();
+            _byKey.Remove(lruNode.Value.Key);
         }
     }
 
