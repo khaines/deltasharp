@@ -117,6 +117,15 @@ internal enum CheckpointFallbackReason
     /// <c>deltasharp.storage.decode.negative_cache_skip{door=checkpoint}</c> counter so a persistently bad
     /// checkpoint stays observable without re-incurring the decode or inflating the timeout signal.</summary>
     NegativeCacheSkip,
+
+    /// <summary>The checkpoint part's CUMULATIVE per-part decoded/action footprint crossed the enforced
+    /// eager-decode ceiling (<c>MaxCheckpointPartDecodedBytes</c>) across its row groups (Round-10 #4 — a
+    /// <see cref="DeltaStorageException"/> with <see cref="StorageErrorKind.DecodeCeilingExceeded"/>).
+    /// Distinguished from <see cref="Malformed"/> because a resource ceiling is NOT proof of corruption — a
+    /// legitimate foreign (Spark) checkpoint part can genuinely decode past the ceiling — so it is fail-closed
+    /// to JSON replay and reported under its own reason rather than mislabeled corrupt. It never negatively
+    /// caches (the part is not proven bad, only oversized for this reader's eager decode).</summary>
+    DecodeCeilingExceeded,
 }
 
 /// <summary>
@@ -407,6 +416,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly ObservableGauge<int> _decodeDetached;
     private readonly ObservableGauge<int> _decodeDetachedCancelled;
     private readonly ObservableGauge<int> _decodeWedged;
+    private readonly ObservableGauge<int> _decodeDoorUnderProvisioned;
 #pragma warning restore IDE0052
 
     internal DeltaStorageTelemetry()
@@ -517,7 +527,20 @@ internal sealed class DeltaStorageTelemetry : IDisposable
                     new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
             },
             unit: "{door}",
-            description: "1 when a decode door is WEDGED (strandedCount == cap with no strand drain over the stall window), else 0, per door (Round-8 #1). A wedged door admits no further decodes and never recovers (.NET cannot abort the stranded threads); a sustained 1 is the liveness-probe signal to recycle the pod — DecoderSaturated on a wedged door is NOT retryable-after-backoff.");
+            description: "1 when a decode door is WEDGED (saturated — byte residual OR strand count — with no strand drain over the stall window), else 0, per door (Round-8 #1, Round-10 #10/#11). A wedged door admits no further decodes and never recovers (.NET cannot abort the stranded threads); a sustained 1 is the liveness-probe signal to recycle the pod — DecoderSaturated on a wedged door is NOT retryable-after-backoff.");
+        _decodeDoorUnderProvisioned = _storageMeter.CreateObservableGauge(
+            "deltasharp.storage.decode.door_under_provisioned",
+            static () => new[]
+            {
+                new Measurement<int>(
+                    BoundedDecode.DataFileUnderProvisioned,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.DataFile))),
+                new Measurement<int>(
+                    BoundedDecode.CheckpointUnderProvisioned,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+            },
+            unit: "{door}",
+            description: "1 when a decode door is UNDER-PROVISIONED (Round-10 #7): its one-maximal-footprint floor exceeds the process-memory cap (processMem/2), so on this pod the door cannot comfortably admit one legit maximal part and admits at most one maximal strand before saturating (fail-fast, retryable). A structural, pod-sizing signal — the max footprint is pod-independent, so a tiny pod protecting a large-row-group/large-checkpoint table is structurally limited and the strand COUNT cap is the operative gate.");
     }
 
     /// <summary>The <c>DeltaSharp.Delta</c> meter (commit instruments). Exposed for reference-identity
@@ -822,6 +845,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CheckpointFallbackReason.DecodeTimeout => "decode_timeout",
         CheckpointFallbackReason.DecoderSaturated => "decoder_saturated",
         CheckpointFallbackReason.NegativeCacheSkip => "negative_cache_skip",
+        CheckpointFallbackReason.DecodeCeilingExceeded => "decode_ceiling_exceeded",
         _ => "malformed",
     };
 

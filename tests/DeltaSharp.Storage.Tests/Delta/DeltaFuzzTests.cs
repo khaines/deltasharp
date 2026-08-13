@@ -43,8 +43,16 @@ public sealed class DeltaFuzzTests
     // case through its OWN decoder confines the permanent strand to a garbage-collected per-test instance; the
     // shared static door only ever sees healthy (never-stranding) decodes. A DedicatedThread execution mirrors
     // the real checkpoint door (a synchronous decode over pre-buffered bytes).
+    //
+    // PRODUCTION-SIZED (Round-10 test sizing): sized from the REAL checkpoint door footprint
+    // (CheckpointMaxFootprintBytes) with a matching residual, NOT the 1-byte default — otherwise every strand
+    // CHARGE clamps to 1 byte and the charge oracles are vacuous. DeriveDoorSizing on a large pod gives the real
+    // residual so a stranded checkpoint books its honest LIVE charge (Round-10 #1).
     private static BoundedDecoder IsolatedCheckpointDecoder() =>
-        new(strandCountCap: 8, execution: DecodeExecution.DedicatedThread);
+        BoundedDecoder.FromSizing(
+            BoundedDecode.DeriveDoorSizing(
+                256L * 1024 * 1024 * 1024, BoundedDecode.CheckpointMaxFootprintBytes, processorCount: 8),
+            DecodeExecution.DedicatedThread);
 
     [Fact]
     public void JsonActionReader_OnlyFailsClosed_OnRandomBytes()

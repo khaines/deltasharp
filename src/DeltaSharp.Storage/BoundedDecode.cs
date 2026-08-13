@@ -122,28 +122,37 @@ internal static class BoundedDecode
     /// silently letting a non-terminating decode run effectively forever.</summary>
     internal static readonly TimeSpan MaxBudget = TimeSpan.FromHours(24);
 
-    /// <summary>The maximum retained footprint a single <b>data-file</b> strand can pin — <b>2×</b> the reader's
-    /// enforced per-row-group eager-decode ceiling (8&#160;GiB = 2 × 4&#160;GiB, where 4&#160;GiB mirrors
-    /// <c>ParquetFileReader.MaxRowGroupDecodedBytes</c> / <c>ParquetDecodeLimits.DefaultMaxRowGroupDecodedBytes</c>).
-    /// A whole-row-group decode retains up to the decompressed ceiling PLUS the total-materialization ceiling
-    /// (<c>EnsureDecodeCeiling</c> guards (ii) and (iv) each bound one 4&#160;GiB ceiling, Round-8 #2), so the
-    /// real per-row-group retained footprint is up to 2× the ceiling; the door footprint is set to that so the
-    /// strand charge is a TRUE ceiling, not a single-column truncation. Held locally (rather than referencing
-    /// the reader constant) so the two doors' <c>static readonly</c> field init cannot depend on cross-type init
-    /// order. It floors the residual budget and clamps the charge a data-file strand books at detach.</summary>
-    internal const long DataFileMaxFootprintBytes = 2L * 4 * 1024 * 1024 * 1024;
+    /// <summary>The maximum retained footprint a single <b>data-file</b> strand can pin — a bounded
+    /// over-approximation of a whole-row-group decode within a documented constant factor (<b>3×</b> the
+    /// reader's enforced per-row-group eager-decode ceiling = 12&#160;GiB = 3 × 4&#160;GiB, where 4&#160;GiB
+    /// mirrors <c>ParquetFileReader.MaxRowGroupDecodedBytes</c> /
+    /// <c>ParquetDecodeLimits.DefaultMaxRowGroupDecodedBytes</c>). A whole-row-group decode retains up to the
+    /// decompressed ceiling PLUS the flat total-materialization ceiling (<c>EnsureDecodeCeiling</c> guards (ii)
+    /// and (iv) each bound one 4&#160;GiB ceiling, Round-8 #2) PLUS the nested reconstruction that runs under its
+    /// OWN independent <c>NestedParquetColumnReader.NestedDecodeBudget(MaxRowGroupDecodedBytes)</c> — which
+    /// guards (ii)/(iv) do NOT count (Round-10 #5, Architect M3), so the honest peak is up to 3× the ceiling.
+    /// This is a bounded over-approximation, NOT a strict Σ ceiling: variable-width string/binary UTF-16
+    /// materialization is separately over-approximated by <c>VariableWidthMaterializationFactor</c> in the
+    /// strand charge (<c>EstimateRowGroupRetainedBytes</c>), and per-element object overhead is not modelled
+    /// byte-exactly — the guarantee is containment within this documented constant factor, which #802 tracks
+    /// calibrating. Held locally (rather than referencing the reader constant) so the two doors'
+    /// <c>static readonly</c> field init cannot depend on cross-type init order. It floors the residual budget
+    /// and clamps the charge a data-file strand books at detach.</summary>
+    internal const long DataFileMaxFootprintBytes = 3L * 4 * 1024 * 1024 * 1024;
 
     /// <summary>The maximum retained footprint a single <b>checkpoint</b> strand can pin — the isolated buffered
     /// part copy it holds (≤512&#160;MiB, mirrors <c>DeltaCheckpointReader.MaxCheckpointPartBytes</c>) PLUS the
-    /// cumulative per-part decoded arrays + <c>List&lt;DeltaAction&gt;</c> across its row groups (≤4&#160;GiB,
+    /// cumulative per-part decoded arrays + <c>List&lt;DeltaAction&gt;</c> across its row groups (≤8&#160;GiB,
     /// <c>DeltaCheckpointReader.MaxCheckpointPartDecodedBytes</c>, enforced in <c>DecodeBufferedAsync</c>) —
-    /// 4.5&#160;GiB total (Round-8 #3). Pre-fix the door charged only the compressed buffer, under-stating the
-    /// decoded arrays a stranded checkpoint retains; the door footprint is raised to cover buffer + cumulative
-    /// decoded so the strand charge is a TRUE clamp, not an under-statement. The 4.5&#160;GiB literal is held
-    /// locally (rather than referencing the reader constants) so the two doors' <c>static readonly</c> field
-    /// init cannot depend on cross-type init order. It floors the residual budget and clamps the charge a
-    /// checkpoint strand books at detach.</summary>
-    internal const long CheckpointMaxFootprintBytes = (4L * 1024 * 1024 * 1024) + (512L * 1024 * 1024);
+    /// 8.5&#160;GiB total (Round-8 #3; the decoded term rose from 4 to 8&#160;GiB in Round-10 #4 so a legit
+    /// foreign multi-row-group part is not falsely rejected). Pre-fix the door charged only the compressed
+    /// buffer, under-stating the decoded arrays a stranded checkpoint retains; the door footprint covers buffer
+    /// + cumulative decoded so the strand's LIVE charge (<c>length + cumulativeDecoded</c>, Round-10 #1) clamps
+    /// to a TRUE ceiling, not an under-statement. The 8.5&#160;GiB literal is held locally (rather than
+    /// referencing the reader constants) so the two doors' <c>static readonly</c> field init cannot depend on
+    /// cross-type init order. It floors the residual budget and clamps the charge a checkpoint strand books at
+    /// detach.</summary>
+    internal const long CheckpointMaxFootprintBytes = (8L * 1024 * 1024 * 1024) + (512L * 1024 * 1024);
 
     /// <summary>The floor multiple <c>k</c> applied to the max footprint when flooring a door's residual budget
     /// (<c>k × maxFootprint</c>, k≥2): at least one maximal legitimate decode is always admissible against an
@@ -206,6 +215,17 @@ internal static class BoundedDecode
     /// <see cref="StorageErrorKind.DecoderSaturated"/> is NOT genuinely "retry after backoff" — a liveness probe
     /// should recycle the pod. Surfaced as the <c>deltasharp.storage.decode.wedged</c> gauge (per door).</summary>
     internal static readonly TimeSpan WedgedDrainStallWindow = TimeSpan.FromMinutes(5);
+
+    /// <summary>The wall-clock grace (Round-10 #2) a CALLER-cancelled decode is given to DRAIN before it is
+    /// booked as a strand. On the caller-cancellation path the door cancels the linked token and then re-races
+    /// the work against this grace: a COOPERATIVE healthy decode observes the cancellation and terminates within
+    /// milliseconds, so it wins the race, is NOT counted, and is NOT charged (the "healthy in-flight is NEVER
+    /// charged" invariant holds even when cancelled — cancelling many concurrent scans no longer transiently
+    /// saturates the door with spurious <see cref="StorageErrorKind.DecoderSaturated"/>). Only a token-IGNORING
+    /// non-terminating decode is still running after the grace; it is then booked (counted + charged) exactly as
+    /// a deadline strand, so a laundering hang stays bounded. Kept comfortably above a cooperative unwind so a
+    /// healthy cancel never races the grace, yet short enough that a laundered strand is booked promptly.</summary>
+    internal static readonly TimeSpan CancellationDrainGrace = TimeSpan.FromMilliseconds(500);
 
     /// <summary>The process/GC memory the doors size their budgets against —
     /// <see cref="GCMemoryInfo.TotalAvailableMemoryBytes"/> (container-cgroup-aware), with a conservative
@@ -294,6 +314,15 @@ internal static class BoundedDecode
 
     /// <summary>Whether the checkpoint door is wedged (see <see cref="DataFileWedged"/>).</summary>
     internal static int CheckpointWedged => CheckpointDecoder.IsWedged ? 1 : 0;
+
+    /// <summary>Whether the data-file door is <b>under-provisioned</b> (Round-10 #7): its one-footprint floor
+    /// exceeds the process-memory cap, so on this pod it cannot comfortably admit one legit maximal part.
+    /// Surfaced as <c>deltasharp.storage.decode.door_under_provisioned</c> (0/1) so the structural limit is
+    /// observable rather than an unconsumed flag.</summary>
+    internal static int DataFileUnderProvisioned => DataFileDecoder.UnderProvisioned ? 1 : 0;
+
+    /// <summary>Whether the checkpoint door is under-provisioned (see <see cref="DataFileUnderProvisioned"/>).</summary>
+    internal static int CheckpointUnderProvisioned => CheckpointDecoder.UnderProvisioned ? 1 : 0;
 }
 
 /// <summary>A door's derived sizing: its stranded-residual byte budget, its strand-count cap, the max
@@ -318,6 +347,7 @@ internal sealed class BoundedDecoder
     private readonly long _maxFootprintBytes;
     private readonly DecodeExecution _execution;
     private readonly int _inFlightCeiling;
+    private readonly bool _underProvisioned;
 
     // The STRANDED residual (the load-bearing bound). Charged ONLY at DETACH (a genuine deadline expiry OR a
     // caller-cancellation that abandons a non-terminating decode, High #5) with the decode's actual retained
@@ -359,7 +389,8 @@ internal sealed class BoundedDecoder
         long maxFootprintBytes = 1,
         DecodeExecution execution = DecodeExecution.Pool,
         int inFlightCeiling = 0,
-        TimeProvider? clock = null)
+        TimeProvider? clock = null,
+        bool underProvisioned = false)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(strandCountCap, 1);
         ArgumentOutOfRangeException.ThrowIfLessThan(residualBudgetBytes, 1);
@@ -381,6 +412,7 @@ internal sealed class BoundedDecoder
         _residualBudgetBytes = residualBudgetBytes;
         _maxFootprintBytes = maxFootprintBytes;
         _execution = execution;
+        _underProvisioned = underProvisioned;
         _clock = clock ?? TimeProvider.System;
         _lastStrandActivityTimestamp = _clock.GetTimestamp();
         // The generous in-flight ceiling (High #6). Default (0) derives k × ProcessorCount, floored well above
@@ -395,12 +427,21 @@ internal sealed class BoundedDecoder
                     int.MaxValue));
     }
 
-    /// <summary>Builds a decoder from a derived <see cref="DoorSizing"/> (the production path).</summary>
+    /// <summary>Builds a decoder from a derived <see cref="DoorSizing"/> (the production path). Carries the
+    /// sizing's <see cref="DoorSizing.UnderProvisioned"/> flag through so the door can surface it (Round-10 #7).</summary>
     internal static BoundedDecoder FromSizing(DoorSizing sizing, DecodeExecution execution) =>
-        new(sizing.StrandCountCap, sizing.ResidualBudgetBytes, sizing.MaxFootprintBytes, execution);
+        new(sizing.StrandCountCap, sizing.ResidualBudgetBytes, sizing.MaxFootprintBytes, execution,
+            underProvisioned: sizing.UnderProvisioned);
 
     /// <summary>The fail-fast cap on the COUNT of concurrent STRANDS (never healthy in-flight decodes).</summary>
     internal int StrandCountCap => _strandCountCap;
+
+    /// <summary>Whether this door is <b>under-provisioned</b> (Round-8 High #10 / Round-10 #7): its one-footprint
+    /// floor exceeds the process-memory cap, so it cannot comfortably admit one legit maximal part and admits at
+    /// most one maximal strand before saturating (fail-fast, retryable). Surfaced as the one-shot
+    /// <c>deltasharp.storage.decode.door_under_provisioned</c> gauge so the honest structural limit is
+    /// observable rather than an unconsumed flag.</summary>
+    internal bool UnderProvisioned => _underProvisioned;
 
     /// <summary>The stranded-residual byte budget (the load-bearing memory bound), charged only at detach.</summary>
     internal long ResidualBudgetBytes => _residualBudgetBytes;
@@ -433,16 +474,18 @@ internal sealed class BoundedDecoder
     /// exposed for tests that assert the byte-aware residual bound.</summary>
     internal long StrandedDecodeBytes => Volatile.Read(ref _strandedBytes);
 
-    /// <summary>Whether this door is <b>wedged</b> (High #1): currently saturated (byte OR count gate) with NO
-    /// strand drain for <see cref="BoundedDecode.WedgedDrainStallWindow"/>. A wedged door's strands are not
-    /// draining, so <see cref="DecodeCapacityExhaustedException"/> is not genuinely retryable — a liveness probe
-    /// should recycle the pod. Surfaced as the <c>deltasharp.storage.decode.wedged</c> gauge.</summary>
+    /// <summary>Whether this door is <b>wedged</b> (High #1): currently saturated (byte OR strand-count OR the
+    /// in-flight admission ceiling, Round-10 #10) with NO strand drain for
+    /// <see cref="BoundedDecode.WedgedDrainStallWindow"/>. A wedged door's strands are not draining, so
+    /// <see cref="DecodeCapacityExhaustedException"/> is not genuinely retryable — a liveness probe should
+    /// recycle the pod. Surfaced as the <c>deltasharp.storage.decode.wedged</c> gauge.</summary>
     internal bool IsWedged
     {
         get
         {
             bool saturated = Volatile.Read(ref _strandedBytes) >= _residualBudgetBytes
-                || Volatile.Read(ref _detached) >= _strandCountCap;
+                || Volatile.Read(ref _detached) >= _strandCountCap
+                || Volatile.Read(ref _inFlight) >= _inFlightCeiling;
             if (!saturated)
             {
                 return false;
@@ -490,7 +533,15 @@ internal sealed class BoundedDecoder
     /// <see cref="TimeProvider.System"/>); injected so deadline tests can drive it deterministically.</param>
     /// <param name="estimatedRetainedBytes">The decode's actual retained-bytes footprint, charged against the
     /// door's stranded residual ONLY if this decode detaches (clamped to the door's max footprint). A healthy
-    /// completion charges nothing. Zero is used by unit tests that exercise the strand-COUNT cap in isolation.</param>
+    /// completion charges nothing. Zero is used by unit tests that exercise the strand-COUNT cap in isolation.
+    /// Ignored when <paramref name="retainedBytesProbe"/> is supplied.</param>
+    /// <param name="retainedBytesProbe">An optional LIVE charge probe (Round-10 #1): when supplied, the strand
+    /// charge is read from it AT THE MOMENT OF DETACH (not from the fixed <paramref name="estimatedRetainedBytes"/>),
+    /// so a decode whose retained footprint GROWS as it runs (the checkpoint part's cumulative decoded arrays)
+    /// charges the actual incremental bytes it has materialized when it strands — never a flat ceiling that would
+    /// degenerate the byte gate into a de-facto count cap. The probe is invoked on the detach path only; its
+    /// result is clamped to the door's max footprint like the static estimate. The production caller floors the
+    /// probe's result at <see cref="MinStrandChargeBytes"/> so a cheap strand still consumes the byte residual.</param>
     /// <exception cref="DecodeCapacityExhaustedException">This door's stranded residual is already full (its
     /// strand-count cap OR its residual byte budget is exhausted by permanent strands) — the call is rejected
     /// fail-fast WITHOUT starting.</exception>
@@ -502,17 +553,20 @@ internal sealed class BoundedDecoder
         Action<T>? onAbandonedResult = null,
         Action? onWorkSettled = null,
         TimeProvider? timeProvider = null,
-        long estimatedRetainedBytes = 0)
+        long estimatedRetainedBytes = 0,
+        Func<long>? retainedBytesProbe = null)
     {
         ArgumentNullException.ThrowIfNull(work);
         ArgumentNullException.ThrowIfNull(onTimeout);
 
-        // The charge a strand of this decode would book at detach: exactly the footprint passed in, clamped to
+        // The charge a strand of this decode would book at detach, evaluated AT DETACH so a live probe
+        // (Round-10 #1) reflects the actual incremental retained bytes rather than a flat ceiling; clamped to
         // the door's max footprint so a mis-estimate can never over-charge the residual (the bound stays
-        // provable). The production call sites FLOOR their estimate at BoundedDecode.MinStrandChargeBytes (High
-        // #1b) so a cheap strand still consumes the byte residual; this method stays literal (charges exactly
-        // what it is passed) so the count-cap-in-isolation unit tests can pass a zero estimate.
-        long strandCharge = Math.Clamp(estimatedRetainedBytes, 0L, _maxFootprintBytes);
+        // provable). The production call sites FLOOR their estimate/probe at BoundedDecode.MinStrandChargeBytes
+        // (High #1b) so a cheap strand still consumes the byte residual; this method stays literal (charges
+        // exactly what it reads) so the count-cap-in-isolation unit tests can pass a zero estimate.
+        long ComputeStrandCharge() =>
+            Math.Clamp(retainedBytesProbe is null ? estimatedRetainedBytes : retainedBytesProbe(), 0L, _maxFootprintBytes);
 
         // onWorkSettled EXACTLY ONCE on every path. The data-file door releases its ParquetReader lease here, so
         // a routine caller-cancellation (whose first act below is ThrowIfCancellationRequested) or a capacity
@@ -599,24 +653,43 @@ internal sealed class BoundedDecoder
         // expiry) each register their abandonment and set `abandoned` before throwing, so the guard's fallback
         // AbandonInBackground fires ONLY for a genuinely unexpected fault (never double-charging a strand).
         bool abandoned = false;
+
+        // Cancel-and-abandon with a DRAIN GRACE (Round-10 #2/#9). Used by BOTH caller-cancellation branches (the
+        // start-hop cancel and the delay-won cancel). Sets `abandoned` BEFORE CancelAsync so a token-registration
+        // fault on cancel cannot re-open strand-laundering via the unexpected-fault fallback (#9), cancels the
+        // linked token, then re-races the work against a short grace: a COOPERATIVE healthy decode observes the
+        // cancellation and terminates within ms — it wins the race, so it is NOT counted and NOT charged
+        // (cancelling many concurrent healthy scans never transiently saturates the door — the "healthy in-flight
+        // is NEVER charged" invariant holds under cancellation). Only a token-IGNORING non-terminating decode is
+        // still running after the grace; it is then booked (counted + charged) exactly like a deadline strand.
+        // Fail-safe: countAsStrand = !workTcs.Task.IsCompleted (a decode that has terminated is never booked).
+        async Task CancelAbandonAsync()
+        {
+            abandoned = true;
+            await linked.CancelAsync().ConfigureAwait(false);
+            await Task.WhenAny(
+                workTcs.Task,
+                Task.Delay(BoundedDecode.CancellationDrainGrace, timeProvider)).ConfigureAwait(false);
+            bool stillRunning = !workTcs.Task.IsCompleted;
+            AbandonInBackground(
+                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, ComputeStrandCharge(),
+                countAsStrand: stillRunning, cancelled: stillRunning);
+        }
+
         try
         {
             // Wait for the work to ACTUALLY START executing before arming the deadline (I3). This is a thread
             // hop, not an admission/queue wait, so it is negligible and never counted against the budget.
-            // Cancellable: if the caller cancels during the start hop, abandon the (now-running) decode — charge
-            // it as a CANCELLED strand (High #5: a token-ignoring non-terminating decode abandoned by
-            // cancellation still holds thread+bytes+lease, so it MUST be bounded; a healthy cancelled decode
-            // drains in ms and un-charges immediately, costing healthy cancellation nothing) and surface the OCE.
+            // Cancellable: if the caller cancels during the start hop, cancel-and-abandon the (now-running)
+            // decode under the drain grace (a healthy decode drains free; only a token-ignoring hang is booked,
+            // High #5 / Round-10 #2) and surface the OCE.
             try
             {
                 await started.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
-                abandoned = true;
-                AbandonInBackground(
-                    workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
-                    countAsStrand: true, cancelled: true);
+                await CancelAbandonAsync().ConfigureAwait(false);
                 throw;
             }
 
@@ -645,27 +718,24 @@ internal sealed class BoundedDecoder
             // caller cancellation stays control flow (OperationCanceledException) and is NEVER masked as a timeout.
             if (cancellationToken.IsCancellationRequested)
             {
-                // Caller cancellation. The linked token is already cancelled, so a cooperative decode terminates
-                // promptly and un-charges in ms. But a token-IGNORING non-terminating decode abandoned here
-                // would otherwise hold thread+bytes+lease FOREVER, invisible to the bound (High #5) — so charge
-                // and count it as a CANCELLED strand (a telemetry sub-dimension); a healthy cancelled decode
-                // drains immediately, so this costs healthy cancellation nothing.
-                await linked.CancelAsync().ConfigureAwait(false);
-                abandoned = true;
-                AbandonInBackground(
-                    workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
-                    countAsStrand: true, cancelled: true);
+                // Caller cancellation (Round-10 #2). Cancel-and-abandon under the drain grace: a cooperative
+                // healthy decode drains in ms and costs nothing (NOT counted, NOT charged), while a token-
+                // IGNORING non-terminating decode is booked as a CANCELLED strand so it cannot launder the bound
+                // (it would otherwise hold thread+bytes+lease FOREVER, invisible to the residual — High #5).
+                await CancelAbandonAsync().ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
             }
 
-            // Genuine deadline expiry — the decode DETACHES. Cancel the linked token (a courtesy, in case the
-            // detached decode observes it), charge the strand's footprint against the stranded residual +
-            // increment the strand gauge (un-charged only if the strand eventually terminates), observe/dispose
-            // its eventual outcome, and fail closed with the caller-supplied typed exception.
-            await linked.CancelAsync().ConfigureAwait(false);
+            // Genuine deadline expiry — the decode DETACHES. Set `abandoned` first (#9), cancel the linked token
+            // (a courtesy, in case the detached decode observes it), charge the strand's LIVE footprint against
+            // the stranded residual + increment the strand gauge (un-charged only if the strand eventually
+            // terminates), observe/dispose its eventual outcome, and fail closed with the caller-supplied typed
+            // exception. A deadline strand always counts (the budget already elapsed without completion) — no
+            // drain grace here.
             abandoned = true;
+            await linked.CancelAsync().ConfigureAwait(false);
             AbandonInBackground(
-                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
+                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, ComputeStrandCharge(),
                 countAsStrand: true, cancelled: false);
             throw onTimeout(budget);
         }
@@ -675,7 +745,7 @@ internal sealed class BoundedDecoder
             // set `abandoned` before throwing). Abandon the work so nothing leaks: observe/dispose it, release
             // the lease + in-flight slot, dispose the linked source; then rethrow unchanged.
             AbandonInBackground(
-                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, strandCharge,
+                workTcs.Task, onAbandonedResult, linked, Settle, ReleaseInFlight, ComputeStrandCharge(),
                 countAsStrand: false, cancelled: false);
             throw;
         }

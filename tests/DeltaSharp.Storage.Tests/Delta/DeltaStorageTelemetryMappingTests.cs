@@ -64,6 +64,7 @@ public sealed class DeltaStorageTelemetryMappingTests
             [CheckpointFallbackReason.DecodeTimeout] = "decode_timeout",
             [CheckpointFallbackReason.DecoderSaturated] = "decoder_saturated",
             [CheckpointFallbackReason.NegativeCacheSkip] = "negative_cache_skip",
+            [CheckpointFallbackReason.DecodeCeilingExceeded] = "decode_ceiling_exceeded",
         };
 
         foreach (CheckpointFallbackReason reason in Enum.GetValues<CheckpointFallbackReason>())

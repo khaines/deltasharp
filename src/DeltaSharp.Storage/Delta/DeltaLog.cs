@@ -50,6 +50,12 @@ internal sealed class DeltaLog
     private readonly TimeSpan? _checkpointDecodeBudget;
     private readonly BoundedDecoder _checkpointDecoder;
 
+    // The cumulative per-PART decoded-bytes ceiling passed through to DeltaCheckpointReader.ReadAsync (Round-10
+    // #4). Defaults to the production ceiling; a TEST seam can inject a tiny value to drive the DecodeCeiling-
+    // Exceeded fallback path end-to-end (a crossing part → JSON replay under the distinct reason, no short
+    // snapshot, probe released for a re-openable next load).
+    private readonly long _checkpointMaxPartDecodedBytes;
+
     /// <summary>The cap on <see cref="TimedOutCheckpointParts"/> so the negative cache can never grow without
     /// bound under a stream of distinct crafted checkpoint identities.</summary>
     private const int NegativeCacheCapacity = 1024;
@@ -120,9 +126,11 @@ internal sealed class DeltaLog
         DeltaStorageTelemetry? telemetry = null,
         TimeSpan? checkpointDecodeBudget = null,
         TimeProvider? timeProvider = null,
-        BoundedDecoder? checkpointDecoder = null)
+        BoundedDecoder? checkpointDecoder = null,
+        long checkpointMaxPartDecodedBytes = DeltaCheckpointReader.MaxCheckpointPartDecodedBytes)
     {
         ArgumentNullException.ThrowIfNull(backend);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(checkpointMaxPartDecodedBytes, nameof(checkpointMaxPartDecodedBytes));
         if (checkpointDecodeBudget is { } budget)
         {
             // Fail fast on a misconfigured operator budget with an explicit paramName — never as a raw
@@ -138,6 +146,7 @@ internal sealed class DeltaLog
         _checkpointDecodeBudget = checkpointDecodeBudget;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _checkpointDecoder = checkpointDecoder ?? BoundedDecode.CheckpointDecoder;
+        _checkpointMaxPartDecodedBytes = checkpointMaxPartDecodedBytes;
         _checkpointLogScope = new KeyValuePair<string, object?>[]
         {
             new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),
@@ -895,18 +904,26 @@ internal sealed class DeltaLog
                         IReadOnlyList<DeltaAction> actions;
                         long decodeStart = _timeProvider.GetTimestamp();
 
-                        // Sustained-pressure poisoning guard (Round-8 #9): snapshot the PRE-EXISTING strand
-                        // pressure BEFORE this decode runs. Captured here (not read in the catch) so THIS decode's
-                        // OWN strand — which RunAsync books at detach, BEFORE the DecodeBudgetExceeded propagates
-                        // — is excluded; otherwise every timeout would see its own fresh strand and never seed.
-                        int strandsBeforeDecode = BoundedDecode.DetachedDecodeCount;
+                        // Sustained-pressure poisoning guard (Round-8 #9, RE-SCOPED Round-10 #3): snapshot the
+                        // pre-existing strand pressure ON THE DECODER ACTUALLY USED (_checkpointDecoder) — NOT the
+                        // process-global BoundedDecode.DetachedDecodeCount, which counted strands from EITHER door
+                        // and never decrements for a permanent strand, so ONE never-terminating strand permanently
+                        // disabled seeding process-wide (self-renewal → wedge). Reading the checkpoint decoder's
+                        // own count means an UNRELATED data-file-door strand is invisible here and cannot block a
+                        // legitimate checkpoint seed. Captured BEFORE this decode runs so a TRANSIENT delta can be
+                        // computed in the catch (a NEW external strand appearing DURING this decode is the pressure
+                        // that must NOT seed; a strand that already existed — including this identity's OWN prior
+                        // permanent strand — is not new and MUST still seed so a genuinely-bad checkpoint reaches
+                        // strike 2).
+                        int strandsBeforeDecode = _checkpointDecoder.DetachedDecodeCount;
                         try
                         {
                             actions = await DeltaCheckpointReader.ReadAsync(
                                 stream, cancellationToken,
                                 decodeBudget: perPartBudget,
                                 timeProvider: _timeProvider,
-                                decoder: _checkpointDecoder).ConfigureAwait(false);
+                                decoder: _checkpointDecoder,
+                                maxPartDecodedBytes: _checkpointMaxPartDecodedBytes).ConfigureAwait(false);
                         }
                         catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
                         {
@@ -926,6 +943,18 @@ internal sealed class DeltaLog
                             RecordCheckpointFallback(CheckpointFallbackReason.UnsupportedFeature, checkpoint.Version);
                             return null;
                         }
+                        catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeCeilingExceeded)
+                        {
+                            // The checkpoint part would eagerly decode past the cumulative per-part decode ceiling
+                            // (Round-10 #4). This is a RESOURCE/decode-ceiling fault, NOT proven corruption: a
+                            // legit foreign (Spark) multi-row-group part can legitimately decode past the flat
+                            // ceiling. Route it to JSON replay under the DISTINCT DecodeCeilingExceeded reason and
+                            // do NOT seed the negative cache (it is not proven bad — the probe is released by the
+                            // finally). Classifying it here — separately from the Malformed catch below — is the
+                            // fix for reporting a resource ceiling as corruption.
+                            RecordCheckpointFallback(CheckpointFallbackReason.DecodeCeilingExceeded, checkpoint.Version);
+                            return null;
+                        }
                         catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecodeBudgetExceeded)
                         {
                             // The checkpoint decode tripped the bounded wall-clock ceiling (a non-terminating
@@ -936,17 +965,24 @@ internal sealed class DeltaLog
                             // seed walk.
                             decodeCeiling.Charge(_timeProvider.GetElapsedTime(decodeStart));
 
-                            // Sustained-pressure poisoning guard (Round-8 #9). A timeout while OTHER bounded-decode
-                            // strands were ALREADY live (captured in strandsBeforeDecode, above) is NOT proof of a
-                            // bad input: detached strands hold threads/bytes and can starve a HEALTHY part's decode
-                            // into a false timeout, which — seeded — would poison a good checkpoint into up-to-24h
-                            // suppression (an unreadable table). Only SEED (record a strike, High #6 strike-gated)
-                            // when NO strand pre-existed this decode, so the timeout is attributable to THIS part's
-                            // own decode. Under pre-existing pressure, fall back to JSON replay WITHOUT a strike
-                            // (the finally releases the probe) so a later, unpressured load can re-probe cleanly. A
-                            // persistently-hanging input under sustained strand pressure is bounded instead by the
-                            // door's stranded-residual + wedged-door signal (High #1), not the negative cache.
-                            if (strandsBeforeDecode == 0)
+                            // Sustained-pressure poisoning guard (Round-8 #9, RE-SCOPED Round-10 #3). A timeout
+                            // while a NEW external checkpoint-door strand appeared DURING this decode is NOT proof
+                            // of a bad input: a detached strand holds threads/bytes and can starve a HEALTHY part's
+                            // decode into a false timeout, which — seeded — would poison a good checkpoint into
+                            // up-to-24h suppression (an unreadable table). Compute the TRANSIENT external delta:
+                            // this decode books its OWN strand at detach (BEFORE this catch runs), so subtract it;
+                            // a strand that pre-existed — INCLUDING this identity's OWN prior permanent strand,
+                            // which is exactly the self-inflicted case that SHOULD seed so a genuinely-bad
+                            // checkpoint still reaches strike 2 and gets suppressed — is in strandsBeforeDecode and
+                            // nets to zero. Only a NEW external strand gives a positive delta and blocks seeding.
+                            // Reading _checkpointDecoder's own count (Round-10 #3a) means an unrelated data-file
+                            // strand never blocks seeding. Under genuine transient pressure, fall back to JSON
+                            // replay WITHOUT a strike (the finally releases the probe) so a later, unpressured load
+                            // can re-probe cleanly; a persistently-hanging input is bounded instead by the door's
+                            // stranded-residual + wedged-door signal (High #1), not the negative cache.
+                            int externalStrandsDuringDecode =
+                                (_checkpointDecoder.DetachedDecodeCount - 1) - strandsBeforeDecode;
+                            if (externalStrandsDuringDecode <= 0)
                             {
                                 TimedOutCheckpointParts.Seed(partKey, _timeProvider);
                                 probeReported = true;

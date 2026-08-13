@@ -817,18 +817,20 @@ public sealed class BoundedDecodeTests
     [Fact]
     public async Task DeriveDoorSizing_BehavioralOracle_OneMaximalStrandDoesNotWedgeTheDoor_AndCheapStrandsDoNotCloseTheCountGate()
     {
-        // Round-8 #1 (the decisive behavioral regression catch) — build a REAL door from the derived sizing and
-        // prove the two failure modes the old count cap (= residualBudget/maxFootprint = 2 on every pod ≤ 64 GiB)
-        // introduced are BOTH closed:
+        // Round-8 #1 / Round-10 behavioral sizing oracle — parameterize at the PRODUCTION maximal footprint
+        // (DataFileMaxFootprintBytes) so the OLD coupled cap (= residualBudget/maxFootprint) was EXACTLY 2, and
+        // prove the two failure modes that cap introduced are BOTH closed:
         //   (1) WEDGE: detaching TWO maximal-footprint strands must NOT wedge the door — a healthy decode is
         //       still admitted. Under the old cap=2, the second strand hit the count gate and every healthy
         //       decode was rejected process-wide. RED under a revert to the coupled cap.
         //   (2) CHEAP-STRAND COUNT GATE: detaching several SMALL-charge strands (well under the byte residual)
-        //       must NOT close the door either — the count gate is far from binding (≥ 64) while the byte gate
+        //       must NOT close the door either — the count gate is far from binding (64) while the byte gate
         //       (the load-bearing one) is nowhere near full. Under the old cap=2 the 3rd cheap strand wedged it.
-        const long footprint = 1L * 1024 * 1024 * 1024;
-        DoorSizing sizing = BoundedDecode.DeriveDoorSizing(64L * 1024 * 1024 * 1024, footprint, processorCount: 8);
-        Assert.Equal(64, sizing.StrandCountCap); // decoupled cap — NOT 2
+        // The pod is sized (256 GiB) so the residual (processMem/8 = 32 GiB) comfortably holds two maximal
+        // strands (24 GiB) AND admits a third — under the coupled cap it would be rejected at the count gate.
+        const long footprint = BoundedDecode.DataFileMaxFootprintBytes; // 12 GiB — the real maximal data-file strand
+        DoorSizing sizing = BoundedDecode.DeriveDoorSizing(256L * 1024 * 1024 * 1024, footprint, processorCount: 8);
+        Assert.Equal(64, sizing.StrandCountCap); // decoupled cap — NOT residualBudget/maxFootprint (= 2)
 
         // (1) Two MAXIMAL strands, then a healthy decode is still admitted.
         var wedgeDoor = BoundedDecoder.FromSizing(sizing, DecodeExecution.Pool);
@@ -837,7 +839,7 @@ public sealed class BoundedDecodeTests
             DetachStrand(wedgeDoor, gate, charge: footprint);
             DetachStrand(wedgeDoor, gate, charge: footprint);
             await WaitForAsync(() => wedgeDoor.DetachedDecodeCount == 2);
-            Assert.Equal(footprint * 2, wedgeDoor.StrandedDecodeBytes); // 2 GiB stranded, well under the 8 GiB residual
+            Assert.Equal(footprint * 2, wedgeDoor.StrandedDecodeBytes); // 24 GiB stranded, under the 32 GiB residual
 
             int admitted = await wedgeDoor.RunAsync(
                 _ => Task.FromResult(1),
@@ -978,16 +980,21 @@ public sealed class BoundedDecodeTests
     [Fact]
     public async Task OpenStrandChargeOracle_ChargesTheInputLengthDerivedFootprint_NotZero()
     {
-        // Round-8 #7 end-to-end charge oracle — strand a REAL open (footer bit-flip drives a non-terminating
-        // CreateAsync) through an injected decoder and assert its stranded residual is the input-length-derived
-        // footprint (floored at MinStrandChargeBytes, clamped to the door footprint), NOT the old fixed 16-MiB
-        // fiction and NOT zero. RED if the open call site's `estimatedRetainedBytes:` is mutated to 0 (the
-        // charge would collapse to 0 instead of the floored file-length footprint).
+        // Round-8 #7 / Round-10 #1 end-to-end charge oracle — strand a REAL open (footer bit-flip drives a
+        // non-terminating CreateAsync) through a PRODUCTION-SIZED injected decoder (DataFileMaxFootprintBytes +
+        // a matching residual) and assert its stranded residual is the footer-metadata charge:
+        // max(min(fileLength, MaxFooterMetadataBytes), MinStrandChargeBytes) — the floored, footer-clamped value
+        // (Round-10 #1), NOT zero and NOT the whole-file/door-footprint over-charge. Under the pre-Round-10
+        // 1-byte-footprint fiction this oracle clamped the expected to 1 byte and was VACUOUS; production sizing
+        // makes it assert the REAL MinStrandChargeBytes floor. RED if the open call site's
+        // `estimatedRetainedBytes:` is mutated to 0, OR if EstimateOpenRetainedBytes drops the footer clamp/floor.
         byte[] file = await BuildDataFileAsync();
         byte[] mutated = (byte[])file.Clone();
         mutated[^9] ^= 1; // hang the open
 
-        var decoder = new BoundedDecoder(strandCountCap: 4, execution: DecodeExecution.Pool);
+        DoorSizing sizing = BoundedDecode.DeriveDoorSizing(
+            256L * 1024 * 1024 * 1024, BoundedDecode.DataFileMaxFootprintBytes, processorCount: 8);
+        var decoder = BoundedDecoder.FromSizing(sizing, DecodeExecution.Pool);
         var reader = new ParquetFileReader(
             new ParquetDecodeLimits(decodeTimeBudget: TimeSpan.FromMilliseconds(200)),
             dataFileDecoder: decoder);
@@ -996,9 +1003,14 @@ public sealed class BoundedDecodeTests
         Assert.IsType<DeltaStorageException>(thrown);
         await WaitForAsync(() => decoder.DetachedDecodeCount == 1);
 
-        long expected = Math.Max((long)mutated.Length, BoundedDecode.MinStrandChargeBytes);
+        // The footer-metadata charge: min(fileLength, MaxFooterMetadataBytes) floored at MinStrandChargeBytes,
+        // clamped to the door footprint. For a small test file this is exactly MinStrandChargeBytes (64 MiB) —
+        // the real floored value, no longer clamped to a 1-byte door.
+        long basis = Math.Min((long)mutated.Length, ParquetFileReader.MaxFooterMetadataBytes);
+        long expected = Math.Max(basis, BoundedDecode.MinStrandChargeBytes);
         expected = Math.Clamp(expected, 0, decoder.MaxFootprintBytes);
-        Assert.Equal(expected, decoder.StrandedDecodeBytes); // the input-length-derived floor, never 0
+        Assert.Equal(BoundedDecode.MinStrandChargeBytes, expected); // production sizing → the real floor, not 1
+        Assert.Equal(expected, decoder.StrandedDecodeBytes); // the footer-clamped floor, never 0
     }
 
     [Fact]
@@ -1020,9 +1032,9 @@ public sealed class BoundedDecodeTests
         ParquetFileReader.ResolvedColumn[] oneField = ParquetFileReader.ResolveFileFields(reader.Schema, oneColumn, false, false, null);
 
         long twoColumnEstimate = ParquetFileReader.EstimateRowGroupRetainedBytes(
-            reader, 0, DataSchema, twoFields, ParquetDecodeLimits.Default);
+            reader, 0, DataSchema, twoFields);
         long oneColumnEstimate = ParquetFileReader.EstimateRowGroupRetainedBytes(
-            reader, 0, oneColumn, oneField, ParquetDecodeLimits.Default);
+            reader, 0, oneColumn, oneField);
 
         Assert.True(twoColumnEstimate > 0, "a real non-empty row group must estimate a positive footprint (never 0).");
         Assert.True(twoColumnEstimate > oneColumnEstimate,
@@ -1031,7 +1043,7 @@ public sealed class BoundedDecodeTests
 
         // Fault path — an out-of-range group index faults OpenRowGroupReader → fall back to the door footprint.
         long faulted = ParquetFileReader.EstimateRowGroupRetainedBytes(
-            reader, group: 9999, DataSchema, twoFields, ParquetDecodeLimits.Default);
+            reader, group: 9999, DataSchema, twoFields);
         Assert.Equal(BoundedDecode.DataFileMaxFootprintBytes, faulted);
     }
 
@@ -1256,11 +1268,18 @@ public sealed class BoundedDecodeTests
     [Fact]
     public async Task CallerCancellation_ReleasesLease_AndIsNotCountedAsAStrand()
     {
-        // High #3 + High #6 — a routine caller cancellation of a healthy in-flight decode must (a) fire
-        // onWorkSettled EXACTLY ONCE so a caller-held lease is released (no leak), and (b) NOT inflate the
-        // detached-strand gauge (a cancelled healthy decode is not a strand). Proven directly: a decode is
-        // cancelled mid-flight; the onWorkSettled callback fires exactly once and the detached count stays 0.
-        var decoder = new BoundedDecoder(strandCountCap: 4);
+        // High #3 + High #6 + Round-10 #2 — a routine caller cancellation of a HEALTHY (cooperative) in-flight
+        // decode must (a) fire onWorkSettled EXACTLY ONCE so a caller-held lease is released (no leak), (b) NOT
+        // inflate the detached-strand gauge, and (c) charge NOTHING — the "healthy in-flight is NEVER charged"
+        // invariant holds even under cancellation (Round-10 #2 drain grace). De-vacuumed: the decoder is sized
+        // with a REAL footprint and the strand would-be charge (estimatedRetainedBytes) is NON-ZERO, so the
+        // not-charged assertion genuinely bites — if the drain grace were removed (booking healthy cancellations
+        // like the pre-Round-10 code), StrandedDecodeBytes would jump to `footprint` and DetachedDecodeCount to
+        // 1. A cooperative decode observes the token and drains in ms, winning the drain-grace race → not counted,
+        // not charged. RED if the drain grace is reverted.
+        const long footprint = 64L * 1024 * 1024;
+        var decoder = new BoundedDecoder(
+            strandCountCap: 4, residualBudgetBytes: footprint * 8, maxFootprintBytes: footprint);
         using var cts = new CancellationTokenSource();
         using var started = new ManualResetEventSlim(initialState: false);
         int settledCount = 0;
@@ -1270,17 +1289,21 @@ public sealed class BoundedDecodeTests
             TimeSpan.FromSeconds(30),
             static _ => DeltaStorageException.DecodeBudgetExceeded("must not time out"),
             cts.Token,
-            onWorkSettled: () => Interlocked.Increment(ref settledCount));
+            onWorkSettled: () => Interlocked.Increment(ref settledCount),
+            estimatedRetainedBytes: footprint);
 
         Assert.True(started.Wait(Watchdog));
         cts.Cancel();
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
 
-        // The lease was released exactly once, and the cancellation was NOT counted as a strand.
+        // The lease was released exactly once; the cancellation was NOT counted as a strand; and NOTHING was
+        // charged (the healthy cooperative decode drained inside the grace).
         await WaitForAsync(() => Volatile.Read(ref settledCount) == 1);
         Assert.Equal(1, Volatile.Read(ref settledCount));
         await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
         Assert.Equal(0, decoder.DetachedDecodeCount);
+        Assert.Equal(0, decoder.CancelledDetachedDecodeCount);
+        Assert.Equal(0L, decoder.StrandedDecodeBytes); // healthy cancellation costs NOTHING — Round-10 #2
     }
 
     [Fact]

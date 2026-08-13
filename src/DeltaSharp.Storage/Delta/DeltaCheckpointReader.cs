@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using System.Runtime.CompilerServices;
 using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
 using Parquet;
@@ -66,31 +67,57 @@ internal static class DeltaCheckpointReader
     /// an OOM on the driver; a legitimately large checkpoint spreads across multiple row groups.</summary>
     internal const long MaxCheckpointRowGroupDecodedBytes = 1L * 1024 * 1024 * 1024;
 
-    /// <summary>The CUMULATIVE per-PART decoded-bytes ceiling (Round-8 #3): the SUM, over ALL row groups of one
-    /// checkpoint part, of the bytes this reader eagerly decodes/materializes (the growing
-    /// <c>List&lt;DeltaAction&gt;</c> plus the current row group's arrays) must not exceed this (4&#160;GiB =
-    /// <see cref="MaxCheckpointPartBytes"/> × <see cref="CheckpointDecodedExpansionFactor"/> — the most a
-    /// ≤512&#160;MiB compressed part can plausibly decode to). The per-ROW-GROUP ceiling
-    /// (<see cref="MaxCheckpointRowGroupDecodedBytes"/>) bounds ONE group, but without a cumulative cap a part
-    /// with many row groups would accumulate unbounded actions while the strand charge counted only the buffered
-    /// COMPRESSED length. Enforced across row groups in <c>DecodeBufferedAsync</c> (fail closed → JSON replay
-    /// when tripped); a legitimately larger checkpoint spreads across multiple PARTS.</summary>
-    internal const long MaxCheckpointPartDecodedBytes = 4L * 1024 * 1024 * 1024;
+    /// <summary>The CUMULATIVE per-PART decoded-bytes ceiling (Round-8 #3, re-derived Round-10 #4): the SUM,
+    /// over ALL row groups of one checkpoint part, of the bytes this reader eagerly decodes/materializes (the
+    /// growing <c>List&lt;DeltaAction&gt;</c> plus the current row group's arrays) must not exceed this. It is
+    /// derived as
+    /// <c>max(MaxCheckpointPartBytes × CheckpointDecodedExpansionFactor,
+    /// CheckpointCumulativeRowGroupFloorMultiple × MaxCheckpointRowGroupDecodedBytes)</c>
+    /// = <c>max(512&#160;MiB × 8, 8 × 1&#160;GiB)</c> = <b>8&#160;GiB</b> (the floor term wins). The floor on
+    /// <c>k × MaxCheckpointRowGroupDecodedBytes</c> is the Round-10 #4 fix: the previous flat 4&#160;GiB ceiling
+    /// wrongly rejected a LEGITIMATE foreign (Spark) checkpoint part (300–512&#160;MiB compressed that decodes to
+    /// &gt;4&#160;GiB once Dremel per-slot levels are counted across several row groups) — and reported it as
+    /// <see cref="DeltaProtocolException"/> corruption. The floor ensures a legit MULTI-row-group part (each
+    /// group ≤ <see cref="MaxCheckpointRowGroupDecodedBytes"/>) is not rejected, and a breach is now classified
+    /// as a distinct <see cref="StorageErrorKind.DecodeCeilingExceeded"/> resource fallback (→ JSON replay), NOT
+    /// corruption. The per-ROW-GROUP ceiling (<see cref="MaxCheckpointRowGroupDecodedBytes"/>) bounds ONE group;
+    /// this bounds the whole part so the strand's LIVE charge (<c>length + cumulativeDecoded</c>, Round-10 #1)
+    /// stays bounded. Enforced across row groups in <c>DecodeBufferedAsync</c> (checked BEFORE each group's
+    /// column decode, Round-10 #6, so the 8&#160;GiB holds at every instant). A legitimately larger checkpoint
+    /// spreads across multiple PARTS.</summary>
+    internal const long MaxCheckpointPartDecodedBytes = 8L * 1024 * 1024 * 1024;
+
+    /// <summary>The floor multiple <c>k</c> on <see cref="MaxCheckpointRowGroupDecodedBytes"/> used to derive
+    /// <see cref="MaxCheckpointPartDecodedBytes"/> (Round-10 #4): the cumulative per-part ceiling is floored at
+    /// <c>k</c> maximal row groups so a legit multi-row-group foreign part is not rejected by a ceiling derived
+    /// only from the compressed-buffer × expansion product. Pinned by a relationship test so the const literal
+    /// above cannot silently drift from the derivation.</summary>
+    internal const int CheckpointCumulativeRowGroupFloorMultiple = 8;
 
     /// <summary>The default per-part wall-clock decode budget FLOOR (design §5.4 C-DECODE, #647/#699/#716):
     /// each checkpoint part is decoded under its OWN size-aware budget derived from THAT part's DECODED-bytes
     /// estimate (see <see cref="DeriveSizeAwareBudget"/>) — never a shrinking aggregate remainder shared across
     /// parts, which would hand a later part a starved budget and seed a healthy-but-slow part into the negative
-    /// cache as "known-bad" (Critical #2b). The floor derives from the enforced per-PART DECODED-bytes ceiling
-    /// (<see cref="MaxCheckpointPartDecodedBytes"/>, 4&#160;GiB — Round-8 #4; the Round-5 code clamped the basis
-    /// to the per-ROW-GROUP 1&#160;GiB ceiling, capping the budget at 32&#160;s &lt; the real decode of a foreign
-    /// 200–500&#160;MiB Spark part → deterministic timeout → strike → 24h suppression → unreadable table) divided
-    /// by a conservative documented FLOOR decode throughput, so its UNITS MATCH the ceiling the decode actually
-    /// enforces (#802 tracks benchmark-backed calibration). Stated floor decode throughput = 32&#160;MiB/s of
-    /// DECODED output (real Parquet decode is &gt;&gt; that; DeltaSharp measures in the hundreds), so 4&#160;GiB ⇒
-    /// 128&#160;s. Floored at <see cref="BoundedDecode.DefaultBudget"/> and capped at
-    /// <see cref="BoundedDecode.MaxBudget"/>.</summary>
+    /// cache as "known-bad" (Critical #2b). The basis derives from the enforced per-PART DECODED-bytes ceiling
+    /// (<see cref="MaxCheckpointPartDecodedBytes"/> — NOT the per-ROW-GROUP 1&#160;GiB ceiling, which capped a
+    /// whole-part budget at 32&#160;s &lt; the real decode of a foreign 200–500&#160;MiB Spark part → deterministic
+    /// timeout → strike → 24h suppression → unreadable table) divided by a conservative documented FLOOR decode
+    /// throughput, so its UNITS MATCH the ceiling the decode actually enforces (#802 tracks benchmark-backed
+    /// calibration). Stated floor decode throughput = 32&#160;MiB/s of DECODED output (real Parquet decode is
+    /// &gt;&gt; that; DeltaSharp measures in the hundreds). Floored at <see cref="BoundedDecode.DefaultBudget"/>
+    /// (30&#160;s) and capped at <see cref="MaxSizeAwareBudget"/> (128&#160;s, Round-10 #11) — the budget-time cap
+    /// is decoupled from the (larger, Round-10 #4) cumulative RESOURCE ceiling so the budget stays ≤ 128&#160;s
+    /// even though the byte ceiling is 8&#160;GiB; a real part decodes far faster than the pessimistic floor, so
+    /// 128&#160;s is ample for a legit 8&#160;GiB-decoding foreign part.</summary>
     private const double FloorDecodedBytesPerSecond = 32.0 * 1024 * 1024;
+
+    /// <summary>The upper cap on the size-aware per-part decode budget (128&#160;s, Round-10 #11): the derived
+    /// budget is <c>min(compressed × CheckpointDecodedExpansionFactor, MaxCheckpointPartDecodedBytes) ÷
+    /// FloorDecodedBytesPerSecond</c>, floored at 30&#160;s and capped HERE at 128&#160;s. The cap is decoupled
+    /// from the cumulative RESOURCE ceiling (now 8&#160;GiB, Round-10 #4) so the budget cannot grow to 256&#160;s;
+    /// 128&#160;s = 4&#160;GiB ÷ 32&#160;MiB/s, and because real decode throughput is &gt;&gt; the 32&#160;MiB/s
+    /// floor, 128&#160;s comfortably covers a legit 8&#160;GiB-decoding part.</summary>
+    private static readonly TimeSpan MaxSizeAwareBudget = TimeSpan.FromSeconds(128);
 
     /// <summary>The conservative bounded DECOMPRESSION expansion factor applied to a part's COMPRESSED buffered
     /// bytes to estimate its DECODED footprint for the size-aware budget (High #6). The Round-5 budget derived
@@ -105,15 +132,15 @@ internal static class DeltaCheckpointReader
 
     // Derives the per-part decode budget from the part's OWN estimated DECODED bytes (High #6): the part's
     // buffered COMPRESSED length is scaled by the bounded decompression expansion factor and clamped to the
-    // enforced per-PART decoded-bytes ceiling (MaxCheckpointPartDecodedBytes, 4 GiB — Round-8 #4, NOT the
-    // per-ROW-GROUP 1 GiB ceiling, which capped a whole-part budget at 32 s < the real decode of a foreign
-    // 200–500 MiB Spark part), then divided by the conservative floor decode throughput, clamped into
-    // [DefaultBudget, MaxBudget]. Using a decoded-bytes basis (not the compressed length the Round-5 code used)
-    // makes the budget actually scale with part size instead of collapsing to the floor for every part. I/O
-    // transfer is EXCLUDED (this is called after BufferAsync completes and the decode clock starts at the
-    // bounded decode's execution start), so a slow download never consumes the decode budget.
-    // Exposed internally for a direct monotonicity/clamp table test (High #6). Callers within this class treat
-    // it as private.
+    // enforced per-PART decoded-bytes ceiling (MaxCheckpointPartDecodedBytes — NOT the per-ROW-GROUP 1 GiB
+    // ceiling, which capped a whole-part budget at 32 s < the real decode of a foreign 200–500 MiB Spark part),
+    // then divided by the conservative floor decode throughput, floored at DefaultBudget (30 s) and capped at
+    // MaxSizeAwareBudget (128 s, Round-10 #11 — the budget-time cap is decoupled from the larger cumulative
+    // resource ceiling). Using a decoded-bytes basis (not the compressed length the Round-5 code used) makes the
+    // budget actually scale with part size instead of collapsing to the floor for every part. I/O transfer is
+    // EXCLUDED (this is called after BufferAsync completes and the decode clock starts at the bounded decode's
+    // execution start), so a slow download never consumes the decode budget. Exposed internally for a direct
+    // monotonicity/clamp table test (High #6). Callers within this class treat it as private.
     internal static TimeSpan DeriveSizeAwareBudget(long compressedBytes)
     {
         long estimatedDecoded = SaturatingScale(Math.Max(compressedBytes, 0L), CheckpointDecodedExpansionFactor);
@@ -124,7 +151,7 @@ internal static class DeltaCheckpointReader
             derived = BoundedDecode.DefaultBudget;
         }
 
-        return derived > BoundedDecode.MaxBudget ? BoundedDecode.MaxBudget : derived;
+        return derived > MaxSizeAwareBudget ? MaxSizeAwareBudget : derived;
     }
 
     // Scales a non-negative byte count by a factor without overflowing to a negative long (saturates at
@@ -152,7 +179,8 @@ internal static class DeltaCheckpointReader
     public static async Task<IReadOnlyList<DeltaAction>> ReadAsync(
         Stream stream, CancellationToken cancellationToken,
         long maxPartBytes = MaxCheckpointPartBytes, long maxDecodedBytes = MaxCheckpointRowGroupDecodedBytes,
-        TimeSpan? decodeBudget = null, TimeProvider? timeProvider = null, BoundedDecoder? decoder = null)
+        TimeSpan? decodeBudget = null, TimeProvider? timeProvider = null, BoundedDecoder? decoder = null,
+        long maxPartDecodedBytes = MaxCheckpointPartDecodedBytes, Action<TimeSpan>? onPartBudget = null)
     {
         ArgumentNullException.ThrowIfNull(stream);
 
@@ -164,6 +192,8 @@ internal static class DeltaCheckpointReader
             ArgumentOutOfRangeException.ThrowIfNegativeOrZero(configured.Ticks, nameof(decodeBudget));
             ArgumentOutOfRangeException.ThrowIfGreaterThan(configured, BoundedDecode.MaxBudget, nameof(decodeBudget));
         }
+
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPartDecodedBytes, nameof(maxPartDecodedBytes));
 
         BoundedDecoder checkpointDecoder = decoder ?? BoundedDecode.CheckpointDecoder;
 
@@ -183,15 +213,25 @@ internal static class DeltaCheckpointReader
         // timeout here is provably past an ADEQUATE budget (so DeltaLog may safely seed the negative cache).
         TimeSpan partBudget = decodeBudget ?? DeriveSizeAwareBudget(length);
 
-        // Honest per-part strand charge (Round-8 #3). A stranded checkpoint decode retains NOT ONLY its buffered
-        // COMPRESSED byte[] (`length`) but also the cumulative decoded arrays + growing List<DeltaAction> across
-        // its row groups — bounded by MaxCheckpointPartDecodedBytes (4 GiB), enforced in DecodeBufferedAsync.
-        // Charge the honest buffer + cumulative-decoded total, clamped to the door footprint (so it is a TRUE
-        // ceiling, not an under-statement), floored at MinStrandChargeBytes so a cheap strand still consumes the
-        // door's residual and the BYTE budget stays the load-bearing gate (Round-8 #1b).
-        long strandCharge = Math.Max(
-            Math.Min(length + MaxCheckpointPartDecodedBytes, BoundedDecode.CheckpointMaxFootprintBytes),
-            BoundedDecode.MinStrandChargeBytes);
+        // TEST seam (Round-10 MultiPart I7): publish the ACTUAL per-part budget threaded into RunAsync below, so a
+        // test can record the real value each part's decode receives (proving it is derived from THIS part's own
+        // buffered bytes, never a shrinking aggregate remainder) rather than re-deriving it and asserting a
+        // tautology. No-op in production (null).
+        onPartBudget?.Invoke(partBudget);
+
+        // LIVE per-part strand charge (Round-10 #1). A stranded checkpoint decode retains its buffered COMPRESSED
+        // byte[] (`length`) PLUS the cumulative decoded arrays + growing List<DeltaAction> across the row groups
+        // it has processed SO FAR. Pre-Round-10 the charge was a FLAT `length + MaxCheckpointPartDecodedBytes`
+        // (the full 8 GiB cumulative ceiling) regardless of how much the strand had actually decoded — so the
+        // byte gate degenerated into a de-facto count cap of ~1 (two crafted strands wedged the door). Instead,
+        // publish the live retained total (`length + cumulativeDecoded`) through this shared counter — updated by
+        // DecodeBufferedAsync per row group — and charge what the counter reads AT THE MOMENT OF DETACH, floored
+        // at MinStrandChargeBytes (so a cheap strand still consumes the byte residual, Round-8 #1b) and clamped
+        // to the door footprint by RunAsync (so it stays a TRUE ceiling). This restores the intended ~64-strand
+        // headroom while keeping the bound honest.
+        var retainedBytes = new StrongBox<long>(length);
+        long RetainedChargeProbe() =>
+            Math.Max(Volatile.Read(ref retainedBytes.Value), BoundedDecode.MinStrandChargeBytes);
 
         // Bounded-time decode (#716/#699/#647). A single corrupted byte (the terminal footer STOP flipped,
         // #699; the byte at index 5595 in the #716 minimized repro; a corrupt data-page header, #647) can
@@ -209,12 +249,12 @@ internal static class DeltaCheckpointReader
         // cap the decode is rejected with a DecodeCapacityExhaustedException (never started) which DeltaLog
         // classifies DecoderSaturated (I8); a valid-but-unsupported UnsupportedFeature and cooperative
         // cancellation both finish inside the budget and propagate unwrapped as the work's own outcome. If this
-        // decode STRANDS (detaches past its deadline), it charges its buffered `length` PLUS the cumulative
-        // per-part decoded ceiling (Round-8 #3), clamped by the door to CheckpointMaxFootprintBytes and floored
-        // at MinStrandChargeBytes, against the checkpoint door's stranded residual — a healthy in-budget decode
+        // decode STRANDS (detaches past its deadline), it charges its LIVE retained footprint via
+        // RetainedChargeProbe (Round-10 #1), clamped by the door to CheckpointMaxFootprintBytes and floored at
+        // MinStrandChargeBytes, against the checkpoint door's stranded residual — a healthy in-budget decode
         // charges NOTHING (§5.4).
         return await checkpointDecoder.RunAsync(
-            decodeToken => DecodeBufferedAsync(bytes, length, maxDecodedBytes, decodeToken),
+            decodeToken => DecodeBufferedAsync(bytes, length, maxDecodedBytes, maxPartDecodedBytes, retainedBytes, decodeToken),
             partBudget,
             static _ => DeltaStorageException.DecodeBudgetExceeded(
                 "The Delta checkpoint Parquet could not be decoded within the bounded-decode time budget."),
@@ -222,7 +262,7 @@ internal static class DeltaCheckpointReader
             onAbandonedResult: null,
             onWorkSettled: null,
             timeProvider: timeProvider,
-            estimatedRetainedBytes: strandCharge).ConfigureAwait(false);
+            retainedBytesProbe: RetainedChargeProbe).ConfigureAwait(false);
     }
 
     // The open + full row-group decode of one buffered checkpoint part (bounded in time by the caller's
@@ -231,7 +271,8 @@ internal static class DeltaCheckpointReader
     // over the caller-supplied bytes (length-limited) so a stranded decode never shares a caller-owned stream
     // (see ReadAsync).
     private static async Task<IReadOnlyList<DeltaAction>> DecodeBufferedAsync(
-        byte[] bytes, int length, long maxDecodedBytes, CancellationToken cancellationToken)
+        byte[] bytes, int length, long maxDecodedBytes, long maxPartDecodedBytes,
+        StrongBox<long> retainedBytes, CancellationToken cancellationToken)
     {
         var buffer = new MemoryStream(bytes, 0, length, writable: false);
         await using (buffer.ConfigureAwait(false))
@@ -252,17 +293,42 @@ internal static class DeltaCheckpointReader
                     {
                         cancellationToken.ThrowIfCancellationRequested();
                         using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(group);
-                        long groupDecoded = await ReadRowGroupAsync(
-                            rowGroup, schema, actions, group, maxDecodedBytes, cancellationToken).ConfigureAwait(false);
+
+                        // Round-10 #6: measure the group's declared decoded footprint (via EnsureDecodeCeiling)
+                        // and enforce the CUMULATIVE per-part ceiling BEFORE this group's columns are decoded, so
+                        // the ceiling holds at EVERY instant — the pre-Round-10 order checked only AFTER
+                        // ReadRowGroupAsync had already materialized the group, letting the transient peak reach
+                        // ceiling + one row group (~5.5 GiB) before the check fired.
+                        (int rowCount, long groupDecoded) = MeasureRowGroup(rowGroup, schema, group, maxDecodedBytes);
                         cumulativeDecoded = SaturatingAdd(cumulativeDecoded, groupDecoded);
-                        if (cumulativeDecoded > MaxCheckpointPartDecodedBytes)
+
+                        // Publish the LIVE retained total (length + cumulativeDecoded) so a strand's charge at
+                        // detach reads the actual incremental bytes retained SO FAR (Round-10 #1), not a flat
+                        // ceiling. Written on the dedicated strand thread; the RunAsync probe reads it via
+                        // Volatile at the moment of detach.
+                        Volatile.Write(ref retainedBytes.Value, SaturatingAdd(length, cumulativeDecoded));
+
+                        if (cumulativeDecoded > maxPartDecodedBytes)
                         {
-                            throw DeltaProtocolException.Malformed(string.Create(
+                            // A resource/decode-ceiling breach is NOT corruption (Round-10 #4): a legit foreign
+                            // (Spark) multi-row-group part can decode past the ceiling. Classify it as a distinct
+                            // DECODE-CEILING fallback reason (DeltaStorageException.DecodeCeilingExceeded) so
+                            // DeltaLog routes to JSON replay WITHOUT mislabelling it Malformed and WITHOUT seeding
+                            // the negative cache (it is not proven bad).
+                            throw DeltaStorageException.DecodeCeilingExceeded(string.Create(
                                 CultureInfo.InvariantCulture,
                                 $"The Delta checkpoint part would eagerly decode {cumulativeDecoded} bytes across "
-                                + $"its row groups, exceeding the {MaxCheckpointPartDecodedBytes}-byte cumulative "
+                                + $"its row groups, exceeding the {maxPartDecodedBytes}-byte cumulative "
                                 + $"per-part decode ceiling."));
                         }
+
+                        if (rowCount == 0)
+                        {
+                            continue;
+                        }
+
+                        await DecodeRowGroupColumnsAsync(
+                            rowGroup, schema, actions, group, rowCount, cancellationToken).ConfigureAwait(false);
                     }
 
                     return actions;
@@ -445,13 +511,15 @@ internal static class DeltaCheckpointReader
         }
     }
 
-    private static async Task<long> ReadRowGroupAsync(
+    // Round-10 #6: measures a row group's declared decoded-bytes footprint WITHOUT decoding any column, so the
+    // caller (DecodeBufferedAsync) can enforce the CUMULATIVE per-part ceiling BEFORE the eager column decode
+    // runs — keeping the peak footprint ≤ the ceiling at every instant. Returns (rowCount, groupDecoded); a
+    // zero-row group is (0, 0). Split out of the former ReadRowGroupAsync (which decoded inline).
+    private static (int RowCount, long GroupDecoded) MeasureRowGroup(
         ParquetRowGroupReader rowGroup,
         CheckpointSchema schema,
-        List<DeltaAction> actions,
         int group,
-        long maxDecodedBytes,
-        CancellationToken cancellationToken)
+        long maxDecodedBytes)
     {
         long declaredRows = rowGroup.RowCount;
         if (declaredRows < 0 || declaredRows > MaxCheckpointRowGroupRows)
@@ -465,13 +533,26 @@ internal static class DeltaCheckpointReader
         int rowCount = (int)declaredRows;
         if (rowCount == 0)
         {
-            return 0;
+            return (0, 0);
         }
 
         // Returns the row group's decoded-bytes footprint so DecodeBufferedAsync can enforce the CUMULATIVE
-        // per-part ceiling across row groups (Round-8 #3).
+        // per-part ceiling across row groups (Round-8 #3, hoisted BEFORE the column decode in Round-10 #6).
         long groupDecoded = EnsureDecodeCeiling(rowGroup, schema.LeafFields(), group, maxDecodedBytes);
+        return (rowCount, groupDecoded);
+    }
 
+    // Decodes one row group's columns and appends the reconstructed actions. Called by DecodeBufferedAsync ONLY
+    // AFTER MeasureRowGroup's decoded footprint has been folded into the cumulative total and checked against
+    // the per-part ceiling (Round-10 #6), so this eager decode never overshoots the ceiling.
+    private static async Task DecodeRowGroupColumnsAsync(
+        ParquetRowGroupReader rowGroup,
+        CheckpointSchema schema,
+        List<DeltaAction> actions,
+        int group,
+        int rowCount,
+        CancellationToken cancellationToken)
+    {
         var columns = await CheckpointColumns.ReadAsync(rowGroup, schema, rowCount, cancellationToken)
             .ConfigureAwait(false);
 
@@ -483,8 +564,6 @@ internal static class DeltaCheckpointReader
                 actions.Add(action);
             }
         }
-
-        return groupDecoded;
     }
 
     /// <summary>Fails closed when the columns this reader will decode for <paramref name="group"/> would

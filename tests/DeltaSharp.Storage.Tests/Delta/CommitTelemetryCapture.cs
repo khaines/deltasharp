@@ -112,6 +112,12 @@ internal sealed class MeterCapture : IDisposable
         _listener.Start();
     }
 
+    // Forces every subscribed OBSERVABLE instrument (gauge) to be sampled NOW, so the callbacks record a fresh
+    // measurement. Counters/histograms record on emit; observable gauges only record when the listener polls
+    // them — this is that poll (used by the decode-gauge oracle for wedged / detached_cancelled /
+    // door_under_provisioned, Round-10 #7/#10/#11).
+    internal void ObserveGauges() => _listener.RecordObservableInstruments();
+
     internal IReadOnlyList<Measurement> Measurements
     {
         get { lock (_gate) { return _measurements.ToArray(); } }

@@ -74,14 +74,20 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     // These tests deliberately drive a NON-TERMINATING checkpoint decode that DETACHES and strands its door
     // FOREVER, across multiple loads. With the honest per-part strand charge (Round-8 #3, GiB-scale) a stranded
     // decode on the PROCESS-GLOBAL static BoundedDecode.CheckpointDecoder would permanently consume its residual
-    // and saturate it for every other test (pre-Round-8 the charge was ~KB, so pollution was harmless). It also
-    // keeps BoundedDecode.DetachedDecodeCount (the static doors) at ZERO so the Round-8 #9 sustained-pressure
-    // guard does not see a PRIOR load's permanent strand and refuse to seed strike 2 — the strike accumulation
-    // these tests assert. Each load gets a FRESH decoder so its permanent strand is confined to a GC'd instance;
-    // the shared static negative CACHE (keyed on stable table identity, not the decoder) still accumulates
-    // strikes across loads exactly as production does.
+    // and saturate it for every other test (pre-Round-8 the charge was ~KB, so pollution was harmless). Under the
+    // Round-10 #3 re-scoping the sustained-pressure guard reads the DECODER ACTUALLY USED (not the static global)
+    // and gates on the TRANSIENT strand delta, so a FRESH per-load decoder starts at zero strands and each load
+    // seeds a strike — the strike accumulation these tests assert accrues on the shared static negative CACHE
+    // (keyed on stable table identity, not the decoder) exactly as production does.
+    //
+    // PRODUCTION-SIZED (Round-10 test sizing): sized from the REAL checkpoint door footprint
+    // (CheckpointMaxFootprintBytes) with a matching residual, NOT the 1-byte default — otherwise every strand
+    // CHARGE clamps to 1 byte and the charge oracles are vacuous.
     private static BoundedDecoder IsolatedCheckpointDecoder() =>
-        new(strandCountCap: 8, execution: DecodeExecution.DedicatedThread);
+        BoundedDecoder.FromSizing(
+            BoundedDecode.DeriveDoorSizing(
+                256L * 1024 * 1024 * 1024, BoundedDecode.CheckpointMaxFootprintBytes, processorCount: 8),
+            DecodeExecution.DedicatedThread);
 
     /// <summary>A 2-version JSON history (v0: protocol+metadata+add(a); v1: add(b)) so a discarded checkpoint
     /// at v1 falls back to a fully replayable log.</summary>
@@ -436,6 +442,136 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         Assert.Equal(3, CountOpensOf(counting, checkpointPart));
     }
 
+    [Fact]
+    public async Task SustainedPressureGuard_SameNonTerminatingIdentity_OnOneSharedDecoder_ReachesStrikeTwo_ThenSuppressed()
+    {
+        // Round-10 #3 (self-renewal wedge) — the DECISIVE behavioral catch for the re-scoped sustained-pressure
+        // guard. The SAME non-terminating checkpoint identity is loaded TWICE through ONE SHARED checkpoint
+        // decoder (so load 1's PERMANENT strand is still live, and VISIBLE to the guard, when load 2 runs). The
+        // guard must still SEED on load 2 — a strand attributable to THIS identity's OWN prior load is exactly
+        // the self-inflicted case that SHOULD seed — so the identity reaches STRIKE 2 and load 3 is SUPPRESSED
+        // (the part is NOT opened a third time). Under the pre-Round-10 MONOTONE guard (`strandsBeforeDecode == 0`)
+        // load 2 would see the load-1 strand (count 1) and REFUSE to seed → the identity NEVER reaches strike 2 →
+        // load 3 re-decodes (opens == 3) → self-renewal → wedge. RED if reverted to the monotone check, and RED
+        // if the guard is reverted to read the process-global BoundedDecode.DetachedDecodeCount (which the shared
+        // injected decoder's strands never touch).
+        LocalFileSystemBackend inner = NewBackend();
+        await WriteHistoryAsync(inner);
+        byte[] hanging = await CheckpointAtV1().ToParquetAsync();
+        hanging[^9] ^= 1; // terminal Thrift STOP flip → non-terminating decode
+        await DeltaTestHarness.WriteRawCheckpointAsync(inner, 1, hanging);
+        await DeltaTestHarness.WriteLastCheckpointAsync(inner, 1);
+
+        var counting = new CountingStorageBackend(inner);
+        var budget = TimeSpan.FromMilliseconds(300);
+        string checkpointPart = "_delta_log/" + 1L.ToString("D20", System.Globalization.CultureInfo.InvariantCulture)
+            + ".checkpoint.parquet";
+
+        // ONE shared decoder across loads 1 and 2 — load 1's strand stays live and visible to the guard on load 2.
+        BoundedDecoder sharedDecoder = IsolatedCheckpointDecoder();
+
+        Snapshot s1 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+            checkpointDecoder: sharedDecoder)
+            .LoadSnapshotAsync();
+        Assert.Null(s1.Metrics.CheckpointVersion);
+        Assert.Equal(1, CountOpensOf(counting, checkpointPart));
+        await WaitForDetachedAsync(sharedDecoder, 1); // load 1 stranded (permanent), visible on load 2
+
+        Snapshot s2 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+            checkpointDecoder: sharedDecoder)
+            .LoadSnapshotAsync();
+        Assert.Null(s2.Metrics.CheckpointVersion);
+        Assert.Equal(2, CountOpensOf(counting, checkpointPart)); // re-decoded (strike-gate), NOW strike 2
+
+        // Load 3 (fresh decoder — the suppression is on the identity-keyed negative cache, not the decoder): the
+        // identity is now SUPPRESSED, so the part is NOT opened again. Under the monotone/global revert the
+        // identity never crossed strike 2 and this would open the part a THIRD time.
+        Snapshot s3 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+            checkpointDecoder: IsolatedCheckpointDecoder())
+            .LoadSnapshotAsync();
+        Assert.Null(s3.Metrics.CheckpointVersion);
+        Assert.Equal(2, CountOpensOf(counting, checkpointPart)); // SUPPRESSED — not re-opened
+    }
+
+    [Fact]
+    public async Task SustainedPressureGuard_UnrelatedDoorStrand_DoesNotBlockSeeding()
+    {
+        // Round-10 #3a (door-scoping) — a permanent strand on an UNRELATED door must NOT block seeding on the
+        // checkpoint door. A separate decoder is stranded FOREVER (standing in for a data-file-door / other-door
+        // strand), then the target identity is loaded twice through its OWN clean checkpoint decoder. Because the
+        // guard reads the DECODER ACTUALLY USED (not a process-global count), the unrelated strand is invisible,
+        // seeding proceeds normally, the identity reaches strike 2, and load 3 is SUPPRESSED. Under the
+        // pre-Round-10 guard reading the process-global BoundedDecode.DetachedDecodeCount, an unrelated-door
+        // strand would inflate that global count and BLOCK seeding process-wide → load 3 re-decodes.
+        using var unrelatedGate = new ManualResetEventSlim(initialState: false);
+        BoundedDecoder unrelatedDoor = IsolatedCheckpointDecoder();
+        StrandForever(unrelatedDoor, unrelatedGate);
+        await WaitForDetachedAsync(unrelatedDoor, 1);
+
+        try
+        {
+            LocalFileSystemBackend inner = NewBackend();
+            await WriteHistoryAsync(inner);
+            byte[] hanging = await CheckpointAtV1().ToParquetAsync();
+            hanging[^9] ^= 1;
+            await DeltaTestHarness.WriteRawCheckpointAsync(inner, 1, hanging);
+            await DeltaTestHarness.WriteLastCheckpointAsync(inner, 1);
+
+            var counting = new CountingStorageBackend(inner);
+            var budget = TimeSpan.FromMilliseconds(300);
+            string checkpointPart = "_delta_log/" + 1L.ToString("D20", System.Globalization.CultureInfo.InvariantCulture)
+                + ".checkpoint.parquet";
+
+            // Two loads through CLEAN checkpoint decoders (each unrelated to the stranded door) reach strike 2…
+            Snapshot s1 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+                checkpointDecoder: IsolatedCheckpointDecoder()).LoadSnapshotAsync();
+            Assert.Null(s1.Metrics.CheckpointVersion);
+            Assert.Equal(1, CountOpensOf(counting, checkpointPart));
+
+            Snapshot s2 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+                checkpointDecoder: IsolatedCheckpointDecoder()).LoadSnapshotAsync();
+            Assert.Null(s2.Metrics.CheckpointVersion);
+            Assert.Equal(2, CountOpensOf(counting, checkpointPart));
+
+            // …and load 3 is suppressed (NOT re-opened) — the unrelated-door strand never blocked seeding.
+            Snapshot s3 = await new DeltaLog(counting, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget,
+                checkpointDecoder: IsolatedCheckpointDecoder()).LoadSnapshotAsync();
+            Assert.Null(s3.Metrics.CheckpointVersion);
+            Assert.Equal(2, CountOpensOf(counting, checkpointPart));
+        }
+        finally
+        {
+            unrelatedGate.Set(); // release the unrelated strand so its dedicated thread can exit
+        }
+    }
+
+    // Strands ONE gated, never-terminating decode on the given decoder FOREVER (until the gate is set), charging
+    // a real footprint. Used to place a permanent strand on an UNRELATED door for the door-scoping guard test.
+    private static void StrandForever(BoundedDecoder decoder, ManualResetEventSlim gate)
+    {
+        _ = Task.Run(() => decoder.RunAsync<int>(
+            token => { gate.Wait(); token.ThrowIfCancellationRequested(); return Task.FromResult(0); },
+            TimeSpan.FromMilliseconds(150),
+            static _ => DeltaStorageException.DecodeBudgetExceeded("stranded"),
+            CancellationToken.None,
+            estimatedRetainedBytes: BoundedDecode.MinStrandChargeBytes).GetAwaiter().GetResult());
+    }
+
+    private static async Task WaitForDetachedAsync(BoundedDecoder decoder, int expected)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (decoder.DetachedDecodeCount < expected)
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException(
+                    $"expected {expected} detached strand(s), saw {decoder.DetachedDecodeCount}.");
+            }
+
+            await Task.Delay(20);
+        }
+    }
+
     private static int CountOpensOf(CountingStorageBackend backend, string suffix) =>
         backend.Opens.Count(p => p.EndsWith(suffix, StringComparison.Ordinal));
 
@@ -521,6 +657,112 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         // (CheckpointVersion == 1). Had the saturation poisoned the negative cache, this load would skip the
         // part and fall back to JSON replay (CheckpointVersion null) — so this assertion is red if a saturation
         // is ever wrongly cached.
+        Assert.Equal(1, healthy.Metrics.CheckpointVersion);
+    }
+
+    [Fact]
+    public async Task CheckpointStrandChargeOracle_ChargesTheLiveRetainedFootprint_NotFlatCeiling_OnProductionSizedDoor()
+    {
+        // Round-10 #1 end-to-end checkpoint charge oracle — strand a REAL checkpoint decode (a terminal-STOP
+        // bit-flip drives a non-terminating decode that hangs at open) through a PRODUCTION-SIZED injected door
+        // (CheckpointMaxFootprintBytes + a matching residual) and assert the strand books its LIVE retained
+        // footprint. A part hanging at open has retained only its buffered COMPRESSED bytes (small) → the LIVE
+        // charge floors to MinStrandChargeBytes (64 MiB). Pre-Round-10 the charge was a FLAT
+        // `length + MaxCheckpointPartDecodedBytes` (~8 GiB) regardless of progress — so this oracle asserting the
+        // 64 MiB live floor is RED under a revert to the flat ceiling (it would book ~8 GiB), and RED if the
+        // charge collapses to the raw compressed length (a few KB, un-floored). Under the pre-Round-10 1-byte
+        // test door this oracle clamped to 1 byte and was vacuous; production sizing makes it bite.
+        LocalFileSystemBackend backend = NewBackend();
+        await WriteHistoryAsync(backend);
+        byte[] hanging = await CheckpointAtV1().ToParquetAsync();
+        hanging[^9] ^= 1; // terminal Thrift STOP flip → non-terminating decode that hangs at open
+        await DeltaTestHarness.WriteRawCheckpointAsync(backend, 1, hanging);
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        BoundedDecoder decoder = IsolatedCheckpointDecoder(); // production-sized (CheckpointMaxFootprintBytes)
+        var budget = TimeSpan.FromMilliseconds(300);
+
+        Snapshot snapshot = await new DeltaLog(
+            backend, DeltaLog.MaxLogObjectBytes, checkpointDecodeBudget: budget, checkpointDecoder: decoder)
+            .LoadSnapshotAsync();
+        Assert.Null(snapshot.Metrics.CheckpointVersion); // failed closed → JSON replay
+
+        await WaitForDetachedAsync(decoder, 1);
+
+        // The LIVE charge: retained = compressed length (small, hung at open) floored at MinStrandChargeBytes,
+        // clamped to the door footprint → exactly MinStrandChargeBytes. NOT the flat ~8 GiB ceiling.
+        Assert.Equal(BoundedDecode.MinStrandChargeBytes, decoder.StrandedDecodeBytes);
+        Assert.True(
+            decoder.StrandedDecodeBytes < BoundedDecode.CheckpointMaxFootprintBytes / 2,
+            $"the live charge ({decoder.StrandedDecodeBytes}) must be far below the flat ceiling "
+            + $"({BoundedDecode.CheckpointMaxFootprintBytes}) — a revert to the flat charge is red here.");
+    }
+
+    [Fact]
+    public async Task DecodeDoorGauges_ArePublishedPerDoor_ViaMeterCapture()
+    {
+        // Round-10 #7/#10/#11 gauge-wiring oracle — the wedged, detached_cancelled, and door_under_provisioned
+        // gauges are all PUBLISHED on the storage meter and sampled per door (data-file + checkpoint) via a
+        // MeterCapture observing the observable instruments. In a healthy process the STATIC doors are neither
+        // wedged nor cancelled, so both report 0 — the wiring pin (a dropped registration would leave the
+        // instrument absent, RED here). The 0→1 transition of the underlying IsWedged predicate and the cancelled
+        // sub-count are covered behaviorally by the BoundedDecode predicate/laundered-strand tests.
+        using var telemetry = new DeltaStorageTelemetry();
+        using var storageMeter = new MeterCapture(telemetry.StorageMeter);
+
+        storageMeter.ObserveGauges();
+        await Task.Yield();
+
+        foreach (string gauge in new[]
+        {
+            "deltasharp.storage.decode.wedged",
+            "deltasharp.storage.decode.detached_cancelled",
+            "deltasharp.storage.decode.door_under_provisioned",
+        })
+        {
+            MeterCapture.Measurement[] samples = storageMeter.ForInstrument(gauge).ToArray();
+            Assert.Contains(samples, m => Equals(m.Tags[DecodeDoorKey], "data_file"));
+            Assert.Contains(samples, m => Equals(m.Tags[DecodeDoorKey], "checkpoint"));
+        }
+    }
+
+    [Fact]
+    public async Task DecodeCeilingExceededCheckpoint_EmitsDecodeCeilingReason_JsonReplay_NoShortSnapshot_AndReleasesProbe()
+    {
+        // Round-10 #4 end-to-end — a VALID checkpoint whose cumulative decode crosses a (tiny, injected) per-part
+        // ceiling must fail closed as a DISTINCT decode-ceiling fallback: JSON replay, the decode_ceiling_exceeded
+        // reason (NOT malformed — a resource ceiling is not corruption), NO short snapshot (CheckpointVersion
+        // null, full replay), and the single-flight probe RELEASED (not seeded) so a SUBSEQUENT load under the
+        // production ceiling re-opens and SEEDS the part. RED if the reader throw reverts to Malformed (reason
+        // would be `malformed`), if the ceiling breach seeds the negative cache (the second load would skip →
+        // CheckpointVersion null), or if the probe is not released (the part would be un-re-openable).
+        LocalFileSystemBackend backend = NewBackend();
+        await WriteHistoryAsync(backend);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        var logger = new RecordingLogger<DeltaLog>();
+        using (var telemetry = new DeltaStorageTelemetry())
+        using (var deltaMeter = new MeterCapture(telemetry.DeltaMeter))
+        {
+            Snapshot snapshot = await new DeltaLog(
+                backend, DeltaLog.MaxLogObjectBytes, logger, telemetry,
+                checkpointMaxPartDecodedBytes: 10) // tiny ceiling → the valid part crosses it
+                .LoadSnapshotAsync();
+
+            // JSON replay, NO short snapshot (checkpoint discarded, full replay).
+            Assert.Null(snapshot.Metrics.CheckpointVersion);
+            Assert.Equal(2, snapshot.Metrics.ReplayedCommitCount);
+
+            // The DISTINCT decode_ceiling_exceeded reason — NOT malformed.
+            MeterCapture.Measurement fallback = Assert.Single(deltaMeter.ForInstrument(FallbackInstrument));
+            Assert.Equal("decode_ceiling_exceeded", fallback.Tags[ReasonKey]);
+        }
+
+        // The probe was RELEASED (not seeded): a SUBSEQUENT load under the PRODUCTION ceiling re-opens the part
+        // and SEEDS the snapshot — proving the ceiling breach neither poisoned the negative cache nor stranded
+        // the single-flight probe.
+        Snapshot healthy = await new DeltaLog(backend, DeltaLog.MaxLogObjectBytes).LoadSnapshotAsync();
         Assert.Equal(1, healthy.Metrics.CheckpointVersion);
     }
 
