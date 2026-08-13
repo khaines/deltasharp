@@ -242,6 +242,9 @@ public sealed class SecretRedactionTests
         // The Round-5 widening must not disturb the scheme-anchored ADLS exemption: a colon-less ADLS
         // authority is a container IDENTITY, so it survives verbatim even when it carries a control
         // character (which the sanitizing layers above this masker, not the masker, are responsible for).
+        // Cross-reference: the raw CR/LF this exemption preserves is neutralized DOWNSTREAM by
+        // DiagnosticText at the rendering sink — log injection is owned by the renderers, not by this
+        // best-effort credential masker, so the exemption is not a log-injection hole.
         const string Path = "abfss://my\r\ncontainer@acct.dfs.core.windows.net/tbl";
 
         Assert.Equal(Path, SecretRedaction.RedactPath(Path));
@@ -250,6 +253,51 @@ public sealed class SecretRedactionTests
         Assert.Equal(
             "abfss://<redacted>@acct.dfs.core.windows.net/tbl",
             SecretRedaction.RedactPath("abfss://c:ACCOUNT\r\nKEY@acct.dfs.core.windows.net/tbl"));
+    }
+
+    [Fact]
+    public void RedactPath_AuthorityBoundaryStopsTheCredentialRun_QueryKeysStillMask()
+    {
+        // ROUND-6 STRUCTURAL PIN (the invariant the class remarks argue, made mechanical). Both credential
+        // runs forbid '/', so a run anchored at 's3://' ends before the FIRST '/' after the scheme. On a
+        // realistic partitioned object path the credential is therefore fully masked WHILE the authority,
+        // the path and — decisively — the '?' that opens the query string all survive, so the later query
+        // pass still sees its key delimiter and masks 'sig='. Pinned to EXACT output: widening either run
+        // past '/' (e.g. [^/]* -> [^\s]*) makes the greedy span run to the LAST '@' in the string (the one
+        // inside 'owner=a@b.com'), collapsing this to "s3://<redacted>@b.com&sig=<redacted>" — RED.
+        const string Path =
+            "s3://ACCESSKEY:SEC?RET@bucket/country=DE/part-0.parquet?owner=a@b.com&sig=SASTOKEN";
+
+        string redacted = SecretRedaction.RedactPath(Path);
+
+        Assert.Equal(
+            "s3://<redacted>@bucket/country=DE/part-0.parquet?owner=a@b.com&sig=<redacted>",
+            redacted);
+        Assert.DoesNotContain("ACCESSKEY", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("SEC?RET", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("SASTOKEN", redacted, System.StringComparison.Ordinal);
+
+        // Non-vacuity for the boundary itself: the authority and path the run must NOT swallow are intact,
+        // which is exactly what a widened run would destroy.
+        Assert.Contains("@bucket/country=DE/part-0.parquet", redacted, System.StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void RedactPath_PathSeparatorFreeCredential_IsTheAcceptedResidual()
+    {
+        // ROUND-6 RESIDUAL PIN — the DOCUMENTED cost of the Round-5 widening, asserted at its ACTUAL current
+        // output rather than described in prose. Remove the '/' authority boundary from the shape above and
+        // the colon-bearing run legitimately spans the interior '?' (required by the monotonicity rule) all
+        // the way to the '@' — swallowing the delimiter the query pass needed, so the trailing 'sig' VALUE
+        // is left unmasked. The credential itself is still masked, and this shape is not one DeltaSharp
+        // authors; see the "Accepted redaction residuals" ledger. Any change to this output — including a
+        // future widening past '/' — turns this RED and forces a deliberate ledger update.
+        Assert.Equal("s3://<redacted>@sig=SECRET", SecretRedaction.RedactPath("s3://u:p?@sig=SECRET"));
+
+        // The minimal pair: adding the authority boundary back restores query masking (same credential).
+        Assert.Equal(
+            "s3://<redacted>@bucket/tbl?sig=<redacted>",
+            SecretRedaction.RedactPath("s3://u:p?@bucket/tbl?sig=SECRET"));
     }
 
     [Fact]

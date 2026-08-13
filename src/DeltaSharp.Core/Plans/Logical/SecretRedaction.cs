@@ -92,10 +92,21 @@ namespace DeltaSharp.Plans.Logical;
 /// known limit above is unchanged.
 /// The widening's cost is the same accepted OVER-MASK direction: on a degenerate, path-separator-free string
 /// the longer colon-bearing span can swallow a <c>?</c>/<c>&amp;</c> that the later query pass would have used
-/// as a key delimiter, leaving a trailing query value unmasked. A 1,000,000-input differential fuzz measured
-/// 18,942 newly MASKED credentials against 55 newly exposed — and <b>zero</b> of those 55 had a real authority
-/// boundary (a <c>/</c> after the scheme, before the <c>@</c>), because a run bounded by <c>/</c> cannot reach
-/// the query of any realistic <c>scheme://host/path?query</c> shape.
+/// as a key delimiter, leaving a trailing query value unmasked.
+/// <b>Why that is confined to the degenerate shape (the checkable, structural argument).</b> Both credential
+/// runs forbid <c>/</c>, so a match that starts at a scheme's <c>://</c> ends before the FIRST <c>/</c> after
+/// that scheme. In any realistic <c>scheme://host/path?query</c> the <c>?</c> that opens the query string is
+/// positioned AFTER that <c>/</c>, so the run provably cannot reach — let alone swallow — a query-key
+/// delimiter. Only a string with NO path separator between the scheme and the query (<c>s3://u:p?@sig=…</c>)
+/// is affected, and there the credential itself is still masked; it is the trailing query value that is left
+/// unmasked. Both halves are pinned by exact-output tests
+/// (<c>RedactPath_AuthorityBoundaryStopsTheCredentialRun_QueryKeysStillMask</c> and
+/// <c>RedactPath_PathSeparatorFreeCredential_IsTheAcceptedResidual</c>), so widening a run past <c>/</c>
+/// turns them RED. A one-shot differential fuzz over ~1,000,000 generated inputs was also run while
+/// developing the change and measured 18,942 newly MASKED credentials against 55 newly exposed, none of them
+/// carrying an authority boundary; that run's seed and generator are not checked in, so treat the figures as
+/// an illustrative one-shot measurement only — the structural argument above and the two pins are the
+/// load-bearing evidence.
 /// </para>
 /// </remarks>
 internal static partial class SecretRedaction

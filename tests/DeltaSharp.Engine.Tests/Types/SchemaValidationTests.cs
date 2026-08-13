@@ -111,11 +111,22 @@ public class SchemaValidationTests
     // ROUND 5 — the SIBLING ingestion producers. SchemaJson.FromJson parses an attacker-influenceable
     // metaData.schemaString out of _delta_log; four of its throw sites echoed the raw, unbounded 'name'/
     // 'kind' token straight into SchemaValidationException.Message (ReadType's unknown complex kind,
-    // ParseNamedType's unknown type name, and BOTH ParseDecimal malformed-decimal throws). That message is
-    // sink-reachable: DeltaReadSource lifts it into DeltaReadException's OWN message (`throw new
-    // DeltaReadException(ex.Message, ex)`), which renders directly — it is NOT the ratified #744 raw-inner
-    // channel. These pins drive FromJson end-to-end (not the private helpers) so a revert to '{name}' or
-    // '{kind}' turns them RED.
+    // ParseNamedType's unknown type name, and BOTH ParseDecimal malformed-decimal throws — the
+    // trailing-garbage site and the unparseable-precision/scale site, each pinned by its own row below).
+    //
+    // WHY sanitize at the PRODUCER (Round-6 correction — the earlier note here over-claimed the route).
+    // Every current SchemaJson.FromJson caller wraps the SchemaValidationException in a FIXED-message outer
+    // (Snapshot.ParseSchema and DeltaCommitter.ParseCommittedSchema → DeltaProtocolException.Inconsistent;
+    // ChangeFeedReader and DeltaLog → DeltaReadException with fixed text), so for THESE producers the raw
+    // token reaches only InnerException — the raw-inner channel ratified in #744, further suppressed for
+    // rendering by DeltaReadException.ToString() → DescribeWithoutInner. Sanitizing here therefore
+    // (a) minimizes the tenant payload that lands in that #744 raw-inner sink, shrinking its retention and
+    // erasure scope, and (b) removes the dependence on every current AND future FromJson caller remembering
+    // to wrap with fixed text. DeltaReadSource's direct lift (`throw new DeltaReadException(ex.Message, ex)`,
+    // DeltaReadSource.cs:177) IS live, but for this catch it carries SchemaValidationExceptions originating
+    // in ParquetTypeMapping / ColumnMappingProjection — the StructType/MapType producers already sanitized in
+    // Round 4 — not these SchemaJson ones. These pins drive FromJson end-to-end (not the private helpers) so
+    // a revert to '{name}' or '{kind}' at ANY of the four sites turns the matching case RED.
     private const int SanitizeCap = 128;
 
     private static string ExpectedSanitized(string raw)
@@ -164,13 +175,30 @@ public class SchemaValidationTests
     }
 
     [Theory]
-    // BOTH ParseDecimal throw sites. The first fires when the closing paren is not the final character
-    // (trailing garbage); the second when the paren-delimited body does not parse as precision,scale.
-    [InlineData("decimal(10,2)\r\nTRAILING")]
-    [InlineData("decimal(9\r\n9,2GARBAGE)")]
-    public void SchemaJson_MalformedDecimal_MessageEchoesSanitizedName_NotTheRawOne(string prefix)
+    // BOTH ParseDecimal throw sites, each reached by construction rather than by hope. Site #1 (the
+    // trailing-garbage guard, `close != name.Length - 1`) fires when the closing paren is NOT the final
+    // character; site #2 (the precision/scale guard) fires only when the paren IS final and the
+    // comma-delimited body fails int.TryParse.
+    //
+    // ROUND-6 FIX. The Round-5 rows appended the 200-character filler AFTER the whole name, which forced
+    // `close != name.Length - 1` — so BOTH rows hit site #1 and site #2's Sanitize(name) was UNPINNED (it
+    // could be reverted to a raw '{name}' with the suite still green). The filler is now injected BETWEEN a
+    // prefix and a suffix, so the third row keeps ')' as the FINAL character and lands on site #2.
+    //                    prefix                      suffix   site
+    [InlineData("decimal(10,2)\r\nTRAILING", "", false)]     // #1 — paren is not final
+    [InlineData("decimal(9\r\n9,2GARBAGE)", "", false)]      // #1 — filler lands after the ')'
+    [InlineData("decimal(9\r\n9", ",2)", true)]              // #2 — ')' IS final; "9\r\n9…" fails int.TryParse
+    public void SchemaJson_MalformedDecimal_MessageEchoesSanitizedName_NotTheRawOne(
+        string prefix,
+        string suffix,
+        bool closingParenIsFinal)
     {
-        string hostile = prefix + new string('z', 200);
+        string hostile = prefix + new string('z', 200) + suffix;
+
+        // Non-vacuity / routing pin: this is exactly the predicate that selects between the two throw sites,
+        // so a future edit cannot silently re-route every row back onto site #1.
+        Assert.Equal(closingParenIsFinal, hostile.EndsWith(')'));
+
         string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"c\",\"type\":" + JsonString(hostile)
             + ",\"nullable\":true,\"metadata\":{}}]}";
 
