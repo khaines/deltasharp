@@ -61,10 +61,14 @@ internal enum DeltaProtocolErrorKind
 /// <see cref="UnsupportedFeatures"/> instead; it applies <see cref="DiagnosticText.SanitizeAndJoin"/>
 /// which also bounds list length (#666). Call sites known as of <c>76d2c8e</c> are verified by
 /// <c>StorageMessageHygieneTests</c> and <c>StorageHygieneSweepTests</c>; new call sites carry
-/// the same obligation. Every interpolated token in this producer is also classified by the source-scan
-/// guard <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
-/// <c>storage-exception-producer-inventory.tsv</c>), which fails CI when a new or reclassified token is
-/// neither hygiene-wrapped nor inventoried (#749).
+/// the same obligation. Coverage is cross-checked by the source-scan guard
+/// <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
+/// <c>storage-exception-producer-inventory.tsv</c>), which — <b>for the interpolated-string-hole shape it
+/// walks</b> — fails CI when a producer token is neither hygiene-wrapped (semantic-model-resolved to a
+/// <c>DiagnosticText</c> type or <c>LocalFileSystemBackend.Redact</c>) nor classified in the site-keyed
+/// inventory (#749). It is an audit prompt for that shape, not a proof of hygiene for every shape; the
+/// composition/pass-through/non-<c>*Exception</c>-helper blind spots listed in the log-routing doc remain
+/// reviewer obligations.
 /// </remarks>
 internal sealed class DeltaProtocolException : Exception
 {

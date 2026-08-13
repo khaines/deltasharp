@@ -57,7 +57,7 @@ test, the test is named inline.
 
 > **Contract.** Treat every storage `.Message` as untrusted tenant data. Fixed literals and tokens actually
 > routed through `DiagnosticText.Sanitize` have the posture described below; the message-posture table
-> below lists the **verified producers for call sites known as of `76d2c8e`; coverage is now cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`), so a new or reclassified producer fails CI until it is classified**,
+> below lists the **verified producers for call sites known as of `76d2c8e`; coverage is cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`) that, **for the interpolation-hole shape it walks**, fails CI when a producer token is neither hygiene-wrapped (resolved via the semantic model to `DiagnosticText`/`LocalFileSystemBackend.Redact`) nor classified in the site-keyed inventory. It is an audit prompt for that shape, **not** a proof of hygiene for every shape — see the known blind spots below**,
 > enforced by `StorageHygieneSweepTests` (a mutation turning a `Sanitize` call into an identity turns a
 > sweep-test case red). Eight of the nine `DeltaStorageException` factories accept a fully-composed
 > message and carry the hygiene obligation in the type-level XML `<remarks>` (only
@@ -230,6 +230,17 @@ from declaring them rather than letting a field bypass this inventory.
 
 <!-- END:reflection-reachable-state -->
 
+> **Abstractions-layer typed sinks (outside the storage-type guard scope).** The compiled inventory above
+> covers only `DeltaSharp.Storage` exception types. One Abstractions-layer type carries the same
+> raw-typed-property posture and is registered here for completeness (it is not in the parsed block above
+> because the guard scans storage types): `DeltaSharp.Types.TypeCoercionException` retains
+> `.SourceType` / `.TargetType` / `.Path` (all **public**, `#707`). For a non-atomic type the `SourceType`/
+> `TargetType` are the recursive `DataType.SimpleString` (every nested foreign field name verbatim) and
+> `Path` is built from foreign schema field names — none reach `.Message`/`ToString`, which echo the bounded
+> `DataType.TypeName` kind and the sanitized, length-bounded path instead. Same obligation as
+> `DeltaReadSchemaEvolutionException.FilePath`: a reflecting sink re-surfaces the raw value, so the consumer
+> owns data-minimization and must not forward it to an untrusted sink.
+
 Read the last two columns together. "Sanitized copy" means the message carries a **length-capped,
 control-character-neutralized** rendering of the same token while the property keeps the original: a
 destructurer therefore re-surfaces the CR/LF and `U+2028` that `Sanitize` removed, and removes the length
@@ -271,7 +282,7 @@ table; a type-level membership match cannot hide a missing property.
 
 `Sanitized` is a **record-forgery and raw-decoder-text** property, not a personal-data property. This page
 previously let the two be read as the same thing. The table below is a behavior-pinned set of
-**verified producers for call sites known as of `76d2c8e`; coverage is now cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`), so a new or reclassified producer fails CI until it is classified**,
+**verified producers for call sites known as of `76d2c8e`; coverage is cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`) that, **for the interpolation-hole shape it walks**, fails CI when a producer token is neither hygiene-wrapped (resolved via the semantic model to `DiagnosticText`/`LocalFileSystemBackend.Redact`) nor classified in the site-keyed inventory. It is an audit prompt for that shape, **not** a proof of hygiene for every shape — see the known blind spots below**,
 enforced by `StorageHygieneSweepTests` for LocalFileSystemBackend and ColumnNotPresentInFile producers,
 `ParquetMessageHygieneTests` and `ParquetCorruptionTests` for Parquet `columnLabel`/`columnName` producers
 (a mutation on any listed sanitizer turns the respective suite red; #749).
@@ -692,6 +703,25 @@ rather than advisory. Revisit this decision if DeltaSharp starts shipping a pack
 **and** a supported logging integration — at that point the sink moves inside a compilation we own, and an
 analyzer becomes both possible and useful.
 
+## Accepted redaction residuals (path recognizer)
+
+The path-disclosure recognizer in `LocalFileSystemBackend.Redact` is proven **monotonic vs `9220b66`** and
+**PARTIAL-free** (every outcome is FULL redaction or DECLINE — never a marker over a half-consumed value)
+by `Redact_MonotonicityMatrix`. A small set of residuals is **irreducible at this layer** and accepted; each
+is pinned by a named test so it cannot silently widen. `id`s match the residual ledger in
+`LocalFileSystemBackend.cs` (the load-bearing comment block above the recognizer).
+
+| Residual | Shape (leaking `L` / over-redacting `O`) | Reachability | Why irreducible | Compensating control | Pinning test | Owner |
+| --- | --- | --- | --- | --- | --- | --- |
+| **R1** | `O` — whitespace-bearing key with **no** right delimiter → the value may be dropped | No genuine door on this backend surfaces a runtime path at all: the confinement/not-found guards pre-empt with their own `DescribePath`, and syscall wrappers synthesize a path-free `errno` detail | A whitespace-bearing key with no closing delimiter is byte-identical to prose; redacting it would over-redact operator text | Over-redaction only (diagnosability, never disclosure); no live door reaches it (#704/#708) | `Redact_NoGenuineDoorOnThisBackendSurfacesARuntimePath` | Storage |
+| **R2** | `L` — key bearing **both** a quote and whitespace × a right delimiter that is **not** a real path separator (the `errno=13` cell) | A **foreign** `add.path` (alphabet DeltaSharp doesn't control) **and** a **legacy** DeltaSharp-authored `add.path` written **before #708** (raw, unencoded keys) | `o'brien y=v'` and `file": errno=13"` are the **same string shape**; no recognizer can redact one and preserve the other. #708 retires the write-path half for **new** writes only, not retroactively | Confined in practice to a partition-**directory** name (a data file appends `/part-<guid>.parquet`, supplying the separator); tracked by #714 | `Redact_MonotonicityMatrix` (asserts `declinedR2 > 0`) | Storage |
+| **R4** | `O`→DECLINE — a **bare** `key=value` with no path evidence anywhere (`k=v`, `k=v.parquet`) is left verbatim | Any message where a relative key=value carries no `/` or `\` evidence | Deliberately indistinguishable from an operator diagnostic (`errno=13`, `retries=5`); redacting it would eat those | Declines (keeps operator diagnostics verbatim); no value is disclosed that a path branch would have caught | `Redact_BareKeyValueWithNoPathEvidence_IsLeftAlone` | Storage |
+| **R5** | `L` (partial) — a legitimately unclosed / truncated quote yields `stat failed on '/tbl/name=<value>' Club Holdings` | A message with an unbalanced/truncated quote around a Hive segment | The byte-identical inputs (interior quote vs unclosed delimiter) are irreducible at this layer | Tracked by #723; the parse still redacts the quoted region and nothing else (no over-claim) | `Redact_UnclosedOpeningQuote_RedactsTheQuotedRegionAndNothingElse`; `Redact_InteriorQuoteInAValue_IsAnIrreduciblePartialResidual` | Storage |
+| **#704(b)** | `O` — a benign query-string `key=value` (`prefix=`, `versionId=`, `uploadId=`) is redacted alongside the credential ones | Any message carrying a query string (`/objects?prefix=data`, `/obj?X-Amz-Signature=…`) | A presigned-URL credential (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`, `sig`) arrives as a query parameter and MUST be redacted; the key classes cannot exclude `?` without reopening that leak | Chosen safe direction: over-redact benign params (diagnosability cost) rather than leak a credential | `Redact_QueryStringKeyValue_IsRedacted_TheChosenSafeDirection` | Storage |
+
+`R3` (quote inside a value) and `R6` (trailing backslash) are **closed**, not accepted. The residual ids and
+their prose live beside the recognizer so the ledger and the code cannot drift.
+
 ## Known gaps in the sanitizer itself
 
 `DiagnosticText.Sanitize` closes the **line-break** class of log injection (the one that lets an
@@ -781,9 +811,24 @@ The compiled guards cannot catch every future integration, so a reviewer must ch
 - **A message that starts carrying a new class of tenant data.** `Sanitize` is an injection control, not
   a classification control; only a reviewer decides whether a newly echoed token is personal data.
 - **The full exception-message producer inventory.** The posture table above covers all call sites
-  known as of `76d2c8e`; coverage is now cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`), so a new or reclassified producer fails CI until it is classified.
+  known as of `76d2c8e`; coverage is cross-checked by an automated source-scan inventory (`StorageExceptionProducerInventoryGuardTests` + the checked-in `storage-exception-producer-inventory.tsv`) that, **for the interpolation-hole shape it walks**, fails CI when a producer token is neither hygiene-wrapped (resolved via the semantic model to `DiagnosticText`/`LocalFileSystemBackend.Redact`) nor classified in the site-keyed inventory. It is an audit prompt for that shape, **not** a proof of hygiene for every shape — see the known blind spots below.
   Verified by `StorageHygieneSweepTests` (each entry has a live behavior pin; the sweep door-matrix is hand-enumerated, not auto-generated). #749 tracks
   additional producers. The sweep door-matrix catches new raw echoes *inside* already-covered guards; a producer at a wholly new guard is not automatically detected and remains a reviewer obligation.
+
+  **Known blind spots of the source-scan guard — these remain REVIEWER obligations, not guard-enforced.**
+  The guard walks interpolated-string holes that reach a `*Exception` constructor/factory; the following
+  shapes silently bypass it and must be caught in review:
+    - a message composed into a **local** before it reaches the producer (the local, not the raw token, is
+      the interpolation hole);
+    - `+` / `string.Format` / `StringBuilder` composition (only interpolated-string holes are walked);
+    - a throw routed through a helper **not** named `*Exception` (the producer detector keys on that suffix);
+    - a whole-message **pass-through** (`new DeltaReadException(ex.Message, ex)`);
+    - a same-token-name reuse in an already-inventoried file — mitigated but not eliminated: rows are keyed on
+      the producer *site* (file + enclosing member + token), so only a reuse in the **same member** with the
+      **same token spelling** can alias an existing classification;
+    - a same-spelling **reclassification** at the same site (the site key is stable, so a semantic change of
+      what the token carries does not move the key);
+    - any producer **outside** `src/DeltaSharp.Storage`.
 - **Inherited `Exception.Data`.** Current storage code does not populate it, but layouts such as NLog's
   default `format=tostring,data` and object-graph destructurers can render it. A change that writes
   attacker- or tenant-derived values there requires table and sink review.

@@ -1,3 +1,6 @@
+using System.Globalization;
+using DeltaSharp.Diagnostics;
+
 namespace DeltaSharp.Types;
 
 /// <summary>
@@ -74,13 +77,33 @@ public sealed class TypeCoercionException : Exception
     {
     }
 
-    /// <summary>The source type that could not be coerced; non-null for path-aware throws.</summary>
+    /// <summary>The source type that could not be coerced; non-null for path-aware throws.
+    /// <para><b>Privacy channel (#707):</b> for a non-atomic type this is the recursive
+    /// <see cref="DataType.SimpleString"/>, which appends every nested <b>foreign schema field name</b>
+    /// verbatim — potential personal data / an un-neutralized foreign-name echo. It is deliberately kept off
+    /// the rendered <see cref="Exception.Message"/>/<c>ToString</c> (which echo the bounded
+    /// <see cref="DataType.TypeName"/> kind instead) and exposed here only for an <b>entitled</b> owner. A
+    /// consumer that logs or destructures this property owns its own data-minimization; do not forward it to
+    /// an untrusted sink.</para></summary>
     public string? SourceType { get; private init; }
 
-    /// <summary>The target type the source could not be coerced to; non-null for path-aware throws.</summary>
+    /// <summary>The target type the source could not be coerced to; non-null for path-aware throws.
+    /// <para><b>Privacy channel (#707):</b> for a non-atomic type this is the recursive
+    /// <see cref="DataType.SimpleString"/>, which appends every nested <b>foreign schema field name</b>
+    /// verbatim — potential personal data / an un-neutralized foreign-name echo. It is deliberately kept off
+    /// the rendered <see cref="Exception.Message"/>/<c>ToString</c> (which echo the bounded
+    /// <see cref="DataType.TypeName"/> kind instead) and exposed here only for an <b>entitled</b> owner. A
+    /// consumer that logs or destructures this property owns its own data-minimization; do not forward it to
+    /// an untrusted sink.</para></summary>
     public string? TargetType { get; private init; }
 
-    /// <summary>The dotted expression path to the offending element; non-null for path-aware throws.</summary>
+    /// <summary>The dotted expression path to the offending element; non-null for path-aware throws.
+    /// <para><b>Privacy channel (#707):</b> this raw path is built from <b>foreign schema field names</b>
+    /// (dotted/<c>element</c>/<c>key</c>/<c>value</c> segments) — potential personal data. It is deliberately
+    /// kept off the rendered <see cref="Exception.Message"/>/<c>ToString</c> (which carry the
+    /// sanitized, length-bounded path via <c>DiagnosticText.Sanitize</c>) and exposed here only for an
+    /// <b>entitled</b> owner. A consumer that logs or destructures this property owns its own
+    /// data-minimization; do not forward it to an untrusted sink.</para></summary>
     public string? Path { get; private init; }
 
     /// <summary>
@@ -106,9 +129,9 @@ public sealed class TypeCoercionException : Exception
     /// </remarks>
     public static TypeCoercionException ForPath(DataType source, DataType target, string path) =>
         new(string.Create(
-            System.Globalization.CultureInfo.InvariantCulture,
+            CultureInfo.InvariantCulture,
             $"Cannot coerce '{DescribeTypeForMessage(source)}' to '{DescribeTypeForMessage(target)}' at " +
-            $"'{DeltaSharp.Diagnostics.DiagnosticText.Sanitize(path)}'."))
+            $"'{DiagnosticText.Sanitize(path)}'."))
         {
             SourceType = source.SimpleString,
             TargetType = target.SimpleString,

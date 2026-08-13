@@ -110,21 +110,35 @@ internal static class DeltaWriteEncoding
     /// </summary>
     /// <remarks>
     /// <para>
-    /// <b>#708 — the encoding asymmetry is settled here, deliberately, in one place.</b> DeltaSharp
-    /// previously percent-encoded only the value and emitted the column name raw, so a legal Delta column
-    /// name containing a space, quote, or control character landed verbatim in <c>add.path</c>. Apache Spark
-    /// percent-encodes both the key and the value when composing a Hive partition directory
-    /// (<c>ExternalCatalogUtils.escapePathName</c> is applied to each), so encoding both is the
-    /// interoperable choice and removes the ambiguity.
+    /// <b>#708 — the encoding is settled here, deliberately, in one place — as a directory-injection
+    /// hardening, NOT a Spark-parity claim.</b> DeltaSharp previously percent-encoded only the value and
+    /// emitted the column name raw, so a legal Delta column name containing a <c>/</c>, <c>=</c>, quote,
+    /// space, or control character landed verbatim in <c>add.path</c> and could fabricate spurious path
+    /// segments or escape the confined table root. Encoding the NAME as well as the value with
+    /// <see cref="Uri.EscapeDataString(string)"/> closes that.
     /// </para>
     /// <para>
-    /// This is safe on read because <b>partition truth is authoritative from <c>add.partitionValues</c></b>,
-    /// never recovered by parsing the directory path (see <c>DeltaWriteTarget.DataFilePath</c>). Tables
-    /// written previously carry a raw key; nothing re-parses the key for correctness, and
-    /// <c>OrphanCleanup</c> already matches on the union of the raw path and its
+    /// <b>This is a known, deliberate DEVIATION from the Delta URI-encoded-path rule, not parity with it.</b>
+    /// DeltaSharp treats <c>add.path</c> as a <b>literal relative object key</b>, not a URI to be decoded —
+    /// the read path never decodes it (<c>DeltaReadSource.cs:310,362</c>). And
+    /// <see cref="Uri.EscapeDataString(string)"/> uses a DIFFERENT alphabet than Apache Spark's
+    /// <c>ExternalCatalogUtils.escapePathName</c> (a 128-entry ASCII bitset that cannot escape non-ASCII), so
+    /// the on-disk segment DeltaSharp writes is not byte-identical to Spark's for the same value. This
+    /// deviation is pre-existing for partition VALUES and is extended here to NAMES. The consequence:
+    /// DeltaSharp tables whose partition names/values contain characters outside the RFC-3986 unreserved set
+    /// are <b>not currently round-trippable with Spark/delta-rs</b>. The correct two-layer fix (physical
+    /// segment via Spark's <c>escapePathName</c> alphabet + URI-encode into <c>add.path</c>, decode on read)
+    /// is tracked by <b>#806</b>.
+    /// </para>
+    /// <para>
+    /// This is safe on read regardless, because <b>partition truth is authoritative from
+    /// <c>add.partitionValues</c></b>, never recovered by parsing the directory path (see
+    /// <c>DeltaWriteTarget.DataFilePath</c>). Tables written previously carry a raw key; nothing re-parses the
+    /// key for correctness, and <c>OrphanCleanup</c> already matches on the union of the raw path and its
     /// <see cref="Uri.UnescapeDataString(string)"/> decoding, so previously-written raw-key layouts still
-    /// resolve. Encoding the key also retires the write-path half of the Hive-redaction residuals (#714):
-    /// DeltaSharp-authored keys can no longer carry a quote or whitespace.
+    /// resolve. Encoding the key also retires the write-path half of the Hive-redaction residuals (#714) for
+    /// NEW writes: DeltaSharp-authored keys can no longer carry a quote or whitespace (a legacy raw-key
+    /// <c>add.path</c> written before #708 can still carry one).
     /// </para>
     /// <para>Both the write path (<c>DeltaWriteTarget.DataFilePath</c>) and OPTIMIZE
     /// (<c>DeltaOptimize.BuildOutputPath</c>) call this, so the two cannot drift.</para>

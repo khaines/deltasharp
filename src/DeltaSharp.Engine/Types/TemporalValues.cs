@@ -62,8 +62,8 @@ public static class TemporalValues
             return mode == AnsiMode.Ansi
                 // #355: value-free message — the raw operand ({day}) is a tenant cell value (potentially
                 // PII/secret) and must not land in an exception string that may be aggregated into shared
-                // logs on a multi-tenant executor. Keep the source/target types and the bound only, matching
-                // DecimalValue.ToType's value-free form.
+                // logs on a multi-tenant executor. Keep the source/target types only (no operand, no rendered
+                // bound), matching DecimalValue.ToType's value-free form.
                 ? throw new ArithmeticOverflowException("Date out of range for timestamp cast.")
                 : null;
         }

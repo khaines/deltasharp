@@ -2,10 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
+using DeltaSharp.Types;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Xunit;
+using SharedDiagnosticText = DeltaSharp.Diagnostics.DiagnosticText;
 
 namespace DeltaSharp.Core.Tests.Diagnostics;
 
@@ -17,35 +20,52 @@ namespace DeltaSharp.Core.Tests.Diagnostics;
 /// <para>
 /// This is a <b>source-backed</b> guard, not a hand-maintained count or family-name denylist. It parses the
 /// real storage sources with the C# compiler (<see cref="CSharpSyntaxTree"/>), builds a semantic model over
-/// the runtime's own BCL + <c>DeltaSharp.Abstractions</c> (via the trusted-platform-assembly set), and for
-/// every exception-message interpolation hole resolves the token's TYPE. A token is auto-cleared when it is
-/// either (a) wrapped in a hygiene helper (<c>Sanitize</c>/<c>DescribePath</c>/<c>DescribeType</c>/
-/// <c>DescribeSchema</c>/<c>SanitizeAndJoin</c>/<c>SanitizeEchoedToken</c>/<c>Redact</c>) — SANITIZED; or
-/// (b) resolved to a bounded value type (integral/enum/bool/char/<c>DateTimeOffset</c>/<c>Guid</c>/…) — BOUNDED,
-/// which cannot carry an attacker string. Every remaining token (a <c>string</c>, or a type the model could not
-/// resolve because its declaring assembly — e.g. Parquet.Net — is intentionally not referenced) MUST appear in
-/// the checked-in inventory <c>storage-exception-producer-inventory.tsv</c> with an explicit classification and
-/// justification. A NEW producer that echoes an unwrapped, non-bounded token therefore surfaces in the
-/// residual set, is absent from the inventory, and turns this guard RED — it cannot silently escape
-/// classification. Removing/renaming a producer leaves a stale inventory row, which is also RED, so the
-/// inventory cannot rot.
+/// an <b>explicitly-anchored</b> reference set (the runtime's own BCL + <c>DeltaSharp.Abstractions</c>), and
+/// for every exception-message interpolation hole resolves the token's TYPE. A token is auto-cleared when it
+/// is either (a) wrapped in a hygiene helper whose call RESOLVES (via the semantic model) to a method on
+/// <c>DeltaSharp.Diagnostics.DiagnosticText</c>, <c>DeltaSharp.Storage.Delta.DiagnosticText</c>, or
+/// <c>LocalFileSystemBackend.Redact</c> — SANITIZED (a bare <c>Sanitize</c>-named local does NOT clear); or
+/// (b) resolved to a bounded value type (integral/enum/bool/char/<c>DateTimeOffset</c>/<c>Guid</c>/…) —
+/// BOUNDED. Every remaining token MUST appear in the checked-in inventory
+/// <c>storage-exception-producer-inventory.tsv</c>, keyed on the producer <b>site</b>
+/// (file + enclosing member + token), with an explicit classification and justification.
+/// </para>
+/// <para>
+/// <b>Round-1 hardening.</b> (1) The hygiene clearance is resolved by SEMANTIC MODEL and gated on the
+/// containing type, not a bare method-name match — a forged local <c>Sanitize</c> identity no longer
+/// auto-clears; an unresolved symbol falls back to residual (fail-safe). (2) Rows are keyed on the site
+/// <c>(file, member, token)</c>, so a NEW unsanitized producer reusing a generic name already inventoried
+/// elsewhere in the file (<c>detail</c>/<c>context</c>/<c>reason</c>/…) cannot auto-clear. (3) Write mode
+/// <see cref="Assert.Fail(string)"/>s after regeneration, so it can never be a green audit. (4) The Roslyn
+/// reference set is anchored EXPLICITLY and the required anchor types are asserted resolved before scanning,
+/// so a missing reference is a NAMED failure, not a silent reclassification. (5) Duplicate <c>.tsv</c> keys
+/// fail rather than silently overwrite a strong class with a weaker one.
+/// </para>
+/// <para>
+/// <b>Known blind spots — these remain REVIEWER obligations, not guard-enforced.</b> A message composed into
+/// a local before it reaches the producer; <c>+</c>/<c>string.Format</c>/<c>StringBuilder</c> composition
+/// (only interpolated-string holes are walked); a throw routed through a helper NOT named <c>*Exception</c>;
+/// a whole-message pass-through (<c>new DeltaReadException(ex.Message, ex)</c>); a producer outside
+/// <c>src/DeltaSharp.Storage</c>. The guard is an audit prompt for the interpolation-hole shape it walks; it
+/// is not a proof of hygiene for every shape.
 /// </para>
 /// <para>
 /// Regenerate the residual key set (after intentionally adding/removing a producer) by running this test with
-/// the environment variable <c>DELTASHARP_WRITE_PRODUCER_INVENTORY=1</c>; it rewrites the <c>file</c>/<c>token</c>
-/// columns (preserving your existing classifications) and passes, so you then fill in the classification and
-/// justification for any newly-added rows and re-run in verify mode.
+/// the environment variable <c>DELTASHARP_WRITE_PRODUCER_INVENTORY=1</c>; it rewrites the site key columns
+/// (preserving existing classifications) and then FAILS, so you classify any newly-added rows and re-run in
+/// verify mode.
 /// </para>
 /// </summary>
 public sealed class StorageExceptionProducerInventoryGuardTests
 {
     private const string InventoryFileName = "storage-exception-producer-inventory.tsv";
 
-    private static readonly HashSet<string> HygieneHelpers = new(StringComparer.Ordinal)
-    {
-        "Sanitize", "SanitizeEchoedToken", "DescribePath", "DescribeType", "DescribeSchema",
-        "SanitizeAndJoin", "Redact", "DescribeValue", "DescribeList", "DescribeConfigToken",
-    };
+    // Hygiene clearance is gated on the CONTAINING TYPE (resolved by the semantic model), not a bare
+    // method-name match. Any method on one of the two DiagnosticText types clears; LocalFileSystemBackend
+    // clears only via its private Redact. A local/foreign `Sanitize` therefore does NOT auto-clear.
+    private const string AbstractionsDiagnosticText = "DeltaSharp.Diagnostics.DiagnosticText";
+    private const string StorageDiagnosticText = "DeltaSharp.Storage.Delta.DiagnosticText";
+    private const string LocalBackend = "DeltaSharp.Storage.Backends.LocalFileSystemBackend";
 
     private static readonly HashSet<string> AllowedClasses = new(StringComparer.Ordinal)
     {
@@ -56,7 +76,7 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         // A numeric/bounded value the model could not resolve (declaring assembly not referenced by the guard).
         "bounded",
         // The token is routed through a hygiene helper BEFORE it reaches the producer (sanitized-at-entry
-        // local, a Redact()ed framework detail, a DescribePath()ed display path).
+        // local, a Redact()ed framework detail, a DescribePath()ed display path, a SanitizeEchoedToken()).
         "sanitized-upstream",
         // A DeltaSharp-generated internal name (staging temp basename) that is never tenant data.
         "internal-name",
@@ -67,19 +87,22 @@ public sealed class StorageExceptionProducerInventoryGuardTests
     [Fact]
     public void EveryStorageExceptionMessageProducerToken_IsClassified_WithNoInventoryDrift()
     {
-        HashSet<(string File, string Token)> residual = ScanResidualProducerTokens();
+        HashSet<ProducerSite> residual = ScanResidualProducerTokens();
         var inventory = LoadInventory();
 
         if (Environment.GetEnvironmentVariable("DELTASHARP_WRITE_PRODUCER_INVENTORY") == "1")
         {
             WriteInventory(residual, inventory);
-            return;
+            Assert.Fail(
+                "inventory regenerated; classify new rows and re-run in verify mode. Write mode never passes "
+                + "so it cannot be mistaken for a green audit.");
         }
 
         // 1. Every discovered residual token has an inventory row — a NEW unclassified producer is RED here.
         var missing = residual.Where(r => !inventory.ContainsKey(r))
-            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Token, StringComparer.Ordinal)
-            .Select(r => $"{r.File}\t{r.Token}")
+            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Member, StringComparer.Ordinal)
+            .ThenBy(r => r.Token, StringComparer.Ordinal)
+            .Select(r => $"{r.File}\t{r.Member}\t{r.Token}")
             .ToList();
         Assert.True(
             missing.Count == 0,
@@ -89,12 +112,13 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
         // 2. Every inventory row still corresponds to a live producer — a stale row is RED (forces upkeep).
         var stale = inventory.Keys.Where(k => !residual.Contains(k))
-            .OrderBy(k => k.File, StringComparer.Ordinal).ThenBy(k => k.Token, StringComparer.Ordinal)
-            .Select(k => $"{k.File}\t{k.Token}")
+            .OrderBy(k => k.File, StringComparer.Ordinal).ThenBy(k => k.Member, StringComparer.Ordinal)
+            .ThenBy(k => k.Token, StringComparer.Ordinal)
+            .Select(k => $"{k.File}\t{k.Member}\t{k.Token}")
             .ToList();
         Assert.True(
             stale.Count == 0,
-            $"Stale {InventoryFileName} row(s) that no longer match any storage producer token "
+            $"Stale {InventoryFileName} row(s) that no longer match any storage producer site "
             + "(regenerate with DELTASHARP_WRITE_PRODUCER_INVENTORY=1):\n" + string.Join("\n", stale));
 
         // 3. Every row carries a valid classification and a non-empty justification.
@@ -102,53 +126,67 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         {
             Assert.True(
                 AllowedClasses.Contains(entry.Class),
-                $"{InventoryFileName} row '{key.File}\t{key.Token}' has invalid class '{entry.Class}'. "
-                + "Allowed: " + string.Join(", ", AllowedClasses.OrderBy(c => c, StringComparer.Ordinal)));
+                $"{InventoryFileName} row '{key.File}\t{key.Member}\t{key.Token}' has invalid class "
+                + $"'{entry.Class}'. Allowed: " + string.Join(", ", AllowedClasses.OrderBy(c => c, StringComparer.Ordinal)));
             Assert.False(
                 string.IsNullOrWhiteSpace(entry.Justification),
-                $"{InventoryFileName} row '{key.File}\t{key.Token}' has an empty justification.");
+                $"{InventoryFileName} row '{key.File}\t{key.Member}\t{key.Token}' has an empty justification.");
         }
     }
 
     [Fact]
-    public void ExplicitlyFlaggedProducers_AreCoveredByTheInventory()
+    public void ExplicitlyFlaggedProducers_AreCoveredByTheInventory_AndSanitizedAtTheDeclaringSite()
     {
-        // #749 names these two families explicitly; pin that they remain in the classified inventory so a
-        // refactor that drops their sanitization cannot pass silently.
+        // #749 names these two families explicitly. Round-1 makes this SOURCE-BACKED rather than a tsv-only
+        // assertion: the hygiene call must be PRESENT at the declaring site, so a refactor that drops the
+        // sanitization is caught here as well as by the behavioural pins
+        // (StorageMessageHygieneTests.NestedReader_ValidateShape_SanitizesColumnLabel and the
+        // LocalFileSystemBackend staged-write hygiene tests).
         var inventory = LoadInventory();
 
-        Assert.True(
-            inventory.TryGetValue(("Parquet/NestedParquetColumnReader.cs", "columnName"), out var col)
-            && col.Class == "sanitized-upstream",
-            "NestedParquetColumnReader.ValidateShape/ReadAsync `columnName` must be inventoried as "
-            + "sanitized-upstream (Sanitize at entry).");
+        Assert.Contains(
+            inventory,
+            kv => kv.Key.File == "Parquet/NestedParquetColumnReader.cs" && kv.Key.Token == "columnName"
+                && kv.Value.Class == "sanitized-upstream");
+        AssertSourceContains(
+            "Parquet/NestedParquetColumnReader.cs",
+            "columnName = DiagnosticText.Sanitize(columnName);",
+            "NestedParquetColumnReader must Sanitize `columnName` at entry (ValidateShape/ReadAsync).");
 
-        Assert.True(
-            inventory.TryGetValue(("Backends/LocalFileSystemBackend.cs", "_displayPath"), out var disp)
-            && disp.Class == "sanitized-upstream",
-            "LocalFileSystemBackend.StagedWriteStream `_displayPath` must be inventoried as sanitized-upstream "
-            + "(DescribePath at construction).");
+        Assert.Contains(
+            inventory,
+            kv => kv.Key.File == "Backends/LocalFileSystemBackend.cs" && kv.Key.Token == "_displayPath"
+                && kv.Value.Class == "sanitized-upstream");
+        AssertSourceContains(
+            "Backends/LocalFileSystemBackend.cs",
+            "_displayPath = DiagnosticText.DescribePath(displayPath);",
+            "LocalFileSystemBackend.StagedWriteStream must set `_displayPath` via DescribePath at construction.");
     }
 
     [Fact]
     public void EveryStorageSourceFile_ParsesCleanly_SoTheWalkCannotSilentlyDegrade()
     {
         var offenders = new List<string>();
-        foreach (string file in EnumerateStorageSources())
+        foreach (CSharpParseOptions leg in ParseLegs)
         {
-            SyntaxTree tree = CSharpSyntaxTree.ParseText(File.ReadAllText(file), ParseLegs[0], path: file);
-            if (tree.GetDiagnostics().Any(d => d.Severity == DiagnosticSeverity.Error))
+            foreach (string file in EnumerateStorageSources())
             {
-                offenders.Add(Path.GetRelativePath(StorageSourceRoot(), file));
+                SyntaxTree tree = CSharpSyntaxTree.ParseText(File.ReadAllText(file), leg, path: file);
+                if (tree.GetDiagnostics().Any(d => d.Severity == DiagnosticSeverity.Error))
+                {
+                    offenders.Add(Path.GetRelativePath(StorageSourceRoot(), file));
+                }
             }
         }
 
         Assert.True(offenders.Count == 0,
-            "Storage source file(s) failed to PARSE (a parser/language drift would silently degrade the "
-            + "producer walk):\n" + string.Join("\n", offenders));
+            "Storage source file(s) failed to PARSE on some parse leg (a parser/language drift would silently "
+            + "degrade the producer walk):\n" + string.Join("\n", offenders.Distinct()));
     }
 
     // ----- scan -----
+
+    private readonly record struct ProducerSite(string File, string Member, string Token);
 
     private static readonly CSharpParseOptions[] ParseLegs =
     [
@@ -158,10 +196,10 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             "NET", "NETCOREAPP", "NET8_0", "NET8_0_OR_GREATER", "DEBUG", "TRACE"),
     ];
 
-    private static HashSet<(string File, string Token)> ScanResidualProducerTokens()
+    private static HashSet<ProducerSite> ScanResidualProducerTokens()
     {
-        var refs = TrustedPlatformReferences();
-        var residual = new HashSet<(string, string)>();
+        var refs = BuildReferences();
+        var residual = new HashSet<ProducerSite>();
 
         foreach (CSharpParseOptions leg in ParseLegs)
         {
@@ -184,6 +222,10 @@ public sealed class StorageExceptionProducerInventoryGuardTests
                 "StorageProducerScan", trees, refs,
                 new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary, allowUnsafe: true));
 
+            // A missing anchor reference must be a NAMED failure, never a silent reclassification of every
+            // DataType/DiagnosticText token into "unresolved -> residual".
+            AssertAnchorTypesResolved(comp);
+
             foreach (SyntaxTree tree in trees)
             {
                 if (!fileByTree.TryGetValue(tree, out string? rel))
@@ -202,7 +244,7 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
                     foreach (InterpolationSyntax hole in interp.Contents.OfType<InterpolationSyntax>())
                     {
-                        if (IsHygieneWrapped(hole.Expression))
+                        if (IsHygieneWrapped(model, hole.Expression))
                         {
                             continue; // SANITIZED
                         }
@@ -214,7 +256,7 @@ public sealed class StorageExceptionProducerInventoryGuardTests
                             continue; // BOUNDED
                         }
 
-                        residual.Add((rel, hole.Expression.ToString()));
+                        residual.Add(new ProducerSite(rel, EnclosingMemberName(hole), hole.Expression.ToString()));
                     }
                 }
             }
@@ -247,10 +289,51 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         return false;
     }
 
-    private static bool IsHygieneWrapped(ExpressionSyntax expr) =>
-        expr is InvocationExpressionSyntax inv
-        && InvokedName(inv) is string name
-        && HygieneHelpers.Contains(name);
+    // ROUND-1: resolve the invocation via the SEMANTIC MODEL and gate on the containing type. A bare
+    // method-name match is forgeable — a local `string Sanitize(string s) => s;` would auto-clear a raw
+    // token. Clearance requires the resolved method (or, when overload binding fails on an unresolved
+    // argument, the resolved RECEIVER TYPE) to belong to one of the two DiagnosticText types, or to be
+    // LocalFileSystemBackend.Redact. Neither path is a name match; an UNRESOLVED call on an unknown receiver
+    // falls back to residual (fail-safe).
+    private static bool IsHygieneWrapped(SemanticModel model, ExpressionSyntax expr)
+    {
+        if (expr is not InvocationExpressionSyntax inv)
+        {
+            return false;
+        }
+
+        // Path 1: the invocation binds -> use the resolved method's containing type. Handles Redact and any
+        // DiagnosticText call whose arguments all resolve.
+        if (model.GetSymbolInfo(inv).Symbol is IMethodSymbol method)
+        {
+            string containing = method.ContainingType?.ToDisplayString() ?? string.Empty;
+            if (containing is AbstractionsDiagnosticText or StorageDiagnosticText)
+            {
+                return true;
+            }
+
+            return containing == LocalBackend && method.Name == "Redact";
+        }
+
+        // Path 2: overload binding failed because an argument is unresolved (e.g. a Parquet.Net-typed
+        // `field.Name`/`leaf.Path`), but a type-qualified call `DiagnosticText.Method(...)` still resolves its
+        // RECEIVER independent of the arguments. Clearing on the resolved receiver TYPE (never a bare name)
+        // keeps a local/foreign `Sanitize` residual while a genuine DiagnosticText wrap clears.
+        if (inv.Expression is MemberAccessExpressionSyntax ma)
+        {
+            string? receiverType = model.GetSymbolInfo(ma.Expression).Symbol switch
+            {
+                INamedTypeSymbol t => t.ToDisplayString(),
+                _ => model.GetTypeInfo(ma.Expression).Type?.ToDisplayString(),
+            };
+            if (receiverType is AbstractionsDiagnosticText or StorageDiagnosticText)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
 
     private static bool IsBoundedType(ITypeSymbol type)
     {
@@ -291,12 +374,49 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         };
     }
 
-    private static string? InvokedName(InvocationExpressionSyntax inv) => inv.Expression switch
+    // The enclosing member (method/local-function/ctor/property/accessor/indexer/field) of a producer hole,
+    // so the inventory key is the producer SITE, not just (file, token). Innermost wins (a local function
+    // inside a method keys to the local function). Field/property initializers fall back to the declared
+    // variable name so a producer in a field initializer still has a stable site.
+    private static string EnclosingMemberName(SyntaxNode node)
     {
-        MemberAccessExpressionSyntax ma => ma.Name.Identifier.ValueText,
-        IdentifierNameSyntax id => id.Identifier.ValueText,
-        _ => null,
-    };
+        for (SyntaxNode? n = node; n is not null; n = n.Parent)
+        {
+            switch (n)
+            {
+                case LocalFunctionStatementSyntax lf:
+                    return lf.Identifier.ValueText;
+                case MethodDeclarationSyntax m:
+                    return m.Identifier.ValueText;
+                case ConstructorDeclarationSyntax c:
+                    return c.Identifier.ValueText + "..ctor";
+                case AccessorDeclarationSyntax a when Ancestor<PropertyDeclarationSyntax>(a) is { } pp:
+                    return pp.Identifier.ValueText + "." + a.Keyword.ValueText;
+                case PropertyDeclarationSyntax p:
+                    return p.Identifier.ValueText;
+                case IndexerDeclarationSyntax:
+                    return "this[]";
+                case VariableDeclaratorSyntax v when v.Parent?.Parent is BaseFieldDeclarationSyntax:
+                    return v.Identifier.ValueText;
+            }
+        }
+
+        return "<file>";
+    }
+
+    private static T? Ancestor<T>(SyntaxNode node)
+        where T : SyntaxNode
+    {
+        for (SyntaxNode? n = node.Parent; n is not null; n = n.Parent)
+        {
+            if (n is T t)
+            {
+                return t;
+            }
+        }
+
+        return null;
+    }
 
     private static string SimpleTypeName(TypeSyntax type) => type switch
     {
@@ -305,18 +425,41 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         _ => type.ToString(),
     };
 
-    private static List<MetadataReference> TrustedPlatformReferences()
+    // ----- references -----
+
+    // Build the reference set EXPLICITLY from anchor types (so a missing one is a NAMED failure), unioned
+    // with the runtime's trusted-platform assemblies for the broad BCL surface. DeltaSharp.Storage is
+    // intentionally excluded (it is compiled from source; referencing its dll would duplicate every type),
+    // and Parquet.Net is intentionally unreferenced (its tokens resolve as unresolved -> residual -> inventory,
+    // which is deterministic and fail-safe).
+    private static readonly (string Name, Func<string> Location)[] AnchorAssemblies =
+    [
+        ("System.Private.CoreLib (object)", () => typeof(object).Assembly.Location),
+        ("System.Text.RegularExpressions (Regex)", () => typeof(Regex).Assembly.Location),
+        ("DeltaSharp.Abstractions (DataType)", () => typeof(DataType).Assembly.Location),
+        ("DeltaSharp.Abstractions (DiagnosticText)", () => typeof(SharedDiagnosticText).Assembly.Location),
+    ];
+
+    private static List<MetadataReference> BuildReferences()
     {
-        // The BCL the test process runs on, plus DeltaSharp.Abstractions/Core (Core.Tests loads them). Parquet.Net
-        // and DeltaSharp.Storage are intentionally NOT here: Storage is compiled from source (referencing its own
-        // compiled dll would duplicate every type), and leaving Parquet.Net unreferenced makes ClrType/level
-        // tokens resolve as unresolved -> residual -> inventory, which is deterministic and fail-safe.
-        var tpa = (AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string ?? string.Empty)
-            .Split(Path.PathSeparator);
-        var refs = new List<MetadataReference>();
-        foreach (string path in tpa)
+        var byPath = new Dictionary<string, MetadataReference>(StringComparer.Ordinal);
+
+        // 1. Explicit anchors first — assert each resolves to a real file so a broken build is NAMED.
+        foreach ((string name, Func<string> location) in AnchorAssemblies)
         {
-            if (path.Length == 0 || !File.Exists(path))
+            string path = location();
+            Assert.False(
+                string.IsNullOrEmpty(path) || !File.Exists(path),
+                $"Required Roslyn anchor reference '{name}' resolved to a missing location '{path}'. Without it "
+                + "the scan would silently reclassify every dependent token instead of resolving it.");
+            byPath[path] = MetadataReference.CreateFromFile(path);
+        }
+
+        // 2. Broad BCL from the trusted-platform assemblies (excluding the from-source Storage dll).
+        string tpa = AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string ?? string.Empty;
+        foreach (string path in tpa.Split(Path.PathSeparator))
+        {
+            if (path.Length == 0 || !File.Exists(path) || byPath.ContainsKey(path))
             {
                 continue;
             }
@@ -326,18 +469,29 @@ public sealed class StorageExceptionProducerInventoryGuardTests
                 continue;
             }
 
-            refs.Add(MetadataReference.CreateFromFile(path));
+            byPath[path] = MetadataReference.CreateFromFile(path);
         }
 
-        return refs;
+        return [.. byPath.Values];
+    }
+
+    private static void AssertAnchorTypesResolved(CSharpCompilation comp)
+    {
+        foreach (string metadataName in new[] { "DeltaSharp.Types.DataType", "DeltaSharp.Diagnostics.DiagnosticText" })
+        {
+            Assert.True(
+                comp.GetTypeByMetadataName(metadataName) is not null,
+                $"Anchor type '{metadataName}' did not resolve in the producer-scan compilation. A missing "
+                + "reference would silently reclassify hygiene/bounded tokens as residual — failing here names it.");
+        }
     }
 
     // ----- inventory I/O -----
 
-    private static Dictionary<(string File, string Token), (string Class, string Justification)> LoadInventory()
+    private static Dictionary<ProducerSite, (string Class, string Justification)> LoadInventory()
     {
         string path = InventoryPath();
-        var map = new Dictionary<(string, string), (string, string)>();
+        var map = new Dictionary<ProducerSite, (string, string)>();
         foreach (string raw in File.ReadAllLines(path))
         {
             string line = raw.TrimEnd();
@@ -347,28 +501,38 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             }
 
             string[] parts = line.Split('\t');
-            Assert.True(parts.Length == 4, $"{InventoryFileName}: expected 4 tab-separated columns, got '{line}'.");
-            map[(parts[0], parts[1])] = (parts[2], parts[3]);
+            Assert.True(parts.Length == 5, $"{InventoryFileName}: expected 5 tab-separated columns, got '{line}'.");
+            var key = new ProducerSite(parts[0], parts[1], parts[2]);
+
+            // Duplicate keys must FAIL rather than silently overwrite a strong class with a weaker one.
+            Assert.False(
+                map.ContainsKey(key),
+                $"{InventoryFileName}: duplicate row for site '{key.File}\t{key.Member}\t{key.Token}'. A "
+                + "duplicate would let a weaker class silently overwrite a stronger one.");
+            map[key] = (parts[3], parts[4]);
         }
 
         return map;
     }
 
     private static void WriteInventory(
-        HashSet<(string File, string Token)> residual,
-        Dictionary<(string File, string Token), (string Class, string Justification)> existing)
+        HashSet<ProducerSite> residual,
+        Dictionary<ProducerSite, (string Class, string Justification)> existing)
     {
         var lines = new List<string>
         {
             "# storage-exception-producer-inventory.tsv — GENERATED KEY SET, MANUAL classification.",
-            "# Columns: file<TAB>token<TAB>class<TAB>justification.",
-            "# Regenerate keys with DELTASHARP_WRITE_PRODUCER_INVENTORY=1; then classify any UNCLASSIFIED rows.",
-            "# Owned by StorageExceptionProducerInventoryGuardTests (#749).",
+            "# Columns: file<TAB>member<TAB>token<TAB>class<TAB>justification.",
+            "# Keyed on the producer SITE (file + enclosing member + token) so a reused generic name in an",
+            "# already-inventoried file cannot auto-clear. Regenerate keys with DELTASHARP_WRITE_PRODUCER_INVENTORY=1;",
+            "# then classify any UNCLASSIFIED rows. Owned by StorageExceptionProducerInventoryGuardTests (#749).",
         };
-        foreach (var key in residual.OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Token, StringComparer.Ordinal))
+        foreach (var key in residual
+            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Member, StringComparer.Ordinal)
+            .ThenBy(r => r.Token, StringComparer.Ordinal))
         {
             (string Class, string Justification) v = existing.TryGetValue(key, out var e) ? e : ("UNCLASSIFIED", "TODO");
-            lines.Add($"{key.File}\t{key.Token}\t{v.Class}\t{v.Justification}");
+            lines.Add($"{key.File}\t{key.Member}\t{key.Token}\t{v.Class}\t{v.Justification}");
         }
 
         File.WriteAllLines(InventoryPath(), lines);
@@ -381,6 +545,13 @@ public sealed class StorageExceptionProducerInventoryGuardTests
     }
 
     // ----- filesystem -----
+
+    private static void AssertSourceContains(string relFile, string needle, string because)
+    {
+        string full = Path.Combine(StorageSourceRoot(), relFile.Replace('/', Path.DirectorySeparatorChar));
+        Assert.True(File.Exists(full), $"{because} (source file '{relFile}' not found).");
+        Assert.True(File.ReadAllText(full).Contains(needle, StringComparison.Ordinal), because);
+    }
 
     private static IEnumerable<string> EnumerateStorageSources() =>
         Directory.EnumerateFiles(StorageSourceRoot(), "*.cs", SearchOption.AllDirectories)

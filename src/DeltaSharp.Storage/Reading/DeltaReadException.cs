@@ -14,10 +14,13 @@ namespace DeltaSharp.Storage;
 /// <remarks>
 /// This facade composes its <see cref="Exception.Message"/> from an already-sanitized inner storage
 /// message (<c>new DeltaReadException(inner.Message, inner)</c>); it introduces no new attacker-influenceable
-/// token of its own. Producers that DO build a message here are classified by the source-scan guard
+/// token of its own. Note the whole-message pass-through shape is itself one of the source-scan guard's known
+/// blind spots (the guard walks interpolation holes, not a pass-through argument), so this pass-through's
+/// safety rests on the inner message already being sanitized, not on the guard. Producers that DO build a
+/// message here via an interpolation hole are cross-checked by the source-scan guard
 /// <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
-/// <c>storage-exception-producer-inventory.tsv</c>), which fails CI when a new or reclassified token is
-/// neither hygiene-wrapped nor inventoried (#749).
+/// <c>storage-exception-producer-inventory.tsv</c>), which fails CI when such a token is neither
+/// hygiene-wrapped nor classified in the site-keyed inventory (#749).
 /// </remarks>
 public sealed class DeltaReadException : Exception
 {
