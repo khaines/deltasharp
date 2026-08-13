@@ -226,6 +226,171 @@ public sealed class DeltaWriteSchemaEligibilityTests : IDisposable
         Assert.Equal(0L, (await log.LoadSnapshotAsync(version: null)).Version);
     }
 
+    // ---- the walk itself must be bounded (Round-2 review, Blocker 1) ------------------------------------
+
+    // The Round-1 door walked the declared type tree RECURSIVELY, to whatever depth the caller declared, and
+    // it runs BEFORE SchemaJson.ToJson — so it ran ahead of the serializer's own depth guard. A programmatic
+    // / schema-inference caller supplying a pathologically deep type tree therefore overflowed the stack with
+    // an UNCATCHABLE StackOverflowException (a process abort, ~4,000 levels on a thread-pool stack), where
+    // the pre-door code path had failed closed with a catchable exception. The walk is now iterative with an
+    // explicit stack and a depth bound (the same rule NestedTypeDepth documents), so a pathological schema is
+    // a planned refusal.
+    //
+    // 5,000 is past the thread-pool stack limit that crashed; 20,000 is past the main-thread limit too. Both
+    // must return a CATCHABLE exception, and neither may publish anything.
+    [Theory]
+    [InlineData(5_000)]
+    [InlineData(20_000)]
+    public async Task DeclaredSchema_NestedAbsurdlyDeep_IsRefusedCatchably_AndCommitsNothing(int levels)
+    {
+        using var target = DeltaWriteTarget.ForLocalPath(_root);
+
+        // A zero-file create again: the door is the only thing between this schema and a schemaString.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => target.AppendAsync(
+                Struct(F("id", DataTypes.LongType, nullable: false), F("deep", DeepArray(levels))),
+                Array.Empty<string>(),
+                Array.Empty<ColumnBatch>()));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        Assert.Contains("nests deeper than", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("'deep'", ex.Message, StringComparison.Ordinal);
+        AssertNothingWasWritten();
+    }
+
+    [Fact]
+    public async Task DeclaredSchema_NestedWithinTheBound_IsStillAccepted()
+    {
+        // The bound must not swallow a legitimately (if unusually) nested schema: a depth the schemaString
+        // serializer itself accepts still creates the table. This is the other side of the depth pin — a
+        // guard that rejected everything would also make the deep-schema test above pass.
+        using var target = DeltaWriteTarget.ForLocalPath(_root);
+
+        DeltaWriteResult result = await target.AppendAsync(
+            Struct(F("id", DataTypes.LongType, nullable: false), F("deep", DeepArray(8))),
+            Array.Empty<string>(),
+            Array.Empty<ColumnBatch>());
+
+        Assert.Equal(0L, result.Version);
+    }
+
+    // An `array<array<...<long>>>` chain `levels` deep, built ITERATIVELY (building it recursively would
+    // overflow the test's own stack before the door could be reached).
+    private static DataType DeepArray(int levels)
+    {
+        DataType type = DataTypes.LongType;
+        for (int i = 0; i < levels; i++)
+        {
+            type = DataTypes.CreateArrayType(type, containsNull: true);
+        }
+
+        return type;
+    }
+
+    // ---- the two previously UNPINNED chokepoints (Round-2 review, Blocker 3) ----------------------------
+
+    // Chokepoint 1 — DeltaTableWriter's name/id-mode evolution branch. It calls EnsureCommittable on the
+    // MAPPED evolved schema, a different call site from the none-mode LogicalEvolution branch the test above
+    // covers, and dropping it left the whole Storage suite green.
+    [Fact]
+    public async Task NameModeEvolution_AddingAVoidColumn_IsRejectedBeforeAnyCommit()
+    {
+        using var backend = new LocalFileSystemBackend(_root);
+        await DeltaTestHarness.WriteCommitAsync(
+            backend, 0, ColumnMappingProtocolLine, NameModeMetadataLine(MappedFields(("id", "long", 1))));
+
+        var log = new DeltaLog(backend);
+        Snapshot snapshot = await log.LoadSnapshotAsync(version: null);
+        var writer = new DeltaTableWriter(backend);
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(() =>
+            writer.AppendAsync(
+                snapshot,
+                Struct(F("id", DataTypes.LongType, nullable: false), F("v", DataTypes.NullType)),
+                new[]
+                {
+                    new StagedDataFile(
+                        "a.parquet",
+                        ImmutableSortedDictionary<string, string?>.Empty.WithComparers(StringComparer.Ordinal),
+                        Size: 1L,
+                        ModificationTime: 1L,
+                        Stats: null),
+                },
+                SchemaEvolutionMode.MergeSchema));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        Assert.Contains("NullType column", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("'v'", ex.Message, StringComparison.Ordinal); // the exact leaf, not merely "a column"
+        Assert.Equal(0L, (await log.LoadSnapshotAsync(version: null)).Version); // nothing published
+    }
+
+    // Chokepoint 2 — CommitSchemaChangeAsync (the metadata-only ALTER path). It stages no file at all, so no
+    // per-file guard can cover it, and it too was unpinned.
+    //
+    // It also carries a deliberate BEHAVIOR CHANGE worth pinning explicitly: a FOREIGN table that already
+    // carries a `void` column stays readable (the read tolerance below is unchanged), but an ALTER of an
+    // UNRELATED column now re-declares that same void column in the post-ALTER schema and is therefore
+    // refused. That is the safe direction — the ALTER would otherwise re-commit the ineligible type — and it
+    // is not a brick: dropping the void column itself still succeeds, which is the remedy.
+    [Fact]
+    public async Task Alter_OnForeignTableCarryingAVoidColumn_IsRefused_ButDroppingTheVoidColumnSucceeds()
+    {
+        using var backend = new LocalFileSystemBackend(_root);
+        await DeltaTestHarness.WriteCommitAsync(
+            backend,
+            0,
+            ColumnMappingProtocolLine,
+            NameModeMetadataLine(MappedFields(("id", "long", 1), ("v", "void", 2))));
+
+        var log = new DeltaLog(backend);
+
+        // The foreign table LOADS (read tolerance for a foreign void column is unchanged).
+        Snapshot loaded = await log.LoadSnapshotAsync(version: null);
+        Assert.Equal(2, loaded.Schema.Count);
+
+        // ALTER of an UNRELATED column re-declares the void column => refused, nothing committed.
+        var writer = new DeltaTableWriter(backend);
+        DeltaStorageException rename = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => writer.RenameColumnAsync("id", "ident"));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, rename.Kind);
+        Assert.Contains("NullType column", rename.Message, StringComparison.Ordinal);
+        Assert.Contains("'v'", rename.Message, StringComparison.Ordinal);
+        Assert.Equal(0L, (await log.LoadSnapshotAsync(version: null)).Version);
+
+        // ...and the remedy works: dropping the void column itself yields an eligible post-ALTER schema.
+        DeltaCommitResult drop = await writer.DropColumnAsync("v");
+        Assert.Equal(1L, drop.Version);
+
+        Snapshot after = await new DeltaLog(backend).LoadSnapshotAsync(version: null);
+        Assert.Single(after.Schema);
+        Assert.Equal("id", after.Schema[0].Name);
+
+        // With the void column gone the previously-refused ALTER succeeds — the refusal was scoped to the
+        // ineligible declaration, not to the table.
+        DeltaCommitResult renamed = await new DeltaTableWriter(backend).RenameColumnAsync("id", "ident");
+        Assert.Equal(2L, renamed.Version);
+    }
+
+    private const string ColumnMappingProtocolLine =
+        """{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}""";
+
+    // Builds the `fields` array of a name-mode schemaString: each column carries the physicalName + id the
+    // mode requires. The `type` is written as a RAW token so a foreign "void" can be declared (the write-side
+    // serializer would refuse to produce this schema — that is the point of the fixture).
+    private static string MappedFields(params (string Name, string Type, long Id)[] columns) =>
+        "{\"type\":\"struct\",\"fields\":["
+        + string.Join(",", columns.Select(c =>
+            $"{{\"name\":\"{c.Name}\",\"type\":\"{c.Type}\",\"nullable\":true,\"metadata\":"
+            + $"{{\"delta.columnMapping.id\":{c.Id.ToString(System.Globalization.CultureInfo.InvariantCulture)},"
+            + $"\"delta.columnMapping.physicalName\":\"col-{c.Name}\"}}}}"))
+        + "]}";
+
+    private static string NameModeMetadataLine(string schemaJson) =>
+        "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},\"schemaString\":"
+        + JsonSerializer.Serialize(schemaJson)
+        + ",\"partitionColumns\":[],\"configuration\":{\"delta.columnMapping.mode\":\"name\","
+        + "\"delta.columnMapping.maxColumnId\":\"2\"}}}";
+
     // ---- the deliberate other half: READ tolerance of a FOREIGN "void" schemaString is unchanged ---------
 
     [Fact]
@@ -292,6 +457,32 @@ public sealed class DeltaWriteSchemaEligibilityTests : IDisposable
         // Content-free at every layer: the malformed token is never echoed.
         Assert.DoesNotContain('\uD800', ex.Message);
         Assert.DoesNotContain('\uD800', ex.InnerException!.Message);
+    }
+
+    // Round-2 review (Blocker 4): the broad fail-closed net above also catches an ArgumentException raised by
+    // a CONSTRUCTOR reached during the read — StructField's ThrowIfNullOrEmpty(name) for a foreign
+    // `"name":""` — which the Round-1 wording described as "invalid UTF-16". The empty name now gets its own
+    // precise, content-free diagnostic (and the residual net no longer asserts a cause it cannot know).
+    [Fact]
+    public async Task ForeignSchemaString_WithEmptyFieldName_FailsClosedWithAPreciseMessage()
+    {
+        const string SchemaJsonText =
+            """{"type":"struct","fields":[{"name":"","type":"string","nullable":true,"metadata":{}}]}""";
+
+        using var backend = new LocalFileSystemBackend(_root);
+        await DeltaTestHarness.WriteCommitAsync(
+            backend, 0,
+            DeltaTestHarness.Protocol(minReader: 1, minWriter: 2),
+            MetadataLine(SchemaJsonText));
+
+        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
+            () => new DeltaLog(backend).LoadSnapshotAsync(version: null));
+
+        Assert.Equal(DeltaProtocolErrorKind.InconsistentLog, ex.Kind);
+        var inner = Assert.IsType<SchemaValidationException>(ex.InnerException);
+        Assert.Contains("must be non-empty", inner.Message, StringComparison.Ordinal);
+        // The mis-attribution the fix removes: an empty name is not a decoding fault.
+        Assert.DoesNotContain("UTF-16", inner.Message, StringComparison.Ordinal);
     }
 
     // A metaData commit line carrying an ARBITRARY schemaString verbatim (the harness helpers serialize a

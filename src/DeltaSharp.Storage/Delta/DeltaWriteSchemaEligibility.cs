@@ -10,9 +10,12 @@ namespace DeltaSharp.Storage.Delta;
 /// <para>
 /// Today the sole ineligible type is <see cref="NullType"/> (the <c>void</c>/<c>null</c> type). It has no
 /// physical layout (<c>PhysicalLayoutResolver.TryResolve</c> returns <see langword="false"/>) and no Parquet
-/// mapping, so a table whose <c>metaData.schemaString</c> declares it is unreadable BY DELTASHARP ITSELF —
-/// every read fails <c>StorageErrorKind.UnsupportedFeature</c>. Committing such a schema therefore bricks the
-/// table at version 0, and the only "fix" is deleting the table.
+/// mapping. An EMPTY such table still loads and reads fine (a schema-only snapshot has no data file to map),
+/// so the damage is deferred, not absent: the moment the table has to touch a data file — any write that
+/// stages a file (<c>ParquetTypeMapping.CreateField</c>) and any read that maps a file's columns — the
+/// operation fails <c>StorageErrorKind.UnsupportedFeature</c>. A committed <c>void</c> column therefore
+/// produces a table that can be created and described but never populated or scanned, and the only "fix" is
+/// dropping the column (or deleting the table).
 /// </para>
 /// <para>
 /// <b>Why this door and not a per-file guard.</b> The pre-#702 reasoning held that
@@ -38,12 +41,33 @@ namespace DeltaSharp.Storage.Delta;
 internal static class DeltaWriteSchemaEligibility
 {
     /// <summary>
+    /// The maximum declared TYPE-tree depth this door walks before failing closed. Sits at the schema
+    /// serializer's own JSON-container bound (<c>SchemaJson.MaxDepth</c> = 64): every type level costs AT
+    /// LEAST one JSON container, and a struct schema pays three containers (struct object, <c>fields</c>
+    /// array, field object) before its first field's type is even opened, so anything <c>SchemaJson.ToJson</c>
+    /// would agree to serialize nests strictly shallower than this — the bound can only reject a schema the
+    /// serializer would reject moments later, never one it would accept.
+    /// </summary>
+    /// <remarks>
+    /// The walk below runs BEFORE <c>SchemaJson.ToJson</c> (that is the whole point of the door: reject
+    /// before a schemaString exists), so it cannot borrow the serializer's depth guard — it needs its own.
+    /// An UNBOUNDED recursive walk of an attacker- or generator-supplied declared schema overflows the stack
+    /// with an <b>uncatchable</b> <see cref="StackOverflowException"/> (process abort, not a planned error) at
+    /// roughly 4,000 levels on a thread-pool stack. Same rule, same remedy, as
+    /// <c>DeltaSharp.Executor.Physical.NestedTypeDepth</c>: walk ITERATIVELY with an explicit stack and a
+    /// depth bound, so a pathological tree is a deterministic refusal.
+    /// </remarks>
+    private const int MaxDepth = 64;
+
+    /// <summary>
     /// Fails closed when <paramref name="schema"/> declares an ineligible type ANYWHERE in its type tree —
-    /// as a top-level field, an array element, a map key, a map value, or a nested struct field.
+    /// as a top-level field, an array element, a map key, a map value, or a nested struct field — or when
+    /// that type tree nests deeper than <see cref="MaxDepth"/>.
     /// </summary>
     /// <param name="schema">The declared write schema about to be serialized into a <c>metaData</c> action.</param>
     /// <exception cref="DeltaStorageException">A column (or a nested leaf) is
-    /// <see cref="NullType"/> (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    /// <see cref="NullType"/>, or the type tree nests deeper than <see cref="MaxDepth"/>
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/> in both cases).</exception>
     public static void EnsureCommittable(StructType schema)
     {
         ArgumentNullException.ThrowIfNull(schema);
@@ -53,35 +77,56 @@ internal static class DeltaWriteSchemaEligibility
         }
     }
 
-    // Walks one field's type tree. The path names the offending LEAF ("v", "s.inner", "a.element", "m.key",
-    // "m.value") using the same dotted convention ColumnMapping's duplicate-name walk uses, so an operator can
-    // locate the column. The segments are the writer's own declared schema identifiers, but they are echoed
-    // through DiagnosticText.Sanitize anyway (uniform posture: bounded + control-char-neutralized), matching
+    // Walks one field's type tree ITERATIVELY (an explicit stack), so validating a pathologically deep
+    // declared schema cannot itself overflow the runtime stack — the depth check is the FIRST thing done to
+    // every popped node, before the eligibility arm and before any child is pushed, so it cannot be skipped
+    // or out-run by a deeper subtree.
+    //
+    // The path names the offending LEAF ("v", "s.inner", "a.element", "m.key", "m.value") using the same
+    // dotted convention ColumnMapping's duplicate-name walk uses, so an operator can locate the column. The
+    // segments are the writer's own declared schema identifiers, but they are echoed through
+    // DiagnosticText.Sanitize anyway (uniform posture: bounded + control-char-neutralized), matching
     // ParquetTypeMapping's identical column-name echo.
     private static void EnsureTypeCommittable(DataType type, string path)
     {
-        switch (type)
+        var pending = new Stack<(DataType Type, string Path, int Depth)>();
+        pending.Push((type, path, 1));
+        while (pending.Count > 0)
         {
-            case NullType:
+            (DataType current, string currentPath, int depth) = pending.Pop();
+            if (depth > MaxDepth)
+            {
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Cannot create a Delta table with a NullType column '{DiagnosticText.Sanitize(path)}'; "
-                    + "the void/null type has no physical layout and cannot be persisted.");
-            case StructType nested:
-                foreach (StructField field in nested)
-                {
-                    EnsureTypeCommittable(field.DataType, path + "." + field.Name);
-                }
+                    $"Cannot commit a Delta table schema whose column '{DiagnosticText.Sanitize(path)}' nests "
+                    + $"deeper than the supported limit of {MaxDepth} type levels; a deeper declared schema is "
+                    + "refused fail-closed (it could not be serialized to a readable schemaString, and walking "
+                    + "it unbounded would overflow the stack).");
+            }
 
-                break;
-            case ArrayType array:
-                EnsureTypeCommittable(array.ElementType, path + ".element");
-                break;
-            case MapType map:
-                EnsureTypeCommittable(map.KeyType, path + ".key");
-                EnsureTypeCommittable(map.ValueType, path + ".value");
-                break;
-            default:
-                break;
+            switch (current)
+            {
+                case NullType:
+                    throw DeltaStorageException.UnsupportedFeature(
+                        "Cannot commit a Delta table schema declaring a NullType column "
+                        + $"'{DiagnosticText.Sanitize(currentPath)}'; the void/null type has no physical layout "
+                        + "and cannot be persisted. Drop the column to proceed.");
+                case StructType nested:
+                    foreach (StructField field in nested)
+                    {
+                        pending.Push((field.DataType, currentPath + "." + field.Name, depth + 1));
+                    }
+
+                    break;
+                case ArrayType array:
+                    pending.Push((array.ElementType, currentPath + ".element", depth + 1));
+                    break;
+                case MapType map:
+                    pending.Push((map.KeyType, currentPath + ".key", depth + 1));
+                    pending.Push((map.ValueType, currentPath + ".value", depth + 1));
+                    break;
+                default:
+                    break;
+            }
         }
     }
 }

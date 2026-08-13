@@ -510,6 +510,52 @@ public sealed class StorageHygieneSweepTests
         AssertNeutralizedAndBounded(ex.Message, p);
     }
 
+    // #702 (Round-2 review): the declared-write-schema eligibility door echoes the offending column's dotted
+    // LEAF PATH, assembled from the caller's declared identifiers — which on a schema-inference or foreign
+    // -schema-driven write are not the writer's own literals. Its Sanitize was unpinned: dropping it left the
+    // whole suite green. Both echo sites are covered — the void-column verdict here and the depth refusal
+    // below.
+    [Theory]
+    [MemberData(nameof(Poisons))]
+    public void Door_DeltaWriteSchemaEligibility_VoidLeafPath(string poison)
+    {
+        string p = Payload(poison);
+        // The void leaf sits INSIDE a nested struct, so the echoed path is built by concatenation
+        // ("<poison>.<poison>") — the shape that would otherwise render the payload twice, unbounded.
+        var schema = new StructType(
+        [
+            new StructField(
+                p,
+                new StructType([new StructField(p, DataTypes.NullType, nullable: true)]),
+                nullable: true),
+        ]);
+
+        DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
+            () => DeltaWriteSchemaEligibility.EnsureCommittable(schema));
+
+        Assert.Contains("NullType column", ex.Message, StringComparison.Ordinal);
+        AssertNeutralizedAndBounded(ex.Message, p);
+    }
+
+    [Theory]
+    [MemberData(nameof(Poisons))]
+    public void Door_DeltaWriteSchemaEligibility_DepthRefusal(string poison)
+    {
+        string p = Payload(poison);
+        DataType deep = DataTypes.LongType;
+        for (int i = 0; i < 200; i++)
+        {
+            deep = DataTypes.CreateArrayType(deep, containsNull: true);
+        }
+
+        DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
+            () => DeltaWriteSchemaEligibility.EnsureCommittable(
+                new StructType([new StructField(p, deep, nullable: true)])));
+
+        Assert.Contains("nests deeper than", ex.Message, StringComparison.Ordinal);
+        AssertNeutralizedAndBounded(ex.Message, p);
+    }
+
     [Theory]
     [MemberData(nameof(Poisons))]
     public void Door_ParquetTypeMapping_ArrayElementUnsupported(string poison)

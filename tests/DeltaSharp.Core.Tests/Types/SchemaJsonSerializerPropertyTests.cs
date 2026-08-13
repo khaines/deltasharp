@@ -395,11 +395,15 @@ public sealed class SchemaJsonSerializerPropertyTests
     //
     // Verified by per-site mutation: dropping the guard at the array / map / fields-array / metadata-object /
     // metadata-array site turns exactly the corresponding row red. The two remaining sites — the struct
-    // OBJECT and the struct FIELD object — are DOMINATED, not unpinned: a struct object is always immediately
-    // followed by opening its "fields" array, and a field object is always immediately followed by opening its
+    // OBJECT and the struct FIELD object — are DOMINATED: a struct object is always immediately followed by
+    // opening its "fields" array, and a field object is always immediately followed by opening its
     // "metadata" object, so removing either guard is still caught one write later by the successor guard and
-    // no observable behavior changes. They are kept for uniformity (a future writer change could make them
-    // load-bearing); this comment records why no row can isolate them.
+    // the ACCEPTED-DOCUMENT SET is unchanged — which is the safety property (nothing extra can be persisted,
+    // so no unreadable schemaString can be committed). It is not a claim of total unobservability: with the
+    // field-object guard removed, a schema sitting EXACTLY at the cap whose field name is invalid UTF-16
+    // fails at ValidateUtf16 instead of at EnsureDepth, so the DIAGNOSTIC differs while the verdict (refusal)
+    // does not. Both guards are kept for uniformity (a future writer change could make them load-bearing);
+    // this comment records why no row can isolate them and why that is not a safety gap.
     //
     // The cap level per shape is derived from the CONTAINER cost of one level (the guard's unit is JSON
     // containers, not schema levels), which is why the numbers differ:
@@ -810,5 +814,52 @@ public sealed class SchemaJsonSerializerPropertyTests
         Assert.True(
             ex.Message.Length < 1_000,
             string.Create(CultureInfo.InvariantCulture, $"message was {ex.Message.Length} chars"));
+    }
+
+    // Round-2 review (Blocker 2): the LARGEST raw-echo producer on this read path was not one of DeltaSharp's
+    // own interpolations at all — it was the JsonException passthrough (`$"Invalid schema JSON: {ex.Message}"`).
+    // System.Text.Json quotes the OFFENDING FRAGMENT of the document in its message, so a hostile
+    // schemaString carrying an invalid literal built from a 100,000-char run produced a ~100 KB message with
+    // a forged log line embedded verbatim (raw CR/LF included). Pinned here: the passthrough is bounded and
+    // control-char-neutralized like every other read-path echo, while the useful STJ text (the reason plus
+    // LineNumber/BytePositionInLine) is preserved for the ordinary short case.
+    [Fact]
+    public void MalformedJson_JsonExceptionPassthrough_IsBoundedAndNeutralized()
+    {
+        // An invalid JSON literal whose text is attacker-chosen: STJ echoes it verbatim ("'tru\r\n... ' is an
+        // invalid JSON literal"), so the raw CR/LF and the 100,000-char run both land in ex.Message.
+        string poison = "tru\r\n[CRITICAL] forged-log-line " + new string('q', 100_000);
+        string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":" + poison
+            + " e,\"nullable\":true,\"metadata\":{}}]}";
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain(new string('q', 300), ex.Message, StringComparison.Ordinal);
+        // Bounded by the passthrough's 256-char cap plus the short "Invalid schema JSON: " prefix.
+        Assert.True(
+            ex.Message.Length < 320,
+            string.Create(CultureInfo.InvariantCulture, $"message was {ex.Message.Length} chars"));
+
+        // ...and the diagnostic is still USEFUL for the ordinary (short) malformed document: the STJ reason
+        // and its position survive the cap.
+        SchemaValidationException ordinary =
+            Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson("{\"type\":\"struct\","));
+        Assert.Contains("LineNumber", ordinary.Message, StringComparison.Ordinal);
+    }
+
+    // Round-2 review (Blocker 4): a foreign `"name":""` reaches StructField's
+    // ArgumentException.ThrowIfNullOrEmpty(name), which the broad fail-closed net re-types. It must be
+    // classified (SchemaValidationException, like every other read-boundary fault) AND described correctly —
+    // an empty name is not a UTF-16 decoding fault.
+    [Fact]
+    public void EmptyFieldName_OnRead_IsRejectedWithAPreciseMessage()
+    {
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(
+            """{"type":"struct","fields":[{"name":"","type":"string","nullable":true,"metadata":{}}]}"""));
+
+        Assert.Contains("must be non-empty", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("UTF-16", ex.Message, StringComparison.Ordinal);
     }
 }

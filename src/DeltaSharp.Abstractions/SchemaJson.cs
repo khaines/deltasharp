@@ -93,7 +93,15 @@ internal static class SchemaJson
         }
         catch (JsonException ex)
         {
-            throw new SchemaValidationException($"Invalid schema JSON: {ex.Message}", ex);
+            // #683-class message hygiene, at the LARGEST raw-echo producer on this untrusted read path:
+            // System.Text.Json embeds a fragment of the OFFENDING DOCUMENT in its message (and the document
+            // here is an attacker-authored schemaString — unbounded, and free to carry CR/LF for log-line
+            // forgery). Bounded + control-char-neutralized exactly like the other read-path echoes; the cap
+            // is generous enough to keep the useful part of the STJ text (the reason plus its LineNumber /
+            // BytePositionInLine). The untruncated original stays available on the InnerException for a
+            // raw-inner diagnostics sink.
+            throw new SchemaValidationException(
+                $"Invalid schema JSON: {DiagnosticText.Sanitize(ex.Message, JsonExceptionMessageMaxLength)}", ex);
         }
         catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
         {
@@ -106,11 +114,24 @@ internal static class SchemaJson
             // at the UNTRUSTED read boundary. Re-typed here so a hostile schemaString is exactly as
             // classifiable as a malformed one. The message is deliberately CONTENT-FREE: the offending token
             // is attacker-authored (and, being invalid UTF-16, is not safely renderable at all).
+            //
+            // The wording is deliberately DE-SPECIFIED: this net is broad by design (fail-closed), so it can
+            // also catch an ArgumentException raised by a type/field CONSTRUCTOR reached during the read
+            // (e.g. a struct field whose "name" is empty) — attributing every such fault to invalid UTF-16
+            // would be a confidently wrong diagnostic. The common cause is named as the common cause, not as
+            // a verdict. Concrete cases worth a precise message get an explicit guard upstream (see
+            // ReadStruct's empty-name check) rather than a narrower catch, which would let a genuine
+            // escaped-surrogate fault escape the fail-closed contract.
             throw new SchemaValidationException(
-                "Invalid schema JSON: the document contains invalid UTF-16 (an unpaired surrogate, raw or "
-                + "escaped) that cannot be decoded as text. The offending content is not echoed.", ex);
+                "Invalid schema JSON: the document could not be decoded as text (most commonly invalid UTF-16 "
+                + "— an unpaired surrogate, raw or escaped). The offending content is not echoed.", ex);
         }
     }
+
+    /// <summary>The cap applied to a <see cref="JsonException"/> message before it is echoed. System.Text.Json
+    /// reports the reason plus <c>LineNumber</c>/<c>BytePositionInLine</c> well within this, while the
+    /// document fragment it may quote is attacker-authored and must never be echoed unbounded.</summary>
+    private const int JsonExceptionMessageMaxLength = 256;
 
     private static void WriteType(Utf8JsonWriter writer, DataType type)
     {
@@ -456,6 +477,16 @@ internal static class SchemaJson
             }
 
             string name = GetRequiredString(fieldElement, "name");
+            if (name.Length == 0)
+            {
+                // A precise diagnostic for a concrete foreign-schema shape. Without it, StructField's
+                // ArgumentException.ThrowIfNullOrEmpty(name) surfaces through FromJson's broad fail-closed
+                // net and gets described as a decoding fault, which is correct in classification but wrong in
+                // attribution. Content-free by construction (the offending value is the empty string).
+                throw new SchemaValidationException(
+                    "Invalid schema JSON: a struct field 'name' must be non-empty.");
+            }
+
             DataType type = ReadType(GetRequired(fieldElement, "type"));
             bool nullable = GetRequiredBoolean(fieldElement, "nullable");
             FieldMetadata metadata = ReadMetadata(fieldElement);
