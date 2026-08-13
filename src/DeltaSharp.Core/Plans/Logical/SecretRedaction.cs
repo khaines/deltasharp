@@ -63,12 +63,23 @@ namespace DeltaSharp.Plans.Logical;
 /// <b>Round-2 fix — ReDoS on the query pass, and no input truncation.</b> ALL THREE passes are now linear:
 /// the two userinfo passes and <see cref="SensitiveQueryValue"/> carry
 /// <see cref="RegexOptions.NonBacktracking"/> (a plain alternation with no backreferences/lookarounds/atomic
-/// groups, so it compiles NonBacktracking), eliminating the quadratic backtracking a long scheme-prefixed
-/// path triggered (measured 187,412 ms → 75 ms on an 8 KB input, byte-identical output). Because every pass
-/// is now linear there is NO input truncation: the Round-1 <c>RedactScanLimit</c> cap has been DELETED. It
-/// was both insufficient (an 8 KB path already blew the CPU budget) and unsafe — truncating at a <c>/</c> or
-/// <c>\</c> boundary could cut INSIDE a userinfo (before its terminating <c>@</c>), exposing a multi-KB
-/// unmasked credential prefix, and it silently dropped legitimate long paths with no marker.
+/// groups, so it compiles NonBacktracking), eliminating the QUADRATIC backtracking a long query-flanked path
+/// triggered. Round-4 re-measurement on this branch (an <c>&amp;</c>-terminated credential pair followed by a
+/// long keyword run — <c>"s3://b/k?sig=SECRETSAS&amp;" + repeat("passkeytoken")</c>): ~73,300 ms → ~5 ms at
+/// 768 KB, byte-identical output. The growth is quadratic, not exponential — the same shape costs ~17 ms at
+/// 8 KB and ~8,100 ms at 256 KB before the fix, and ~1–3 ms after it. Because every pass is now linear there
+/// is NO input truncation: the Round-1 <c>RedactScanLimit</c> cap has been DELETED. It was unsafe —
+/// truncating at a <c>/</c> or <c>\</c> boundary could cut INSIDE a userinfo (before its terminating
+/// <c>@</c>), exposing a multi-KB unmasked credential prefix, and it silently dropped legitimate long paths
+/// with no marker.
+/// </para>
+/// <para>
+/// <b>Accepted OVER-MASK boundary (query-borne <c>@</c>).</b> Because this is a textual masker and not a URI
+/// parser, a query string carrying an <c>@</c> (an e-mail address, say) pulls the colon-bearing pass past the
+/// authority: <c>https://host:8443?to=a@b.com</c> → <c>https://&lt;redacted&gt;@b.com</c>, destroying the
+/// host:port. This is the SAFE direction (over-mask, never under-mask) and is required by the monotonicity
+/// rule above — the colon-bearing run must span an interior <c>?</c>/<c>#</c> so <c>s3://user:p?ss@bucket</c>
+/// stays masked. The boundary is pinned by an exact-output test so it cannot silently widen.
 /// </para>
 /// </remarks>
 internal static partial class SecretRedaction
@@ -133,7 +144,9 @@ internal static partial class SecretRedaction
     // and allows a vendor prefix/suffix. #433 broadened the catalogue (auth, pwd, apikey, access[_-]?token);
     // Round-1 added pass/code/assertion/jwt/bearer. Round-2: NonBacktracking makes this pass linear too --
     // it is a plain alternation with no backreferences/lookarounds/atomic groups, so it compiles
-    // NonBacktracking and closes the query-pass ReDoS (measured 187,412 ms -> 75 ms, byte-identical output).
+    // NonBacktracking and closes the query-pass ReDoS (Round-4 measurement: ~73,300 ms -> ~5 ms on a 768 KB
+    // adversarial query-flanked input, byte-identical output; the pre-fix cost is QUADRATIC -- ~17 ms at
+    // 8 KB, ~8,100 ms at 256 KB -- so only a large input exceeds a CPU budget).
     // KNOWN LIMITS accepted
     // as best-effort: a ';'-delimited option string (value runs to the next ';', not '&') and a
     // percent-encoded key (e.g. "%73ig") are NOT recognized -- a URI parser, not a textual masker, is the

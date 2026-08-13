@@ -79,11 +79,16 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
     // The sanitizing/bounding methods on either DiagnosticText type that genuinely neutralize their argument.
     // DescribeWithoutInner is DELIBERATELY EXCLUDED (it echoes exception.Message raw). Any DescribeType/echo
-    // that surfaces a raw token is likewise excluded.
+    // that surfaces a raw token is likewise excluded. ROUND-4: `SanitizeEchoedToken` was REMOVED — it is a
+    // private member of ColumnMapping, not of either DiagnosticText type, so it could never satisfy the
+    // type-gated clearance; the entry was dead AND pre-authorized a future same-named DiagnosticText method.
+    // Its three real call sites stay classified `sanitized-upstream` in the inventory. Every name here is
+    // asserted to resolve to a real member of an allowlisted DiagnosticText type by
+    // AssertClearingMethodsResolveToRealMembers, so a dead/over-permissive entry fails the guard.
     private static readonly HashSet<string> DiagnosticTextClearingMethods = new(StringComparer.Ordinal)
     {
         "Sanitize", "SanitizeAndJoin", "SanitizeAndJoinCounted", "SanitizeTo", "SanitizeToBudget",
-        "SanitizeEchoedToken", "DescribePath", "DescribeSchema", "DescribeType",
+        "DescribePath", "DescribeSchema", "DescribeType",
     };
 
     private static readonly HashSet<string> AllowedClasses = new(StringComparer.Ordinal)
@@ -294,6 +299,7 @@ internal sealed class Probe
             // A missing anchor reference must be a NAMED failure, never a silent reclassification of every
             // DataType/DiagnosticText token into "unresolved -> residual".
             AssertAnchorTypesResolved(comp);
+            AssertClearingMethodsResolveToRealMembers(comp);
 
             foreach (SyntaxTree tree in trees)
             {
@@ -585,6 +591,41 @@ internal sealed class Probe
                 $"Anchor type '{metadataName}' did not resolve in the producer-scan compilation. A missing "
                 + "reference would silently reclassify hygiene/bounded tokens as residual — failing here names it.");
         }
+    }
+
+    // ROUND-4 guard-of-the-allowlist. Every name in DiagnosticTextClearingMethods must resolve to a REAL
+    // member of one of the two allowlisted DiagnosticText types. A name that resolves nowhere is dead (it can
+    // never clear anything) AND pre-authorizes a future same-named method to auto-clear without review — the
+    // exact defect the removed `SanitizeEchoedToken` entry had (it is a private ColumnMapping member).
+    // The two types need two lookups: the Storage one is compiled FROM SOURCE in this compilation (source
+    // symbols, all accessibilities), while the Abstractions one arrives as a metadata REFERENCE whose
+    // non-public members Roslyn drops (MetadataImportOptions.Public) — so it is enumerated by reflection,
+    // which this friend assembly can do. Both are real-member checks against the real, shipped types.
+    private static void AssertClearingMethodsResolveToRealMembers(CSharpCompilation comp)
+    {
+        INamedTypeSymbol? storage = comp.GetTypeByMetadataName(StorageDiagnosticText);
+        Assert.True(
+            storage is not null,
+            $"'{StorageDiagnosticText}' did not resolve in the producer-scan compilation; the allowlist "
+            + "resolution check would be vacuous.");
+
+        var declared = storage!.GetMembers().OfType<IMethodSymbol>()
+            .Select(m => m.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var method in typeof(SharedDiagnosticText).GetMethods(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
+            | System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Instance))
+        {
+            declared.Add(method.Name);
+        }
+
+        var dead = DiagnosticTextClearingMethods.Where(m => !declared.Contains(m))
+            .OrderBy(m => m, StringComparer.Ordinal).ToList();
+        Assert.True(
+            dead.Count == 0,
+            "DiagnosticTextClearingMethods entr(ies) that resolve to NO member of "
+            + $"{AbstractionsDiagnosticText} or {StorageDiagnosticText}: {string.Join(", ", dead)}. Such an "
+            + "entry is dead (the clearance is type-gated, so it can never fire) and pre-authorizes a future "
+            + "same-named method to auto-clear unreviewed — remove it, or allowlist the type that declares it.");
     }
 
     // ----- inventory I/O -----

@@ -30,9 +30,25 @@ public sealed class SecretRedactionTests
     [InlineData("s3://user:p#ss@bucket/key", "s3://<redacted>@bucket/key")]
     // A bare token still masked for a non-ADLS scheme (the exemption is scoped to ADLS only).
     [InlineData("https://TOKEN@host/path", "https://<redacted>@host/path")]
+    // ACCEPTED OVER-MASK boundary (Round-4 pin): a query-borne '@' (an e-mail address) pulls the
+    // colon-bearing pass past the authority, so host:port is destroyed. That is the SAFE direction and is
+    // required by the monotonicity rule (the colon-bearing run must span an interior '?'). Pinned to exact
+    // output so the over-mask cannot silently WIDEN without a deliberate golden update.
+    [InlineData("https://host:8443?to=a@b.com", "https://<redacted>@b.com")]
     public void RedactPath_MasksEntireUserInfo_ExactOutput(string path, string expected)
     {
         Assert.Equal(expected, SecretRedaction.RedactPath(path));
+    }
+
+    [Theory]
+    // DOCUMENTED KNOWN LIMIT (class remarks): the colon-LESS userinfo run is `[^/?#\s:]*`, so it stops at an
+    // interior '?'/'#' and a colon-less credential carrying one is left UNMASKED. This characterization row
+    // pins CURRENT behaviour — widening it later must be a deliberate golden update, not a silent drift.
+    [InlineData("s3://TOK?EN@host/key")]
+    [InlineData("s3://TOK#EN@host/key")]
+    public void RedactPath_ColonlessUserInfoWithInteriorQueryOrFragment_IsLeftUnmasked_KnownLimit(string path)
+    {
+        Assert.Equal(path, SecretRedaction.RedactPath(path));
     }
 
     [Theory]
@@ -134,22 +150,29 @@ public sealed class SecretRedactionTests
     [Fact]
     public void RedactPath_QueryPass_TerminatesQuickly_OnAdversarialQueryFlankedInput()
     {
-        // BEHAVIOURAL ReDoS pin for the QUERY pass specifically (Round-2). This input actually REACHES the
-        // query pass: a `sig=`-flanked value with a long adversarial '?'-run tail. Before NonBacktracking on
-        // SensitiveQueryValue() this pass measured 187,412 ms on an 8 KB input; now it is linear (~75 ms).
-        // No input truncation exists anymore, so the full input reaches the pass. Timing is a GENEROUS,
-        // SECONDARY canary (the structural pin above is primary).
-        string adversarial = "s3://b/k?sig=" + new string('S', 4096) + new string('?', 4096);
+        // BEHAVIOURAL ReDoS pin for the QUERY pass specifically (Round-2; made DISCRIMINATING in Round-4).
+        // The Round-2 input (8 KB) cost only ~7 ms pre-fix, so it could never breach the 10 s budget — the
+        // test was VACUOUS. This is the reproducible worst shape instead: an '&'-terminated credential pair
+        // (so the first match ends at the '&' and scanning RESUMES) followed by a long keyword-bearing run
+        // that contains NO further '=', so every subsequent start position backtracks over the whole tail.
+        // Measured on this branch: pre-fix (NonBacktracking stripped from SensitiveQueryValue only)
+        // ~73,300 ms at 768 KB — quadratic, ~17 ms at 8 KB and ~8,100 ms at 256 KB, which is why the input
+        // must be large; post-fix ~5 ms. The 10 s budget therefore sits ~7x BELOW the pre-fix cost and
+        // ~1,800x ABOVE the post-fix cost, so it is RED on revert and cannot flake on a shared runner.
+        // Timing stays a GENEROUS, SECONDARY canary (the structural .Options pin above is primary); do NOT
+        // tighten this budget toward the observed post-fix time.
+        string tail = string.Concat(Enumerable.Repeat("passkeytoken", 768 * 1024 / 12));
+        string adversarial = "s3://b/k?sig=SECRETSAS&" + tail;
 
         var sw = Stopwatch.StartNew();
         string redacted = SecretRedaction.RedactPath(adversarial);
         sw.Stop();
 
-        Assert.Equal("s3://b/k?sig=<redacted>", redacted);
+        Assert.Equal("s3://b/k?sig=<redacted>&" + tail, redacted);
         Assert.True(
             sw.ElapsedMilliseconds < 10_000,
-            $"RedactPath took {sw.ElapsedMilliseconds} ms on an 8 KB query-flanked input — a query-pass "
-            + "ReDoS regression (expected sub-second with NonBacktracking on SensitiveQueryValue()).");
+            $"RedactPath took {sw.ElapsedMilliseconds} ms on a 768 KB query-flanked input — a query-pass "
+            + "ReDoS regression (expected single-digit ms with NonBacktracking on SensitiveQueryValue()).");
     }
 
     [Fact]
