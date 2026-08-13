@@ -90,8 +90,9 @@ internal static class DeltaCheckpointReader
     /// <summary>The floor multiple <c>k</c> on <see cref="MaxCheckpointRowGroupDecodedBytes"/> used to derive
     /// <see cref="MaxCheckpointPartDecodedBytes"/> (Round-10 #4): the cumulative per-part ceiling is floored at
     /// <c>k</c> maximal row groups so a legit multi-row-group foreign part is not rejected by a ceiling derived
-    /// only from the compressed-buffer × expansion product. Pinned by a relationship test so the const literal
-    /// above cannot silently drift from the derivation.</summary>
+    /// only from the compressed-buffer × expansion product. Pinned by a relationship test
+    /// (<c>DeltaCheckpointReaderTests.Consts_CheckpointDecodedCeilings_MatchTheirDerivation</c>) so the const
+    /// literal above cannot silently drift from the derivation.</summary>
     internal const int CheckpointCumulativeRowGroupFloorMultiple = 8;
 
     /// <summary>The default per-part wall-clock decode budget FLOOR (design §5.4 C-DECODE, #647/#699/#716):
@@ -129,6 +130,13 @@ internal static class DeltaCheckpointReader
     /// Eight is a conservative upper bound on columnar (snappy/zstd) checkpoint expansion; #802 tracks
     /// calibration.</summary>
     private const double CheckpointDecodedExpansionFactor = 8.0;
+
+    /// <summary>Test-only accessor (Round-13) exposing the private <see cref="CheckpointDecodedExpansionFactor"/>
+    /// so a relationship test can pin the <see cref="MaxCheckpointPartDecodedBytes"/> derivation
+    /// (<c>max(MaxCheckpointPartBytes × factor, CheckpointCumulativeRowGroupFloorMultiple ×
+    /// MaxCheckpointRowGroupDecodedBytes)</c>) against silent drift — the literal above and the
+    /// <see cref="BoundedDecode.CheckpointMaxFootprintBytes"/> door footprint must stay in lockstep.</summary>
+    internal static double CheckpointDecodedExpansionFactorForTest => CheckpointDecodedExpansionFactor;
 
     // Derives the per-part decode budget from the part's OWN estimated DECODED bytes (High #6): the part's
     // buffered COMPRESSED length is scaled by the bounded decompression expansion factor and clamped to the
@@ -227,8 +235,13 @@ internal static class DeltaCheckpointReader
         // publish the live retained total (`length + cumulativeDecoded`) through this shared counter — updated by
         // DecodeBufferedAsync per row group — and charge what the counter reads AT THE MOMENT OF DETACH, floored
         // at MinStrandChargeBytes (so a cheap strand still consumes the byte residual, Round-8 #1b) and clamped
-        // to the door footprint by RunAsync (so it stays a TRUE ceiling). This restores the intended ~64-strand
-        // headroom while keeping the bound honest.
+        // to the door footprint by RunAsync (so it stays a TRUE ceiling). The charge is the retained total AT THE
+        // DETACH INSTANT — an over-approximation of the cumulative permitted decode work, NOT a measurement of
+        // live retained bytes (post-detach growth is separately bounded by the per-part decoded ceiling and the
+        // decode terminates); the resulting per-strand headroom is therefore a function of THIS part's declared
+        // footprint (a maximal-footprint strand consumes a larger slice, a cheap strand the MinStrandChargeBytes
+        // floor), so the number of strands the byte residual admits varies with the input rather than being a
+        // fixed ~64. See storage-delta-architecture.md §5.4 and #802.
         var retainedBytes = new StrongBox<long>(length);
         long RetainedChargeProbe() =>
             Math.Max(Volatile.Read(ref retainedBytes.Value), BoundedDecode.MinStrandChargeBytes);

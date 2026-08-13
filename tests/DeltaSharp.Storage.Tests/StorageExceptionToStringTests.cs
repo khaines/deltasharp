@@ -189,6 +189,7 @@ public sealed class StorageExceptionToStringTests
         "DeltaCommitLog.CommitStarted(ILogger logger, Int64 targetVersion, String backend)",
         "DeltaCommitLog.CommitTransientRetry(ILogger logger, Int32 retry)",
         "DeltaCommitLog.CommitUnknownState(ILogger logger, Int64 version)",
+        "DeltaDecodeLog.DoorUnderProvisioned(ILogger logger, String door, Int64 maxFootprintBytes, Int64 residualBudgetBytes, Int64 processMemoryBytes)",
         "DeltaDeleteLog.DeleteAborted(ILogger logger, String exceptionType)",
         "DeltaDeleteLog.DeleteCanceled(ILogger logger)",
         "DeltaDeleteLog.DeleteCompleted(ILogger logger, Int64 readVersion, Int64 committedVersion, Int64 rowsDeleted, Int32 filesWithDeletionVector, Double durationMs)",

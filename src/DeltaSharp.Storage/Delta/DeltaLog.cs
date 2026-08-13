@@ -147,6 +147,16 @@ internal sealed class DeltaLog
         _timeProvider = timeProvider ?? TimeProvider.System;
         _checkpointDecoder = checkpointDecoder ?? BoundedDecode.CheckpointDecoder;
         _checkpointMaxPartDecodedBytes = checkpointMaxPartDecodedBytes;
+
+        // One-shot startup Warning (Round-13) for an under-provisioned door. The process-global door fields have
+        // no ILogger in scope at static-field init, so the first DeltaLog construction that reaches a logger
+        // emits it — at most once per door (an Interlocked-once flag on each BoundedDecoder). DeltaLog is the
+        // entry point for every table read (a snapshot load precedes any data-file read), so warning BOTH the
+        // checkpoint door actually used and the static data-file door here surfaces the structural residual
+        // limit from the only read-path constructor with a logger in scope, without threading one through
+        // ParquetFileReader. The message names only the door label + derived sizing (no untrusted content).
+        _checkpointDecoder.WarnIfUnderProvisioned(_logger, DeltaStorageTelemetry.ToLabel(DecodeDoor.Checkpoint));
+        BoundedDecode.DataFileDecoder.WarnIfUnderProvisioned(_logger, DeltaStorageTelemetry.ToLabel(DecodeDoor.DataFile));
         _checkpointLogScope = new KeyValuePair<string, object?>[]
         {
             new(DeltaSharpTelemetry.ComponentKey, DeltaStorageTelemetry.DeltaComponent),

@@ -80,9 +80,12 @@ public sealed class BoundedDecodeTests
 
         DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
         Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
-        // The DecodeBudgetExceeded kind already proves the budget won the race: had the (token-ignoring)
-        // work completed first, RunAsync would have returned its value, not thrown. A tight wall-clock
-        // ceiling here only adds CI flake under thread-pool contention, so it is intentionally omitted.
+        // The budget must actually elapse before the caller is released — a lower bound kills a "budget fires
+        // instantly / is ignored downward" mutation. The DecodeBudgetExceeded kind already proves the budget won
+        // the race; no tight UPPER bound is asserted (that only adds CI flake under thread-pool contention).
+        Assert.True(
+            stopwatch.Elapsed >= TimeSpan.FromMilliseconds(200),
+            $"expected the caller to be held at least the 200 ms budget, took {stopwatch.Elapsed}.");
     }
 
     [Fact]
@@ -912,6 +915,80 @@ public sealed class BoundedDecodeTests
         gate.Set(); // the strand drains → the door is no longer saturated
         await WaitForAsync(() => decoder.DetachedDecodeCount == 0);
         Assert.False(decoder.IsWedged);
+    }
+
+    [Fact]
+    public async Task WedgedSignal_StrandFreeDoorAtInFlightSaturation_IsNotWedged()
+    {
+        // Architect/Security Low (Round-13) — the in-flight arm of IsWedged must NOT report wedged=1 on a door
+        // with ZERO strands: those admitted decodes are HEALTHY in-flight work that will settle and release
+        // their slots, not un-abortable strands. Reporting wedged (whose documented action is "recycle the pod")
+        // on a strand-free door is a false liveness kill. Fill the in-flight ceiling with cooperative decodes
+        // (never detaching → zero strands), advance the DOOR clock past the stall window, and assert NOT wedged.
+        // RED under the pre-fix in-flight arm (`inFlight >= ceiling` ungated by `detached > 0`).
+        var doorClock = new ControllableClock(TimeSpan.FromHours(1).Ticks);
+        var decodeClock = new ControllableClock(TimeSpan.FromHours(1).Ticks); // frozen — the decode budget never expires
+        const long footprint = 64L * 1024 * 1024;
+        var decoder = new BoundedDecoder(
+            strandCountCap: 64, residualBudgetBytes: footprint * 8, maxFootprintBytes: footprint,
+            execution: DecodeExecution.Pool, inFlightCeiling: 2, clock: doorClock);
+
+        using var gate = new ManualResetEventSlim(initialState: false);
+        Task<int> a = decoder.RunAsync<int>(
+            _ => { gate.Wait(); return Task.FromResult(1); },
+            TimeSpan.FromHours(1), static _ => DeltaStorageException.DecodeBudgetExceeded("no timeout"),
+            CancellationToken.None, timeProvider: decodeClock, estimatedRetainedBytes: footprint);
+        Task<int> b = decoder.RunAsync<int>(
+            _ => { gate.Wait(); return Task.FromResult(2); },
+            TimeSpan.FromHours(1), static _ => DeltaStorageException.DecodeBudgetExceeded("no timeout"),
+            CancellationToken.None, timeProvider: decodeClock, estimatedRetainedBytes: footprint);
+
+        await WaitForAsync(() => decoder.InFlightCount == 2); // in-flight ceiling reached with ZERO strands
+        Assert.Equal(0, decoder.DetachedDecodeCount);
+
+        // Advance the door clock well past the stall window: with a genuine strand pile this WOULD read wedged,
+        // but the door is NOT strand-saturated (0 strands), so the gated in-flight arm keeps it not wedged.
+        doorClock.Advance(BoundedDecode.WedgedDrainStallWindow + TimeSpan.FromMinutes(1));
+        Assert.False(decoder.IsWedged, "a strand-free door at in-flight saturation must NOT be reported wedged.");
+
+        gate.Set();
+        await a;
+        await b;
+        await WaitForAsync(() => decoder.InFlightCount == 0);
+        Assert.False(decoder.IsWedged);
+    }
+
+    [Fact]
+    public void UnderProvisionedDoor_EmitsExactlyOneStartupWarning_PerDoor()
+    {
+        // Balanced/Security/Architect Medium (Round-13) — the operator-valued half of the under-provisioned
+        // signal. A door constructed under-provisioned emits EXACTLY ONE startup Warning (LoggerMessage 4500),
+        // idempotent across repeated first-use calls via the Interlocked-once guard. The message names only the
+        // door label + derived sizing (residual, footprint, process memory) — no untrusted content. A tiny pod
+        // (2 GiB) with a 1-GiB footprint is under-provisioned (2×footprint floor > mem/2 cap).
+        DoorSizing sizing = BoundedDecode.DeriveDoorSizing(
+            2L * 1024 * 1024 * 1024, 1L * 1024 * 1024 * 1024, processorCount: 8);
+        Assert.True(sizing.UnderProvisioned);
+        var door = BoundedDecoder.FromSizing(sizing, DecodeExecution.Pool);
+
+        var logger = new RecordingLogger<BoundedDecoder>();
+        door.WarnIfUnderProvisioned(logger, "data_file");
+        door.WarnIfUnderProvisioned(logger, "data_file"); // idempotent — the once-flag suppresses re-emit
+        door.WarnIfUnderProvisioned(logger, "data_file");
+
+        RecordingLogger<BoundedDecoder>.Entry warning = Assert.Single(
+            logger.Entries, e => e.EventId.Name == "DeltaDecodeDoorUnderProvisioned");
+        Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, warning.Level);
+        Assert.Equal("data_file", warning.Field("Door"));
+
+        // A well-provisioned door emits NOTHING.
+        DoorSizing bigSizing = BoundedDecode.DeriveDoorSizing(
+            256L * 1024 * 1024 * 1024, 1L * 1024 * 1024 * 1024, processorCount: 8);
+        Assert.False(bigSizing.UnderProvisioned);
+        var bigDoor = BoundedDecoder.FromSizing(bigSizing, DecodeExecution.Pool);
+        var bigLogger = new RecordingLogger<BoundedDecoder>();
+        bigDoor.WarnIfUnderProvisioned(bigLogger, "checkpoint");
+        Assert.DoesNotContain(bigLogger.Entries, e => e.EventId.Name == "DeltaDecodeDoorUnderProvisioned");
     }
 
     [Fact]

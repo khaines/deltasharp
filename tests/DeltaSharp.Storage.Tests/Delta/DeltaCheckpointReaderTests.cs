@@ -1477,4 +1477,29 @@ public sealed class DeltaCheckpointReaderTests
         Assert.True(part2AfterPart1 > TimeSpan.Zero, "part 2 must always get a positive, viable budget of its own.");
         Assert.True(part1Budget >= part2AfterPart1, "the larger part 1 must derive a budget ≥ the smaller part 2's.");
     }
+
+    [Fact]
+    public void Consts_CheckpointDecodedCeilings_MatchTheirDerivation()
+    {
+        // Specialist Medium (Round-13): pin the checkpoint decoded-bytes ceilings against silent literal drift.
+        // The MaxCheckpointPartDecodedBytes doc claims it is DERIVED as
+        // max(MaxCheckpointPartBytes × CheckpointDecodedExpansionFactor,
+        //     CheckpointCumulativeRowGroupFloorMultiple × MaxCheckpointRowGroupDecodedBytes)
+        // but the const is a hard literal — this test makes that derivation load-bearing so the literal cannot
+        // drift from the two contributing ceilings (the floor term currently wins: 8 × 1 GiB = 8 GiB).
+        long derivedPartDecoded = Math.Max(
+            DeltaCheckpointReader.MaxCheckpointPartBytes
+                * (long)DeltaCheckpointReader.CheckpointDecodedExpansionFactorForTest,
+            DeltaCheckpointReader.CheckpointCumulativeRowGroupFloorMultiple
+                * DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+        Assert.Equal(DeltaCheckpointReader.MaxCheckpointPartDecodedBytes, derivedPartDecoded);
+
+        // The checkpoint DOOR footprint (BoundedDecode.CheckpointMaxFootprintBytes) is the isolated buffered part
+        // copy (≤ MaxCheckpointPartBytes) PLUS the cumulative per-part decoded arrays (≤ MaxCheckpointPartDecoded
+        // Bytes). Pin that too so the two doors' literal footprint cannot drift from the reader ceilings it
+        // mirrors (the BoundedDecode literal is held locally to avoid cross-type static-init order dependence).
+        Assert.Equal(
+            BoundedDecode.CheckpointMaxFootprintBytes,
+            DeltaCheckpointReader.MaxCheckpointPartBytes + DeltaCheckpointReader.MaxCheckpointPartDecodedBytes);
+    }
 }

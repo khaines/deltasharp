@@ -1319,7 +1319,12 @@ All Parquet/JSON/checkpoint bytes are **untrusted input**:
         released, and the un-abortable decode keeps running), *that* is when it charges the **actual retained
         footprint** it was permitted — the projected per-row-group/per-part decoded footprint (hoisted from
         `ProjectedFootprints`/`EnsureDecodeCeiling`), **clamped to the door's enforced max footprint** — and
-        increments the strand count. Both are **un-charged** when the strand finally terminates.
+        increments the strand count. Both are **un-charged** when the strand finally terminates. **The charge is
+        the detach-INSTANT value** — an over-approximation of the cumulative permitted decode work, not a live
+        measurement that tracks post-detach growth; any further growth of the still-running strand is separately
+        bounded by the per-row-group / per-part decoded ceiling (`EnsureDecodeCeiling` /
+        `MaxCheckpointPartDecodedBytes`, which the decode is still enforcing), and that ceiling breach terminates
+        the strand — so the per-strand charge stays a sound upper bound on retained bytes without a live probe.
       - **Admission fails fast against the current STRANDED residual, not against healthy in-flight.** When a
         NEW untrusted decode is admitted, if `strandedBytes ≥ residualBudget` **or** `strandedCount ≥
         countCap` it is rejected fail-fast **without starting**; otherwise it is admitted and charged nothing.
@@ -1335,14 +1340,21 @@ All Parquet/JSON/checkpoint bytes are **untrusted input**:
         at least one maximal legitimate decode/part is **always** admissible (`ResidualFloorMultiple ×
         maxFootprint`, ≥ 2) and **capped at `ProcessMemoryBytes / 2`** (Round-8 #10) so on a tiny pod the derived
         residual can never exceed the pod it protects (which would render the byte gate inoperative). The honest
-        combined rule is **`residual = max(min(target = mem/8, mem/2), one footprint)`**: on a well-provisioned
-        pod the `mem/8` target dominates; on a small pod (below ≈ `2 × maxFootprint × 4`, i.e. roughly a
-        4–16 GiB pod for the data-file door) the **one-footprint floor** wins and the residual is pinned at a
-        single footprint — the door is then **structurally under-provisioned**, admits exactly one maximal
-        strand before saturating (fail-fast, retryable), and the **strand-COUNT cap becomes the operative gate**
-        rather than the byte residual. That condition is surfaced at door construction as a one-shot startup
-        **Warning** and a `deltasharp.storage.decode.door_under_provisioned{door}` gauge (`UnderProvisioned`,
-        Round-10 #7) so an operator can right-size the pod. The **strand-COUNT cap is sized from the thread/fd
+        combined rule is **`residual = max(min(target = max(mem/8, 2×F), memCap = max(mem/2, F)), F)`** (F = the
+        door's max footprint): on a well-provisioned pod the `mem/8` target dominates; the derived small-pod
+        boundaries are exact — the residual is **pinned at one footprint** once **`mem < 2×F`** (data-file
+        F = 12 GiB ⇒ **< 24 GiB**; checkpoint F = 8.5 GiB ⇒ < 17 GiB), and the door is flagged
+        **`UnderProvisioned`** once **`mem < 4×F`** (data-file **< 48 GiB**; checkpoint **< 34 GiB**). In the
+        pinned regime the residual is a single footprint — the door is **structurally under-provisioned**, admits
+        exactly one maximal strand before saturating (fail-fast, retryable), and the **strand-COUNT cap becomes
+        the operative gate** rather than the byte residual. That condition is surfaced as a one-shot startup
+        **Warning** (emitted from the first table read — `DeltaLog` construction — since the process-global door
+        fields have no logger in scope at static-field init, guarded by a per-door once-flag) plus a
+        `deltasharp.storage.decode.door_under_provisioned{door}` gauge (`UnderProvisioned`, Round-10 #7) so an
+        operator can right-size the pod. **Operator note:** because the max footprint is pod-independent and both
+        thresholds sit well above a typical 8–32 GiB pod, the gauge reads **1 by default** on such pods — it is a
+        **sizing signal, not an alarm** (the door still serves reads; it simply admits at most one maximal strand
+        before shedding load retryably). The **strand-COUNT cap is sized from the thread/fd
         budget, NOT
         from `residualBudget / maxFootprint`** (Round-8 #1a): the old count derivation collapsed to **2 on every
         pod ≤ 64 GiB**, so with honest (small) charges the COUNT gate fired while `strandedBytes ≈ 0` and two

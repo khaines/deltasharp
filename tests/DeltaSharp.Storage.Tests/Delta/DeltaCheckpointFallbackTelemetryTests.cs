@@ -452,9 +452,13 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         // the self-inflicted case that SHOULD seed — so the identity reaches STRIKE 2 and load 3 is SUPPRESSED
         // (the part is NOT opened a third time). Under the pre-Round-10 MONOTONE guard (`strandsBeforeDecode == 0`)
         // load 2 would see the load-1 strand (count 1) and REFUSE to seed → the identity NEVER reaches strike 2 →
-        // load 3 re-decodes (opens == 3) → self-renewal → wedge. RED if reverted to the monotone check, and RED
-        // if the guard is reverted to read the process-global BoundedDecode.DetachedDecodeCount (which the shared
-        // injected decoder's strands never touch).
+        // load 3 re-decodes (opens == 3) → self-renewal → wedge. This test kills the MONOTONE mutation (reverting
+        // the door-scoped delta to `strandsBeforeDecode == 0` makes it RED). It deliberately does NOT exercise the
+        // door-scoped-vs-process-global mutation: the shared injected decoder's strands never touch the
+        // process-global BoundedDecode.DetachedDecodeCount, so a process-global revert would read zero here and
+        // stay green. That mutation (door-scoped read vs process-global sum) is killed by
+        // SustainedPressureGuard_UnrelatedDoorStrand_DoesNotBlockSeeding, which strands the REAL static data-file
+        // door so its strand inflates the process-global sum.
         LocalFileSystemBackend inner = NewBackend();
         await WriteHistoryAsync(inner);
         byte[] hanging = await CheckpointAtV1().ToParquetAsync();
@@ -497,16 +501,22 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     public async Task SustainedPressureGuard_UnrelatedDoorStrand_DoesNotBlockSeeding()
     {
         // Round-10 #3a (door-scoping) — a permanent strand on an UNRELATED door must NOT block seeding on the
-        // checkpoint door. A separate decoder is stranded FOREVER (standing in for a data-file-door / other-door
-        // strand), then the target identity is loaded twice through its OWN clean checkpoint decoder. Because the
-        // guard reads the DECODER ACTUALLY USED (not a process-global count), the unrelated strand is invisible,
-        // seeding proceeds normally, the identity reaches strike 2, and load 3 is SUPPRESSED. Under the
-        // pre-Round-10 guard reading the process-global BoundedDecode.DetachedDecodeCount, an unrelated-door
-        // strand would inflate that global count and BLOCK seeding process-wide → load 3 re-decodes.
+        // checkpoint door. The REAL static data-file door (BoundedDecode.DataFileDecoder — an UNRELATED door to
+        // the injected checkpoint door under test) is stranded FOREVER, so its strand inflates the process-global
+        // BoundedDecode.DetachedDecodeCount sum. The target identity is then loaded twice through its OWN clean
+        // checkpoint decoder. Because the guard reads the DECODER ACTUALLY USED (_checkpointDecoder), not the
+        // process-global sum, the unrelated data-file strand is invisible: seeding proceeds normally, the identity
+        // reaches strike 2, and load 3 is SUPPRESSED. This is the DECISIVE catch for the door-scoped-vs-process-
+        // global mutation: reverting the guard to its pre-Round-10 form (reading the process-global
+        // BoundedDecode.DetachedDecodeCount) makes the data-file strand visible → it BLOCKS seeding process-wide →
+        // the identity never reaches strike 2 → load 3 re-decodes (opens == 3) → RED. Stranding an ISOLATED
+        // decoder (as an earlier revision did) would NOT touch the global sum, so a process-global revert would
+        // stay green — under-guarded. The static door is drained in the finally so it never pollutes other tests.
         using var unrelatedGate = new ManualResetEventSlim(initialState: false);
-        BoundedDecoder unrelatedDoor = IsolatedCheckpointDecoder();
+        BoundedDecoder unrelatedDoor = BoundedDecode.DataFileDecoder;
+        int detachedBefore = unrelatedDoor.DetachedDecodeCount;
         StrandForever(unrelatedDoor, unrelatedGate);
-        await WaitForDetachedAsync(unrelatedDoor, 1);
+        await WaitForDetachedAsync(unrelatedDoor, detachedBefore + 1);
 
         try
         {
@@ -541,7 +551,10 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
         }
         finally
         {
-            unrelatedGate.Set(); // release the unrelated strand so its dedicated thread can exit
+            unrelatedGate.Set(); // release the unrelated strand so it drains off the shared static door
+            // Drain wait (never pollute the shared static data-file door for other tests): poll until the door's
+            // detached count returns to its pre-test value.
+            await WaitForDrainAsync(unrelatedDoor, detachedBefore);
         }
     }
 
@@ -566,6 +579,24 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             {
                 throw new TimeoutException(
                     $"expected {expected} detached strand(s), saw {decoder.DetachedDecodeCount}.");
+            }
+
+            await Task.Delay(20);
+        }
+    }
+
+    // Polls until the decoder's detached-strand count drains back to (or below) `target` — used to guarantee a
+    // strand placed on a SHARED static door (BoundedDecode.DataFileDecoder) is drained before the test returns,
+    // so it never pollutes that door for other tests in the suite.
+    private static async Task WaitForDrainAsync(BoundedDecoder decoder, int target)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (decoder.DetachedDecodeCount > target)
+        {
+            if (DateTime.UtcNow > deadline)
+            {
+                throw new TimeoutException(
+                    $"expected detached strand(s) to drain to {target}, still {decoder.DetachedDecodeCount}.");
             }
 
             await Task.Delay(20);
