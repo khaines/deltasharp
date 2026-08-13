@@ -49,6 +49,9 @@ public sealed class DeltaFooterLogParityCoverageTests
     [Fact]
     public async Task ParityGuard_DrivesEveryWriteEntryPoint()
     {
+        // Precondition: the scan scope must be whole before anything derived from it is trusted.
+        AssertScanScopeIsComplete();
+
         MethodInfo[] required = typeof(DeltaWriteTarget)
             .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
             .Where(m => m.ReturnType == typeof(Task<DeltaWriteResult>))
@@ -140,6 +143,10 @@ public sealed class DeltaFooterLogParityCoverageTests
     [Fact]
     public async Task ParityGuard_ReachesEverySchemaJsonCallSite()
     {
+        // Precondition: an incomplete scan scope makes "every call site is reached" a statement
+        // about a smaller set of call sites than production actually has (#743).
+        AssertScanScopeIsComplete();
+
         MethodBase[] callSites = RequiredSites().ToArray();
 
         // Non-vacuity: if the scan finds nothing every check below passes for the wrong reason --
@@ -206,14 +213,17 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// </para>
     /// <para>
     /// The set spans EVERY production assembly that can see <c>SchemaJson</c> --
-    /// <c>DeltaSharp.Storage</c>, <c>DeltaSharp.Core</c> and <c>DeltaSharp.Engine</c> -- derived
-    /// from the <see cref="InternalsVisibleToAttribute"/> grants on <c>DeltaSharp.Abstractions</c>
-    /// by <see cref="ProductionAssemblies"/>, not hand-listed at one. It used to walk only
-    /// <c>typeof(DeltaWriteTarget).Assembly</c>, so a call site in <c>DeltaSharp.Core</c> (which
-    /// owns <c>Sql/</c> and <c>Plans/</c>) or <c>DeltaSharp.Engine</c> was outside the scan entirely
-    /// and could go undriven with this guard green. Widening the SCOPE, not the walk, is the fix
-    /// (#743): today those two assemblies contribute no call site, so the required set is unchanged,
-    /// but a future serializer seam in either surfaces here automatically.
+    /// <c>DeltaSharp.Storage</c>, <c>DeltaSharp.Core</c> and <c>DeltaSharp.Engine</c>, derived from
+    /// the <see cref="InternalsVisibleToAttribute"/> grants on <c>DeltaSharp.Abstractions</c>, plus
+    /// <c>DeltaSharp.Abstractions</c> itself, which DECLARES the serializer and therefore needs no
+    /// grant to call it -- by <see cref="ProductionAssemblies"/>, not hand-listed at one. It used to
+    /// walk only <c>typeof(DeltaWriteTarget).Assembly</c>, so a call site in <c>DeltaSharp.Core</c>
+    /// (which owns <c>Sql/</c> and <c>Plans/</c>) or <c>DeltaSharp.Engine</c> was outside the scan
+    /// entirely and could go undriven with this guard green. Widening the SCOPE, not the walk, is the
+    /// fix (#743); the scope is itself asserted complete by
+    /// <see cref="ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson"/>, so it cannot narrow back
+    /// silently. Today those assemblies contribute no call site, so the required set is unchanged,
+    /// but a future serializer seam in any of them surfaces here automatically.
     /// </para>
     /// </remarks>
     private static HashSet<MethodBase> RequiredSites()
@@ -255,6 +265,27 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
+    /// Grantees that <see cref="ResolveProductionAssemblies"/> could not load, with the load fault.
+    /// Non-empty means the scan silently lost scope -- a RED condition, see
+    /// <see cref="ProductionAssemblies"/>.
+    /// </summary>
+    /// <remarks>
+    /// DECLARATION ORDER MATTERS: this is written by <see cref="ResolveProductionAssemblies"/>, and
+    /// static field initializers run top to bottom, so it must be declared BEFORE
+    /// <see cref="ProductionAssemblies"/>. Declared after, it is still <see langword="null"/> when
+    /// the resolver records a load fault and the guard dies with a NullReferenceException instead of
+    /// the diagnostic naming the missing assembly (observed while proving RED-on-revert).
+    /// </remarks>
+    private static readonly List<string> UnloadableGrantees = new();
+
+    /// <summary>
+    /// The simple names of every non-test <see cref="InternalsVisibleToAttribute"/> grantee of the
+    /// assembly declaring <c>SchemaJson</c>, PLUS that assembly itself and the write-door assembly:
+    /// exactly the set <see cref="ProductionAssemblies"/> must resolve to, with nothing dropped.
+    /// </summary>
+    private static readonly string[] ExpectedScanScope = ComputeExpectedScanScope();
+
+    /// <summary>
     /// Every PRODUCTION assembly that can see <c>SchemaJson</c>, DERIVED from the
     /// <see cref="InternalsVisibleToAttribute"/> grants on the assembly that declares it rather
     /// than hand-listed at one.
@@ -271,31 +302,63 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// divergence with the whole solution green (#743).
     /// </para>
     /// <para>
-    /// The set is read off IVT so it stays derived rather than hand-listed at one, and cannot fall
-    /// behind a future grant. Test assemblies are excluded because the property is about PRODUCTION
-    /// call sites; the write-door assembly is seeded unconditionally so the scan is never vacuous.
+    /// <c>DeltaSharp.Abstractions</c> ITSELF is seeded, because it DECLARES <c>SchemaJson</c> and so
+    /// needs no grant to call it -- it can never appear in its own grantee list. Deriving the set
+    /// purely from IVT therefore omitted the one assembly with unconditional access, and a
+    /// <c>SchemaJson.ToJson</c> seam written inside <c>DeltaSharp.Abstractions</c> reproduced the
+    /// #679 divergence class with this guard green. Seeding it closes that hole by construction.
+    /// </para>
+    /// <para>
+    /// The set is read off IVT so it stays derived rather than hand-listed at one. It CANNOT quietly
+    /// fall behind a future grant, and that is enforced rather than asserted in prose: resolution
+    /// used to swallow a grantee that would not load, which made the scope silently self-narrowing
+    /// -- the exact #743 defect one level up, since dropping the <c>DeltaSharp.Core</c>
+    /// <c>ProjectReference</c> from this test project (no test code binds it) would have reverted
+    /// the scan to Storage-only with all three guards still green. Now an unloadable grantee is a
+    /// HARD FAILURE (<see cref="ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson"/>, and a
+    /// precondition on both coverage guards), so a new grant forces either a matching
+    /// <c>ProjectReference</c> here or removal of the grant. Test assemblies are excluded because
+    /// the property is about PRODUCTION call sites; the write-door assembly is seeded
+    /// unconditionally so the scan is never vacuous.
     /// </para>
     /// </remarks>
     private static readonly Assembly[] ProductionAssemblies = ResolveProductionAssemblies();
 
+    /// <summary>The simple name of the assembly that declares <c>SchemaJson</c>.</summary>
+    private static Assembly AbstractionsAssembly => typeof(global::DeltaSharp.Types.SchemaJson).Assembly;
+
+    private static string[] NonTestGranteeNames() =>
+        AbstractionsAssembly.GetCustomAttributes<InternalsVisibleToAttribute>()
+            // AssemblyName may carry a public key; the simple name is everything before the comma.
+            .Select(ivt => ivt.AssemblyName.Split(',')[0].Trim())
+            // Test assemblies are excluded: the property is about PRODUCTION call sites. (The
+            // ".Tests" suffix already covers DeltaSharp.Abstractions.Tests, which Directory.Build.props
+            // auto-injects, so no per-assembly special case is needed.)
+            .Where(name => !name.EndsWith(".Tests", StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+    private static string[] ComputeExpectedScanScope() =>
+        NonTestGranteeNames()
+            // SchemaJson's OWN assembly needs no grant to call it, so it is absent from the grantee
+            // list by construction and must be added explicitly.
+            .Append(AbstractionsAssembly.GetName().Name!)
+            // The write-door assembly, seeded so the scan is never vacuous.
+            .Append(typeof(DeltaWriteTarget).Assembly.GetName().Name!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
     private static Assembly[] ResolveProductionAssemblies()
     {
         // Seeded with the write-door assembly so the required-side scan cannot silently become
-        // vacuous even if the IVT read below yields nothing.
-        var assemblies = new HashSet<Assembly> { typeof(DeltaWriteTarget).Assembly };
+        // vacuous even if the IVT read below yields nothing, and with the DECLARING assembly, which
+        // can call SchemaJson without a grant and so never appears in the grantee list at all.
+        var assemblies = new HashSet<Assembly> { typeof(DeltaWriteTarget).Assembly, AbstractionsAssembly };
 
-        Assembly abstractions = typeof(global::DeltaSharp.Types.SchemaJson).Assembly;
-        foreach (InternalsVisibleToAttribute ivt in
-            abstractions.GetCustomAttributes<InternalsVisibleToAttribute>())
+        foreach (string name in NonTestGranteeNames())
         {
-            // AssemblyName may carry a public key; the simple name is everything before the comma.
-            string name = ivt.AssemblyName.Split(',')[0].Trim();
-            if (name.EndsWith(".Tests", StringComparison.Ordinal)
-                || name.Equals("DeltaSharp.Abstractions.Tests", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
             try
             {
                 assemblies.Add(Assembly.Load(name));
@@ -303,12 +366,57 @@ public sealed class DeltaFooterLogParityCoverageTests
             catch (Exception ex)
                 when (ex is FileNotFoundException or FileLoadException or BadImageFormatException)
             {
-                // A grantee that is not loadable in the test context is not a place a call site
-                // could be hiding from this run; skip it rather than fail for an unrelated reason.
+                // FAIL-CLOSED (#743, round-1): this used to `continue`, on the reasoning that a
+                // grantee absent from the test context is not a place a call site could hide. That
+                // reasoning is backwards -- absence from THIS PROCESS says nothing about whether the
+                // SHIPPED assembly holds a call site, and swallowing it is precisely how the scope
+                // shrinks without anyone noticing. Record it; the guards assert this list is empty,
+                // so an IVT-granted assembly that is not loadable here reddens until it is either
+                // referenced by this test project or has its grant removed.
+                UnloadableGrantees.Add($"{name} ({ex.GetType().Name})");
             }
         }
 
         return assemblies.ToArray();
+    }
+
+    /// <summary>
+    /// The scan SCOPE of the two coverage guards equals every assembly that can see
+    /// <c>SchemaJson</c> -- nothing dropped for being unloadable in this test process.
+    /// </summary>
+    /// <remarks>
+    /// A guard whose scope quietly shrinks stays green while covering less, which is the failure
+    /// mode this whole file exists to remove. This is its own [Fact] so the cause is named directly
+    /// rather than surfacing as a confusing "no call sites found" from a downstream guard, and it is
+    /// ALSO asserted as a precondition inside both coverage guards so neither can pass on a
+    /// narrowed scope if this one is skipped or deleted.
+    /// </remarks>
+    [Fact]
+    public void ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson() => AssertScanScopeIsComplete();
+
+    private static void AssertScanScopeIsComplete()
+    {
+        // Non-vacuity: the grantee list itself must be non-empty, or "every grantee resolved" is
+        // trivially true and the derivation has stopped working.
+        Assert.NotEmpty(NonTestGranteeNames());
+
+        Assert.True(
+            UnloadableGrantees.Count == 0,
+            "DeltaSharp.Abstractions grants InternalsVisibleTo to production assemblies that this "
+            + "test process cannot LOAD, so their SchemaJson.ToJson call sites are outside the "
+            + "coverage scan entirely while these guards stay green (#743)."
+            + $"{Environment.NewLine}  unloadable grantees: {string.Join(", ", UnloadableGrantees)}"
+            + $"{Environment.NewLine}  Fix by adding a ProjectReference to the named assembly from "
+            + "DeltaSharp.Storage.Tests.csproj (a reference no test code needs to bind -- its only "
+            + "job is to put the assembly in this test context), or by removing the IVT grant.");
+
+        string[] resolved = ProductionAssemblies
+            .Select(a => a.GetName().Name!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(ExpectedScanScope, resolved);
     }
 
     /// <summary>Every method in the production assemblies, including compiler-generated ones.</summary>
@@ -331,10 +439,18 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
-    /// The types of <paramref name="assembly"/> that load cleanly. A cross-assembly scan can hit a
-    /// type whose dependency does not resolve in the test context; that is a scan artifact, not a
-    /// call site, so it is skipped rather than allowed to abort the whole walk.
+    /// The types of <paramref name="assembly"/>. A cross-assembly scan CAN hit a type whose
+    /// dependency does not resolve in the test context -- but that narrows the required set, so it
+    /// is reported as a hard failure rather than absorbed.
     /// </summary>
+    /// <remarks>
+    /// This used to return the loadable subset and swallow the <see cref="ReflectionTypeLoadException"/>
+    /// as "a scan artifact, not a call site". Same fail-open shape as the swallowed grantee load
+    /// (see <see cref="ProductionAssemblies"/>): a type that will not load here is a type whose
+    /// <c>SchemaJson.ToJson</c> call sites are absent from the required set, and the guard goes
+    /// GREEN over the smaller set. If this ever fires, the fix is to make the type loadable in this
+    /// test context (usually a missing <c>ProjectReference</c>), not to skip it.
+    /// </remarks>
     private static IEnumerable<Type> LoadableTypes(Assembly assembly)
     {
         try
@@ -343,7 +459,21 @@ public sealed class DeltaFooterLogParityCoverageTests
         }
         catch (ReflectionTypeLoadException ex)
         {
-            return ex.Types.Where(t => t is not null)!;
+            string[] faults = ex.LoaderExceptions
+                .Where(e => e is not null)
+                .Select(e => e!.Message)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(m => m, StringComparer.Ordinal)
+                .Take(10)
+                .ToArray();
+
+            Assert.Fail(
+                $"Types of production assembly '{assembly.GetName().Name}' failed to load, so its "
+                + "SchemaJson.ToJson call sites are silently missing from the required set and this "
+                + "guard would pass over a NARROWED scan (#743)."
+                + $"{Environment.NewLine}  loaded: {ex.Types.Count(t => t is not null)} of {ex.Types.Length}"
+                + $"{Environment.NewLine}  loader faults: {string.Join($"{Environment.NewLine}    ", faults)}");
+            throw; // unreachable: Assert.Fail always throws.
         }
     }
 

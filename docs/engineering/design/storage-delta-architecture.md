@@ -703,6 +703,27 @@ schema is thus effectively part of the write's read dependency; no stale-schema 
   OPTIMIZE note (§2.11.7) for the DV-input skip.
 - **Automatic `required → nullable` relaxation** is **not** performed — the table's declared nullability is
   preserved as-is. A deliberate nullability change is a separate `ALTER TABLE`-style metadata operation.
+- **Logical nullability → Parquet physical repetition (#730) — implemented.** The declared
+  `schemaString` nullability of a column is what the writer stamps into the data file's **footer**: a
+  `"nullable": true` column is written **OPTIONAL** (definition level 1) and a `"nullable": false` column is
+  written **REQUIRED** (definition level 0), for **every** supported scalar type — including the
+  reference-typed `string` and `binary` lanes, whose Parquet.Net `DataField<T>(name)` constructor otherwise
+  defaults to always-nullable regardless of the declaration. `ParquetFileWriter` therefore builds its fields
+  with `ParquetTypeMapping.CreateField(field, honorReferenceNullability: true)`, so a file's physical
+  repetition and the commit's `metaData.schemaString` cannot disagree. This is the mapping Spark
+  (`parquet-mr`), `arrow-rs`/delta-rs and pyarrow all use, so a DeltaSharp-written file's footer now matches
+  what those engines would have written for the same Delta schema — and a foreign reader that trusts
+  repetition (e.g. one that skips definition-level decoding for a REQUIRED column) reads it correctly.
+  *Compatibility:* the change is **write-side only and forward-only**. A file written **before** #730 may
+  carry **OPTIONAL** for a column the log declares required; such files remain readable **unchanged** and
+  need **no rewrite** — the read path deliberately builds its expected field with
+  `honorReferenceNullability: false` so a log-required string/binary column stored as OPTIONAL is accepted
+  rather than rejected as a `SchemaMismatch`. A **mixed-vintage** table (pre- and post-#730 files side by
+  side, with differing physical repetition for the same declared-required column) is therefore an
+  **expected and supported** state, not a corruption: Delta's authoritative nullability is the log's, and the
+  footer is advisory physical detail. No protocol/feature flag, no version bump, and no OPTIMIZE/rewrite is
+  required to converge a table — files converge naturally as they are rewritten by normal writes or
+  compaction.
 - **Case-insensitive name *resolution*** (Spark's default for *matching* a write column to a table column) is a
   higher-layer name-resolution concern, not a storage-layer type-compatibility rule; the enforcer *matches*
   case-sensitively/ordinally. It does, however, reject a merged schema that would contain a case-fold **collision**

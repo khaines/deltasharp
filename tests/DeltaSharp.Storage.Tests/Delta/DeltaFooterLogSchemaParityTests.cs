@@ -661,6 +661,12 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// bulk path would choke on: non-ASCII keys and values, an astral pair, an empty key, an empty
     /// value, and characters requiring escapes.
     /// <para>
+    /// The KEY-NAME domain is corpus content too, not only the value domain (#731). A key under a
+    /// CALLER namespace (<c>tenant.*</c>) is included, because a strip conditioned on the caller's own
+    /// prefix — rather than on entry count or value shape — matched none of the empty/padding/accent
+    /// keys and so survived every other member of this corpus.
+    /// </para>
+    /// <para>
     /// The value kinds are enumerated from <see cref="MetadataValueKind"/> itself rather than
     /// listed, so a kind added later is carried here without anyone remembering to add it.
     /// </para>
@@ -676,6 +682,16 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             new("ключ", MetadataValue.String("значение")),
             new("astral\U0001F600", MetadataValue.String("\U0001F600")),
             new("quote\"tab\tnewline\n", MetadataValue.String("back\\slash")),
+
+            // #731 round-1: the KEY-NAME domain is part of the corpus, not just the value domain. Every
+            // other key here is either empty, a padding name, or an accent/emoji token, and the writer's
+            // only reserved namespace is `delta.*` — so a strip conditioned on a CALLER namespace (the
+            // shape of the rogue that filed #731: "drop any key under the tenant's own prefix") matched
+            // nothing this schema declares and shipped green. A caller-namespaced key makes that rogue
+            // RED, and it is the compliance-visible case: classification/PII tags live under exactly such
+            // a prefix, and losing them from the committed schemaString is silent.
+            new("tenant.classification", MetadataValue.String("restricted")),
+            new("tenant.pii.fields", MetadataValue.Array(new[] { MetadataValue.String("région") })),
         };
 
         for (int i = 0; bulky.Count < 96; i++)

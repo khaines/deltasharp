@@ -473,7 +473,7 @@ public sealed class StorageHygieneSweepTests
             [new StructField(p, DataTypes.LongType, nullable: true)]), valueContainsNull: true);
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(new StructField(p, nested, nullable: true)));
+            () => ParquetTypeMapping.CreateField(new StructField(p, nested, nullable: true), honorReferenceNullability: false));
 
         AssertNeutralizedAndBounded(ex.Message, p);
     }
@@ -491,7 +491,7 @@ public sealed class StorageHygieneSweepTests
         string p = Payload(poison);
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(new StructField(p, DataTypes.NullType, nullable: true)));
+            () => ParquetTypeMapping.CreateField(new StructField(p, DataTypes.NullType, nullable: true), honorReferenceNullability: false));
 
         Assert.Contains("is not supported", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
@@ -504,7 +504,7 @@ public sealed class StorageHygieneSweepTests
         string p = Payload(poison);
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(Mapped(p, "col-1", 0)));
+            () => ParquetTypeMapping.CreateField(Mapped(p, "col-1", 0), honorReferenceNullability: false));
 
         Assert.Contains("outside the Parquet", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
@@ -629,7 +629,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
             () => ParquetTypeMapping.CreateField(
-                new StructField(p, DataTypes.CreateDecimalType(38, 2), nullable: true)));
+                new StructField(p, DataTypes.CreateDecimalType(38, 2), nullable: true), honorReferenceNullability: false));
 
         Assert.Contains("decimal precision", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
@@ -1543,7 +1543,7 @@ public sealed class StorageHygieneSweepTests
 
         // (2) …and the NESTED types are intercepted before those arms, by an arm that renders only the KIND.
         DeltaStorageException mapping = Assert.ThrowsAny<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(new StructField("c", nested, nullable: true)));
+            () => ParquetTypeMapping.CreateField(new StructField("c", nested, nullable: true), honorReferenceNullability: false));
         Assert.Contains("nested types (phased", mapping.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("' of type '", mapping.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(mapping.Message, p);
@@ -1575,7 +1575,7 @@ public sealed class StorageHygieneSweepTests
             if (type == DataTypes.NullType)
             {
                 DeltaStorageException rejected = Assert.ThrowsAny<DeltaStorageException>(
-                    () => ParquetTypeMapping.CreateField(new StructField("c", type, nullable: true)));
+                    () => ParquetTypeMapping.CreateField(new StructField("c", type, nullable: true), honorReferenceNullability: false));
                 Assert.Contains("Parquet mapping for column", rejected.Message, StringComparison.Ordinal);
                 Assert.DoesNotContain("Parquet write for column", rejected.Message, StringComparison.Ordinal);
                 Assert.DoesNotContain("Parquet read for column", rejected.Message, StringComparison.Ordinal);

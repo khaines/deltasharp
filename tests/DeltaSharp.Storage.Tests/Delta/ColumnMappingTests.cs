@@ -1354,11 +1354,11 @@ public sealed class ColumnMappingTests : IDisposable
         // Parquet default (-1) — so name/none-mode writes (whose physical schema drops the id) stay
         // byte-unchanged.
         global::Parquet.Schema.DataField stamped =
-            ParquetTypeMapping.CreateField(PhysFieldWithId("x", DataTypes.LongType, nullable: false, id: 7));
+            ParquetTypeMapping.CreateField(PhysFieldWithId("x", DataTypes.LongType, nullable: false, id: 7), honorReferenceNullability: false);
         Assert.Equal(7, stamped.FieldId);
 
         global::Parquet.Schema.DataField plain =
-            ParquetTypeMapping.CreateField(new StructField("x", DataTypes.LongType, nullable: false));
+            ParquetTypeMapping.CreateField(new StructField("x", DataTypes.LongType, nullable: false), honorReferenceNullability: false);
         Assert.Equal(-1, plain.FieldId);
     }
 
@@ -1370,7 +1370,7 @@ public sealed class ColumnMappingTests : IDisposable
     public void CreateField_RejectsNonPositiveFieldId_FailClosed_Since572()
     {
         DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(PhysFieldWithId("x", DataTypes.LongType, nullable: false, id: 0)));
+            () => ParquetTypeMapping.CreateField(PhysFieldWithId("x", DataTypes.LongType, nullable: false, id: 0), honorReferenceNullability: false));
         Assert.Contains("field_id range [1, int.MaxValue]", ex.Message, StringComparison.Ordinal);
     }
 

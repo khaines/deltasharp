@@ -486,7 +486,7 @@ public sealed class StorageMessageHygieneTests
             new StructType(new[] { new StructField("x", IntegerType.Instance, nullable: true) }),
             nullable: true);
 
-        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.CreateField(nested));
+        DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.CreateField(nested, honorReferenceNullability: false));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
         AssertFullyNeutralized(ex.Message);

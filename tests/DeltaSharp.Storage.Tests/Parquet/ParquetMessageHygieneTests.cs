@@ -274,7 +274,7 @@ public sealed class ParquetMessageHygieneTests
 
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
             () => ParquetTypeMapping.CreateField(
-                new StructField(FullInjectionCorpus, new StructType(fields), nullable: true)));
+                new StructField(FullInjectionCorpus, new StructType(fields), nullable: true), honorReferenceNullability: false));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.Contains("'struct'", error.Message, StringComparison.Ordinal);

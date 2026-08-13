@@ -67,12 +67,14 @@ public sealed class ParquetEncryptionClassifierFuzzTests
         // values (negative, zero, off-by-one, whole-file, int overflow). The bound check must reject each
         // without reading out of range, throwing, or classifying a non-encrypted file as encrypted.
         //
-        // #717 survivor (3): the upper bound `footerLength > length - 8`. The OPEN WINDOW (length-8, length]
-        // gives it bite — a weaker bound (e.g. `> length`) that admits any of these values then seeks to
-        // `length - 8 - footerLength`, which is NEGATIVE, and throws ArgumentOutOfRangeException (NOT in the
-        // probe's IO-fault catch filter) instead of failing closed. The correct bound rejects the whole window
-        // and returns null with no throw, so asserting null-and-no-throw across (length-8, length) kills every
-        // fail-open relaxation of the bound.
+        // #717 survivor (3): the upper bound `footerLength > length - 8`. The OPEN WINDOW (length-8, length)
+        // gives it bite — a weaker bound (e.g. `> length - 4`, which the PRE-PR corpus did NOT catch: it
+        // jumped straight from length-8 to length, so no probed value fell inside the relaxed window) admits
+        // these values and then seeks to `length - 8 - footerLength`, which is NEGATIVE, and throws
+        // ArgumentOutOfRangeException (NOT in the probe's IO-fault catch filter) instead of failing closed.
+        // The correct bound rejects the whole window and returns null with no throw, so asserting
+        // null-and-no-throw ACROSS the window (not just at its ends) kills every fail-open relaxation of the
+        // bound, not only the maximal `> length` one the old corpus happened to reach.
         byte[] file = await ValidPlaintextFileAsync();
         int[] hostileLengths =
         {

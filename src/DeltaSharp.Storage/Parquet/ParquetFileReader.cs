@@ -581,8 +581,9 @@ internal sealed class ParquetFileReader
     /// Reads only the Parquet footer and reconstructs the file's <b>actual physical data schema</b> (field
     /// names + DeltaSharp types via <see cref="ParquetTypeMapping.ToDataSchema"/>), decoding no data pages.
     /// The write-door records this on each staged file so schema enforcement gates the <b>real written
-    /// bytes</b>, not the caller's declared write schema (#497). Nullability is the footer's view (Parquet
-    /// models string/binary as nullable); callers compare the returned schema by name + type only.
+    /// bytes</b>, not the caller's declared write schema (#497). Nullability is the footer's physical
+    /// REPETITION (which since #730 matches the declared schema for files DeltaSharp writes, but need not on
+    /// a foreign or pre-#730 file); callers compare the returned schema by name + type only.
     /// </summary>
     /// <exception cref="DeltaStorageException">The footer is malformed/truncated
     /// (<see cref="StorageErrorKind.CorruptData"/>), or a footer field has no supported DeltaSharp type
@@ -1383,7 +1384,10 @@ internal sealed class ParquetFileReader
         // routed to NestedParquetColumnReader.ValidateShape long before it reaches here. On a scalar,
         // SimpleString is a bounded literal ("bigint", "decimal(10,2)") carrying no caller text. Do NOT copy
         // this pattern into a context that can see a nested type.
-        DataField expected = ParquetTypeMapping.CreateField(requestedField);
+        // honorReferenceNullability: false — `expected` is the ALWAYS-NULLABLE reference shape this guard is
+        // deliberately written around (see the nullability check below and issue #807). Passing true here
+        // would reject every foreign/pre-#730 file that stores a log-required string/binary as OPTIONAL.
+        DataField expected = ParquetTypeMapping.CreateField(requestedField, honorReferenceNullability: false);
 
         // Read-side promotion gate: a narrower physical type that is a sanctioned widening of the request is
         // accepted (the values are widened on read) ONLY when the caller opened the promotion gate. This is
@@ -1404,9 +1408,13 @@ internal sealed class ParquetFileReader
 
         // A nullable file column cannot be read into a column the writer would have emitted as
         // non-nullable without risking a null in a required lane; reject rather than coerce. We compare
-        // against the EXPECTED field's nullability (not the requested engine flag) because Parquet.Net
-        // always models string/binary as nullable, so a required string legitimately maps to a nullable
-        // physical column and must not trip this guard.
+        // against the EXPECTED field's nullability (not the requested engine flag) because `expected` is
+        // built with honorReferenceNullability:false — BY CONSTRUCTION always-nullable for string/binary.
+        // That is deliberate on the read path: a file this reader did not write (a foreign producer, or a
+        // DeltaSharp file written before #730) may store a log-REQUIRED string/binary column as OPTIONAL,
+        // and those files must stay readable. The consequence — this guard is inert for string/binary — is
+        // a known, dispositioned residual (issue #807); it still bites for every value-typed column, whose
+        // physical repetition has always tracked the declared flag.
         if (fileField.IsNullable && !expected.IsNullable)
         {
             throw DeltaStorageException.SchemaMismatch(
