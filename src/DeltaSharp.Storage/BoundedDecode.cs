@@ -466,7 +466,17 @@ internal sealed class BoundedDecoder
     {
         ArgumentNullException.ThrowIfNull(logger);
         ArgumentNullException.ThrowIfNull(door);
-        if (!_underProvisioned || Interlocked.Exchange(ref _underProvisionedWarned, 1) != 0)
+
+        // Gate on IsEnabled BEFORE consuming the once-token: a NullLogger (or any logger with Warning
+        // suppressed) returns false, so it must NOT flip _underProvisionedWarned — otherwise the first
+        // DeltaLog built without a real logger would permanently swallow the warning for every later
+        // DeltaLog that DOES provide one. The token is spent only when an emission actually happens.
+        if (!_underProvisioned || !logger.IsEnabled(Microsoft.Extensions.Logging.LogLevel.Warning))
+        {
+            return;
+        }
+
+        if (Interlocked.Exchange(ref _underProvisionedWarned, 1) != 0)
         {
             return;
         }

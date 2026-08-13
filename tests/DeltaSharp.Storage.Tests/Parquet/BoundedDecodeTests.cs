@@ -992,6 +992,34 @@ public sealed class BoundedDecodeTests
     }
 
     [Fact]
+    public void UnderProvisionedDoor_NullLoggerFirst_DoesNotSwallowTheWarning_ForALaterRealLogger()
+    {
+        // Red-team MISS (Round-13): the once-token must be spent only when an emission actually happens.
+        // If the first DeltaLog process-wide is built without a real logger (NullLogger — the constructor
+        // default), a null-logger first-use must NOT flip _underProvisionedWarned; otherwise every later
+        // DeltaLog that DOES provide a logger would permanently swallow the startup Warning. Reverting the
+        // IsEnabled gate to an unconditional Interlocked.Exchange turns this red.
+        DoorSizing sizing = BoundedDecode.DeriveDoorSizing(
+            2L * 1024 * 1024 * 1024, 1L * 1024 * 1024 * 1024, processorCount: 8);
+        Assert.True(sizing.UnderProvisioned);
+        var door = BoundedDecoder.FromSizing(sizing, DecodeExecution.Pool);
+
+        // First use with a NullLogger (IsEnabled(Warning) == false) — emits nothing AND must not consume the token.
+        door.WarnIfUnderProvisioned(
+            Microsoft.Extensions.Logging.Abstractions.NullLogger<BoundedDecoder>.Instance, "data_file");
+
+        // A subsequent real logger must still get exactly one Warning.
+        var logger = new RecordingLogger<BoundedDecoder>();
+        door.WarnIfUnderProvisioned(logger, "data_file");
+        door.WarnIfUnderProvisioned(logger, "data_file"); // now idempotent
+
+        RecordingLogger<BoundedDecoder>.Entry warning = Assert.Single(
+            logger.Entries, e => e.EventId.Name == "DeltaDecodeDoorUnderProvisioned");
+        Assert.Equal(Microsoft.Extensions.Logging.LogLevel.Warning, warning.Level);
+        Assert.Equal("data_file", warning.Field("Door"));
+    }
+
+    [Fact]
     public async Task CancellationLaunderedStrand_IsCountedAndCharged_OnATokenIgnoringNonTerminatingDecode()
     {
         // Round-8 #5 — a non-terminating decode abandoned via CALLER CANCELLATION (not a deadline) must be
