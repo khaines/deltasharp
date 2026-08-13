@@ -639,6 +639,32 @@ public sealed class StorageHygieneSweepTests
         }
     }
 
+    // Round-1 review (smaller item): the `loneSurr` row above deliberately pre-transcodes its column name to
+    // U+FFFD (SchemaFixtureName) so the null-lane echo under test still gets reached — which means the #710
+    // WRITE-door rejection itself is not exercised at THIS layer by that row. Pin it here directly: a RAW
+    // lone-surrogate column name must fail closed inside ParquetFileWriter.WriteAsync (the footer schema goes
+    // through SchemaJson.ToJson), with a message that names only the sanitized ROLE + offset and never the
+    // malformed content.
+    [Fact]
+    public async Task Door_ParquetFileWriter_LoneSurrogateColumnName_FailsClosed()
+    {
+        string p = Payload("loneSurr");
+        Assert.Contains('\uD800', p); // the fixture is non-vacuous: the RAW payload really is malformed
+        var schema = new StructType([new StructField(p, DataTypes.LongType, nullable: true)]);
+
+        MutableColumnVector vector = ColumnVectors.Create(DataTypes.LongType, 1);
+        vector.AppendValue(1L);
+        var batch = new ManagedColumnBatch(schema, [vector], 1);
+
+        using var output = new MemoryStream();
+        SchemaValidationException ex = await Assert.ThrowsAsync<SchemaValidationException>(
+            () => new ParquetFileWriter().WriteAsync(output, schema, [batch], CancellationToken.None));
+
+        Assert.Contains("field name", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("invalid UTF-16", ex.Message, StringComparison.Ordinal);
+        AssertNeutralizedAndBounded(ex.Message, p);
+    }
+
     // A wide, poisoned struct: SimpleString recurses through every one of these field names, so any site that
     // echoes it for a NESTED type is both an unbounded aggregate and a raw-name echo.
     private static StructType PoisonedStruct(string payload) =>

@@ -386,6 +386,177 @@ public sealed class SchemaJsonSerializerPropertyTests
         return json.Substring(open, json.IndexOf('}', open) - open + 1);
     }
 
+    // #711 (Round-1 review, Blocker 5): the depth guard sits on SEVEN container sites (StartObject/StartArray
+    // for array, map, struct-object, struct fields-array, struct field-object, metadata object, metadata
+    // array), but only the ARRAY path used to be pinned — deleting EnsureDepth from any of the others left the
+    // suite green. This theory drives SIX structurally distinct shapes, each asserting BOTH sides of the
+    // bound: at the cap the schema round-trips (ToJson then FromJson back to the SAME tree), one level deeper
+    // the WRITE door fails closed.
+    //
+    // Verified by per-site mutation: dropping the guard at the array / map / fields-array / metadata-object /
+    // metadata-array site turns exactly the corresponding row red. The two remaining sites — the struct
+    // OBJECT and the struct FIELD object — are DOMINATED, not unpinned: a struct object is always immediately
+    // followed by opening its "fields" array, and a field object is always immediately followed by opening its
+    // "metadata" object, so removing either guard is still caught one write later by the successor guard and
+    // no observable behavior changes. They are kept for uniformity (a future writer change could make them
+    // load-bearing); this comment records why no row can isolate them.
+    //
+    // The cap level per shape is derived from the CONTAINER cost of one level (the guard's unit is JSON
+    // containers, not schema levels), which is why the numbers differ:
+    //   array            1 container/level  ({"type":"array",...})                         => 64 levels
+    //   map              1 container/level  ({"type":"map",...})                           => 64 levels
+    //   struct           3 containers/level (struct object + "fields" array + field object)
+    //                    plus the innermost field's synthesized "metadata" object (+1)     => 21 levels
+    //   empty-struct     N arrays + struct object (N+1) + empty "fields" array (N+2); no
+    //                    field object and no metadata follow, so the fields ARRAY is the
+    //                    boundary container and the site is isolated                       => 62 arrays
+    //   metadata-object  struct(1)+fields(2)+field(3) then 1 container per metadata level  => 61 levels
+    //   metadata-array   struct(1)+fields(2)+field(3)+metadata(4) then 1 per array level   => 60 levels
+    [Theory]
+    [InlineData("array", 64)]
+    [InlineData("map", 64)]
+    [InlineData("struct", 21)]
+    [InlineData("empty-struct", 62)]
+    [InlineData("metadata-object", 61)]
+    [InlineData("metadata-array", 60)]
+    public void DepthGuard_HoldsOnEveryContainerSite_AtTheCapRoundTrips_OneDeeperFailsClosed(
+        string shape, int capLevels)
+    {
+        DataType atCap = NestedShape(shape, capLevels);
+        string json = SchemaJson.ToJson(atCap);
+        Assert.Equal(atCap, SchemaJson.FromJson(json));
+
+        DataType overCap = NestedShape(shape, capLevels + 1);
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(overCap));
+        Assert.Contains("maximum supported depth of 64", ex.Message, StringComparison.Ordinal);
+        // The unit is JSON containers, not schema levels — the message must say so (a bare "64" reads as a
+        // contradiction next to the 21 struct levels this very theory pins).
+        Assert.Contains("JSON container nesting", ex.Message, StringComparison.Ordinal);
+    }
+
+    private static DataType NestedShape(string shape, int levels) => shape switch
+    {
+        "array" => NestedArrays(levels),
+        "map" => NestedMaps(levels),
+        "struct" => NestedStructs(levels),
+        "empty-struct" => WrapInArrays(StructType.Empty, levels),
+        "metadata-object" => FieldWithNestedMetadataObjects(levels),
+        "metadata-array" => FieldWithNestedMetadataArrays(levels),
+        _ => throw new ArgumentOutOfRangeException(nameof(shape)),
+    };
+
+    private static DataType WrapInArrays(DataType inner, int levels)
+    {
+        DataType type = inner;
+        for (int i = 0; i < levels; i++)
+        {
+            type = DataTypes.CreateArrayType(type, containsNull: true);
+        }
+
+        return type;
+    }
+
+    private static DataType NestedMaps(int depth)
+    {
+        DataType type = DataTypes.StringType;
+        for (int i = 0; i < depth; i++)
+        {
+            type = DataTypes.CreateMapType(DataTypes.StringType, type, valueContainsNull: true);
+        }
+
+        return type;
+    }
+
+    private static DataType NestedStructs(int depth)
+    {
+        DataType type = DataTypes.StringType;
+        for (int i = 0; i < depth; i++)
+        {
+            type = new StructType(new[] { new StructField("f", type, nullable: true) });
+        }
+
+        return type;
+    }
+
+    private static DataType FieldWithNestedMetadataObjects(int depth)
+    {
+        FieldMetadata metadata = FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>("leaf", MetadataValue.Long(1)),
+        });
+        for (int i = 1; i < depth; i++)
+        {
+            metadata = FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("n", MetadataValue.Nested(metadata)),
+            });
+        }
+
+        return new StructType(new[]
+        {
+            new StructField("f", DataTypes.LongType, nullable: true, metadata),
+        });
+    }
+
+    private static DataType FieldWithNestedMetadataArrays(int depth)
+    {
+        MetadataValue value = MetadataValue.Long(1);
+        for (int i = 0; i < depth; i++)
+        {
+            value = MetadataValue.Array(new[] { value });
+        }
+
+        return new StructType(new[]
+        {
+            new StructField("f", DataTypes.LongType, nullable: true, FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("a", value),
+            })),
+        });
+    }
+
+    // #711 (Round-1 review, Blocker 4): the ACCURATE invariant is one-directional — anything DeltaSharp
+    // WRITES it can read back — NOT "the two sides accept the same documents". The read side is deliberately
+    // one container MORE tolerant in exactly one documented case: a FOREIGN schema whose deepest struct field
+    // OMITS "metadata". FromJson accepts the omission; ToJson always materializes "metadata":{}, one extra
+    // container. So such a schema sitting exactly at read depth 64 loads and can be queried, but can never be
+    // RE-SERIALIZED — schema evolution / overwrite of that table fails closed. Pinned as a LIMITATION (a
+    // refusal, never a silently unreadable commit), so a future change that quietly alters either bound has
+    // to confront it.
+    [Fact]
+    public void ForeignSchemaAtTheReadCap_WithMetadataOmitted_Reads_ButCannotBeReSerialized()
+    {
+        // Shape: 61 nested arrays wrapping a struct with ONE field, and that field object carries NO
+        // "metadata" member. Container depths: array levels 1..61, struct object 62, "fields" array 63, field
+        // object 64 — exactly the read cap, so FromJson accepts it. ToJson re-emits the same containers and
+        // then must open the synthesized "metadata":{} object at depth 65, which the shared bound refuses.
+        // (Arrays, not more structs, carry the depth here precisely because the asymmetry is ONE container
+        // while a struct level costs three.)
+        var foreign = new StringBuilder();
+        const int ArrayLevels = 61;
+        for (int i = 0; i < ArrayLevels; i++)
+        {
+            foreign.Append("{\"type\":\"array\",\"elementType\":");
+        }
+
+        // No "metadata" member at all — legal on read, and one container cheaper than what ToJson emits.
+        foreign.Append("{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":\"string\",\"nullable\":true}]}");
+        for (int i = 0; i < ArrayLevels; i++)
+        {
+            foreign.Append(",\"containsNull\":true}");
+        }
+
+        string json = foreign.ToString();
+
+        // Read side: accepted (the document is within the read bound).
+        DataType parsed = SchemaJson.FromJson(json);
+
+        // Write side: refused — the synthesized "metadata":{} object pushes the deepest container past the
+        // shared bound. This is the documented asymmetry; it fails CLOSED.
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(parsed));
+        Assert.Contains("maximum supported depth of 64", ex.Message, StringComparison.Ordinal);
+    }
+
     // #711: the write side must refuse to serialize a schema nested deeper than FromJson can re-read, so a
     // schema can never commit to metaData.schemaString and then be permanently unreadable. FromJson parses
     // with JsonDocumentOptions.MaxDepth = 64: a 64-deep type tree round-trips, a 65-deep one is rejected on
@@ -405,8 +576,12 @@ public sealed class SchemaJsonSerializerPropertyTests
         Assert.Contains("maximum supported depth of 64", ex.Message, StringComparison.Ordinal);
     }
 
+    // Round-1 review (Blocker 4): renamed from "..._AgreeExactly_..." — the bounds do NOT accept the same
+    // set of documents in both directions (see ForeignSchemaAtTheReadCap_WithMetadataOmitted_...). What holds
+    // is that for the SAME shape the two bounds meet at the same container LEVEL: the write side refuses to
+    // emit what the read side would refuse to parse, so neither can drift past the other.
     [Fact]
-    public void ReadCap_And_WriteCap_AgreeExactly_SoNeitherCanDriftPastTheOther()
+    public void ReadBound_RejectsTheSameContainerLevel_TheWriteBoundRefusesToEmit()
     {
         // Independently prove the two bounds meet at the same level: build the 65-deep JSON as raw text (so
         // the read path is exercised even though the write path now refuses to emit it) and confirm FromJson
@@ -523,5 +698,117 @@ public sealed class SchemaJsonSerializerPropertyTests
         Assert.Equal(
             new StructType(new[] { new StructField("x\uD83D\uDE00", DataTypes.StringType, nullable: true) }),
             SchemaJson.FromJson(astralJson));
+    }
+
+    // #710 (Round-1 review, smaller item): the message reports the offending UTF-16 CODE-UNIT OFFSET, and
+    // that offset was unpinned — a mutant replacing `offset` with `offset + 999` survived the whole suite.
+    // Pin the exact value for a leading / trailing / mid-string lone surrogate. (The names are spelled in
+    // code, not as [InlineData]: xUnit serializes theory arguments for discovery and a lone surrogate does
+    // not survive that round trip.)
+    [Fact]
+    public void InvalidUtf16Message_ReportsTheExactCodeUnitOffset()
+    {
+        (string Name, int Offset)[] cases =
+        [
+            ("\uD800x", 0),   // leading lone high surrogate
+            ("x\uD800", 1),   // trailing lone high surrogate
+            ("a\uD800b", 1),  // lone high surrogate mid-string
+            ("ab\uDC00", 2),  // lone LOW surrogate, offset 2
+        ];
+
+        foreach ((string name, int offset) in cases)
+        {
+            var schema = new StructType(new[] { new StructField(name, DataTypes.StringType, nullable: true) });
+
+            SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.ToJson(schema));
+            Assert.Contains(
+                string.Create(CultureInfo.InvariantCulture, $"code-unit offset {offset})"),
+                ex.Message,
+                StringComparison.Ordinal);
+        }
+    }
+
+    // ---- READ door: invalid UTF-16 is a SchemaValidationException, not an untyped leak (#710 mirror) ------
+
+    // Round-1 review (Blocker 2): FromJson used to catch ONLY JsonException, but System.Text.Json signals
+    // invalid UTF-16 with untyped exceptions — JsonDocument.Parse throws ArgumentException for a RAW unpaired
+    // surrogate and JsonElement.GetString()/JsonProperty.Name throw InvalidOperationException for an ESCAPED
+    // one ("\uD800"). Both escaped every read caller's `catch (SchemaValidationException)` (Snapshot,
+    // DeltaReadSource, DeltaLog, ChangeFeedReader, DeltaCommitter), breaking the fail-closed contract at the
+    // UNTRUSTED read boundary. Each position below reaches a different GetString()/Name call site.
+    [Theory]
+    [InlineData("field name", """{"type":"struct","fields":[{"name":"x\uD800","type":"string","nullable":true,"metadata":{}}]}""")]
+    [InlineData("metadata key", """{"type":"struct","fields":[{"name":"f","type":"string","nullable":true,"metadata":{"k\uD800":1}}]}""")]
+    [InlineData("metadata string value", """{"type":"struct","fields":[{"name":"f","type":"string","nullable":true,"metadata":{"k":"v\uD800"}}]}""")]
+    [InlineData("type name", """{"type":"struct","fields":[{"name":"f","type":"str\uD800","nullable":true,"metadata":{}}]}""")]
+    [InlineData("complex type kind", """{"type":"arr\uD800"}""")]
+    public void EscapedLoneSurrogate_OnRead_SurfacesAsSchemaValidationException(string position, string json)
+    {
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.Contains("invalid UTF-16", ex.Message, StringComparison.Ordinal);
+        // Content-free: the offending (malformed) token is never echoed, in any form.
+        Assert.DoesNotContain('\uD800', ex.Message);
+        Assert.DoesNotContain('\uFFFD', ex.Message);
+        Assert.NotNull(position);
+    }
+
+    [Fact]
+    public void RawLoneSurrogate_OnRead_SurfacesAsSchemaValidationException()
+    {
+        // A RAW (unescaped) unpaired surrogate fails inside JsonDocument.Parse itself with ArgumentException
+        // ("Cannot transcode invalid UTF-16 string to UTF-8 JSON text") — a different .NET exception type
+        // from the escaped case, and equally must not escape the read boundary untyped.
+        string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"x\uD800\",\"type\":\"string\","
+            + "\"nullable\":true,\"metadata\":{}}]}";
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+        Assert.Contains("invalid UTF-16", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\uD800', ex.Message);
+    }
+
+    // ---- READ door: message hygiene on attacker-authored tokens (Round-1 review, Blocker 3) --------------
+
+    // Every one of these messages interpolates a token lifted VERBATIM out of an untrusted schemaString. They
+    // must be bounded (DiagnosticText's 128-char cap + ellipsis) and control-char-neutralized (U+FFFD), the
+    // same posture ParquetTypeMapping already applies to its identical column-name echo — otherwise a
+    // 1,000,000-char token renders a 1,000,000-char log line and a CRLF token forges log lines.
+    [Theory]
+    [InlineData("unknown-type-name")]
+    [InlineData("unknown-complex-kind")]
+    [InlineData("malformed-decimal-shape")]
+    [InlineData("malformed-decimal-parts")]
+    [InlineData("duplicate-field-name")]
+    public void HostileTokensInReadMessages_AreBoundedAndNeutralized(string door)
+    {
+        // A poison token: control characters a log sink treats as line breaks, plus sheer length.
+        string poison = "p\r\n[CRITICAL] forged" + new string('q', 100_000);
+        string escaped = System.Text.Json.JsonSerializer.Serialize(poison);
+        const string FieldTail = ",\"nullable\":true,\"metadata\":{}}";
+        string json = door switch
+        {
+            "unknown-type-name" =>
+                "{\"type\":\"struct\",\"fields\":[{\"name\":\"f\",\"type\":" + escaped + FieldTail + "]}",
+            "unknown-complex-kind" => "{\"type\":" + escaped + "}",
+            "malformed-decimal-shape" =>
+                System.Text.Json.JsonSerializer.Serialize("decimal(10,2) " + poison),
+            "malformed-decimal-parts" =>
+                System.Text.Json.JsonSerializer.Serialize("decimal(" + poison + ")"),
+            "duplicate-field-name" =>
+                "{\"type\":\"struct\",\"fields\":[{\"name\":" + escaped + ",\"type\":\"string\"" + FieldTail
+                + ",{\"name\":" + escaped + ",\"type\":\"string\"" + FieldTail + "]}",
+            _ => throw new ArgumentOutOfRangeException(nameof(door)),
+        };
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.DoesNotContain(poison, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        // Bounded: the sanitizer caps the echoed token at 128 chars, so the whole message stays far below the
+        // 100,000-char token it was handed.
+        Assert.True(
+            ex.Message.Length < 1_000,
+            string.Create(CultureInfo.InvariantCulture, $"message was {ex.Message.Length} chars"));
     }
 }

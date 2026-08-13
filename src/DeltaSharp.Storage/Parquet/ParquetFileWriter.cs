@@ -54,6 +54,11 @@ internal sealed class ParquetFileWriter
     /// <exception cref="DeltaStorageException">A column's type has no supported Parquet mapping
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>), or a non-nullable column holds a null
     /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    /// <exception cref="SchemaValidationException">#710/#711: <paramref name="schema"/> cannot be serialized
+    /// into the Parquet footer's schema string — a field name / metadata key / metadata string value carries
+    /// invalid UTF-16 (an unpaired surrogate <c>Utf8JsonWriter</c> would lossily transcode to U+FFFD), or the
+    /// type tree nests deeper than the shared read/write JSON container bound. Fails closed before any bytes
+    /// are written.</exception>
     public async Task WriteAsync(
         Stream output, StructType schema, IReadOnlyList<ColumnBatch> batches, CancellationToken cancellationToken)
     {
@@ -153,6 +158,11 @@ internal sealed class ParquetFileWriter
     /// <exception cref="DeltaStorageException">A column's type has no supported Parquet mapping
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>), or a non-nullable column holds a null
     /// (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    /// <exception cref="SchemaValidationException">#710/#711: <paramref name="schema"/> cannot be serialized
+    /// into the Parquet footer's schema string — a field name / metadata key / metadata string value carries
+    /// invalid UTF-16 (an unpaired surrogate <c>Utf8JsonWriter</c> would lossily transcode to U+FFFD), or the
+    /// type tree nests deeper than the shared read/write JSON container bound. Fails closed before any bytes
+    /// are written.</exception>
     public async Task<WriteResult> WriteWithStatisticsAsync(
         Stream output,
         StructType schema,

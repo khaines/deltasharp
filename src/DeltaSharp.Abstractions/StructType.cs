@@ -1,5 +1,6 @@
 using System.Collections.ObjectModel;
 using System.Text;
+using DeltaSharp.Diagnostics;
 
 namespace DeltaSharp.Types;
 
@@ -96,8 +97,11 @@ public sealed class StructType : DataType, IReadOnlyList<StructField>
 
             if (!_indexByName.TryAdd(field.Name, i))
             {
+                // #683-class message hygiene: this constructor is reached from SchemaJson.ReadStruct, i.e.
+                // from an UNTRUSTED schemaString, so the duplicated name is attacker-authored, unbounded, and
+                // may carry control characters. Bound + neutralize it before echo (the positions are ints).
                 throw new SchemaValidationException(
-                    $"Duplicate field name '{field.Name}' in struct (at positions "
+                    $"Duplicate field name '{DiagnosticText.Sanitize(field.Name)}' in struct (at positions "
                     + $"{_indexByName[field.Name]} and {i}).");
             }
         }

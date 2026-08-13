@@ -2,6 +2,7 @@ using System.Buffers;
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using DeltaSharp.Diagnostics;
 
 namespace DeltaSharp.Types;
 
@@ -24,10 +25,28 @@ internal static class SchemaJson
     /// <c>JsonDocumentOptions.MaxDepth = MaxDepth</c> (rejecting any JSON nested deeper) and
     /// <see cref="ToJson(DataType)"/> refuses to open a container once <see cref="Utf8JsonWriter.CurrentDepth"/>
     /// reaches this bound. <see cref="Utf8JsonWriter.CurrentDepth"/> counts open objects/arrays exactly as
-    /// <see cref="JsonDocument"/> measures depth, so the two agree to the level: JSON with container depth
-    /// &lt;= <see cref="MaxDepth"/> round-trips and depth &gt; <see cref="MaxDepth"/> is rejected on both
-    /// sides. Kept as one constant so a future edit cannot drift the bounds apart.
+    /// <see cref="JsonDocument"/> measures depth, so the two BOUNDS meet at the same container level and the
+    /// load-bearing invariant holds: <b>anything DeltaSharp WRITES it can read back</b> — every string
+    /// <see cref="ToJson(DataType)"/> agrees to emit is at container depth &lt;= <see cref="MaxDepth"/>, which
+    /// <see cref="FromJson(string)"/> always accepts.
     /// </summary>
+    /// <remarks>
+    /// <para><b>The converse does NOT hold, deliberately.</b> The read side is more tolerant than the write
+    /// side by exactly one container in one documented case: a FOREIGN schema whose deepest struct field
+    /// OMITS <c>"metadata"</c> (or writes <c>"metadata":null</c>). <see cref="FromJson(string)"/> tolerates
+    /// the omission (Spark/delta-rs both emit it, but the field is optional in practice), while
+    /// <see cref="ToJson(DataType)"/> always materializes a <c>"metadata":{}</c> object — one MORE container
+    /// than the input carried. So a legal foreign schema sitting exactly at read depth <see cref="MaxDepth"/>
+    /// reads fine and can be queried, but cannot be RE-SERIALIZED: a schema evolution / overwrite of that
+    /// table fails closed at <see cref="ToJson(DataType)"/>. That is the safe direction (a refusal, never a
+    /// silently unreadable commit) and is pinned as a documented limitation, not a claim of symmetry.</para>
+    /// <para>The unit is JSON CONTAINERS (open objects/arrays), not schema levels: an array/map level costs 1
+    /// container, a struct level costs 3 (the struct object, its <c>fields</c> array, the field object), so
+    /// <see cref="MaxDepth"/> = 64 admits ~21 nested struct levels. This is a serialization-shape bound and is
+    /// unrelated to <c>DeltaSharp.Executor.Physical.NestedTypeDepth.MaxDepth</c> (the query-execution
+    /// nested-value recursion bound), which counts TYPE levels — the two numbers measure different things and
+    /// are not in conflict.</para>
+    /// </remarks>
     private const int MaxDepth = 64;
 
     /// <summary>
@@ -54,7 +73,12 @@ internal static class SchemaJson
 
     /// <summary>Parses a type tree from Spark-compatible schema JSON produced by <see cref="ToJson(DataType)"/>.</summary>
     /// <exception cref="ArgumentNullException"><paramref name="json"/> is null.</exception>
-    /// <exception cref="SchemaValidationException">The JSON is malformed or describes an invalid/unknown type.</exception>
+    /// <exception cref="SchemaValidationException">The JSON is malformed, nests deeper than
+    /// <see cref="MaxDepth"/> JSON containers, contains invalid UTF-16 (an unpaired surrogate, raw or
+    /// <c>\uD800</c>-escaped), or describes an invalid/unknown type. This is the ONLY exception type this
+    /// method raises for a hostile document: it is the untrusted read boundary, and every caller
+    /// (<c>Snapshot</c>, <c>DeltaReadSource</c>, <c>DeltaLog</c>, <c>ChangeFeedReader</c>,
+    /// <c>DeltaCommitter</c>) catches exactly this to fail closed.</exception>
     public static DataType FromJson(string json)
     {
         ArgumentNullException.ThrowIfNull(json);
@@ -70,6 +94,21 @@ internal static class SchemaJson
         catch (JsonException ex)
         {
             throw new SchemaValidationException($"Invalid schema JSON: {ex.Message}", ex);
+        }
+        catch (Exception ex) when (ex is InvalidOperationException or ArgumentException)
+        {
+            // #710 (read-side mirror): System.Text.Json signals INVALID UTF-16 with untyped exceptions rather
+            // than JsonException — JsonDocument.Parse throws ArgumentException for a RAW unpaired surrogate
+            // ("Cannot transcode invalid UTF-16 string to UTF-8 JSON text") and JsonElement.GetString() /
+            // JsonProperty.Name throw InvalidOperationException for an ESCAPED one ("\uD800", "Cannot read
+            // incomplete UTF-16 JSON text as string with missing low surrogate"). Both would otherwise escape
+            // every caller's `catch (SchemaValidationException)` and break the documented fail-closed contract
+            // at the UNTRUSTED read boundary. Re-typed here so a hostile schemaString is exactly as
+            // classifiable as a malformed one. The message is deliberately CONTENT-FREE: the offending token
+            // is attacker-authored (and, being invalid UTF-16, is not safely renderable at all).
+            throw new SchemaValidationException(
+                "Invalid schema JSON: the document contains invalid UTF-16 (an unpaired surrogate, raw or "
+                + "escaped) that cannot be decoded as text. The offending content is not echoed.", ex);
         }
     }
 
@@ -126,13 +165,20 @@ internal static class SchemaJson
                 // #702: NullType serializes to the type name "void", which is NOT a Delta-protocol primitive.
                 // That string is intentionally still EMITTED here (and FromJson still ACCEPTS "void"/"null")
                 // so DeltaSharp stays tolerant of a schemaString another engine wrote — delta-rs 1.6.2 reads
-                // "void" as Arrow Null. It cannot, however, reach a schemaString DeltaSharp itself commits:
-                // NullType has no physical layout (PhysicalLayoutResolver.TryResolve returns false), so no
-                // ColumnVector/ColumnBatch can carry a NullType column into the write door, and even a
-                // partition-less data column is rejected fail-closed at ParquetTypeMapping.CreateField
-                // (UnsupportedFeature) BEFORE any metaData/schemaString is written. The write door is thus
-                // closed to NullType upstream of serialization; pinned by DeltaSchemaEnforcerTests and
-                // StorageHygieneSweepTests.Door_ParquetTypeMapping_UnsupportedScalarWrite.
+                // "void" as Arrow Null. Rejecting it in this SERIALIZER would be the wrong door: ToJson also
+                // re-serializes a FOREIGN snapshot's schema (checkpoint/footer/evolution paths), so a reject
+                // here would make a table another engine created unreadable rather than merely un-creatable.
+                //
+                // The door that keeps "void" out of a schemaString DeltaSharp COMMITS is the declared
+                // WRITE-SCHEMA eligibility check in the Delta writer
+                // (DeltaSharp.Storage.Delta.DeltaWriteSchemaEligibility.EnsureCommittable), which walks the
+                // whole type tree — top-level field, array element, map key AND value, nested struct field —
+                // and runs on every path that builds a metaData action (create, create-mapped, schema
+                // evolution, overwriteSchema replacement), INDEPENDENT of how many data files are staged.
+                // That independence is the point: a ZERO-FILE create (an empty write to a fresh path)
+                // reaches none of the per-file guards — not ParquetTypeMapping.CreateField, not
+                // ValidateStagedWriteSchema — so before that check a `void` column committed at version 0 and
+                // produced a table DeltaSharp itself could not read.
                 if (type is AtomicType or DecimalType)
                 {
                     writer.WriteStringValue(type.TypeName);
@@ -163,15 +209,16 @@ internal static class SchemaJson
     // containers: one more would emit JSON at depth MaxDepth+1, which FromJson (JsonDocumentOptions.MaxDepth
     // = MaxDepth) rejects — a schema that would commit to metaData.schemaString and then be permanently
     // unreadable (#711). Utf8JsonWriter.CurrentDepth counts open objects/arrays exactly as JsonDocument
-    // measures depth, so the two bounds meet at the same level. The message names the limit and carries no
-    // caller-supplied content.
+    // measures depth, so the two bounds meet at the same level. The message names the limit AND its unit
+    // (JSON containers, not schema levels — see the MaxDepth remarks) and carries no caller-supplied content.
     private static void EnsureDepth(Utf8JsonWriter writer)
     {
         if (writer.CurrentDepth >= MaxDepth)
         {
             throw new SchemaValidationException(
-                $"Schema nesting exceeds the maximum supported depth of {MaxDepth}; a deeper schema would "
-                + "serialize to a schemaString that could never be read back.");
+                $"Schema nesting exceeds the maximum supported depth of {MaxDepth} (JSON container nesting; "
+                + "each struct level consumes 3 containers); a deeper schema would serialize to a "
+                + "schemaString that could never be read back.");
         }
     }
 
@@ -309,7 +356,11 @@ internal static class SchemaJson
                     "array" => ReadArray(element),
                     "map" => ReadMap(element),
                     "struct" => ReadStruct(element),
-                    _ => throw new SchemaValidationException($"Unknown complex type kind '{kind}'."),
+                    // #683-class message hygiene: `kind` is a raw token from an UNTRUSTED schemaString —
+                    // unbounded and control-char-bearing. Bound + neutralize it exactly as
+                    // ParquetTypeMapping does for the identical column-name echo.
+                    _ => throw new SchemaValidationException(
+                        $"Unknown complex type kind '{DiagnosticText.Sanitize(kind)}'."),
                 };
 
             default:
@@ -340,7 +391,10 @@ internal static class SchemaJson
             "timestamp" => TimestampType.Instance,
             "timestamp_ntz" => TimestampNtzType.Instance,
             "void" or "null" => NullType.Instance,
-            _ => throw new SchemaValidationException($"Unknown type name '{name}'."),
+            // Same hygiene obligation as the complex-kind arm: an unknown type NAME is attacker-authored
+            // content from a foreign schemaString, so it is bounded + control-char-neutralized before echo.
+            _ => throw new SchemaValidationException(
+                $"Unknown type name '{DiagnosticText.Sanitize(name)}'."),
         };
     }
 
@@ -351,8 +405,9 @@ internal static class SchemaJson
         if (open < 0 || close <= open || close != name.Length - 1)
         {
             // The closing paren must be the final character — reject trailing garbage such as
-            // "decimal(10,2) junk".
-            throw new SchemaValidationException($"Malformed decimal type '{name}'.");
+            // "decimal(10,2) junk". The name is untrusted (and here, by definition, malformed), so it is
+            // bounded + neutralized before echo.
+            throw new SchemaValidationException($"Malformed decimal type '{DiagnosticText.Sanitize(name)}'.");
         }
 
         string inner = name[(open + 1)..close];
@@ -361,7 +416,7 @@ internal static class SchemaJson
             || !int.TryParse(parts[0].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int precision)
             || !int.TryParse(parts[1].Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int scale))
         {
-            throw new SchemaValidationException($"Malformed decimal type '{name}'.");
+            throw new SchemaValidationException($"Malformed decimal type '{DiagnosticText.Sanitize(name)}'.");
         }
 
         // Constructor re-validates precision/scale and throws SchemaValidationException on bad ranges.

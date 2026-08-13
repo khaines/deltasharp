@@ -23,25 +23,29 @@ public sealed class DeltaSchemaEnforcerTests
 
     // ---- #702: NullType ("void") reachability through the Delta WRITE door -----------------------------
 
-    // VERDICT (#702): a NullType column CANNOT reach a committed metaData.schemaString, so SchemaJson
-    // emitting the non-protocol type name "void" is documentation-only — not a live write defect.
+    // VERDICT (#702, CORRECTED at Round-1 review): the pre-review claim — that a NullType column cannot reach
+    // a committed metaData.schemaString because ParquetTypeMapping.CreateField rejects it first — was FALSE.
+    // CreateField is a PER-FILE guard; a ZERO-FILE create (an empty write to a fresh path) stages no file at
+    // all, so neither CreateField nor DeltaTableWriter.ValidateStagedWriteSchema (which iterates the staged
+    // file list) ever runs, and the declared schema went straight into version 0 as "type":"void" — a table
+    // DeltaSharp itself then refused to read. See
+    // DeltaWriteSchemaEligibilityTests.ZeroFileCreate_WithVoidColumn_CommitsNothing for the end-to-end repro.
     //
-    // DeltaSchemaEnforcer.Reconcile is NOT the guard that closes this: it runs only for an append/overwrite
-    // against an EXISTING table (a CREATE at version 0 bypasses it entirely), and to reach even the enforcer
-    // a write must first produce staged Parquet data files. The write door stages every file through
-    // ParquetFileWriter -> ParquetTypeMapping.CreateField, whose default arm rejects NullType fail-closed
-    // (StorageErrorKind.UnsupportedFeature) BEFORE any metaData is written. A NullType column also has no
-    // physical layout (PhysicalLayoutResolver.TryResolve returns false), so it cannot even be materialized
-    // into a ColumnVector/ColumnBatch to hand to the door. Both facts are upstream of serialization, so the
-    // "void" string is never committed by DeltaSharp. Read-side tolerance is deliberately unchanged
-    // (SchemaJson.FromJson still accepts "void"/"null"), so a schemaString another engine wrote — delta-rs
-    // 1.6.2 maps "void" to Arrow Null — still round-trips.
+    // The door is now closed at DeltaWriteSchemaEligibility.EnsureCommittable, invoked on every path that
+    // builds a metaData action, INDEPENDENT of the staged-file count. DeltaSchemaEnforcer.Reconcile is still
+    // not the guard (a CREATE at version 0 bypasses it entirely). Read-side tolerance is deliberately
+    // unchanged (SchemaJson.FromJson still accepts "void"/"null"), so a schemaString another engine wrote —
+    // delta-rs 1.6.2 maps "void" to Arrow Null — still round-trips.
+    //
+    // This test keeps the per-file guard honest; the write-schema door itself is pinned end-to-end by
+    // DeltaWriteSchemaEligibilityTests.
     [Fact]
-    public void NullTypeColumn_IsRejectedAtTheWriteDoor_SoVoidCannotReachSchemaString()
+    public void NullTypeColumn_IsAlsoRejectedByThePerFileParquetGuard()
     {
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
             () => ParquetTypeMapping.CreateField(new StructField("n", DataTypes.NullType, nullable: true)));
 
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
         Assert.Contains("is not supported", ex.Message, StringComparison.Ordinal);
     }
 
