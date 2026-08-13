@@ -64,11 +64,16 @@ internal enum DeltaProtocolErrorKind
 /// the same obligation. Coverage is cross-checked by the source-scan guard
 /// <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
 /// <c>storage-exception-producer-inventory.tsv</c>), which — <b>for the interpolated-string-hole shape it
-/// walks</b> — fails CI when a producer token is neither hygiene-wrapped (semantic-model-resolved to a
-/// <c>DiagnosticText</c> type or <c>LocalFileSystemBackend.Redact</c>) nor classified in the site-keyed
-/// inventory (#749). It is an audit prompt for that shape, not a proof of hygiene for every shape; the
-/// composition/pass-through/non-<c>*Exception</c>-helper blind spots listed in the log-routing doc remain
-/// reviewer obligations.
+/// walks</b> — fails CI when a producer token is neither hygiene-wrapped (semantic-model-resolved to an
+/// allowlisted sanitizing method on a <c>DiagnosticText</c> type — never the raw-echoing
+/// <c>DescribeWithoutInner</c> — or <c>LocalFileSystemBackend.Redact</c>) nor auto-cleared as a bounded value
+/// type (integral/float/decimal/enum/<c>Guid</c>/<c>DateTime</c>/<c>DateTimeOffset</c>/<c>TimeSpan</c>,
+/// cleared with no inventory row) nor classified in the site-keyed
+/// <c>(file, type, member, token)</c> inventory (#749). It is an audit prompt for that shape, not a proof of hygiene for every shape; the
+/// composition/pass-through/non-<c>*Exception</c>-helper blind spots (plus a tenant-derived numeric/temporal/
+/// <c>Guid</c> value auto-cleared as BOUNDED) listed in the log-routing doc remain reviewer obligations. The
+/// <c>sanitized-upstream</c>/<c>fixed</c> classification is an unverified provenance claim (strongest for
+/// parameter tokens).
 /// </remarks>
 internal sealed class DeltaProtocolException : Exception
 {

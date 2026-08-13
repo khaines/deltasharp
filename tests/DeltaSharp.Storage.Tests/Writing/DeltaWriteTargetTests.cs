@@ -277,18 +277,24 @@ public sealed class DeltaWriteTargetTests : IDisposable
     [Theory]
     [InlineData("a/b")]     // a raw '/' would fabricate a spurious path segment
     [InlineData("a=b")]     // a raw '=' would fabricate a second Hive key/value split
-    [InlineData("..")]      // a raw ".." would climb out of the confined table root
     [InlineData("région")]  // a non-ASCII name (Uri.EscapeDataString differs from Spark escapePathName)
     public void HivePartitionSegment_HostileColumnName_IsSingleInjectionSafeSegment(string column)
     {
         // #708: a legal-but-hostile partition column NAME must render as exactly ONE directory segment with
         // exactly ONE structural '=' (the Hive key/value separator) and no embedded '/'. The encoding is a
         // directory-injection hardening, NOT parity with Spark's escapePathName alphabet (see #806).
+        //
+        // NOTE: a raw ".." is NOT neutralized by this ENCODER (Uri.EscapeDataString treats '.' as unreserved,
+        // so ".." survives verbatim) — the '..' path-climb control is the committer guard
+        // EnsureNoneModePartitionNamesSafe / FindUnsafePathSegmentReason, tested separately, not this encoder.
         string segment = DeltaWriteEncoding.HivePartitionSegment(column, "v");
 
         Assert.DoesNotContain('/', segment);                 // no fabricated sub-directory
         Assert.Equal(1, segment.Count(c => c == '='));       // exactly one structural key/value split
-        // The value half is intact and the raw hostile name never appears verbatim in the key half.
+        // The raw hostile name never appears verbatim in the segment (each of these rows is percent-encoded,
+        // so this assertion is DISCRIMINATING — it fails if the name encoding is removed).
+        Assert.DoesNotContain(column, segment, StringComparison.Ordinal);
+        // The value half is intact.
         Assert.EndsWith("=v", segment, StringComparison.Ordinal);
     }
 

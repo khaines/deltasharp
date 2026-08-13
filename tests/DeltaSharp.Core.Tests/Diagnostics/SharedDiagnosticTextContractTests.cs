@@ -674,15 +674,38 @@ public sealed class SharedDiagnosticTextContractTests
     }
 
     [Theory]
+    [InlineData("a, b")]           // separator-bearing name
+    [InlineData("say \"hi\"")]     // quote-bearing name
+    [InlineData("… (+7 more)")]    // forged elision-marker lead
+    public void SanitizeAndJoinCounted_QuotesHostileItem_AndAppendsStructuralElision(string hostile)
+    {
+        // #751 C1(a): SanitizeAndJoinCounted must (a) RFC-4180 QUOTE a hostile item (separator-bearing,
+        // quote-bearing, or '…'-lead) so it cannot masquerade as two columns / as the structural marker, AND
+        // (b) append the STRUCTURAL "… (+N more)" tail BARE when total > shown.Count. total 9 - shown 2 = 7.
+        // Dropping the EscapeItem quoting (SharedDiagnosticText / DiagnosticText.cs:~293) turns this red.
+        var shown = new[] { hostile, "clean" };
+
+        string rendered = SharedDiagnosticText.SanitizeAndJoinCounted(shown, total: 9, maxItemLength: 64);
+
+        string quoted = "\"" + hostile.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+        Assert.StartsWith(quoted + ", clean", rendered);   // hostile item quoted, clean item verbatim
+        Assert.EndsWith(", … (+7 more)", rendered);          // structural elision appended BARE
+    }
+
+    [Theory]
     [InlineData(1)]
+    [InlineData(3)]
     [InlineData(7)]
+    [InlineData(11)]
     [InlineData(20)]
+    [InlineData(42)]
+    [InlineData(99)]
     public void SanitizeAndJoin_IsInjective_ParseReversesJoin_OverAHostileAlphabet(int seed)
     {
         // Round-trip / injectivity property (#751): for any list whose length does not force an elision,
         // parse(join(items)) == items.Select(Sanitize). The corpus is drawn from the adversarial alphabet
         // that motivated quoting — the separator, a quote, the elision-marker shape, control characters, and
-        // boundary lengths — so a regression in the escaping or the '…'-lead force-quote turns this red.
+        // boundary lengths — so a regression in the escaping turns this red.
         const int maxItemLength = 24;
         string[] alphabet =
         [
@@ -702,6 +725,56 @@ public sealed class SharedDiagnosticTextContractTests
         string[] parsed = ParseRfc4180(joined, ", ");
 
         Assert.Equal(expected, parsed);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(7)]
+    [InlineData(11)]
+    [InlineData(20)]
+    [InlineData(42)]
+    [InlineData(99)]
+    public void SanitizeAndJoin_ForcedElision_AppendsExactlyOneStructuralMarker_WithTheRealHiddenCount(int seed)
+    {
+        // #751 C2 second leg: when maxItems < count a STRUCTURAL "… (+N more)" marker IS appended (exactly
+        // one, at the tail, BARE), and N is the REAL hidden count (count - maxItems). The '…'-lead force-quote
+        // still holds: any shown item literally leading with '…' renders quoted, so the structural marker is
+        // the ONLY bare "… (+N more)" — an oracle a regression in the force-quote or the elision count breaks.
+        const int maxItemLength = 24;
+        string[] alphabet =
+        [
+            "clean", "col.b", "feature-x", "a", "a, b", "say \"hi\"", "… (+7 more)", "…leading",
+            "a\r\nb", new string('z', 40), "trailing…", "a,b,c",
+        ];
+
+        var rng = new Random(seed);
+        int count = rng.Next(3, 16);
+        int maxItems = rng.Next(1, count);   // strictly fewer shown than present -> forced elision
+        string[] raw = Enumerable.Range(0, count).Select(_ => alphabet[rng.Next(alphabet.Length)]).ToArray();
+
+        string joined = SharedDiagnosticText.SanitizeAndJoin(raw, maxItemLength, maxItems, separator: ", ");
+
+        string marker = string.Create(CultureInfo.InvariantCulture, $"… (+{count - maxItems} more)");
+        Assert.EndsWith(", " + marker, joined);
+
+        // Exactly ONE occurrence of the BARE structural marker: a forged '…'-lead item renders quoted
+        // ("\"…"), so it never matches the unquoted ", …" boundary. Count bare-marker occurrences.
+        int occurrences = CountOccurrences(joined, ", " + marker);
+        Assert.Equal(1, occurrences);
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        int n = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal);
+            i >= 0;
+            i = haystack.IndexOf(needle, i + 1, StringComparison.Ordinal))
+        {
+            n++;
+        }
+
+        return n;
     }
 
     // A minimal RFC-4180 reader for the SanitizeAndJoin grammar: a field beginning with '"' is quoted and

@@ -60,6 +60,36 @@ public sealed class ParquetWriterTests
     }
 
     [Fact]
+    public async Task WriteAsync_SchemaMismatchMessage_QuotesCommaBearingColumnName_NotAliasedAsTwoColumns()
+    {
+        // #751 storage-level pin for the DescribeSchema -> SanitizeAndJoinCounted quoting. The writer's
+        // schema-mismatch guard renders BOTH schemas via DescribeSchema; a foreign column literally named
+        // `a, b` must render RFC-4180 QUOTED so it cannot masquerade as two columns. Dropping the
+        // SanitizeAndJoinCounted quoting (DiagnosticText.cs:~293) turns this red.
+        var writerSchema = new StructType(new[]
+        {
+            new StructField("x", DataTypes.LongType, nullable: false),
+        });
+        var batchSchema = new StructType(new[]
+        {
+            new StructField("a, b", DataTypes.LongType, nullable: false),
+        });
+        MutableColumnVector col = ColumnVectors.Create(DataTypes.LongType, 1);
+        col.AppendValue(1L);
+        var batch = new ManagedColumnBatch(batchSchema, new ColumnVector[] { col }, 1);
+
+        using var stream = new MemoryStream();
+        ArgumentException ex = await Assert.ThrowsAsync<ArgumentException>(
+            () => new ParquetFileWriter().WriteAsync(
+                stream, writerSchema, new[] { batch }, CancellationToken.None));
+
+        // The comma-bearing name renders quoted...
+        Assert.Contains("struct with 1 column(s): [\"a, b\"]", ex.Message);
+        // ...and NEVER as a bare two-column split.
+        Assert.DoesNotContain("struct with 1 column(s): [a, b]", ex.Message);
+    }
+
+    [Fact]
     public async Task WrittenFile_IsReadableByParquetNetDirectly()
     {
         using var stream = new MemoryStream();

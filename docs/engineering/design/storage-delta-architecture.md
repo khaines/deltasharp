@@ -261,8 +261,15 @@ orphan data files (never active) but no partial log; an acknowledged commit is d
 >   deletes by directory-prefix on the **raw** logical name must be updated to key on the percent-encoded
 >   segment (or, preferably, drive off `add.partitionValues` rather than the path), since new writes no longer
 >   land under the raw-name prefix for non-unreserved names.
+> - **Failure signal is silent under-deletion, not an error.** A prefix-keyed DSAR / retention / erasure job
+>   that still enumerates by the **raw** logical-name prefix does **not** fault — it simply matches nothing
+>   under the new encoded prefix and **silently under-deletes** (a compliance miss, not a crash). Detection:
+>   scan `add.partitionValues` for any name/value carrying a character outside the RFC-3986 unreserved set
+>   (i.e. any name/value where `EscapeDataString(raw) != raw`); during the legacy-window sweep, enumerate the
+>   **union** `{raw, EscapeDataString(raw)}` so both pre-#708 raw-key and post-#708 encoded directories are
+>   covered.
 
-
+### 2.6 Public (packable) API surface — kept minimal
 
 Only user-facing types cross into `DeltaSharp.Core`/`DeltaSharp.Abstractions` (must compile on `net8.0`
 until the sunset, stay reflection-free and trim/AOT-annotation-clean, and hold **no** Engine/Storage

@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Text.RegularExpressions;
 using DeltaSharp.Plans.Logical;
 using Xunit;
 
@@ -110,26 +111,72 @@ public sealed class SecretRedactionTests
     }
 
     [Fact]
-    public void RedactPath_BoundsInputAndTerminatesQuickly_OnAdversarialUnboundedInput()
+    public void AllThreeRedactionPasses_CompileNonBacktracking_SoNoPassCanReDoS()
     {
-        // BEHAVIOUR PIN for the RedactScanLimit input bound (Round-1). A long scheme-prefixed path with no
-        // '@' was the ReDoS trigger (128 KB -> 28 s, 256 KB -> 100 s BEFORE the NonBacktracking + input
-        // bound). With both in place the render is linear AND the OUTPUT is bounded by the scan limit, so a
-        // maintainer who silently removes the bound turns this red: the output length assertion fails and the
-        // timing budget catches a re-introduced quadratic.
-        string adversarial = "s3://" + new string('a', 256 * 1024) + "/tail.parquet";
+        // STRUCTURAL PIN (Round-2). All three recognizer passes MUST carry RegexOptions.NonBacktracking so
+        // none can ReDoS on a long scheme-prefixed / query-flanked path. Read .Options off each compiled
+        // [GeneratedRegex] via its parameterless factory (they are private static partial). Removing
+        // NonBacktracking from ANY of the three — including SensitiveQueryValue() — turns this RED.
+        Type type = typeof(SecretRedaction);
+        foreach (string factory in new[] { "ColonBearingUserInfo", "ColonlessUserInfo", "SensitiveQueryValue" })
+        {
+            var method = type.GetMethod(
+                factory,
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+            Assert.NotNull(method);
+            var regex = (Regex)method!.Invoke(null, null)!;
+            Assert.True(
+                regex.Options.HasFlag(RegexOptions.NonBacktracking),
+                $"SecretRedaction.{factory}() is missing RegexOptions.NonBacktracking — that pass can ReDoS.");
+        }
+    }
+
+    [Fact]
+    public void RedactPath_QueryPass_TerminatesQuickly_OnAdversarialQueryFlankedInput()
+    {
+        // BEHAVIOURAL ReDoS pin for the QUERY pass specifically (Round-2). This input actually REACHES the
+        // query pass: a `sig=`-flanked value with a long adversarial '?'-run tail. Before NonBacktracking on
+        // SensitiveQueryValue() this pass measured 187,412 ms on an 8 KB input; now it is linear (~75 ms).
+        // No input truncation exists anymore, so the full input reaches the pass. Timing is a GENEROUS,
+        // SECONDARY canary (the structural pin above is primary).
+        string adversarial = "s3://b/k?sig=" + new string('S', 4096) + new string('?', 4096);
 
         var sw = Stopwatch.StartNew();
         string redacted = SecretRedaction.RedactPath(adversarial);
         sw.Stop();
 
+        Assert.Equal("s3://b/k?sig=<redacted>", redacted);
         Assert.True(
-            redacted.Length <= SecretRedaction.RedactScanLimit,
-            $"RedactPath output ({redacted.Length}) exceeded the RedactScanLimit "
-            + $"({SecretRedaction.RedactScanLimit}); the input bound was removed or widened.");
-        Assert.True(
-            sw.ElapsedMilliseconds < 2000,
-            $"RedactPath took {sw.ElapsedMilliseconds} ms on a 256 KB adversarial input — a quadratic/ReDoS "
-            + "regression (expected sub-second with NonBacktracking + input bound).");
+            sw.ElapsedMilliseconds < 10_000,
+            $"RedactPath took {sw.ElapsedMilliseconds} ms on an 8 KB query-flanked input — a query-pass "
+            + "ReDoS regression (expected sub-second with NonBacktracking on SensitiveQueryValue()).");
+    }
+
+    [Fact]
+    public void RedactPath_BackslashBearingUserInfo_IsFullyMasked_NoRawRunLeaks()
+    {
+        // ROUND-2 REGRESSION PIN. The deleted RedactScanLimit truncation could cut INSIDE a userinfo at a
+        // '/' or '\\' before its terminating '@', surfacing a multi-KB unmasked credential prefix. A
+        // backslash-bearing colon-BEARING userinfo > 8 KB must now be fully masked to the last '@'.
+        string path = "s3://user:" + new string('S', 5000) + "\\" + new string('T', 5000) + "@host/key";
+
+        string redacted = SecretRedaction.RedactPath(path);
+
+        Assert.Equal("s3://<redacted>@host/key", redacted);
+        Assert.DoesNotContain("SSSS", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("TTTT", redacted, System.StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // ROUND-2 ADLS-spoof: a mid-string 'abfss://…@' is NOT the leading scheme, so the exemption must NOT
+    // apply — the embedded credential must be MASKED (m.Index == 0 anchor).
+    [InlineData("s3://abfss://SECRETTOKEN@host/key")]
+    [InlineData("s3://bucket/abfss://SECRETTOKEN@x")]
+    public void RedactPath_ForgedMidStringAdlsScheme_IsMasked_NotExempted(string path)
+    {
+        string redacted = SecretRedaction.RedactPath(path);
+
+        Assert.Contains("<redacted>@", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("SECRETTOKEN", redacted, System.StringComparison.Ordinal);
     }
 }

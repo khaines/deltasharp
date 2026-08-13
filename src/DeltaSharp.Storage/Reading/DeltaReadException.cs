@@ -20,7 +20,12 @@ namespace DeltaSharp.Storage;
 /// message here via an interpolation hole are cross-checked by the source-scan guard
 /// <c>StorageExceptionProducerInventoryGuardTests</c> (backed by
 /// <c>storage-exception-producer-inventory.tsv</c>), which fails CI when such a token is neither
-/// hygiene-wrapped nor classified in the site-keyed inventory (#749).
+/// hygiene-wrapped nor auto-cleared as a bounded value type (integral/float/decimal/enum/<c>Guid</c>/
+/// <c>DateTime</c>/<c>DateTimeOffset</c>/<c>TimeSpan</c>, cleared with no inventory row) nor classified in
+/// the site-keyed <c>(file, type, member, token)</c> inventory (#749). A tenant-derived numeric/temporal/
+/// <c>Guid</c> value auto-clears as BOUNDED, and whether it is personal data is a reviewer obligation; the
+/// <c>sanitized-upstream</c>/<c>fixed</c> classification is an unverified provenance claim (strongest for
+/// parameter tokens).
 /// </remarks>
 public sealed class DeltaReadException : Exception
 {

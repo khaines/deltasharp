@@ -22,20 +22,27 @@ namespace DeltaSharp.Core.Tests.Diagnostics;
 /// real storage sources with the C# compiler (<see cref="CSharpSyntaxTree"/>), builds a semantic model over
 /// an <b>explicitly-anchored</b> reference set (the runtime's own BCL + <c>DeltaSharp.Abstractions</c>), and
 /// for every exception-message interpolation hole resolves the token's TYPE. A token is auto-cleared when it
-/// is either (a) wrapped in a hygiene helper whose call RESOLVES (via the semantic model) to a method on
-/// <c>DeltaSharp.Diagnostics.DiagnosticText</c>, <c>DeltaSharp.Storage.Delta.DiagnosticText</c>, or
-/// <c>LocalFileSystemBackend.Redact</c> — SANITIZED (a bare <c>Sanitize</c>-named local does NOT clear); or
+/// is either (a) wrapped in a hygiene helper whose call RESOLVES (via the semantic model) to an
+/// ALLOWLISTED sanitizing/bounding method (<c>Sanitize</c>/<c>SanitizeAndJoin</c>/
+/// <c>SanitizeAndJoinCounted</c>/<c>SanitizeTo</c>/<c>SanitizeToBudget</c>/<c>DescribePath</c>/
+/// <c>DescribeSchema</c>/<c>DescribeType</c>) on <c>DeltaSharp.Diagnostics.DiagnosticText</c> or
+/// <c>DeltaSharp.Storage.Delta.DiagnosticText</c>, or <c>LocalFileSystemBackend.Redact</c> — SANITIZED (a
+/// bare <c>Sanitize</c>-named local does NOT clear, and <c>DiagnosticText.DescribeWithoutInner</c>, which
+/// echoes <c>exception.Message</c> RAW, is DELIBERATELY NOT allowlisted); or
 /// (b) resolved to a bounded value type (integral/enum/bool/char/<c>DateTimeOffset</c>/<c>Guid</c>/…) —
 /// BOUNDED. Every remaining token MUST appear in the checked-in inventory
 /// <c>storage-exception-producer-inventory.tsv</c>, keyed on the producer <b>site</b>
-/// (file + enclosing member + token), with an explicit classification and justification.
+/// (file + enclosing TYPE chain + enclosing member + token), with an explicit classification and justification.
 /// </para>
 /// <para>
-/// <b>Round-1 hardening.</b> (1) The hygiene clearance is resolved by SEMANTIC MODEL and gated on the
-/// containing type, not a bare method-name match — a forged local <c>Sanitize</c> identity no longer
-/// auto-clears; an unresolved symbol falls back to residual (fail-safe). (2) Rows are keyed on the site
-/// <c>(file, member, token)</c>, so a NEW unsanitized producer reusing a generic name already inventoried
-/// elsewhere in the file (<c>detail</c>/<c>context</c>/<c>reason</c>/…) cannot auto-clear. (3) Write mode
+/// <b>Round-1/Round-2 hardening.</b> (1) The hygiene clearance is resolved by SEMANTIC MODEL and gated on an
+/// explicit <c>(type, method)</c> ALLOWLIST, not a bare method-name match and not a whole-type clearance —
+/// a forged local <c>Sanitize</c> identity does not auto-clear, and a <c>DescribeWithoutInner</c> wrapper (raw
+/// <c>.Message</c> echo) no longer auto-clears as sanitized (Round-2); an unresolved symbol falls back to
+/// residual (fail-safe). (2) Rows are keyed on the site <c>(file, type, member, token)</c> — the enclosing
+/// TYPE chain (<c>INamedTypeSymbol.ToDisplayString()</c>) is now in the key, so a nested-type/overload/
+/// <c>partial</c>-class method-name collision cannot alias two classifications, and a NEW unsanitized producer
+/// reusing a generic name (<c>detail</c>/<c>context</c>/<c>reason</c>/…) cannot auto-clear. (3) Write mode
 /// <see cref="Assert.Fail(string)"/>s after regeneration, so it can never be a green audit. (4) The Roslyn
 /// reference set is anchored EXPLICITLY and the required anchor types are asserted resolved before scanning,
 /// so a missing reference is a NAMED failure, not a silent reclassification. (5) Duplicate <c>.tsv</c> keys
@@ -60,12 +67,24 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 {
     private const string InventoryFileName = "storage-exception-producer-inventory.tsv";
 
-    // Hygiene clearance is gated on the CONTAINING TYPE (resolved by the semantic model), not a bare
-    // method-name match. Any method on one of the two DiagnosticText types clears; LocalFileSystemBackend
-    // clears only via its private Redact. A local/foreign `Sanitize` therefore does NOT auto-clear.
+    // Hygiene clearance is gated on the CONTAINING TYPE (resolved by the semantic model) AND on an EXPLICIT
+    // (type, method) allowlist, not a bare method-name match and not a whole-type clearance. A whole-type
+    // clearance is unsound because DiagnosticText.DescribeWithoutInner emits `exception.Message` RAW — an
+    // interpolated raw-message pass-through wrapped in DescribeWithoutInner would auto-clear as sanitized.
+    // Only the methods that actually SANITIZE/BOUND their argument clear. A local/foreign `Sanitize` does
+    // NOT auto-clear (name match alone is forgeable and is rejected).
     private const string AbstractionsDiagnosticText = "DeltaSharp.Diagnostics.DiagnosticText";
     private const string StorageDiagnosticText = "DeltaSharp.Storage.Delta.DiagnosticText";
     private const string LocalBackend = "DeltaSharp.Storage.Backends.LocalFileSystemBackend";
+
+    // The sanitizing/bounding methods on either DiagnosticText type that genuinely neutralize their argument.
+    // DescribeWithoutInner is DELIBERATELY EXCLUDED (it echoes exception.Message raw). Any DescribeType/echo
+    // that surfaces a raw token is likewise excluded.
+    private static readonly HashSet<string> DiagnosticTextClearingMethods = new(StringComparer.Ordinal)
+    {
+        "Sanitize", "SanitizeAndJoin", "SanitizeAndJoinCounted", "SanitizeTo", "SanitizeToBudget",
+        "SanitizeEchoedToken", "DescribePath", "DescribeSchema", "DescribeType",
+    };
 
     private static readonly HashSet<string> AllowedClasses = new(StringComparer.Ordinal)
     {
@@ -88,21 +107,21 @@ public sealed class StorageExceptionProducerInventoryGuardTests
     public void EveryStorageExceptionMessageProducerToken_IsClassified_WithNoInventoryDrift()
     {
         HashSet<ProducerSite> residual = ScanResidualProducerTokens();
-        var inventory = LoadInventory();
 
         if (Environment.GetEnvironmentVariable("DELTASHARP_WRITE_PRODUCER_INVENTORY") == "1")
         {
-            WriteInventory(residual, inventory);
+            WriteInventory(residual, LoadInventoryForRegen());
             Assert.Fail(
                 "inventory regenerated; classify new rows and re-run in verify mode. Write mode never passes "
                 + "so it cannot be mistaken for a green audit.");
         }
 
+        var inventory = LoadInventory();
         // 1. Every discovered residual token has an inventory row — a NEW unclassified producer is RED here.
         var missing = residual.Where(r => !inventory.ContainsKey(r))
-            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Member, StringComparer.Ordinal)
-            .ThenBy(r => r.Token, StringComparer.Ordinal)
-            .Select(r => $"{r.File}\t{r.Member}\t{r.Token}")
+            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Type, StringComparer.Ordinal)
+            .ThenBy(r => r.Member, StringComparer.Ordinal).ThenBy(r => r.Token, StringComparer.Ordinal)
+            .Select(r => $"{r.File}\t{r.Type}\t{r.Member}\t{r.Token}")
             .ToList();
         Assert.True(
             missing.Count == 0,
@@ -112,9 +131,9 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
         // 2. Every inventory row still corresponds to a live producer — a stale row is RED (forces upkeep).
         var stale = inventory.Keys.Where(k => !residual.Contains(k))
-            .OrderBy(k => k.File, StringComparer.Ordinal).ThenBy(k => k.Member, StringComparer.Ordinal)
-            .ThenBy(k => k.Token, StringComparer.Ordinal)
-            .Select(k => $"{k.File}\t{k.Member}\t{k.Token}")
+            .OrderBy(k => k.File, StringComparer.Ordinal).ThenBy(k => k.Type, StringComparer.Ordinal)
+            .ThenBy(k => k.Member, StringComparer.Ordinal).ThenBy(k => k.Token, StringComparer.Ordinal)
+            .Select(k => $"{k.File}\t{k.Type}\t{k.Member}\t{k.Token}")
             .ToList();
         Assert.True(
             stale.Count == 0,
@@ -126,11 +145,11 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         {
             Assert.True(
                 AllowedClasses.Contains(entry.Class),
-                $"{InventoryFileName} row '{key.File}\t{key.Member}\t{key.Token}' has invalid class "
+                $"{InventoryFileName} row '{key.File}\t{key.Type}\t{key.Member}\t{key.Token}' has invalid class "
                 + $"'{entry.Class}'. Allowed: " + string.Join(", ", AllowedClasses.OrderBy(c => c, StringComparer.Ordinal)));
             Assert.False(
                 string.IsNullOrWhiteSpace(entry.Justification),
-                $"{InventoryFileName} row '{key.File}\t{key.Member}\t{key.Token}' has an empty justification.");
+                $"{InventoryFileName} row '{key.File}\t{key.Type}\t{key.Member}\t{key.Token}' has an empty justification.");
         }
     }
 
@@ -164,6 +183,56 @@ public sealed class StorageExceptionProducerInventoryGuardTests
     }
 
     [Fact]
+    public void GuardOfTheGuard_DescribeWithoutInnerWrapper_IsNotCleared_ButSanitizingWrappersAre()
+    {
+        // ROUND-2 guard-of-the-guard. Hygiene clearance is a (type, method) ALLOWLIST, not whole-type. Prove
+        // it directly against IsHygieneWrapped: a DiagnosticText.DescribeWithoutInner(...) wrapper — which
+        // emits exception.Message RAW — must NOT clear, while Sanitize/DescribeSchema/DescribePath on the same
+        // type MUST. A stub `DiagnosticText` in the DeltaSharp.Storage.Delta namespace makes the receiver type
+        // resolve to the same display string the real one carries, so the allowlist is exercised exactly.
+        const string source = @"
+namespace DeltaSharp.Storage.Delta
+{
+    internal static class DiagnosticText
+    {
+        internal static string DescribeWithoutInner(System.Exception e) => e.Message;
+        internal static string DescribeSchema(object s) => string.Empty;
+        internal static string DescribePath(string s) => s;
+        internal static string Sanitize(string s) => s;
+    }
+}
+
+internal sealed class Probe
+{
+    public string RawEcho(System.Exception ex) => $""{DeltaSharp.Storage.Delta.DiagnosticText.DescribeWithoutInner(ex)}"";
+    public string SchemaWrap(object s) => $""{DeltaSharp.Storage.Delta.DiagnosticText.DescribeSchema(s)}"";
+    public string PathWrap(string s) => $""{DeltaSharp.Storage.Delta.DiagnosticText.DescribePath(s)}"";
+    public string SanitizeWrap(string s) => $""{DeltaSharp.Storage.Delta.DiagnosticText.Sanitize(s)}"";
+}";
+
+        SyntaxTree tree = CSharpSyntaxTree.ParseText(source, ParseLegs[0]);
+        var comp = CSharpCompilation.Create(
+            "GuardOfGuardProbe", new[] { tree }, BuildReferences(),
+            new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary));
+        SemanticModel model = comp.GetSemanticModel(tree);
+
+        var holes = tree.GetRoot().DescendantNodes()
+            .OfType<InterpolatedStringExpressionSyntax>()
+            .SelectMany(i => i.Contents.OfType<InterpolationSyntax>())
+            .ToDictionary(
+                h => ((MemberAccessExpressionSyntax)((InvocationExpressionSyntax)h.Expression).Expression).Name.Identifier.ValueText,
+                h => h.Expression);
+
+        Assert.False(
+            IsHygieneWrapped(model, holes["DescribeWithoutInner"]),
+            "DescribeWithoutInner echoes exception.Message RAW — it MUST NOT auto-clear a producer token. "
+            + "A whole-type clearance (the Round-1 bug) would clear it green.");
+        Assert.True(IsHygieneWrapped(model, holes["DescribeSchema"]), "DescribeSchema must clear.");
+        Assert.True(IsHygieneWrapped(model, holes["DescribePath"]), "DescribePath must clear.");
+        Assert.True(IsHygieneWrapped(model, holes["Sanitize"]), "Sanitize must clear.");
+    }
+
+    [Fact]
     public void EveryStorageSourceFile_ParsesCleanly_SoTheWalkCannotSilentlyDegrade()
     {
         var offenders = new List<string>();
@@ -186,7 +255,7 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
     // ----- scan -----
 
-    private readonly record struct ProducerSite(string File, string Member, string Token);
+    private readonly record struct ProducerSite(string File, string Type, string Member, string Token);
 
     private static readonly CSharpParseOptions[] ParseLegs =
     [
@@ -256,7 +325,8 @@ public sealed class StorageExceptionProducerInventoryGuardTests
                             continue; // BOUNDED
                         }
 
-                        residual.Add(new ProducerSite(rel, EnclosingMemberName(hole), hole.Expression.ToString()));
+                        residual.Add(new ProducerSite(
+                            rel, EnclosingTypeName(model, hole), EnclosingMemberName(hole), hole.Expression.ToString()));
                     }
                 }
             }
@@ -289,12 +359,13 @@ public sealed class StorageExceptionProducerInventoryGuardTests
         return false;
     }
 
-    // ROUND-1: resolve the invocation via the SEMANTIC MODEL and gate on the containing type. A bare
-    // method-name match is forgeable — a local `string Sanitize(string s) => s;` would auto-clear a raw
-    // token. Clearance requires the resolved method (or, when overload binding fails on an unresolved
-    // argument, the resolved RECEIVER TYPE) to belong to one of the two DiagnosticText types, or to be
-    // LocalFileSystemBackend.Redact. Neither path is a name match; an UNRESOLVED call on an unknown receiver
-    // falls back to residual (fail-safe).
+    // ROUND-2: resolve the invocation via the SEMANTIC MODEL and gate on an EXPLICIT (type, method)
+    // allowlist. A whole-type clearance is unsound: DiagnosticText.DescribeWithoutInner emits
+    // `exception.Message` raw, so wrapping a raw-message pass-through in it would auto-clear. Clearance
+    // requires the resolved method (or, when overload binding fails on an unresolved argument, the resolved
+    // RECEIVER TYPE plus the syntactic method name) to be one of the sanitizing/bounding methods on a
+    // DiagnosticText type, or LocalFileSystemBackend.Redact. An UNRESOLVED call on an unknown receiver falls
+    // back to residual (fail-safe).
     private static bool IsHygieneWrapped(SemanticModel model, ExpressionSyntax expr)
     {
         if (expr is not InvocationExpressionSyntax inv)
@@ -302,14 +373,14 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             return false;
         }
 
-        // Path 1: the invocation binds -> use the resolved method's containing type. Handles Redact and any
-        // DiagnosticText call whose arguments all resolve.
+        // Path 1: the invocation binds -> use the resolved method's containing type AND name. Handles Redact
+        // and any DiagnosticText call whose arguments all resolve.
         if (model.GetSymbolInfo(inv).Symbol is IMethodSymbol method)
         {
             string containing = method.ContainingType?.ToDisplayString() ?? string.Empty;
             if (containing is AbstractionsDiagnosticText or StorageDiagnosticText)
             {
-                return true;
+                return DiagnosticTextClearingMethods.Contains(method.Name);
             }
 
             return containing == LocalBackend && method.Name == "Redact";
@@ -317,8 +388,10 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
         // Path 2: overload binding failed because an argument is unresolved (e.g. a Parquet.Net-typed
         // `field.Name`/`leaf.Path`), but a type-qualified call `DiagnosticText.Method(...)` still resolves its
-        // RECEIVER independent of the arguments. Clearing on the resolved receiver TYPE (never a bare name)
-        // keeps a local/foreign `Sanitize` residual while a genuine DiagnosticText wrap clears.
+        // RECEIVER independent of the arguments. Clear on the resolved receiver TYPE plus the SYNTACTIC method
+        // name against the allowlist (never a bare name, never a whole-type clearance) — so a genuine
+        // sanitizing DiagnosticText wrap clears while a DescribeWithoutInner-wrapped raw pass-through, or a
+        // local/foreign `Sanitize`, stays residual.
         if (inv.Expression is MemberAccessExpressionSyntax ma)
         {
             string? receiverType = model.GetSymbolInfo(ma.Expression).Symbol switch
@@ -328,7 +401,7 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             };
             if (receiverType is AbstractionsDiagnosticText or StorageDiagnosticText)
             {
-                return true;
+                return DiagnosticTextClearingMethods.Contains(ma.Name.Identifier.ValueText);
             }
         }
 
@@ -358,6 +431,7 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             case SpecialType.System_UIntPtr:
             case SpecialType.System_Single:
             case SpecialType.System_Double:
+            case SpecialType.System_Decimal:
                 return true;
         }
 
@@ -366,12 +440,39 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             return IsBoundedType(nullable.TypeArguments[0]);
         }
 
+        // NOTE: `decimal` is matched via SpecialType.System_Decimal above — ToDisplayString() renders the C#
+        // keyword `decimal`, never `System.Decimal`, so a `"System.Decimal"` string match here would be DEAD.
+        // The remaining entries have no C# keyword, so ToDisplayString() DOES render them fully qualified.
         return type.ToDisplayString() switch
         {
             "System.DateTimeOffset" or "System.DateTime" or "System.TimeSpan" or "System.Version"
-                or "System.Int128" or "System.UInt128" or "System.Guid" or "System.Decimal" => true,
+                or "System.Int128" or "System.UInt128" or "System.Guid" => true,
             _ => false,
         };
+    }
+
+    // ROUND-2: the enclosing TYPE chain of a producer hole, resolved by the semantic model so a nested type
+    // (LocalFileSystemBackend.StagedWriteStream) or a `partial`-class split renders its full containing chain
+    // (INamedTypeSymbol.ToDisplayString()). Prefixing the key with the type disambiguates a method-name
+    // collision across a nested type or an overload that would otherwise alias two distinct classifications
+    // onto one (file, member, token) key. Falls back to the syntactic type identifier if the symbol does not
+    // resolve (fail-safe: still a stable, non-empty discriminator).
+    private static string EnclosingTypeName(SemanticModel model, SyntaxNode node)
+    {
+        for (SyntaxNode? n = node; n is not null; n = n.Parent)
+        {
+            if (n is BaseTypeDeclarationSyntax typeDecl)
+            {
+                if (model.GetDeclaredSymbol(typeDecl) is INamedTypeSymbol sym)
+                {
+                    return sym.ToDisplayString();
+                }
+
+                return typeDecl.Identifier.ValueText;
+            }
+        }
+
+        return "<file>";
     }
 
     // The enclosing member (method/local-function/ctor/property/accessor/indexer/field) of a producer hole,
@@ -488,6 +589,42 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
     // ----- inventory I/O -----
 
+    // Lenient loader for REGEN only: tolerates the previous 5-column layout (file, member, token, class,
+    // justification) AND the current 6-column one (file, type, member, token, class, justification), keyed on
+    // the type-INDEPENDENT tuple (file, member, token) so an existing classification is preserved across the
+    // type-in-key migration. Verify mode uses the strict LoadInventory below.
+    private static Dictionary<(string File, string Member, string Token), (string Class, string Justification)>
+        LoadInventoryForRegen()
+    {
+        string path = InventoryPath();
+        var map = new Dictionary<(string, string, string), (string, string)>();
+        if (!File.Exists(path))
+        {
+            return map;
+        }
+
+        foreach (string raw in File.ReadAllLines(path))
+        {
+            string line = raw.TrimEnd();
+            if (line.Length == 0 || line.StartsWith("#", StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            string[] p = line.Split('\t');
+            if (p.Length == 6)
+            {
+                map[(p[0], p[2], p[3])] = (p[4], p[5]);
+            }
+            else if (p.Length == 5)
+            {
+                map[(p[0], p[1], p[2])] = (p[3], p[4]);
+            }
+        }
+
+        return map;
+    }
+
     private static Dictionary<ProducerSite, (string Class, string Justification)> LoadInventory()
     {
         string path = InventoryPath();
@@ -501,15 +638,15 @@ public sealed class StorageExceptionProducerInventoryGuardTests
             }
 
             string[] parts = line.Split('\t');
-            Assert.True(parts.Length == 5, $"{InventoryFileName}: expected 5 tab-separated columns, got '{line}'.");
-            var key = new ProducerSite(parts[0], parts[1], parts[2]);
+            Assert.True(parts.Length == 6, $"{InventoryFileName}: expected 6 tab-separated columns, got '{line}'.");
+            var key = new ProducerSite(parts[0], parts[1], parts[2], parts[3]);
 
             // Duplicate keys must FAIL rather than silently overwrite a strong class with a weaker one.
             Assert.False(
                 map.ContainsKey(key),
-                $"{InventoryFileName}: duplicate row for site '{key.File}\t{key.Member}\t{key.Token}'. A "
+                $"{InventoryFileName}: duplicate row for site '{key.File}\t{key.Type}\t{key.Member}\t{key.Token}'. A "
                 + "duplicate would let a weaker class silently overwrite a stronger one.");
-            map[key] = (parts[3], parts[4]);
+            map[key] = (parts[4], parts[5]);
         }
 
         return map;
@@ -517,22 +654,24 @@ public sealed class StorageExceptionProducerInventoryGuardTests
 
     private static void WriteInventory(
         HashSet<ProducerSite> residual,
-        Dictionary<ProducerSite, (string Class, string Justification)> existing)
+        Dictionary<(string File, string Member, string Token), (string Class, string Justification)> existing)
     {
         var lines = new List<string>
         {
             "# storage-exception-producer-inventory.tsv — GENERATED KEY SET, MANUAL classification.",
-            "# Columns: file<TAB>member<TAB>token<TAB>class<TAB>justification.",
-            "# Keyed on the producer SITE (file + enclosing member + token) so a reused generic name in an",
-            "# already-inventoried file cannot auto-clear. Regenerate keys with DELTASHARP_WRITE_PRODUCER_INVENTORY=1;",
-            "# then classify any UNCLASSIFIED rows. Owned by StorageExceptionProducerInventoryGuardTests (#749).",
+            "# Columns: file<TAB>type<TAB>member<TAB>token<TAB>class<TAB>justification.",
+            "# Keyed on the producer SITE (file + enclosing TYPE chain + enclosing member + token) so a reused",
+            "# generic name across a nested type / overload / partial-class split cannot auto-clear. Regenerate",
+            "# keys with DELTASHARP_WRITE_PRODUCER_INVENTORY=1; then classify any UNCLASSIFIED rows. Owned by",
+            "# StorageExceptionProducerInventoryGuardTests (#749).",
         };
         foreach (var key in residual
-            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Member, StringComparer.Ordinal)
-            .ThenBy(r => r.Token, StringComparer.Ordinal))
+            .OrderBy(r => r.File, StringComparer.Ordinal).ThenBy(r => r.Type, StringComparer.Ordinal)
+            .ThenBy(r => r.Member, StringComparer.Ordinal).ThenBy(r => r.Token, StringComparer.Ordinal))
         {
-            (string Class, string Justification) v = existing.TryGetValue(key, out var e) ? e : ("UNCLASSIFIED", "TODO");
-            lines.Add($"{key.File}\t{key.Member}\t{key.Token}\t{v.Class}\t{v.Justification}");
+            (string Class, string Justification) v =
+                existing.TryGetValue((key.File, key.Member, key.Token), out var e) ? e : ("UNCLASSIFIED", "TODO");
+            lines.Add($"{key.File}\t{key.Type}\t{key.Member}\t{key.Token}\t{v.Class}\t{v.Justification}");
         }
 
         File.WriteAllLines(InventoryPath(), lines);
