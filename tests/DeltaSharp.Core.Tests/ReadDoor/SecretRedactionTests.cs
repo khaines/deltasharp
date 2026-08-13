@@ -202,4 +202,73 @@ public sealed class SecretRedactionTests
         Assert.Contains("<redacted>@", redacted, System.StringComparison.Ordinal);
         Assert.DoesNotContain("SECRETTOKEN", redacted, System.StringComparison.Ordinal);
     }
+
+    [Theory]
+    // ROUND-5 REGRESSION PIN. Both credential runs used to exclude '\s', and '\r'/'\n'/'\t' ARE whitespace,
+    // so a control character planted INSIDE the userinfo terminated the run before its closing '@', the match
+    // failed, and the ENTIRE credential was rendered verbatim — while the same path without the control
+    // character masked correctly, making the miss silent. The runs are now bounded only by '/', the real
+    // authority boundary. Restoring '\s' to either run turns the matching row RED.
+    [InlineData("s3://user:sec\r\nret@host/key", "s3://<redacted>@host/key")]
+    [InlineData("s3://user:sec\tret@host/key", "s3://<redacted>@host/key")]
+    [InlineData("s3://user:sec ret@host/key", "s3://<redacted>@host/key")]
+    // Colon-LESS control-char variant on a NON-ADLS scheme (the ADLS exemption is scheme-anchored and is
+    // pinned separately below): the token must be masked despite the embedded CR/LF.
+    [InlineData("https://TOK\r\nEN@host/key", "https://<redacted>@host/key")]
+    [InlineData("s3://TOK\tEN@host/key", "s3://<redacted>@host/key")]
+    public void RedactPath_ControlCharacterInsideUserInfo_StillMasks_ExactOutput(string path, string expected)
+    {
+        Assert.Equal(expected, SecretRedaction.RedactPath(path));
+    }
+
+    [Fact]
+    public void RedactPath_ControlCharacterInsideUserInfo_LeaksNoCredentialFragment()
+    {
+        // Non-vacuity companion to the exact-output rows: the credential fragments themselves are gone, not
+        // merely re-arranged, and no raw control character survives into the rendered path.
+        string redacted = SecretRedaction.RedactPath("s3://ACCESSKEY:SUPER\r\nSECRET@bucket/tbl/part-0.parquet");
+
+        Assert.Equal("s3://<redacted>@bucket/tbl/part-0.parquet", redacted);
+        Assert.DoesNotContain("ACCESSKEY", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("SUPER", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain("SECRET", redacted, System.StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', redacted);
+        Assert.DoesNotContain('\n', redacted);
+    }
+
+    [Fact]
+    public void RedactPath_ControlCharacterInsideAdlsContainer_KeepsTheIdentityExemption()
+    {
+        // The Round-5 widening must not disturb the scheme-anchored ADLS exemption: a colon-less ADLS
+        // authority is a container IDENTITY, so it survives verbatim even when it carries a control
+        // character (which the sanitizing layers above this masker, not the masker, are responsible for).
+        const string Path = "abfss://my\r\ncontainer@acct.dfs.core.windows.net/tbl";
+
+        Assert.Equal(Path, SecretRedaction.RedactPath(Path));
+
+        // …while the colon-BEARING ADLS shape (a real account-key credential) is still masked.
+        Assert.Equal(
+            "abfss://<redacted>@acct.dfs.core.windows.net/tbl",
+            SecretRedaction.RedactPath("abfss://c:ACCOUNT\r\nKEY@acct.dfs.core.windows.net/tbl"));
+    }
+
+    [Fact]
+    public void RedactPath_ControlCharBearingUserInfo_TerminatesQuickly_SoTheWiderRunStaysLinear()
+    {
+        // The Round-5 runs are [^/]* — a WIDER character class than the [^/\s]* they replaced. Under
+        // NonBacktracking the two greedy runs stay linear, so a 768 KB control-character-laced userinfo is
+        // not a new synchronous-CPU sink. Same generous, secondary-canary budget as the query-pass pin.
+        string credential = string.Concat(Enumerable.Repeat("a\r\nb", 768 * 1024 / 4));
+        string path = "s3://user:" + credential + "@host/key";
+
+        var sw = Stopwatch.StartNew();
+        string redacted = SecretRedaction.RedactPath(path);
+        sw.Stop();
+
+        Assert.Equal("s3://<redacted>@host/key", redacted);
+        Assert.True(
+            sw.ElapsedMilliseconds < 10_000,
+            $"RedactPath took {sw.ElapsedMilliseconds} ms on a 768 KB control-char-laced userinfo — the "
+            + "widened [^/]* run must stay linear under NonBacktracking (expected low tens of ms).");
+    }
 }

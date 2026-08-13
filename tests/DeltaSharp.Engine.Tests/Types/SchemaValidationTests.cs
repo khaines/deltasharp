@@ -108,6 +108,105 @@ public class SchemaValidationTests
         Assert.True(ex.Message.Length < 256, $"message was {ex.Message.Length} chars; expected bounded.");
     }
 
+    // ROUND 5 — the SIBLING ingestion producers. SchemaJson.FromJson parses an attacker-influenceable
+    // metaData.schemaString out of _delta_log; four of its throw sites echoed the raw, unbounded 'name'/
+    // 'kind' token straight into SchemaValidationException.Message (ReadType's unknown complex kind,
+    // ParseNamedType's unknown type name, and BOTH ParseDecimal malformed-decimal throws). That message is
+    // sink-reachable: DeltaReadSource lifts it into DeltaReadException's OWN message (`throw new
+    // DeltaReadException(ex.Message, ex)`), which renders directly — it is NOT the ratified #744 raw-inner
+    // channel. These pins drive FromJson end-to-end (not the private helpers) so a revert to '{name}' or
+    // '{kind}' turns them RED.
+    private const int SanitizeCap = 128;
+
+    private static string ExpectedSanitized(string raw)
+    {
+        // The rule restated independently of DiagnosticText: every control character becomes U+FFFD and the
+        // token is capped at 128 retained characters with a trailing ellipsis.
+        string neutralized = raw.Replace("\r", "\uFFFD", StringComparison.Ordinal)
+            .Replace("\n", "\uFFFD", StringComparison.Ordinal)
+            .Replace("\t", "\uFFFD", StringComparison.Ordinal);
+        return neutralized.Length <= SanitizeCap ? neutralized : neutralized[..SanitizeCap] + "…";
+    }
+
+    private static string JsonString(string value) => System.Text.Json.JsonSerializer.Serialize(value);
+
+    [Fact]
+    public void SchemaJson_UnknownTypeName_MessageEchoesSanitizedName_NotTheRawOne()
+    {
+        string hostile = "weird\r\nINJECTED" + new string('x', 200);
+        string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"c\",\"type\":" + JsonString(hostile)
+            + ",\"nullable\":true,\"metadata\":{}}]}";
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.Contains(ExpectedSanitized(hostile), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostile, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('x', 200), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.Contains("Unknown type name", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SchemaJson_UnknownComplexTypeKind_MessageEchoesSanitizedKind_NotTheRawOne()
+    {
+        string hostile = "bogus\r\nKIND" + new string('y', 200);
+        string json = "{\"type\":" + JsonString(hostile) + "}";
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.Contains(ExpectedSanitized(hostile), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostile, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('y', 200), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.Contains("Unknown complex type kind", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // BOTH ParseDecimal throw sites. The first fires when the closing paren is not the final character
+    // (trailing garbage); the second when the paren-delimited body does not parse as precision,scale.
+    [InlineData("decimal(10,2)\r\nTRAILING")]
+    [InlineData("decimal(9\r\n9,2GARBAGE)")]
+    public void SchemaJson_MalformedDecimal_MessageEchoesSanitizedName_NotTheRawOne(string prefix)
+    {
+        string hostile = prefix + new string('z', 200);
+        string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"c\",\"type\":" + JsonString(hostile)
+            + ",\"nullable\":true,\"metadata\":{}}]}";
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.Contains(ExpectedSanitized(hostile), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostile, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(new string('z', 200), ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.Contains("Malformed decimal type", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    // Sanitizing must be a NO-OP on clean, short input: the ordinary diagnostic text is byte-identical, so
+    // the fix costs no diagnosability. (Non-vacuity for the hostile rows above.)
+    [InlineData("\"decimal(10,2) junk\"", "Malformed decimal type 'decimal(10,2) junk'.")]
+    [InlineData("\"decimal(a,b)\"", "Malformed decimal type 'decimal(a,b)'.")]
+    [InlineData("\"int32\"", "Unknown type name 'int32'.")]
+    [InlineData("{\"type\":\"tuple\"}", "Unknown complex type kind 'tuple'.")]
+    public void SchemaJson_CleanToken_MessageIsUnchangedBySanitizing(string typeJson, string expected)
+    {
+        string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"c\",\"type\":" + typeJson
+            + ",\"nullable\":true,\"metadata\":{}}]}";
+
+        SchemaValidationException ex = Assert.Throws<SchemaValidationException>(() => SchemaJson.FromJson(json));
+
+        Assert.Equal(expected, ex.Message);
+    }
+
+    [Fact]
+    public void SchemaJson_ValidDecimalName_StillParses()
+    {
+        Assert.Equal(new DecimalType(10, 2), SchemaJson.FromJson("\"decimal(10,2)\""));
+    }
+
     [Theory]
     [InlineData(0, 0)]
     [InlineData(39, 0)]

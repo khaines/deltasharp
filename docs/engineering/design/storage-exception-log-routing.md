@@ -248,6 +248,14 @@ from declaring them rather than letting a field bypass this inventory.
 > `DiagnosticText.Sanitize(field.Name)` (control-character-neutralized, length-bounded — previously the raw
 > field name, CRLF and all). This is the same treatment `TypeCoercionException.ForPath` received; the raw
 > values are not exposed on any typed property of `SchemaValidationException`.
+>
+> The sibling **ingestion** producers on the same path are now sanitized in-layer too, so the pattern is
+> consistent across every `SchemaJson.FromJson` throw site that echoes an attacker-authored token:
+> `SchemaJson`'s unknown-type-name, unknown-complex-type-kind, and both malformed-decimal messages render
+> `DiagnosticText.Sanitize(name/kind)`. These matter because `DeltaReadSource` lifts
+> `SchemaValidationException.Message` into `DeltaReadException`'s **own** message
+> (`throw new DeltaReadException(ex.Message, ex)`), which renders directly — that is not the raw-inner
+> channel ratified in `#744`.
 
 Read the last two columns together. "Sanitized copy" means the message carries a **length-capped,
 control-character-neutralized** rendering of the same token while the property keeps the original: a

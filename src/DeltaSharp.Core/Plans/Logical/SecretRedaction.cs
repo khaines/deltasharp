@@ -16,9 +16,9 @@ namespace DeltaSharp.Plans.Logical;
 /// (<c>user:secret@…</c>) is masked regardless of whether the credential is percent-encoded, carries an
 /// interior <c>?</c>/<c>#</c>, or carries the colon itself (the colon-bearing pass spans an interior
 /// <c>?</c>/<c>#</c>). A <b>colon-less</b> token pass, by contrast, stops at the first <c>?</c>/<c>#</c>
-/// (its run is <c>[^/?#\s:]*</c>), so a colon-less credential carrying an interior <c>?</c>/<c>#</c> — e.g.
+/// (its run is <c>[^/?#:]*</c>), so a colon-less credential carrying an interior <c>?</c>/<c>#</c> — e.g.
 /// <c>s3://TOK?EN@host</c> — is a DOCUMENTED KNOWN LIMIT: only the pre-<c>?</c> prefix (<c>TOK</c>) is seen
-/// and the token is left unmasked. And it masks
+/// and the token is left unmasked. Neither run stops at whitespace or a control character. And it masks
 /// (b) the value of any query-string parameter whose key looks credential-bearing
 /// (<c>sig</c>, <c>signature</c>, <c>password</c>, <c>pass</c>, <c>pwd</c>, <c>token</c>, <c>key</c>,
 /// <c>secret</c>, <c>credential</c>, <c>sas</c>, <c>auth</c>, <c>apikey</c>, <c>access[_-]?token</c>,
@@ -81,6 +81,22 @@ namespace DeltaSharp.Plans.Logical;
 /// rule above — the colon-bearing run must span an interior <c>?</c>/<c>#</c> so <c>s3://user:p?ss@bucket</c>
 /// stays masked. The boundary is pinned by an exact-output test so it cannot silently widen.
 /// </para>
+/// <para>
+/// <b>Round-5 fix — an embedded control character inside the userinfo no longer defeats the mask.</b> Both
+/// credential runs previously excluded <c>\s</c>, and <c>\r</c>/<c>\n</c>/<c>\t</c> ARE whitespace, so a
+/// control character planted inside the userinfo — <c>s3://user:sec\r\nret@host/key</c> — terminated the run
+/// BEFORE the closing <c>@</c>, the match failed, and the whole <c>user:sec…ret</c> credential was rendered
+/// verbatim (the plain <c>s3://user:secret@host/key</c> masked correctly, so the miss was silent). The runs
+/// are now bounded only by <c>/</c> — the real authority boundary — not by whitespace: <c>[^/]*:[^/]*@</c>
+/// and <c>[^/?#:]*@</c>. The <c>?</c>/<c>#</c> exclusions on the colon-less run are KEPT, so its documented
+/// known limit above is unchanged.
+/// The widening's cost is the same accepted OVER-MASK direction: on a degenerate, path-separator-free string
+/// the longer colon-bearing span can swallow a <c>?</c>/<c>&amp;</c> that the later query pass would have used
+/// as a key delimiter, leaving a trailing query value unmasked. A 1,000,000-input differential fuzz measured
+/// 18,942 newly MASKED credentials against 55 newly exposed — and <b>zero</b> of those 55 had a real authority
+/// boundary (a <c>/</c> after the scheme, before the <c>@</c>), because a run bounded by <c>/</c> cannot reach
+/// the query of any realistic <c>scheme://host/path?query</c> shape.
+/// </para>
 /// </remarks>
 internal static partial class SecretRedaction
 {
@@ -121,21 +137,27 @@ internal static partial class SecretRedaction
     }
 
     // scheme://<user>:<secret>@host  ->  capture "scheme://" and mask the WHOLE colon-bearing userinfo up
-    // to the LAST '@' in the authority. Crucially the runs are [^/\s]* (NOT [^/?#\s]*), so an interior
-    // '?'/'#' inside a credential -- e.g. user:p?ss / user:p#ss -- is spanned rather than terminating the
-    // match; that is the monotonicity fix against main, whose colon-delimited-password matcher masked these.
+    // to the LAST '@' in the authority. Crucially the runs are [^/]* (NOT [^/?#\s]* and NOT [^/\s]*), so an
+    // interior '?'/'#' inside a credential -- e.g. user:p?ss / user:p#ss -- is spanned rather than
+    // terminating the match (the monotonicity fix against main, whose colon-delimited-password matcher
+    // masked these), and so is an interior CONTROL CHARACTER or space -- e.g. user:sec\r\nret -- which
+    // otherwise ended the run before the terminating '@' and left the WHOLE credential unmasked (Round-5).
+    // Only '/' bounds the run, which is the real authority boundary.
     // NonBacktracking makes the two greedy runs linear (no quadratic backtrack on a long '@'-less prefix).
     [GeneratedRegex(
-        @"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/\s]*:[^/\s]*@",
+        @"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/]*:[^/]*@",
         RegexOptions.CultureInvariant | RegexOptions.NonBacktracking)]
     private static partial Regex ColonBearingUserInfo();
 
     // scheme://<token>@host  ->  capture "scheme://" and mask a COLON-LESS token in the userinfo position.
     // The run excludes ':' (the colon-bearing pass owns that shape) and stops at the first path/query/
-    // fragment/whitespace boundary. The ADLS/WASB exemption is applied by the MatchEvaluator in RedactPath,
-    // not the pattern, because a colon-less ADLS authority is a container identity, not a credential.
+    // fragment boundary. It does NOT stop at whitespace/control characters (Round-5): a token carrying an
+    // embedded '\r'/'\n'/'\t' must still be masked. The '?'/'#' exclusions are KEPT deliberately -- the
+    // colon-less pass stopping there is the DOCUMENTED KNOWN LIMIT in the class remarks. The ADLS/WASB
+    // exemption is applied by the MatchEvaluator in RedactPath, not the pattern, because a colon-less ADLS
+    // authority is a container identity, not a credential.
     [GeneratedRegex(
-        @"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/?#\s:]*@",
+        @"([a-zA-Z][a-zA-Z0-9+.\-]*://)[^/?#:]*@",
         RegexOptions.CultureInvariant | RegexOptions.NonBacktracking)]
     private static partial Regex ColonlessUserInfo();
 
