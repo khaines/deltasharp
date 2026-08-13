@@ -290,8 +290,11 @@ public sealed class SecretRedactionTests
         // the colon-bearing run legitimately spans the interior '?' (required by the monotonicity rule) all
         // the way to the '@' — swallowing the delimiter the query pass needed, so the trailing 'sig' VALUE
         // is left unmasked. The credential itself is still masked, and this shape is not one DeltaSharp
-        // authors; see the "Accepted redaction residuals" ledger. Any change to this output — including a
-        // future widening past '/' — turns this RED and forces a deliberate ledger update.
+        // authors; see the "Accepted redaction residuals" ledger. This pin CHARACTERIZES that accepted
+        // output: any change to it turns this RED and forces a deliberate ledger update. It is NOT the
+        // widening detector — both inputs below are output-invariant under a '/'-widening (the first has no
+        // '/' after the scheme, the second a single '@'). The mechanical detector of a widening past '/' is
+        // RedactPath_AuthorityBoundaryStopsTheCredentialRun_QueryKeysStillMask above, which must be kept.
         Assert.Equal("s3://<redacted>@sig=SECRET", SecretRedaction.RedactPath("s3://u:p?@sig=SECRET"));
 
         // The minimal pair: adding the authority boundary back restores query masking (same credential).

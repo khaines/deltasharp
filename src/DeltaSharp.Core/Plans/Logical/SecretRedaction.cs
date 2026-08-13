@@ -99,10 +99,14 @@ namespace DeltaSharp.Plans.Logical;
 /// positioned AFTER that <c>/</c>, so the run provably cannot reach — let alone swallow — a query-key
 /// delimiter. Only a string with NO path separator between the scheme and the query (<c>s3://u:p?@sig=…</c>)
 /// is affected, and there the credential itself is still masked; it is the trailing query value that is left
-/// unmasked. Both halves are pinned by exact-output tests
-/// (<c>RedactPath_AuthorityBoundaryStopsTheCredentialRun_QueryKeysStillMask</c> and
-/// <c>RedactPath_PathSeparatorFreeCredential_IsTheAcceptedResidual</c>), so widening a run past <c>/</c>
-/// turns them RED. A one-shot differential fuzz over ~1,000,000 generated inputs was also run while
+/// unmasked. Both halves are pinned by exact-output tests, with DISTINCT jobs: widening a run past <c>/</c>
+/// turns the authority-boundary pin
+/// (<c>RedactPath_AuthorityBoundaryStopsTheCredentialRun_QueryKeysStillMask</c>) RED — it is the SOLE
+/// mechanical detector of that widening, so do not retire it; the residual pin
+/// (<c>RedactPath_PathSeparatorFreeCredential_IsTheAcceptedResidual</c>) characterizes the ACCEPTED cost at
+/// its exact current output and is invariant under that widening (its inputs carry no <c>/</c> after the
+/// scheme, or a single <c>@</c>), so any change to it forces a deliberate ledger update.
+/// A one-shot differential fuzz over ~1,000,000 generated inputs was also run while
 /// developing the change and measured 18,942 newly MASKED credentials against 55 newly exposed, none of them
 /// carrying an authority boundary; that run's seed and generator are not checked in, so treat the figures as
 /// an illustrative one-shot measurement only — the structural argument above and the two pins are the

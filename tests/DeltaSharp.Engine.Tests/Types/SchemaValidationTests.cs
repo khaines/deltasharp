@@ -117,15 +117,18 @@ public class SchemaValidationTests
     // WHY sanitize at the PRODUCER (Round-6 correction — the earlier note here over-claimed the route).
     // Every current SchemaJson.FromJson caller wraps the SchemaValidationException in a FIXED-message outer
     // (Snapshot.ParseSchema and DeltaCommitter.ParseCommittedSchema → DeltaProtocolException.Inconsistent;
-    // ChangeFeedReader and DeltaLog → DeltaReadException with fixed text), so for THESE producers the raw
-    // token reaches only InnerException — the raw-inner channel ratified in #744, further suppressed for
-    // rendering by DeltaReadException.ToString() → DescribeWithoutInner. Sanitizing here therefore
+    // ChangeFeedReader → DeltaReadException; DeltaLog → DeltaProtocolException.Malformed, reached
+    // transitively via ColumnMappingIdentity.FromMetadata whose callers all wrap — all with fixed text), so
+    // for THESE producers the raw token reaches only InnerException — the raw-inner channel ratified in
+    // #744, further suppressed for rendering by DeltaReadException.ToString() → DescribeWithoutInner.
+    // Sanitizing here therefore
     // (a) minimizes the tenant payload that lands in that #744 raw-inner sink, shrinking its retention and
     // erasure scope, and (b) removes the dependence on every current AND future FromJson caller remembering
     // to wrap with fixed text. DeltaReadSource's direct lift (`throw new DeltaReadException(ex.Message, ex)`,
     // DeltaReadSource.cs:177) IS live, but for this catch it carries SchemaValidationExceptions originating
-    // in ParquetTypeMapping / ColumnMappingProjection — the StructType/MapType producers already sanitized in
-    // Round 4 — not these SchemaJson ones. These pins drive FromJson end-to-end (not the private helpers) so
+    // in ColumnMappingProjection (new StructType, ColumnMappingProjection.cs:92) — the StructType/MapType
+    // producers already sanitized in Round 4 — not these SchemaJson ones. These pins drive FromJson
+    // end-to-end (not the private helpers) so
     // a revert to '{name}' or '{kind}' at ANY of the four sites turns the matching case RED.
     private const int SanitizeCap = 128;
 
@@ -195,9 +198,11 @@ public class SchemaValidationTests
     {
         string hostile = prefix + new string('z', 200) + suffix;
 
-        // Non-vacuity / routing pin: this is exactly the predicate that selects between the two throw sites,
-        // so a future edit cannot silently re-route every row back onto site #1.
-        Assert.Equal(closingParenIsFinal, hostile.EndsWith(')'));
+        // Non-vacuity / routing pin: mirrors ParseDecimal's ACTUAL site selector
+        // (`close != name.Length - 1`, where `close = name.IndexOf(')')`) rather than an EndsWith
+        // approximation, so a future row carrying an INTERIOR ')' cannot silently re-route to site #1 with
+        // this pin still green.
+        Assert.Equal(closingParenIsFinal, hostile.IndexOf(')') == hostile.Length - 1);
 
         string json = "{\"type\":\"struct\",\"fields\":[{\"name\":\"c\",\"type\":" + JsonString(hostile)
             + ",\"nullable\":true,\"metadata\":{}}]}";
