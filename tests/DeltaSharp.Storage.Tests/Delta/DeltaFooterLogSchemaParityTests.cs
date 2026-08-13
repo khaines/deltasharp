@@ -661,10 +661,25 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// bulk path would choke on: non-ASCII keys and values, an astral pair, an empty key, an empty
     /// value, and characters requiring escapes.
     /// <para>
-    /// The KEY-NAME domain is corpus content too, not only the value domain (#731). A key under a
-    /// CALLER namespace (<c>tenant.*</c>) is included, because a strip conditioned on the caller's own
-    /// prefix — rather than on entry count or value shape — matched none of the empty/padding/accent
+    /// The KEY-NAME domain is corpus content too, not only the value domain (#731). Keys under the
+    /// two realistic CALLER namespaces are included — a user/tenant prefix (<c>tenant.*</c>) and the
+    /// Spark-interop prefix (<c>spark.sql.*</c>) — because a strip conditioned on a caller's own
+    /// prefix, rather than on entry count or value shape, matched none of the empty/padding/accent
     /// keys and so survived every other member of this corpus.
+    /// </para>
+    /// <para>
+    /// INHERENT LIMIT, disclosed rather than papered over (round 2, red-team). Corpus-based
+    /// detection of a metadata STRIP is only as wide as the corpus: a strip conditioned on a key
+    /// NAMESPACE catches fire here only for namespaces this corpus enumerates, which are the two
+    /// realistic caller namespaces above plus the engine namespace <c>delta.columnMapping.*</c>. A
+    /// rogue conditioned on some namespace absent from the corpus (say <c>acme.internal.*</c>) still
+    /// ships green, and no amount of key-adding closes that — the key-name domain is unbounded, so
+    /// enumerating it is namespace whack-a-mole, not a proof. This is an ACCEPTED, DOCUMENTED
+    /// residual on the same discipline as #726/#734 in this PR: keep the strongest bounded guard
+    /// (every key the caller declared must survive, over a corpus that covers the namespaces real
+    /// callers actually use) and state the boundary in place, so it is a known limit rather than a
+    /// recurring surprise. What is NOT residual: an UNCONDITIONAL strip, a count-threshold strip, a
+    /// value-shape strip, and a strip on any of the three enumerated namespaces are all RED here.
     /// </para>
     /// <para>
     /// The value kinds are enumerated from <see cref="MetadataValueKind"/> itself rather than
@@ -692,6 +707,17 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             // a prefix, and losing them from the committed schemaString is silent.
             new("tenant.classification", MetadataValue.String("restricted")),
             new("tenant.pii.fields", MetadataValue.Array(new[] { MetadataValue.String("région") })),
+
+            // Round 2 (red-team): `tenant.*` alone left the CLASS half-closed. The OTHER realistic
+            // caller namespace is Spark interop's `spark.sql.*` — the most common field-metadata
+            // prefix in a Spark-written Delta schema, since a table round-tripped through Spark
+            // carries Spark-owned per-field metadata alongside the caller's own. A rogue stripping
+            // `spark.sql.*` matched nothing this corpus declared and shipped 100% green; with these
+            // entries it is RED. The LEAF names are representative, not normative — what the corpus
+            // needs is the PREFIX, and both a string and a non-string value under it, so a rogue
+            // that also conditions on value kind cannot slip past on the other lane.
+            new("spark.sql.catalyst.charVarcharType", MetadataValue.String("varchar(32)")),
+            new("spark.sql.parquet.fieldId", MetadataValue.Long(11)),
         };
 
         for (int i = 0; bulky.Count < 96; i++)

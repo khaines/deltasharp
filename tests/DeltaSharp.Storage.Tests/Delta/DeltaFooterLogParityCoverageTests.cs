@@ -84,8 +84,8 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
-    /// Every <c>SchemaJson.ToJson</c> call site in production is reached by something the parity
-    /// suite actually ran.
+    /// Every DIRECT-IL <c>SchemaJson.ToJson</c> call site in production is reached by something the
+    /// parity suite actually ran.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -101,8 +101,8 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// </para>
     /// <para>
     /// So the required set is read off the property itself: every method in the production
-    /// assembly whose IL contains a call to <c>SchemaJson.ToJson</c>. A new call site, on a new
-    /// type, with a new return type, surfaces here automatically. The driven side had been
+    /// assembly whose IL contains a DIRECT call to <c>SchemaJson.ToJson</c>. A new call site, on a
+    /// new type, with a new return type, surfaces here automatically. The driven side had been
     /// hardened against hand-listing three times over while the required side stayed two literals.
     /// </para>
     /// <para>
@@ -139,12 +139,30 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// act on. No assertion can distinguish a correct empty-schema serializer from a corrupted one
     /// on that input, so counting it toward coverage is honest only with this stated.
     /// </para>
+    /// <para>
+    /// A third limit, on the SCAN's reach rather than on what a covered site proves (round 2,
+    /// red-team). The required side is built by walking IL for DIRECT references --
+    /// <c>Call</c>/<c>Callvirt</c>/<c>Ldftn</c>/<c>Ldtoken</c> -- so it finds every direct-IL call
+    /// site and NOT a REFLECTIVE one: a seam invoking
+    /// <c>typeof(SchemaJson).GetMethod("ToJson").Invoke(...)</c> emits no reference to the method
+    /// and is invisible here, so an undriven reflective seam would ship green. That is an ACCEPTED,
+    /// DOCUMENTED limit, not an oversight, for three reasons. (a) <c>SchemaJson</c> is
+    /// <c>internal</c> and is directly visible via IVT to every production assembly that could want
+    /// it, so production DeltaSharp has no reason to reach it reflectively and does not. (b) A
+    /// reflection scanner is itself trivially evadable -- the method name can be a computed or
+    /// obfuscated string, so the scanner would buy an over-claim ("we detect reflective seams")
+    /// rather than a property, which is the exact failure this guard family exists to remove.
+    /// (c) A reflective serializer seam is a CODE-REVIEW concern: it is conspicuous in a diff in a
+    /// way an ordinary method call is not, whereas the direct call sites this scan covers are the
+    /// ones that appear routinely and silently. So the claim this test makes is bounded and exact:
+    /// every DIRECT-IL call site is reached by an executed entry point.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task ParityGuard_ReachesEverySchemaJsonCallSite()
     {
-        // Precondition: an incomplete scan scope makes "every call site is reached" a statement
-        // about a smaller set of call sites than production actually has (#743).
+        // Precondition: an incomplete scan scope makes "every direct-IL call site is reached" a
+        // statement about a smaller set of call sites than production actually has (#743).
         AssertScanScopeIsComplete();
 
         MethodBase[] callSites = RequiredSites().ToArray();
@@ -848,8 +866,15 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
-    /// The methods <paramref name="method"/> references in its IL.
+    /// The methods <paramref name="method"/> references DIRECTLY in its IL.
     /// </summary>
+    /// <remarks>
+    /// Direct references only: a target reached REFLECTIVELY
+    /// (<c>GetMethod(...)</c>/<c>Invoke(...)</c>) leaves no reference to itself in the caller's IL
+    /// and is therefore invisible to every walk built on this. That is a disclosed, accepted limit
+    /// of the required-side scan -- see the third limit documented on
+    /// <see cref="ParityGuard_ReachesEverySchemaJsonCallSite"/>.
+    /// </remarks>
     /// <param name="method">The method whose body is walked.</param>
     /// <param name="includeFunctionPointers">
     /// Also yield targets taken by ADDRESS (<c>ldftn</c>/<c>ldvirtftn</c>) rather than called.
