@@ -195,15 +195,17 @@ optional (a kill-switch that reverts to the null-observer reconstruction bypasse
 | `ReplayedMetadataLog` (#712) | Prove metadata | Add a **derive-prevailing accessor** (§2.2(b)) — the `_recorded` map is SPARSE (no entry for an inheriting version), so the accessor returns the prevailing state for **any covered version** as the step function seeded at `_lineageAtWindowStart` and advanced by recorded transitions — never a bare stored-pair lookup |
 | `ChangeDataFeedFeature` | Enablement predicate | Reuse `IsEnabled(config)` (single-source with the write door) |
 | `OrphanCleanup` | Consume the cdc protected set | **Unchanged** (empty set on skip is identical to "no in-window cdc") |
-| Telemetry (#641 item 2) | scan cost + `VacuumCdcScanCompleted` | Emit a distinct **skipped** counter with a bounded scan-reason label (§7); do NOT pollute the scan histograms on skip |
+| Telemetry (#641 item 2) | scan cost + `VacuumCdcScanCompleted` | Emit a distinct **`cdc_scan.skipped`** counter (skip path ONLY) + a distinct **`cdc_scan.scanned{reason}`** counter (scan path); do NOT record the scan histograms on skip (§7) |
 
 ### 2.6 API surface
 
 Internal only. A `DeltaLog` reconstruction overload returning `(snapshot, unsealed ReplayedMetadataLog)`, plus a
 skip query that returns a **tri-state** — `skip` (proven-none), `scan_cdf_present` (proven-on), or
 `scan_unproven` (coverage gap / inert / seal-degraded). The tri-state is **preserved through to telemetry**
-(§7 scan-reason label) — collapsing it to binary at the API would discard exactly the distinction an operator
-needs to see *why* a scan was not elided (a coverage regression vs. genuinely-active CDF). No public API change.
+(§7): `skip` increments `cdc_scan.skipped` (so that counter's aggregate is exactly the skip count), while
+`scan_cdf_present`/`scan_unproven` increment `cdc_scan.scanned{reason}` — so an operator sees *why* a scan was
+not elided (a coverage regression vs. genuinely-active CDF) without polluting or overcounting the skip metric.
+No public API change.
 
 ---
 
@@ -214,7 +216,12 @@ needs to see *why* a scan was not elided (a coverage regression vs. genuinely-ac
   covers the in-window range, **with actual reclaimable orphans present**: assert
   `CollectInWindowChangeDataPathsAsync` is **not** called (spy), the deletion set is **non-empty** and equals
   the unconditional-scan baseline (co-extensiveness proven on a non-empty set, not vacuously), and the
-  `skipped` counter is emitted with reason `skip`.
+  `cdc_scan.skipped` counter is emitted with `reason = proven_cdf_off`.
+
+> **Telemetry taxonomy — single source of truth.** The internal tri-state (§2.6) maps to the telemetry
+> `reason` label as: `skip → proven_cdf_off`, `scan_cdf_present → cdf_present`,
+> `scan_unproven → { unproven_coverage | unproven_inert | seal_degraded }`. Tests assert the **label value**
+> (`proven_cdf_off`), never the internal enum name, so §7's closed low-cardinality set is the only vocabulary.
 
 ### 3.2 Safety edge cases (must scan) — each a red-team/storage-review data-loss trap
 - **Enable-then-disable across versions → SCAN + protection preserved (AC-1).** CDF on at `vₐ` (cdc file), off
@@ -222,15 +229,29 @@ needs to see *why* a scan was not elided (a coverage regression vs. genuinely-ac
 - **Transitioning commit → SCAN.** A single in-window commit `v` that carries a `metaData` toggling CDF **and**
   `AddCdcFileAction`s: because the predicate checks **both** `prevailingBefore` and `prevailingAfter`, `v` is
   scored CDF-on (on at one boundary) → scan → its cdc files protected. (Both the ON→OFF and OFF→ON transitions.)
-- **Inherited CDF-on — TWO distinct paths (both must SCAN).** The derive-prevailing accessor has two code
-  paths, pinned separately: **(i) enabled BEFORE coverage** (the `_lineageAtWindowStart` seed path) — CDF on at
-  the checkpoint/replay floor, in-window versions carry no `metaData`; **(ii) enabled WITHIN coverage, earlier
-  than an inheriting in-window version** (the carry-forward-from-recorded-transition path). Both must prove
-  CDF-on at the inheriting version → scan. (A bare `_recorded.TryGetValue(v)` implementation would return empty
-  for the inheritor → wrong skip; these two tests catch that regression by construction.)
+- **Inherited CDF-on — TWO distinct paths (both must SCAN), the enabler placed to KILL the mutant each claims.**
+  The derive-prevailing accessor has two code paths; each test must pin the enabling transition where a
+  seed-only / bare-lookup mutant actually survives, or the test is decorative:
+  - **(i) enabled BEFORE coverage** (the `_lineageAtWindowStart` seed path) — CDF on at the checkpoint/replay
+    floor (`< CoveredFromInclusive`), in-window versions carry no `metaData`; a bare
+    `_recorded.TryGetValue(v)` returns empty → off → wrong SKIP, so the SCAN assertion kills it.
+  - **(ii) enabled WITHIN coverage but BELOW the in-window low end** — the enabling CDF-on recorded transition
+    sits at a version `vₑ` with `CoveredFromInclusive ≤ vₑ < lo`, its **mtime known and `< logRetentionCutoffMillis`**
+    (so `vₑ` is itself aged out of the in-window set), and **every** in-window version carries no `metaData`
+    (inheriting). This is the full-replay firing envelope (`CoveredFromInclusive < lo`) and is the ONLY shape
+    that exercises reformulation §2.2(b) condition (i)'s "applied config of the last recorded `metaData`
+    **at/below `lo`**." It must SCAN + protect the inherited cdc. A mutant that reads `_lineageAtWindowStart`
+    plus only the *in-window* records (dropping recorded transitions in `[CoveredFromInclusive, lo)`) still
+    scores off → wrong SKIP → **data loss**; this placement is what kills it. (Placing `vₑ` **in-window**
+    instead would let a seed-only mutant scan anyway and pass green — explicitly avoided.)
 - **Unknown/missing-mtime in-window commit → SCAN/protected.** A commit whose timestamp the listing lacks is
   in-window for **both** the scan and the predicate (same `logRetentionCutoffMillis`); if it carries cdc it is
   protected.
+- **Two-cutoff separation → SCAN (predicate must key on the SCAN's cutoff).** With
+  `delta.logRetentionDuration` ≠ the vacuum retention, a CDF-on/cdc-bearing commit whose mtime lands strictly
+  between the two cutoffs is **in-window for the scan** (log-retention) but would be **excluded** by a predicate
+  keyed on the vacuum `cutoffMillis` (:388) → wrong all-off SKIP → data loss. Pinned by the §3.3 two-cutoff-gap
+  row (plus the `mtime == logRetentionCutoffMillis` equality-boundary row for the `<`-vs-`<=` off-by-one).
 - **Un-proven in-window version → SCAN (fail-closed).** Window extends below coverage (checkpoint-seeded deep
   retention) or observer inert: scan even though the *snapshot* flag is CDF-off.
 - **Seal-degraded → SCAN (never skip, never throw).** An observer whose lineage is unaccountable (`Seal()`
@@ -251,11 +272,16 @@ needs to see *why* a scan was not elided (a coverage regression vs. genuinely-ac
 The differential oracle is **split by corpus class** so a conforming co-extensiveness assertion is never
 weakened to accommodate the forged residual:
 
-- **Conforming corpus → IDENTICAL (hard assert).** For CDF-bearing and never-CDF tables built only through the
-  spec-conforming write door (enabled-throughout, enabled-late, toggled, inherited-on, deep-retention,
-  unknown-mtime, single-commit-transition), the protected `_change_data/` set **and** the final deletion set
-  are **byte-for-byte identical** with the skip enabled vs. a forced-unconditional-scan control. Pin as a
-  property test over the whole conforming corpus.
+- **Conforming corpus → IDENTICAL, against the NULL-OBSERVER baseline (hard assert).** For CDF-bearing and
+  never-CDF tables built only through the spec-conforming write door (enabled-throughout, enabled-late,
+  toggled, inherited-on, deep-retention, unknown-mtime, single-commit-transition), the protected
+  `_change_data/` set, the final deletion set, **and the reconstructed snapshot identity** are **byte-for-byte
+  identical** with skip-**ON** vs. the **kill-switch-OFF null-observer reconstruction** (today's exact path) —
+  **not** a "skip code with scan forced / piggyback-observer-present" arm. Crossing the null-observer boundary
+  is required: if the control also ran the piggyback reconstruction, any snapshot divergence introduced by the
+  observer piggyback (§2.5's "byte-identical" claim) would appear in *both* arms and **cancel**, hiding a
+  reconstruction-fidelity bug that changes add/remove classification → deletion set. Pin as a property test
+  over the whole conforming corpus, asserting snapshot identity so a piggyback infidelity fails the assert.
 - **Discriminating table (each row a distinct trap).** A table enumerating the exact predicate-sensitive
   shapes, each asserting the decision AND the deletion set:
 
@@ -265,12 +291,19 @@ weakened to accommodate the forged residual:
   | enabled-throughout | on, proven | SCAN | == baseline (cdc protected) |
   | toggled ON→OFF in-window | on at a boundary | SCAN | cdc protected |
   | inherited-on (before coverage) | seed-path on | SCAN | cdc protected |
-  | inherited-on (within coverage) | carry-forward on | SCAN | cdc protected |
+  | inherited-on (within coverage, `vₑ`<`lo`) | carry-forward on | SCAN | cdc protected |
   | single-commit CDF-transition | both-boundary check | SCAN | cdc protected |
   | unknown-mtime in-window commit | in-window, un-proven mtime | SCAN | cdc protected |
+  | **two-cutoff gap: CDF-on/cdc commit, mtime ∈ [now−logRetention, now−vacuumRetention)** | in-window for the scan (log-retention cutoff), CDF-on | **SCAN** | **cdc protected — DIES if the predicate keys on the vacuum `cutoffMillis` (:388) instead of `logRetentionCutoffMillis` (:398)** |
+  | **cutoff-equality boundary: mtime == `logRetentionCutoffMillis`** | scan keeps `==` in-window (`< cutoff`) | matches scan | **kills a `<=` off-by-one that would shrink the predicate set below the scan's** |
   | below-coverage (deep-retention) | un-proven | SCAN (fail-closed) | == baseline |
   | seal-degraded lineage | Seal throws | SCAN (caught) | == baseline, VACUUM succeeds |
   | empty in-window set | no commits | SKIP ≡ forced-scan | both empty |
+
+  The two bolded rows must set `delta.logRetentionDuration ≠` the vacuum retention (defaults differ, ~30d vs
+  ~7d) with a seeded clock (§3.4) so a CDF-on/cdc-bearing commit's mtime lands strictly between the two cutoffs
+  (or exactly on `logRetentionCutoffMillis`) — the only shapes that discriminate the correct cutoff and the
+  `<`-vs-`<=` boundary.
 
 - **Forged cdc-without-enablement → MEASURED, not asserted-identical.** A hand-crafted log with an
   `AddCdcFileAction` at a version the metadata proves CDF-off: the test **records** the divergence (skip elides
@@ -307,23 +340,32 @@ weakened to accommodate the forged residual:
   checkpoint-seeded deep-retention table (the in-window range is below the replay floor → un-proven → scan);
   that case is unchanged.
 - **Regression gate (scoped to the envelope).** For a never-CDF, **full-replay-reconstructed** table with the
-  in-window set within coverage: `cdc_scan.commits == 0`. The gate is expressed over **total VACUUM wall-clock
-  AND allocated bytes** (BenchmarkDotNet `MemoryDiagnoser`), not just the elided-commit count, so a skip that
-  accidentally *adds* work (e.g. an extra reconstruction) is caught. Apply a **noise budget** and report
-  **p50/p95/p99** (VACUUM is IO-bound and multi-tenant-noisy); the gate trips on a p95 regression outside the
-  budget, not a single p99 spike. For every CDF-bearing or checkpoint-seeded table: cost unchanged within the
-  noise budget, and the differential coverage-neutrality oracle (§3.3) green. **No** gate claiming a reduction
-  on checkpoint-seeded deep-retention tables (the earlier draft's error).
+  in-window set within coverage: `cdc_scan.commits == 0` — this count-based arm is deterministic,
+  cache-independent, and is the **primary** signal. The gate is *also* expressed over **total VACUUM wall-clock
+  AND allocated bytes** (BenchmarkDotNet `MemoryDiagnoser`), so a skip that accidentally *adds* work (e.g. an
+  extra reconstruction) is caught. The wall-clock arm is **corroborating, not primary**, and its budget is
+  **empirically derived, not asserted**: run an **A/A baseline** (skip-**OFF** vs skip-**OFF**, same
+  table/env/cache state) to measure the p95 wall-clock **noise floor**, then define the budget as
+  `floor + <stated margin>` (record the derived number, or the derivation procedure, in the benchmark README so
+  "within budget" is falsifiable and not an escape hatch). Report **p50/p95/p99**; the gate trips on a **p95**
+  regression above the derived threshold, not a single p99 spike. For every CDF-bearing or checkpoint-seeded
+  table: cost unchanged within the derived budget, and the differential coverage-neutrality oracle (§3.3) green.
+  **No** gate claiming a reduction on checkpoint-seeded deep-retention tables (the earlier draft's error).
 - **Predicate cost.** `O(in-window versions)` in-memory prevailing-pair lookups; no allocation beyond the
   version enumeration; no I/O. When un-proven, cost = today's scan + one in-memory pass.
 - **Benchmark (BenchmarkDotNet + `MemoryDiagnoser`).** Harness VACUUM over synthetic tables at retention depths,
   {full-replay vs. checkpoint-seeded} × {never-CDF vs. CDF-bearing}, measuring `cdc_scan.commits`/`.duration`,
-  total wall-clock and allocated bytes at p50/p95/p99. Required cells: **(1)** null-observer reconstruction vs.
-  **piggybacked-observer** reconstruction on the SAME table — proving the observer adds no measurable
-  reconstruction cost (the piggyback claim); **(2)** straddle-checkpoint window (part above, part below the
-  latest checkpoint) — proving the un-proven low end forces a scan, no wrong skip; **(3)** inert-at-scale — a
-  table with `> MaxRetainedObservations` metadata-moving commits, proving the observer goes inert → scan
-  without pathological cost. Assert the envelope above.
+  total wall-clock and allocated bytes at p50/p95/p99. **Confound control (the wall-clock/`.duration` metrics
+  are IO-bound):** pin the **storage backend, executor/node shape, and .NET runtime**; use BenchmarkDotNet's
+  warm-up/iteration handling as the **JIT-warmup control**; and **state warm-vs-cold cache explicitly per
+  cell** — the honest case for the elided commit-JSON re-read is **cold OS-page/object-store cache**, since a
+  warm cache masks exactly the IO the skip removes. Treat wall-clock as *corroborating within the measured
+  floor* and `cdc_scan.commits` as the cache-independent primary signal. Required cells: **(1)** null-observer
+  reconstruction vs. **piggybacked-observer** reconstruction on the SAME table — proving the observer adds no
+  measurable reconstruction cost (the piggyback claim; falsifiable here); **(2)** straddle-checkpoint window
+  (part above, part below the latest checkpoint) — proving the un-proven low end forces a scan, no wrong skip;
+  **(3)** inert-at-scale — a table with `> MaxRetainedObservations` metadata-moving commits, proving the
+  observer goes inert → scan without pathological cost. Assert the envelope above.
 
 ---
 
@@ -381,26 +423,33 @@ is explicitly outside the predicate's trust boundary.
 
 ## 7 · Observability
 
-- **Metrics — a DISTINCT counter, not a histogram tag.** Emit
-  `deltasharp.delta.vacuum.cdc_scan.skipped` (a **counter**), tagged with a **bounded scan-reason label**
-  `reason ∈ { proven_cdf_off, /* skip */ }` on the skip path and the scan path tagged
-  `reason ∈ { cdf_present, unproven_coverage, unproven_inert, seal_degraded }` — a **closed, low-cardinality
-  set** (never a path or version). Adding a `skipped=true` *tag to the existing `cdc_scan.duration` histogram*
-  is explicitly rejected: it changes an existing metric's tag schema (a breaking dashboard/alert change) and
-  pollutes latency aggregates with zero-cost rows. On skip, **do NOT record** the `cdc_scan.commits` /
-  `.duration` scan histograms at all (a skip is not a zero-cost scan); the distinct counter carries the signal.
+- **Metrics — TWO distinct counters, each aggregate meaningful; never a histogram tag.**
+  - `deltasharp.delta.vacuum.cdc_scan.skipped` (a **counter**) — incremented **only on the skip path**, so
+    `sum(cdc_scan.skipped)` is exactly the number of elided scans (no filtering required, no overcount). It
+    carries `reason = proven_cdf_off` (a single value; kept as a label only for symmetry / a future proven-off
+    sub-reason), never a path or version.
+  - `deltasharp.delta.vacuum.cdc_scan.scanned` (a **counter**) — incremented **only on the scan path**, tagged
+    `reason ∈ { cdf_present, unproven_coverage, unproven_inert, seal_degraded }` — a **closed, low-cardinality
+    set** (never a path or version) — so an operator sees *why* a scan was not elided.
+  - The instrument name matches its semantics, so neither aggregate is a trap. Overloading a single
+    `skipped{reason}` counter across both paths is explicitly rejected: `sum` would overcount skips and every
+    skip-rate query would have to remember to filter `reason=proven_cdf_off` on a data-loss-adjacent metric.
+    Adding a `skipped=true` *tag to the existing `cdc_scan.duration` histogram* is likewise rejected: it changes
+    an existing metric's tag schema (a breaking dashboard/alert change) and pollutes latency aggregates. On
+    skip, **do NOT record** the `cdc_scan.commits` / `.duration` scan histograms at all (a skip is not a
+    zero-cost scan); the `skipped` counter carries the signal.
 - **Logs.** A distinct Information log `DeltaVacuumCdcScanSkipped`, **EventId 4109** (next free in the 41xx
   VACUUM range — pinned to avoid the collision class that bit the Stage-E merge), at a **value-type-only,
   path-free** log site: it renders only the bounded proven-version count, the in-window range size, and the
-  bounded scan-reason label — **no paths, no tenant tokens** — and is registered in
+  bounded `reason` label — **no paths, no tenant tokens** — and is registered in
   `StorageLogSiteSignatures` so the log-site hygiene guard enforces the path-free shape.
 - **Correlation.** Stamp the same vacuum `activity`/operation scope the scan telemetry uses, so a skip and a
   scan sit on the same VACUUM trace.
-- **Dashboards / alerting.** No new alert; a new `cdc_scan.skipped` panel (by `reason`) makes skips and *why a
-  scan was not elided* observable. A rising `unproven_coverage` rate on a fleet is a **coverage-regression**
-  signal (the optimization silently stopped firing); `seal_degraded > 0` is a lineage-integrity signal worth a
-  low-severity look. An unexpectedly *high* scan cost on a known-never-CDF table is a tuning signal, not an
-  incident.
+- **Dashboards / alerting.** No new alert; a `cdc_scan.skipped` panel (skip rate) plus a `cdc_scan.scanned` panel
+  **sliced by `reason`** make skips and *why a scan was not elided* observable. A rising `unproven_coverage`
+  rate on a fleet is a **coverage-regression** signal (the optimization silently stopped firing);
+  `seal_degraded > 0` is a lineage-integrity signal worth a low-severity look. An unexpectedly *high* scan cost
+  on a known-never-CDF table is a tuning signal, not an incident.
 
 ---
 
@@ -419,9 +468,10 @@ is explicitly outside the predicate's trust boundary.
   2. **Canary.** Enable skip on a small, low-risk table population; watch `unproven_coverage`/`seal_degraded`
      and the wrong-skip alarm (now against the live decision) before fleet-wide default-on.
   3. **Default-on**, kill-switch retained indefinitely.
-- **Force-scan control is test-required.** A test asserts the kill-switch (OFF) reverts to the null-observer
-  reconstruction and produces a decision/deletion-set **identical** to pre-change VACUUM (the forced-scan
-  control already used as the §3.3 oracle baseline) — so the escape hatch is proven, not assumed.
+- **Force-scan control is test-required.** A test asserts the kill-switch (OFF) reverts to the **null-observer**
+  reconstruction and produces a decision/deletion-set **identical** to pre-change VACUUM — this is the exact
+  **null-observer baseline** the §3.3 conforming differential compares against (crossing the null-observer
+  boundary, not a piggyback-scan-forced arm) — so the escape hatch is proven, not assumed.
 - **Rollback.** Flip the gate to OFF → the always-correct unconditional scan. No data/metadata migration; no
   persisted state changes; recovery time = one config round-trip.
 - **Risk register.** Top risk = a predicate bug that skips when it should scan (**irreversible data loss**).
@@ -429,12 +479,14 @@ is explicitly outside the predicate's trust boundary.
   every uncertainty; the seal→try/catch→scan degrade (§2.5); the **shadow wrong-skip alarm** as a pre-loss
   tripwire; and the default-off kill-switch. Severity is why this is a design-doc-first, threat-modeled change
   despite being "just an optimization."
-- **Launch checklist.** Split coverage-neutrality oracle green (conforming identical + forged measured);
-  inherited-on (both paths), transitioning, unknown-mtime, un-proven→scan, seal-degraded→scan, empty-window,
-  candidate-invariance tests green; benchmark shows `cdc_scan.commits == 0` on never-CDF-in-coverage AND
-  null-vs-piggybacked observer cost parity; distinct `skipped` counter + EventId 4109 path-free log wired and
-  roster-registered; VACUUM log-site hygiene guard passes; kill-switch force-scan test green; shadow wrong-skip
-  alarm wired.
+- **Launch checklist.** Split coverage-neutrality oracle green (conforming identical against the null-observer
+  baseline + snapshot identity + forged measured); inherited-on (both paths, `vₑ`<`lo` for path ii),
+  two-cutoff-gap + cutoff-equality, transitioning, unknown-mtime, un-proven→scan, seal-degraded→scan,
+  empty-window, candidate-invariance tests green; benchmark shows `cdc_scan.commits == 0` on
+  never-CDF-in-coverage AND null-vs-piggybacked observer cost parity within the **A/A-derived** noise budget
+  (cold-cache cell stated); distinct `cdc_scan.skipped` + `cdc_scan.scanned{reason}` counters + EventId 4109
+  path-free log wired and roster-registered; VACUUM log-site hygiene guard passes; kill-switch force-scan test
+  green; shadow wrong-skip alarm wired.
 
 ---
 
