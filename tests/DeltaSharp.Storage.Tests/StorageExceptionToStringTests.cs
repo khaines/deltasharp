@@ -734,6 +734,13 @@ public sealed class StorageExceptionToStringTests
         // repo's own log sites because they "never pass the exception object, its message, or its inner".
         // True today, but nothing made it stay true — and it is load-bearing for the "an in-repo analyzer
         // would have zero call sites to flag" reasoning. Six lines of reflection make it rot loudly.
+        //
+        // #810: this reflection sweep is, by design, scoped to [LoggerMessage] source-generated sites. The
+        // complementary gap — a DIRECT LoggerExtensions.Log*(…, Exception, …) call anywhere in a production
+        // assembly, which would hand the exception object to the sink and re-leak ToString() — is now closed at
+        // COMPILE TIME by the BannedSymbols.txt bans on all 14 exception-taking LoggerExtensions overloads
+        // (RS0030, enforced on every src/ assembly). So the "zero call sites to flag" guarantee is no longer
+        // merely conventional: a future direct exception-logging call fails the build.
         MethodInfo[] logSites = typeof(DeltaStorageException).Assembly.GetTypes()
             .SelectMany(type => type.GetMethods(
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly))
