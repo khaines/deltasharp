@@ -10,18 +10,30 @@ namespace DeltaSharp.Storage.Delta;
 /// unconditionally-emitting <c>LoggerMessage</c> sink.
 /// </summary>
 /// <remarks>
-/// <para>A <see cref="string"/> cannot be converted TO a <see cref="PathDescription"/> implicitly, so the
-/// only way to obtain one is to call <see cref="DiagnosticText.DescribePath"/>; a sink that requires a
-/// described path (e.g. <c>DeltaVacuumLog.VacuumCandidateDecision</c>) therefore CANNOT be handed an
-/// undescribed one. The reverse — a described path FLOWING INTO a <see cref="string"/> context, such as an
-/// interpolated exception message — is always safe (the value is already sanitized), so an implicit
-/// conversion to <see cref="string"/> and a value-returning <see cref="ToString"/> are provided; that keeps
-/// every existing message- and log-rendering call site byte-identical.</para>
+/// <para>The construction of a <see cref="PathDescription"/> is confined so the "described" claim cannot be
+/// forged. A <see cref="string"/> cannot be converted TO a <see cref="PathDescription"/> implicitly, so the
+/// accidental/copy-paste bare-string disclosure vector — silently handing a raw <c>add.path</c> where a
+/// described path is required — is a compile error; the primary constructor is banned by
+/// <c>BannedSymbols.txt</c> (RS0030), so a direct <c>new PathDescription(raw)</c> is a build error
+/// EVERYWHERE except <see cref="DiagnosticText.DescribePath"/>'s single sanctioned, pragma-suppressed call
+/// site (#700/#696); and <see cref="Value"/> is get-only, so <c>existing with { Value = raw }</c> cannot
+/// re-init a described path from an unsanitized string. A sink that requires a described path (e.g.
+/// <c>DeltaVacuumLog.VacuumCandidateDecision</c>) therefore CANNOT be handed an undescribed one. The reverse
+/// — a described path FLOWING INTO a <see cref="string"/> context, such as an interpolated exception message
+/// — is always safe (the value is already sanitized), so an implicit conversion to <see cref="string"/> and
+/// a value-returning <see cref="ToString"/> are provided; that keeps every existing message- and
+/// log-rendering call site byte-identical.</para>
 /// <para>A <c>readonly record struct</c> (not a class) so wrapping the renderer's result adds NO heap
 /// allocation on the fault/diagnostic path, and it stays trim/AOT-clean.</para>
 /// </remarks>
-internal readonly record struct PathDescription(string Value)
+internal readonly record struct PathDescription
 {
+    internal PathDescription(string value) => Value = value;
+
+    /// <summary>The sanitized path description. Get-only so <c>with { Value = … }</c> cannot re-init a
+    /// described path from an unsanitized string.</summary>
+    public string Value { get; }
+
     /// <summary>Returns the sanitized description verbatim, so interpolation renders byte-identically to
     /// the pre-#700 <c>string</c>-returning <see cref="DiagnosticText.DescribePath"/>.</summary>
     public override string ToString() => Value;

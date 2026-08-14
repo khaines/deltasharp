@@ -158,6 +158,16 @@ public sealed class DeltaOptimizeTests : IDisposable
 
     // ---------------------------------------------------------------- AC1: compact → one commit
 
+    // #566 guard: the per-test temp root MUST fold Environment.ProcessId into its name so two concurrent
+    // same-host `dotnet test` invocations of this class do not both start at seq 1 and collide on the SAME
+    // root (cross-contaminating each other's tables). Mirrors OperatorSpillTests' deltasharp-spill-{pid}-
+    // pin: removing the `p{ProcessId}` fold makes this assert go RED.
+    [Fact]
+    public void TempRoot_FoldsProcessId_ForCrossProcessUniqueness()
+    {
+        Assert.Contains($"p{System.Environment.ProcessId}", _root);
+    }
+
     [Fact]
     public async Task Optimize_WritesOptimizeCommitInfo()
     {
