@@ -364,8 +364,8 @@ which drops Hive partition values and keeps only the file/directory shape plus p
 `SurfaceFailure`'s root-redacted framework detail is also line-break-sanitized.
 `ColumnNotPresentInFile` routes the displayed column name through `DiagnosticText.Sanitize`, so line-break
 and format controls are neutralized there too. Backend write/publish and Parquet schema producers known as of `76d2c8e` are covered by the sweep or
-the Parquet-specific suites; new producers remain a reviewer obligation tracked by
-[#749](https://github.com/khaines/deltasharp/issues/749) <!-- issue-state:open -->. None of these controls
+the Parquet-specific suites; new producers are enforced by the producer-inventory guard from
+[#749](https://github.com/khaines/deltasharp/issues/749) <!-- issue-state:closed -->. None of these controls
 removes the tenant's own data from a relative path or column name.
 
 **Consequences for routing:**

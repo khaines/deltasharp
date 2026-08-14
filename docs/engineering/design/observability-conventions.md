@@ -364,7 +364,7 @@ rendering it**, not by a redactor:
   not exhaustive. Covered types can also carry a **raw, unsanitized** `Exception.InnerException`
   (retained for server-side debugging) and raw typed properties (`.FilePath`, `.Path`, `.Constraint`,
   `.ColumnName`). The hygiene sweep in [PR #774](https://github.com/khaines/deltasharp/pull/774) completes the [#747](https://github.com/khaines/deltasharp/issues/747) <!-- issue-state:closed --> work (issue closes on merge);
-  [#749](https://github.com/khaines/deltasharp/issues/749) <!-- issue-state:open --> remains open for producers added after `76d2c8e`. The covered types' `ToString()` overrides cut
+  [#749](https://github.com/khaines/deltasharp/issues/749) <!-- issue-state:closed --> is closed — the producer-inventory guard now enforces classification for producers added after `76d2c8e`. The covered types' `ToString()` overrides cut
   the chain, and that works because
   `Exception.ToString()` recurses through the inner's *own* virtual `ToString()`. So the safe/unsafe axis
   is **not** "renders vs reflects" — it is **"does the sink walk `.InnerException` itself"**:

@@ -10,16 +10,25 @@ using Xunit;
 namespace DeltaSharp.Storage.Tests.Reading;
 
 /// <summary>
-/// Pinned deterministic regression for #647: the exact adversarial <c>cdc</c> input the CDF read-door fuzz
-/// flagged (<c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148 — a 957-byte cdc file with an
+/// Pinned deterministic regression for #647: an adversarial <c>cdc</c> input the CDF read-door fuzz strategy
+/// produces (<c>DELTASHARP_TEST_SEED=35</c>, byte-flip strategy, iteration 14 — a 951-byte cdc file with an
 /// intact footer whose decode Parquet.Net 6.0.3 drove into a non-terminating, cancellation-ignoring CPU loop)
 /// must now fail closed with a typed <see cref="DeltaStorageException"/> WITHIN the bounded-decode budget,
 /// not hang (design §5.4 C-DECODE — the bounded wall-clock decode ceiling).
+/// <para>
+/// The pin is DERIVED, not sacred: it is re-created by replaying the shared <see cref="CdcFuzzMutation"/>
+/// stream, so when the base cdc file's bytes change the pin is re-derived against the CURRENT file (this is
+/// exactly why the mutation strategy is shared with the live fuzz). The original repro
+/// (<c>seed=42, iteration=148</c>, a 957-byte file) stopped driving the non-terminating decode once #730 made
+/// the string column emit its declared (non-null) footer repetition, shrinking the base cdc file to 951 bytes;
+/// the seed/iteration above is the re-minimized input that reproduces the identical bounded-decode fail-closed
+/// behavior against the post-#730 file.
+/// </para>
 /// </summary>
 /// <remarks>
 /// The cdc file's bytes are reproduced deterministically by rebuilding the same table the fuzz builds (create
 /// → enable CDF → append three rows → partial delete, materializing one explicit cdc file) and replaying the
-/// same seeded mutation stream to iteration 148. The read is driven at the shared <see cref="ParquetFileReader"/>
+/// same seeded mutation stream (seed 35) to iteration 14. The read is driven at the shared <see cref="ParquetFileReader"/>
 /// tier (the engine every Parquet read — snapshot, checkpoint, cdc — shares) so the LOW decode budget seam is
 /// reachable, keeping the test fast and deterministic; the real read door uses the same reader with the
 /// conservative default budget.
@@ -54,15 +63,17 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
     {
         byte[] cdc = await BuildFuzzCdcFileAsync();
 
-        // The #647 minimized input: seed 42, the fuzz's scope-combined RNG, replayed to iteration 148, via the
+        // The #647 minimized input: seed 35, the fuzz's scope-combined RNG, replayed to iteration 14, via the
         // SHARED mutation helper both suites call (so this pin cannot drift off the live fuzz strategy).
-        byte[] mutated = CdcFuzzMutation.ReplayToIteration(cdc, baseSeed: 42, scope: FuzzScope, iteration: 148);
+        // Re-derived against the post-#730 base cdc file (see the type-level remarks); the pre-#730 input
+        // (seed 42, iteration 148) no longer drives the non-terminating decode once the file shrank to 951 B.
+        byte[] mutated = CdcFuzzMutation.ReplayToIteration(cdc, baseSeed: 35, scope: FuzzScope, iteration: 14);
 
-        // Pin the exact minimized shape the issue recorded — by CONTENT (SHA-256), not merely length: a length
-        // check alone would accept a different 957-byte mutation if the (deterministic) build or replay drifted.
-        Assert.Equal(957, mutated.Length);
+        // Pin the exact minimized shape by CONTENT (SHA-256), not merely length: a length check alone would
+        // accept a different 951-byte mutation if the (deterministic) build or replay drifted.
+        Assert.Equal(951, mutated.Length);
         Assert.Equal(
-            "8d77ac2c287569275768573755f99966d69598ead15380599029646ea34df6f1",
+            "710de774791564a3bfe6fd12c93fe1ba7f3aed002188bf1f84da0a424d345f33",
             Sha256Hex(mutated));
 
         // Read the (unmutated) cdc data schema so we can decode the mutated file through the shared reader.

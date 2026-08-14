@@ -20,6 +20,25 @@
 
   <ItemGroup>
     <ProjectReference Include="../../src/DeltaSharp.Storage/DeltaSharp.Storage.csproj" />
+    <!--
+      DeltaSharp.Core is referenced only so DeltaFooterLogParityCoverageTests can LOAD it and scan
+      it for SchemaJson.ToJson call sites (#743). SchemaJson is IVT-visible to DeltaSharp.Core as
+      well as Storage/Engine, so a schemaString-producing seam added in Core would otherwise be
+      outside the required-side scan entirely while the guard stayed green. Storage itself does not
+      depend on Core; this reference exists purely to make Core's assembly present in this test
+      context so the coverage guard's cross-assembly scan is not silently vacuous over it.
+
+      DO NOT remove this as an "unused reference": no test code binds a Core type, so it looks
+      unused, and until the round-1 fix removing it silently reverted the scan to Storage-only with
+      every guard still green. ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson now asserts the
+      resolved scan set equals the full IVT grantee set, so deleting this line turns that guard RED
+      (proven by reverting it) rather than quietly shrinking what the harness covers.
+      DeltaSharp.Engine — the other non-test grantee — arrives transitively via DeltaSharp.Storage,
+      and DeltaSharp.Abstractions (which declares SchemaJson and needs no grant) via both; if a
+      future grant names an assembly that is not in this closure, that guard reddens until a
+      ProjectReference for it is added here or the grant is dropped.
+    -->
+    <ProjectReference Include="../../src/DeltaSharp.Core/DeltaSharp.Core.csproj" />
   </ItemGroup>
 
   <!--

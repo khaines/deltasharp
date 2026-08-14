@@ -144,6 +144,12 @@
       "deltasharp.abstractions": {
         "type": "Project"
       },
+      "deltasharp.core": {
+        "type": "Project",
+        "dependencies": {
+          "DeltaSharp.Abstractions": "[0.1.0, )"
+        }
+      },
       "deltasharp.engine": {
         "type": "Project",
         "dependencies": {

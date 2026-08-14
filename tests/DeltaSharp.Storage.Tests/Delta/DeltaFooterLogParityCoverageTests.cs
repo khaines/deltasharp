@@ -49,6 +49,9 @@ public sealed class DeltaFooterLogParityCoverageTests
     [Fact]
     public async Task ParityGuard_DrivesEveryWriteEntryPoint()
     {
+        // Precondition: the scan scope must be whole before anything derived from it is trusted.
+        AssertScanScopeIsComplete();
+
         MethodInfo[] required = typeof(DeltaWriteTarget)
             .GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance)
             .Where(m => m.ReturnType == typeof(Task<DeltaWriteResult>))
@@ -81,8 +84,8 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
-    /// Every <c>SchemaJson.ToJson</c> call site in production is reached by something the parity
-    /// suite actually ran.
+    /// Every DIRECT-IL <c>SchemaJson.ToJson</c> call site in production is reached by something the
+    /// parity suite actually ran.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -98,8 +101,8 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// </para>
     /// <para>
     /// So the required set is read off the property itself: every method in the production
-    /// assembly whose IL contains a call to <c>SchemaJson.ToJson</c>. A new call site, on a new
-    /// type, with a new return type, surfaces here automatically. The driven side had been
+    /// assembly whose IL contains a DIRECT call to <c>SchemaJson.ToJson</c>. A new call site, on a
+    /// new type, with a new return type, surfaces here automatically. The driven side had been
     /// hardened against hand-listing three times over while the required side stayed two literals.
     /// </para>
     /// <para>
@@ -112,10 +115,21 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// <para>
     /// That gap is MEASURED, not merely suspected: a <c>SchemaJson.ToJson</c> call site placed
     /// behind a branch that never fires is reported covered (0 kills), while the same site with no
-    /// call from a reached method is reported unreached. It is tracked as issue #734, whose remedy
-    /// is to make this leg dynamic too -- most likely from the coverage data this repo already
-    /// collects -- rather than to refine the walk, for the same reason the driven side had to stop
-    /// being static: "could this be reached" cannot answer "was this executed".
+    /// call from a reached method is reported unreached (tracked as #734). VERDICT (#734,
+    /// closed-as-documented): fully closing it is a CHANGE OF KIND, not a refinement of the walk.
+    /// "Could this be reached" is a call-graph fact; "was this executed" is a run-time fact that
+    /// static forward reachability cannot express, for the same reason the driven side had to stop
+    /// being static. The sound remedy is line-level EXECUTION coverage of each call site -- coverlet
+    /// is already wired into this repo via <c>coverlet.runsettings</c> -- collected by the parity
+    /// suite's own run and asserted here. That requires reading a coverage report produced by the
+    /// enclosing <c>dotnet test</c> invocation (a report an in-process <c>[Fact]</c> cannot read of
+    /// its own still-running process without spawning a nested instrumented run), so it is deferred
+    /// to a dedicated change rather than bolted on here where it would make the gate fragile. The
+    /// residual is BOUNDED, not open: the DRIVEN side is already dynamic (a call site whose owning
+    /// operation nothing executes is caught), and the parity assertions pin BEHAVIOUR at every site
+    /// a test drives, so what remains uncovered is only a call site that is both statically
+    /// reachable from an executed entry point AND sits in a branch that entry point never takes --
+    /// a shape no current production path has, and one a reviewer sees as a new never-taken branch.
     /// </para>
     /// <para>
     /// A second limit, so that "every call site is covered" is not read as more than it is: one of
@@ -125,10 +139,32 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// act on. No assertion can distinguish a correct empty-schema serializer from a corrupted one
     /// on that input, so counting it toward coverage is honest only with this stated.
     /// </para>
+    /// <para>
+    /// A third limit, on the SCAN's reach rather than on what a covered site proves (round 2,
+    /// red-team). The required side is built by walking IL for DIRECT references --
+    /// <c>Call</c>/<c>Callvirt</c>/<c>Ldftn</c>/<c>Ldtoken</c> -- so it finds every direct-IL call
+    /// site and NOT a REFLECTIVE one: a seam invoking
+    /// <c>typeof(SchemaJson).GetMethod("ToJson").Invoke(...)</c> emits no reference to the method
+    /// and is invisible here, so an undriven reflective seam would ship green. That is an ACCEPTED,
+    /// DOCUMENTED limit, not an oversight, for three reasons. (a) <c>SchemaJson</c> is
+    /// <c>internal</c> and is directly visible via IVT to every production assembly that could want
+    /// it, so production DeltaSharp has no reason to reach it reflectively and does not. (b) A
+    /// reflection scanner is itself trivially evadable -- the method name can be a computed or
+    /// obfuscated string, so the scanner would buy an over-claim ("we detect reflective seams")
+    /// rather than a property, which is the exact failure this guard family exists to remove.
+    /// (c) A reflective serializer seam is a CODE-REVIEW concern: it is conspicuous in a diff in a
+    /// way an ordinary method call is not, whereas the direct call sites this scan covers are the
+    /// ones that appear routinely and silently. So the claim this test makes is bounded and exact:
+    /// every DIRECT-IL call site is reached by an executed entry point.
+    /// </para>
     /// </remarks>
     [Fact]
     public async Task ParityGuard_ReachesEverySchemaJsonCallSite()
     {
+        // Precondition: an incomplete scan scope makes "every direct-IL call site is reached" a
+        // statement about a smaller set of call sites than production actually has (#743).
+        AssertScanScopeIsComplete();
+
         MethodBase[] callSites = RequiredSites().ToArray();
 
         // Non-vacuity: if the scan finds nothing every check below passes for the wrong reason --
@@ -181,21 +217,31 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// covered by StagedFileOverloads_PreserveEveryMetadataEntryTheCallerDeclared.
     /// </para>
     /// <para>
-    /// LIMIT -- "reached" is NOT uniformly strong across this set. Two members, the public
-    /// staged-file overloads AppendAsync(StructType, IReadOnlyList&lt;StagedDataFile&gt;, ...) and
-    /// the matching OverwriteAsync, are covered by metadata-survival into the committed
-    /// schemaString rather than by footer-vs-log BYTE PARITY, because they emit NO FOOTER: the
-    /// caller stages the file and the writer only commits log actions, so there is no second
-    /// artifact to compare against. Everything else in this set is pinned by byte parity. Do not
-    /// read a green result here as equivalent coverage for those two. Tracked by #741.
+    /// The two public staged-file overloads AppendAsync(StructType,
+    /// IReadOnlyList&lt;StagedDataFile&gt;, ...) and the matching OverwriteAsync emit NO FOOTER --
+    /// the caller stages the file and the writer only commits log actions -- so there is no second
+    /// artifact for a footer-vs-log BYTE comparison. Previously they were pinned only by
+    /// metadata-survival, which is weaker than the byte parity every other member of this set
+    /// carries (#741). They are now additionally pinned by BYTE PARITY against the shared serializer:
+    /// StagedFileOverloads_PreserveEveryMetadataEntryTheCallerDeclared asserts the committed
+    /// schemaString for an unmapped table is byte-identical to SchemaJson.ToJson of the schema the
+    /// caller handed, which catches field-ordering, envelope-whitespace/key-order and type-name
+    /// spelling drift just as the footer overloads' oracle does. "Reached" is now uniformly strong
+    /// across this set.
     /// </para>
     /// <para>
-    /// LIMIT -- the set is scoped to ONE assembly, DeltaSharp.Storage (ProductionMethods walks
-    /// typeof(DeltaWriteTarget).Assembly). "The production assembly" reads as though there is only
-    /// one, and there is not: SchemaJson is internal but IVT-visible to DeltaSharp.Engine and
-    /// DeltaSharp.Core as well, so a call site in either of those is outside this walk entirely and
-    /// this guard will stay green while it goes undriven. Widening the scope is the fix, not
-    /// widening the walk. Tracked by #743.
+    /// The set spans EVERY production assembly that can see <c>SchemaJson</c> --
+    /// <c>DeltaSharp.Storage</c>, <c>DeltaSharp.Core</c> and <c>DeltaSharp.Engine</c>, derived from
+    /// the <see cref="InternalsVisibleToAttribute"/> grants on <c>DeltaSharp.Abstractions</c>, plus
+    /// <c>DeltaSharp.Abstractions</c> itself, which DECLARES the serializer and therefore needs no
+    /// grant to call it -- by <see cref="ProductionAssemblies"/>, not hand-listed at one. It used to
+    /// walk only <c>typeof(DeltaWriteTarget).Assembly</c>, so a call site in <c>DeltaSharp.Core</c>
+    /// (which owns <c>Sql/</c> and <c>Plans/</c>) or <c>DeltaSharp.Engine</c> was outside the scan
+    /// entirely and could go undriven with this guard green. Widening the SCOPE, not the walk, is the
+    /// fix (#743); the scope is itself asserted complete by
+    /// <see cref="ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson"/>, so it cannot narrow back
+    /// silently. Today those assemblies contribute no call site, so the required set is unchanged,
+    /// but a future serializer seam in any of them surfaces here automatically.
     /// </para>
     /// </remarks>
     private static HashSet<MethodBase> RequiredSites()
@@ -236,19 +282,216 @@ public sealed class DeltaFooterLogParityCoverageTests
         }
     }
 
-    /// <summary>Every method in the production assembly, including compiler-generated ones.</summary>
+    /// <summary>
+    /// Grantees that <see cref="ResolveProductionAssemblies"/> could not load, with the load fault.
+    /// Non-empty means the scan silently lost scope -- a RED condition, see
+    /// <see cref="ProductionAssemblies"/>.
+    /// </summary>
+    /// <remarks>
+    /// DECLARATION ORDER MATTERS: this is written by <see cref="ResolveProductionAssemblies"/>, and
+    /// static field initializers run top to bottom, so it must be declared BEFORE
+    /// <see cref="ProductionAssemblies"/>. Declared after, it is still <see langword="null"/> when
+    /// the resolver records a load fault and the guard dies with a NullReferenceException instead of
+    /// the diagnostic naming the missing assembly (observed while proving RED-on-revert).
+    /// </remarks>
+    private static readonly List<string> UnloadableGrantees = new();
+
+    /// <summary>
+    /// The simple names of every non-test <see cref="InternalsVisibleToAttribute"/> grantee of the
+    /// assembly declaring <c>SchemaJson</c>, PLUS that assembly itself and the write-door assembly:
+    /// exactly the set <see cref="ProductionAssemblies"/> must resolve to, with nothing dropped.
+    /// </summary>
+    private static readonly string[] ExpectedScanScope = ComputeExpectedScanScope();
+
+    /// <summary>
+    /// Every PRODUCTION assembly that can see <c>SchemaJson</c>, DERIVED from the
+    /// <see cref="InternalsVisibleToAttribute"/> grants on the assembly that declares it rather
+    /// than hand-listed at one.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <c>SchemaJson</c> is <c>internal</c> in <c>DeltaSharp.Abstractions</c> and IVT-visible to
+    /// <c>DeltaSharp.Storage</c>, <c>DeltaSharp.Core</c> and <c>DeltaSharp.Engine</c>. A
+    /// <c>schemaString</c>-producing call site written in ANY of them commits the same artifact, so
+    /// scanning only <c>DeltaSharp.Storage</c> (which is what the required side used to do) left the
+    /// other two invisible: a serializer seam added in <c>DeltaSharp.Core</c> -- which owns
+    /// <c>Sql/</c> and <c>Plans/</c>, where a <c>CREATE TABLE</c> path could plausibly build and
+    /// serialize a schema -- or in <c>DeltaSharp.Engine</c> would reproduce issue #679's footer/log
+    /// divergence with the whole solution green (#743).
+    /// </para>
+    /// <para>
+    /// <c>DeltaSharp.Abstractions</c> ITSELF is seeded, because it DECLARES <c>SchemaJson</c> and so
+    /// needs no grant to call it -- it can never appear in its own grantee list. Deriving the set
+    /// purely from IVT therefore omitted the one assembly with unconditional access, and a
+    /// <c>SchemaJson.ToJson</c> seam written inside <c>DeltaSharp.Abstractions</c> reproduced the
+    /// #679 divergence class with this guard green. Seeding it closes that hole by construction.
+    /// </para>
+    /// <para>
+    /// The set is read off IVT so it stays derived rather than hand-listed at one. It CANNOT quietly
+    /// fall behind a future grant, and that is enforced rather than asserted in prose: resolution
+    /// used to swallow a grantee that would not load, which made the scope silently self-narrowing
+    /// -- the exact #743 defect one level up, since dropping the <c>DeltaSharp.Core</c>
+    /// <c>ProjectReference</c> from this test project (no test code binds it) would have reverted
+    /// the scan to Storage-only with all three guards still green. Now an unloadable grantee is a
+    /// HARD FAILURE (<see cref="ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson"/>, and a
+    /// precondition on both coverage guards), so a new grant forces either a matching
+    /// <c>ProjectReference</c> here or removal of the grant. Test assemblies are excluded because
+    /// the property is about PRODUCTION call sites; the write-door assembly is seeded
+    /// unconditionally so the scan is never vacuous.
+    /// </para>
+    /// </remarks>
+    private static readonly Assembly[] ProductionAssemblies = ResolveProductionAssemblies();
+
+    /// <summary>The simple name of the assembly that declares <c>SchemaJson</c>.</summary>
+    private static Assembly AbstractionsAssembly => typeof(global::DeltaSharp.Types.SchemaJson).Assembly;
+
+    private static string[] NonTestGranteeNames() =>
+        AbstractionsAssembly.GetCustomAttributes<InternalsVisibleToAttribute>()
+            // AssemblyName may carry a public key; the simple name is everything before the comma.
+            .Select(ivt => ivt.AssemblyName.Split(',')[0].Trim())
+            // Test assemblies are excluded: the property is about PRODUCTION call sites. (The
+            // ".Tests" suffix already covers DeltaSharp.Abstractions.Tests, which Directory.Build.props
+            // auto-injects, so no per-assembly special case is needed.)
+            .Where(name => !name.EndsWith(".Tests", StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+    private static string[] ComputeExpectedScanScope() =>
+        NonTestGranteeNames()
+            // SchemaJson's OWN assembly needs no grant to call it, so it is absent from the grantee
+            // list by construction and must be added explicitly.
+            .Append(AbstractionsAssembly.GetName().Name!)
+            // The write-door assembly, seeded so the scan is never vacuous.
+            .Append(typeof(DeltaWriteTarget).Assembly.GetName().Name!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+    private static Assembly[] ResolveProductionAssemblies()
+    {
+        // Seeded with the write-door assembly so the required-side scan cannot silently become
+        // vacuous even if the IVT read below yields nothing, and with the DECLARING assembly, which
+        // can call SchemaJson without a grant and so never appears in the grantee list at all.
+        var assemblies = new HashSet<Assembly> { typeof(DeltaWriteTarget).Assembly, AbstractionsAssembly };
+
+        foreach (string name in NonTestGranteeNames())
+        {
+            try
+            {
+                assemblies.Add(Assembly.Load(name));
+            }
+            catch (Exception ex)
+                when (ex is FileNotFoundException or FileLoadException or BadImageFormatException)
+            {
+                // FAIL-CLOSED (#743, round-1): this used to `continue`, on the reasoning that a
+                // grantee absent from the test context is not a place a call site could hide. That
+                // reasoning is backwards -- absence from THIS PROCESS says nothing about whether the
+                // SHIPPED assembly holds a call site, and swallowing it is precisely how the scope
+                // shrinks without anyone noticing. Record it; the guards assert this list is empty,
+                // so an IVT-granted assembly that is not loadable here reddens until it is either
+                // referenced by this test project or has its grant removed.
+                UnloadableGrantees.Add($"{name} ({ex.GetType().Name})");
+            }
+        }
+
+        return assemblies.ToArray();
+    }
+
+    /// <summary>
+    /// The scan SCOPE of the two coverage guards equals every assembly that can see
+    /// <c>SchemaJson</c> -- nothing dropped for being unloadable in this test process.
+    /// </summary>
+    /// <remarks>
+    /// A guard whose scope quietly shrinks stays green while covering less, which is the failure
+    /// mode this whole file exists to remove. This is its own [Fact] so the cause is named directly
+    /// rather than surfacing as a confusing "no call sites found" from a downstream guard, and it is
+    /// ALSO asserted as a precondition inside both coverage guards so neither can pass on a
+    /// narrowed scope if this one is skipped or deleted.
+    /// </remarks>
+    [Fact]
+    public void ParityGuard_ScansEveryAssemblyThatCanSeeSchemaJson() => AssertScanScopeIsComplete();
+
+    private static void AssertScanScopeIsComplete()
+    {
+        // Non-vacuity: the grantee list itself must be non-empty, or "every grantee resolved" is
+        // trivially true and the derivation has stopped working.
+        Assert.NotEmpty(NonTestGranteeNames());
+
+        Assert.True(
+            UnloadableGrantees.Count == 0,
+            "DeltaSharp.Abstractions grants InternalsVisibleTo to production assemblies that this "
+            + "test process cannot LOAD, so their SchemaJson.ToJson call sites are outside the "
+            + "coverage scan entirely while these guards stay green (#743)."
+            + $"{Environment.NewLine}  unloadable grantees: {string.Join(", ", UnloadableGrantees)}"
+            + $"{Environment.NewLine}  Fix by adding a ProjectReference to the named assembly from "
+            + "DeltaSharp.Storage.Tests.csproj (a reference no test code needs to bind -- its only "
+            + "job is to put the assembly in this test context), or by removing the IVT grant.");
+
+        string[] resolved = ProductionAssemblies
+            .Select(a => a.GetName().Name!)
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Equal(ExpectedScanScope, resolved);
+    }
+
+    /// <summary>Every method in the production assemblies, including compiler-generated ones.</summary>
     private static IEnumerable<MethodBase> ProductionMethods()
     {
         const BindingFlags flags = BindingFlags.Public | BindingFlags.NonPublic
             | BindingFlags.Instance | BindingFlags.Static | BindingFlags.DeclaredOnly;
 
-        foreach (Type type in typeof(DeltaWriteTarget).Assembly.GetTypes())
+        foreach (Assembly assembly in ProductionAssemblies)
         {
-            foreach (MethodBase method in type.GetMethods(flags).Cast<MethodBase>()
-                .Concat(type.GetConstructors(flags)))
+            foreach (Type type in LoadableTypes(assembly))
             {
-                yield return method;
+                foreach (MethodBase method in type.GetMethods(flags).Cast<MethodBase>()
+                    .Concat(type.GetConstructors(flags)))
+                {
+                    yield return method;
+                }
             }
+        }
+    }
+
+    /// <summary>
+    /// The types of <paramref name="assembly"/>. A cross-assembly scan CAN hit a type whose
+    /// dependency does not resolve in the test context -- but that narrows the required set, so it
+    /// is reported as a hard failure rather than absorbed.
+    /// </summary>
+    /// <remarks>
+    /// This used to return the loadable subset and swallow the <see cref="ReflectionTypeLoadException"/>
+    /// as "a scan artifact, not a call site". Same fail-open shape as the swallowed grantee load
+    /// (see <see cref="ProductionAssemblies"/>): a type that will not load here is a type whose
+    /// <c>SchemaJson.ToJson</c> call sites are absent from the required set, and the guard goes
+    /// GREEN over the smaller set. If this ever fires, the fix is to make the type loadable in this
+    /// test context (usually a missing <c>ProjectReference</c>), not to skip it.
+    /// </remarks>
+    private static IEnumerable<Type> LoadableTypes(Assembly assembly)
+    {
+        try
+        {
+            return assembly.GetTypes();
+        }
+        catch (ReflectionTypeLoadException ex)
+        {
+            string[] faults = ex.LoaderExceptions
+                .Where(e => e is not null)
+                .Select(e => e!.Message)
+                .Distinct(StringComparer.Ordinal)
+                .OrderBy(m => m, StringComparer.Ordinal)
+                .Take(10)
+                .ToArray();
+
+            Assert.Fail(
+                $"Types of production assembly '{assembly.GetName().Name}' failed to load, so its "
+                + "SchemaJson.ToJson call sites are silently missing from the required set and this "
+                + "guard would pass over a NARROWED scan (#743)."
+                + $"{Environment.NewLine}  loaded: {ex.Types.Count(t => t is not null)} of {ex.Types.Length}"
+                + $"{Environment.NewLine}  loader faults: {string.Join($"{Environment.NewLine}    ", faults)}");
+            throw; // unreachable: Assert.Fail always throws.
         }
     }
 
@@ -256,7 +499,7 @@ public sealed class DeltaFooterLogParityCoverageTests
     private static HashSet<MethodBase> ReachableInProduction(
         IReadOnlySet<(string Type, string Method, string Signature)> executed)
     {
-        Assembly production = typeof(DeltaWriteTarget).Assembly;
+        var production = ProductionAssemblies.ToHashSet();
         MethodBase[] roots = ResolveRecorded(executed).ToArray();
 
         // Non-vacuity: recorded entry points that resolve to nothing would empty the reachable set
@@ -280,7 +523,11 @@ public sealed class DeltaFooterLogParityCoverageTests
 
             foreach (MethodBase called in CallTargets(current))
             {
-                if (called.DeclaringType?.Assembly == production && seen.Add(called))
+                // Follow calls into ANY production assembly, not just the write-door one, so a
+                // SchemaJson.ToJson call site reachable in DeltaSharp.Core or DeltaSharp.Engine
+                // from a Storage entry point is walked rather than dropped at the assembly edge.
+                if (called.DeclaringType?.Assembly is { } owner && production.Contains(owner)
+                    && seen.Add(called))
                 {
                     queue.Enqueue(called);
                 }
@@ -533,9 +780,20 @@ public sealed class DeltaFooterLogParityCoverageTests
     /// <para>
     /// So ambiguity is an ERROR here rather than a broadcast: a label matching several methods
     /// fails instead of rooting all of them. That is the fail-closed direction, and it makes the
-    /// author say which overload ran (via the parameter-type arguments to <c>Record</c>) instead of
-    /// silently claiming all of them. This is the same defect as the function-pointer blind spot,
-    /// one level down -- an opcode set is not a call graph, and a name is not a method.
+    /// author say which overload ran (via the parameter-type signature <c>DriveAsync</c> resolves
+    /// from the compiled call expression) instead of silently claiming all of them. This is the
+    /// same defect as the function-pointer blind spot, one level down -- an opcode set is not a
+    /// call graph, and a name is not a method.
+    /// </para>
+    /// <para>
+    /// The signature-disambiguation leg is EXERCISED, not merely present (#738). <c>DriveAsync</c>
+    /// records the resolved parameter types for every entry point, and the public staged-file
+    /// overloads give <c>DeltaTableWriter.AppendAsync</c> and <c>OverwriteAsync</c> two genuinely
+    /// same-named methods each (the <c>StagedDataFile</c> overload and its <c>Snapshot</c>-taking
+    /// sibling), so the recorded label resolves cleanly ONLY because the signature narrows it. Gut
+    /// <see cref="WriteEntryPointRecorder.SignatureOf"/> to the empty string and both names go
+    /// AMBIGUOUS (2 kills) -- so the leg the AMBIGUOUS message instructs is a road a test now walks,
+    /// rather than dead code the message advertised.
     /// </para>
     /// </remarks>
     private static HashSet<MethodBase> ResolveRecorded(
@@ -608,8 +866,15 @@ public sealed class DeltaFooterLogParityCoverageTests
     }
 
     /// <summary>
-    /// The methods <paramref name="method"/> references in its IL.
+    /// The methods <paramref name="method"/> references DIRECTLY in its IL.
     /// </summary>
+    /// <remarks>
+    /// Direct references only: a target reached REFLECTIVELY
+    /// (<c>GetMethod(...)</c>/<c>Invoke(...)</c>) leaves no reference to itself in the caller's IL
+    /// and is therefore invisible to every walk built on this. That is a disclosed, accepted limit
+    /// of the required-side scan -- see the third limit documented on
+    /// <see cref="ParityGuard_ReachesEverySchemaJsonCallSite"/>.
+    /// </remarks>
     /// <param name="method">The method whose body is walked.</param>
     /// <param name="includeFunctionPointers">
     /// Also yield targets taken by ADDRESS (<c>ldftn</c>/<c>ldvirtftn</c>) rather than called.

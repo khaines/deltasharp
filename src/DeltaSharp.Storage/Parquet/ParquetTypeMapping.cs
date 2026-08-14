@@ -38,15 +38,44 @@ internal static class ParquetTypeMapping
     /// Builds the Parquet <see cref="DataField"/> for <paramref name="field"/>, choosing the nullable
     /// Parquet field when <see cref="StructField.Nullable"/> is set.
     /// </summary>
+    /// <param name="field">The engine field to map.</param>
+    /// <param name="honorReferenceNullability">
+    /// When <see langword="true"/>, string/binary (reference-typed) columns follow the declared
+    /// <see cref="StructField.Nullable"/> flag rather than Parquet.Net's reference-type default of
+    /// always-nullable (#730). The WRITE path sets this so the footer's physical repetition matches
+    /// the declared <c>schemaString</c>; the READ path passes <see langword="false"/> because it uses
+    /// the result as the <b>always-nullable expected shape</b> its physical-vs-requested guard is
+    /// written around — a foreign/legacy file may store a log-required string/binary column as
+    /// OPTIONAL, and rejecting that would break reads of files DeltaSharp itself wrote before #730.
+    /// <para>
+    /// There is deliberately NO default. The two semantics are not interchangeable: the read value
+    /// (<see langword="false"/>) is fail-OPEN on the write path — it re-creates exactly the #730
+    /// footer↔log divergence this parameter exists to remove — so a defaulted parameter would let a
+    /// future write call site pick the wrong one by saying nothing. Making it required puts the
+    /// choice in front of the compiler at every present and future call site.
+    /// </para>
+    /// <para>
+    /// The read path's asymmetry (its nullability guard cannot bite on a string/binary column while
+    /// the expected shape is built always-nullable) is a known, dispositioned residual: see
+    /// issue #807.
+    /// </para>
+    /// </param>
     /// <exception cref="DeltaStorageException">
     /// The field's type has no supported Parquet mapping
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>): a nested type, the void type, or a decimal
     /// with precision &gt; 28.
     /// </exception>
-    public static DataField CreateField(StructField field)
+    public static DataField CreateField(StructField field, bool honorReferenceNullability)
     {
         ArgumentNullException.ThrowIfNull(field);
         bool nullable = field.Nullable;
+
+        // #730: for reference-typed columns, DataField<T>(name) defaults IsNullable=true regardless
+        // of the declared schema. On the WRITE path we pass the declared flag so a "nullable":false
+        // string/binary column is emitted as a REQUIRED Parquet column (its footer repetition then
+        // matches the log). Passing null keeps Parquet.Net's always-nullable default, which the READ
+        // path's nullability guard is deliberately written around.
+        bool? referenceNullable = honorReferenceNullability ? nullable : null;
         DataField dataField = field.DataType switch
         {
             BooleanType => Value<bool>(field.Name, nullable),
@@ -56,8 +85,13 @@ internal static class ParquetTypeMapping
             LongType => Value<long>(field.Name, nullable),
             FloatType => Value<float>(field.Name, nullable),
             DoubleType => Value<double>(field.Name, nullable),
-            StringType => new DataField<string>(field.Name),
-            BinaryType => new DataField<byte[]>(field.Name),
+            // #730: string/binary are reference-typed in Parquet.Net, whose DataField<T>(name)
+            // ctor defaults IsNullable=true regardless of the declared schema. On the write path
+            // `referenceNullable` carries the declared flag so a "nullable":false column is emitted
+            // REQUIRED (its footer repetition then matches the log); on the read path it is null,
+            // preserving the always-nullable default the read guard is written around.
+            StringType => new DataField<string>(field.Name, referenceNullable),
+            BinaryType => new DataField<byte[]>(field.Name, referenceNullable),
             DateType => new DateTimeDataField(field.Name, DateTimeFormat.Date, isNullable: nullable),
             // Both timestamp lanes use DateTimeFormat.Timestamp + Micros, which emits the modern
             // LogicalType.TIMESTAMP{isAdjustedToUTC, unit=MICROS} (Parquet.Net's Timestamp format writes ONLY
@@ -159,7 +193,10 @@ internal static class ParquetTypeMapping
                 // Scalar (or unsupported scalar/void/decimal>28): the exact same validation the write path
                 // uses. A nested type never reaches here (handled above), so this only rejects unsupported
                 // scalars. Also stamps/validates any column-mapping id, preserving the prior read behavior.
-                _ = CreateField(field);
+                // honorReferenceNullability: false — this is a READ-path validation that only asks "does this
+                // type map at all"; the returned field is discarded, so the repetition it carries is
+                // immaterial and the read default is kept for continuity with ValidateFileField.
+                _ = CreateField(field, honorReferenceNullability: false);
                 break;
         }
     }
@@ -180,7 +217,9 @@ internal static class ParquetTypeMapping
                 + "not supported.");
         }
 
-        _ = CreateField(new StructField("_leaf", type, nullable: true));
+        // honorReferenceNullability: false — a discarded probe of the LEAF type's mappability; the
+        // returned field's repetition is never observed.
+        _ = CreateField(new StructField("_leaf", type, nullable: true), honorReferenceNullability: false);
     }
 
     /// <summary>
@@ -188,8 +227,10 @@ internal static class ParquetTypeMapping
     /// the inverse of <see cref="CreateField"/>. Used by the write-door to derive the <b>actual physical data
     /// schema a staged file was written with</b> (read back from its footer) so schema enforcement gates the
     /// real bytes, not the caller's declaration (#497). Nullability is deliberately <b>not</b> reconstructed
-    /// as authoritative here: Parquet.Net models string/binary as always-nullable and a footer does not
-    /// faithfully carry Spark nullability, so a footer-derived schema is compared by name + type only.
+    /// as authoritative here: a footer carries a column's physical REPETITION, not Spark nullability, and the
+    /// two can legitimately disagree on a file this reader did not write — a foreign producer, or a DeltaSharp
+    /// file written before #730, may store a log-<i>required</i> string/binary column as OPTIONAL. So a
+    /// footer-derived schema is compared by name + type only.
     /// </summary>
     /// <exception cref="DeltaStorageException">The footer field's physical type has no supported DeltaSharp
     /// mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>) — the inverse of the deferrals in
@@ -261,7 +302,10 @@ internal static class ParquetTypeMapping
     /// Reconstructs the DeltaSharp data <see cref="StructType"/> a written Parquet footer encodes (each
     /// <see cref="ParquetSchema.DataFields"/> mapped via <see cref="ToDataType"/>, in footer order). This is
     /// the ACTUAL physical schema of the bytes on disk, used by the write-door for #497 physical
-    /// write-schema validation. Compared by name + type only (nullability/metadata are not footer-faithful).
+    /// write-schema validation. Compared by name + logical type only: the reconstructed
+    /// <see cref="StructField.Nullable"/> is the footer's physical REPETITION, which since #730 matches the
+    /// declared schema for files DeltaSharp writes but need not on a foreign or pre-#730 file, and field
+    /// metadata is not carried in a footer at all — neither is footer-faithful.
     /// </summary>
     /// <exception cref="DeltaStorageException">A footer field has no supported DeltaSharp mapping
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>

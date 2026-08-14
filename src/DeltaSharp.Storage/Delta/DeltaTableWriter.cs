@@ -50,8 +50,10 @@ internal enum PartitionOverwriteMode
 ///
 /// <para><b>Physical write-schema validation (#497).</b> <see cref="DataSchema"/> is the file's real
 /// footer-derived data schema (physical-named under column mapping). The commit-time cross-check compares
-/// it by name + logical type only, because Parquet.Net models string/binary as nullable and a footer does
-/// not carry Spark field metadata — neither is footer-faithful.</para>
+/// it by name + logical type only: a footer carries a column's physical REPETITION rather than Spark
+/// nullability (they agree for files DeltaSharp writes since #730, but a foreign or pre-#730 file may store
+/// a log-required string/binary as OPTIONAL) and a footer does not carry Spark field metadata at all —
+/// neither is footer-faithful.</para>
 ///
 /// <para><b>Content checksum (#504).</b> <see cref="ContentChecksum"/> is the advisory
 /// <c>sha256:&lt;hex&gt;</c> fingerprint of the file's on-disk bytes, stamped onto the committed
@@ -1516,10 +1518,12 @@ internal sealed class DeltaTableWriter
     // bytes, this genuinely gates the written columns/types rather than re-validating the declaration against
     // itself: a staged file whose footer diverges from the committed declaration (a foreign producer, or a
     // staging-vs-commit schema mismatch) is rejected fail-closed BEFORE any action is built or committed
-    // (mirroring ValidatePartitionCoverage). Comparison is by NAME + logical TYPE only — Parquet.Net models
-    // string/binary as always-nullable and a footer does not carry Spark field metadata, so nullability and
-    // metadata are NOT footer-faithful and must not be compared (comparing them would false-reject a valid
-    // required-string write). A file whose DataSchema is null (a caller that does not supply it) is skipped —
+    // (mirroring ValidatePartitionCoverage). Comparison is by NAME + logical TYPE only — a footer carries a
+    // column's physical REPETITION rather than Spark nullability, and carries no Spark field metadata at
+    // all, so neither is footer-faithful. Since #730 the two AGREE for a file DeltaSharp just wrote, but a
+    // staged file produced elsewhere (a foreign writer) or written by a pre-#730 DeltaSharp legitimately
+    // stores a log-required string/binary column as OPTIONAL, so comparing repetition would false-reject a
+    // valid required-string write of exactly that vintage. A file whose DataSchema is null (a caller that does not supply it) is skipped —
     // the cross-check binds only when the producing write-door supplies the true written schema. The
     // `writeSchema`/`partitionColumns` passed here are the PHYSICAL forms for a name-mode table (#525/#541:
     // ResolveWrite maps the logical write columns to their physicalName — reusing the existing mapping, or the
@@ -1550,8 +1554,9 @@ internal sealed class DeltaTableWriter
     }
 
     // Structural equality of two data schemas by NAME (ordinal) + logical TYPE, in order — deliberately
-    // ignoring nullability and field metadata (see ValidateStagedWriteSchema: neither is footer-faithful, so
-    // comparing them against a footer-derived schema would false-reject a valid write).
+    // ignoring nullability and field metadata (see ValidateStagedWriteSchema: a footer carries physical
+    // REPETITION, not Spark nullability, and no field metadata at all, so comparing either against a
+    // footer-derived schema would false-reject a valid write of a foreign or pre-#730 staged file).
     private static bool DataColumnsMatch(StructType expected, StructType actual)
     {
         if (expected.Count != actual.Count)

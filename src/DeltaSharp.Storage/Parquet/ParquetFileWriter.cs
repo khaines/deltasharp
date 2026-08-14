@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Globalization;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
@@ -70,7 +71,10 @@ internal sealed class ParquetFileWriter
         var fields = new DataField[columnCount];
         for (int c = 0; c < columnCount; c++)
         {
-            fields[c] = ParquetTypeMapping.CreateField(schema[c]);
+            // honorReferenceNullability: the WRITTEN footer's physical repetition must match the
+            // declared schemaString, so a "nullable":false string/binary column is emitted REQUIRED
+            // rather than Parquet.Net's reference-type always-nullable default (#730).
+            fields[c] = ParquetTypeMapping.CreateField(schema[c], honorReferenceNullability: true);
         }
 
         // Apply any selection once and record each batch's logical row count, so row groups can be sized
@@ -230,7 +234,23 @@ internal sealed class ParquetFileWriter
         int size,
         CancellationToken cancellationToken)
     {
-        bool nullable = schemaField.Nullable;
+        // #730 backstop: this method's null-rejection flag and the Parquet field's REPETITION
+        // (REQUIRED/OPTIONAL, chosen by ParquetTypeMapping.CreateField from the same
+        // StructField.Nullable) are two readings of ONE decision. Parquet.Net 6.0.3 does not
+        // cross-check them: writing a null-bearing (nullable) value array into a field the footer
+        // declares REQUIRED — or a non-null array into an OPTIONAL field — produces a structurally
+        // corrupt file with NO exception. So take the flag from the DataField that is actually
+        // stamped into the footer (single source), and assert it against the declared schema so a
+        // future divergence is loud in a Debug/test run rather than silent on disk. (MEASURED: with
+        // the write flag flipped back to the read semantics, this fires with
+        // "IsNullable=True ... Nullable=False" as a DebugAssertException the test host reports as a
+        // normal failure. It rides the DATA path, so a zero-row write — which emits no row group —
+        // does not reach it; the footer-shape guards in ParquetWriterTests cover that case.)
+        Debug.Assert(
+            field.IsNullable == schemaField.Nullable,
+            $"Parquet field repetition (IsNullable={field.IsNullable}) diverges from the declared "
+            + $"schema (Nullable={schemaField.Nullable}); writing would corrupt the file (#730).");
+        bool nullable = field.IsNullable;
         switch (schemaField.DataType)
         {
             case BooleanType:

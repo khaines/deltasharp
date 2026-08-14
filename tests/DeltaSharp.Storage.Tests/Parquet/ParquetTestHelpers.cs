@@ -433,6 +433,50 @@ internal static class ParquetTestHelpers
         return forged.ToArray();
     }
 
+    /// <summary>The SURVIVOR-#4 sibling of <see cref="PlaintextFooterEncryptedFileAsync"/>: sets the file-level
+    /// <c>EncryptionAlgorithm</c> (so the failure-path footer probe classifies it encrypted) AND nulls the
+    /// <c>Type</c> of the first leaf <c>SchemaElement</c>. A null leaf type re-serializes into a footer that
+    /// <see cref="ParquetReader.CreateAsync(System.IO.Stream, ParquetOptions?, bool, CancellationToken)"/>
+    /// still OPENS (the reader is constructed and <c>reader.Metadata</c> is populated), but whose high-level
+    /// <c>reader.Schema</c> materialization THROWS (Parquet.Net 6.0.3: "cannot decode schema for field ...").
+    /// This is the ONE shape that reaches <c>DeltaCheckpointReader.OpenAsync</c>'s failure-path catch with a
+    /// <b>non-null</b> reader — so it is the only fixture that exercises the "classify BEFORE dispose" ordering
+    /// (#717 survivor 4). Both checkpoint failure-path encryption fixtures make <c>CreateAsync</c> itself throw
+    /// (reader stays null, no dispose runs), which is exactly why that ordering survived mutation. Because the
+    /// footer carries a non-empty <c>encryption_algorithm</c> union with all four required FileMetaData fields
+    /// intact, the raw footer probe classifies it <see cref="StorageErrorKind.UnsupportedFeature"/> — but only
+    /// if it runs while the input stream is still open.</summary>
+    public static async Task<byte[]> PlaintextFooterEncryptedButSchemaThrowsFileAsync(byte[] bytes)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                metadata.EncryptionAlgorithm = new global::Parquet.Meta.EncryptionAlgorithm
+                {
+                    AESGCMV1 = new global::Parquet.Meta.AesGcmV1(),
+                };
+                global::Parquet.Meta.SchemaElement leaf =
+                    metadata.Schema.FirstOrDefault(e => e.Type is not null)
+                    ?? throw new InvalidOperationException("no leaf schema element with a physical type to null");
+                leaf.Type = null; // Opens fine; reader.Schema then throws on the un-typed leaf.
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
     /// <summary>The per-column SIBLING of <see cref="PlaintextFooterEncryptedFileAsync"/>: leaves the
     /// file-level <c>EncryptionAlgorithm</c> UNSET and instead marks the single column chunk
     /// (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>) with <c>ColumnCryptoMetaData</c> — the

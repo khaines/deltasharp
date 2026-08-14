@@ -55,6 +55,26 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// OUTSIDE both the prober and the probed; a helper that re-derives one of the two artifacts being
 /// compared sits BETWEEN them. Only the second is a tautology.
 /// </para>
+/// <para>
+/// VERDICT (#724, closed-as-documented): the tempting collapse -- "serialize the schema ONCE and
+/// pass that one <c>schemaString</c> down so footer and log are a single computation, not two that
+/// must agree" -- is NOT implementable, and this is measured, not asserted. The footer schema and
+/// the log schema are DIFFERENT schemas by design: (1) partition columns live in the log's
+/// <c>add.partitionValues</c> and are stripped from the data-file footer, so the footer schema is
+/// the table schema MINUS the partition columns (see
+/// <see cref="Partitioned_FooterOmitsExactlyThePartitionColumns_AndNothingElse"/>); (2) in name/id
+/// column-mapping mode the footer carries PHYSICAL names while the log carries LOGICAL names (see
+/// <see cref="ColumnMappingEvolution_PreservesEveryMetadataEntryTheCallerDeclared"/>); and (3) the
+/// log <c>schemaString</c> is produced at commit time AFTER the data files (and their footers) are
+/// already written. There is no single string to pass. The weaker variant -- have
+/// <c>ParquetFileWriter</c> take a pre-serialized <c>string schemaJson</c> -- does not close the
+/// class either: the caller then serializes at a NEW call site, so the rogue site MOVES rather than
+/// vanishes, and the public API is made worse (every caller must know the Delta footer JSON dialect).
+/// The strongest IMPLEMENTABLE guard is therefore not deduplication but this end-to-end suite plus
+/// the artifact guards: the two real artifacts are read back off disk and compared where they must be
+/// equal, and checked against a caller-derived (never write-path-derived) expectation where they must
+/// differ.
+/// </para>
 /// </remarks>
 public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 {
@@ -320,6 +340,9 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 
         // The evolution commit's log, parsed off disk. Every caller-declared entry must be present
         // verbatim; the commit is allowed to ADD delta.columnMapping.* and nothing else.
+        // "Verbatim" is only load-bearing against a TRUNCATING serializer while the corpus carries
+        // a value longer than any plausible fixed buffer, so that is asserted first (#726, round 2).
+        AssertCorpusCarriesALongMetadataValue(evolved);
         var logged = (StructType)SchemaJson.FromJson(written[^1].Declared);
         Assert.Equal(evolved.Count, logged.Count);
 
@@ -569,11 +592,26 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             "the staged-file overload produced no new schema-carrying commit; versions seen: "
             + string.Join(", ", committed.Select(c => c.Version)));
 
+        // #741: BYTE PARITY, not only metadata-survival. These overloads emit NO footer, so the
+        // metadata-survival oracle below cannot see field-ORDERING drift, whitespace/separator/
+        // key-order drift in the JSON envelope, or type-name spelling drift -- every one a genuine
+        // #679-class divergence that the footer-writing overloads ARE pinned against by byte parity
+        // (EveryCommit... asserts SchemaJson.ToJson(replaced) == the committed string). This table
+        // is unpartitioned and unmapped, so the committed schemaString must be BYTE-IDENTICAL to the
+        // shared serializer's output for the schema the caller handed -- the same strength every
+        // other member of the required set carries, so "driven" is now uniform across it.
+        Assert.Equal(SchemaJson.ToJson(evolved), committed[^1].Declared);
+
         AssertDeclaredPreservesCallerMetadata(evolved, committed[^1].Declared);
     }
 
     private static void AssertDeclaredPreservesCallerMetadata(StructType expectedSchema, string declared)
     {
+        // The oracle below is value EQUALITY over a re-parsed artifact, which is exactly what
+        // catches a truncating serializer -- but only if something in the corpus is long enough to
+        // be truncated. That precondition is asserted, not assumed (#726, round 2).
+        AssertCorpusCarriesALongMetadataValue(expectedSchema);
+
         var logged = (StructType)SchemaJson.FromJson(declared);
         Assert.Equal(expectedSchema.Count, logged.Count);
 
@@ -631,6 +669,36 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// bulk path would choke on: non-ASCII keys and values, an astral pair, an empty key, an empty
     /// value, and characters requiring escapes.
     /// <para>
+    /// The KEY-NAME domain is corpus content too, not only the value domain (#731). Keys under the
+    /// two realistic CALLER namespaces are included — a user/tenant prefix (<c>tenant.*</c>) and the
+    /// Spark-interop prefix (<c>spark.sql.*</c>) — because a strip conditioned on a caller's own
+    /// prefix, rather than on entry count or value shape, matched none of the empty/padding/accent
+    /// keys and so survived every other member of this corpus.
+    /// </para>
+    /// <para>
+    /// INHERENT LIMIT, disclosed rather than papered over (round 2, red-team). Corpus-based
+    /// detection of a metadata STRIP is only as wide as the corpus: a strip conditioned on a key
+    /// NAMESPACE catches fire here only for namespaces this corpus enumerates, which are the two
+    /// realistic caller namespaces above plus the engine namespace <c>delta.columnMapping.*</c>. A
+    /// rogue conditioned on some namespace absent from the corpus (say <c>acme.internal.*</c>) still
+    /// ships green, and no amount of key-adding closes that — the key-name domain is unbounded, so
+    /// enumerating it is namespace whack-a-mole, not a proof. This is an ACCEPTED, DOCUMENTED
+    /// residual on the same discipline as #726/#734 in this PR: keep the strongest bounded guard
+    /// (every key the caller declared must survive, over a corpus that covers the namespaces real
+    /// callers actually use) and state the boundary in place, so it is a known limit rather than a
+    /// recurring surprise. What is NOT residual: an UNCONDITIONAL strip, a count-threshold strip, a
+    /// value-shape strip, and a strip on any of the three enumerated namespaces are all RED here.
+    /// </para>
+    /// <para>
+    /// The VALUE-LENGTH domain is corpus content too (#726, round 2, red-team). The corpus carries a
+    /// metadata string value of <see cref="LongMetadataValueLength"/> characters -- flat, inside an
+    /// ARRAY, and inside a NESTED object -- because every guard in this file that checks value
+    /// FIDELITY is bounded by the longest value it is handed, and a serializer truncating metadata
+    /// values at a fixed buffer is invisible below that bound AND invisible to footer/log byte
+    /// parity (the truncation is symmetric: both artifacts go through the same serializer).
+    /// <see cref="AssertCorpusCarriesALongMetadataValue"/> stops that value being deleted quietly.
+    /// </para>
+    /// <para>
     /// The value kinds are enumerated from <see cref="MetadataValueKind"/> itself rather than
     /// listed, so a kind added later is carried here without anyone remembering to add it.
     /// </para>
@@ -646,6 +714,54 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             new("ключ", MetadataValue.String("значение")),
             new("astral\U0001F600", MetadataValue.String("\U0001F600")),
             new("quote\"tab\tnewline\n", MetadataValue.String("back\\slash")),
+
+            // #731 round-1: the KEY-NAME domain is part of the corpus, not just the value domain. Every
+            // other key here is either empty, a padding name, or an accent/emoji token, and the writer's
+            // only reserved namespace is `delta.*` — so a strip conditioned on a CALLER namespace (the
+            // shape of the rogue that filed #731: "drop any key under the tenant's own prefix") matched
+            // nothing this schema declares and shipped green. A caller-namespaced key makes that rogue
+            // RED, and it is the compliance-visible case: classification/PII tags live under exactly such
+            // a prefix, and losing them from the committed schemaString is silent.
+            new("tenant.classification", MetadataValue.String("restricted")),
+            new("tenant.pii.fields", MetadataValue.Array(new[] { MetadataValue.String("région") })),
+
+            // Round 2 (red-team): `tenant.*` alone left the CLASS half-closed. The OTHER realistic
+            // caller namespace is Spark interop's `spark.sql.*` — the most common field-metadata
+            // prefix in a Spark-written Delta schema, since a table round-tripped through Spark
+            // carries Spark-owned per-field metadata alongside the caller's own. A rogue stripping
+            // `spark.sql.*` matched nothing this corpus declared and shipped 100% green; with these
+            // entries it is RED. The LEAF names are representative, not normative — what the corpus
+            // needs is the PREFIX, and both a string and a non-string value under it, so a rogue
+            // that also conditions on value kind cannot slip past on the other lane.
+            new("spark.sql.catalyst.charVarcharType", MetadataValue.String("varchar(32)")),
+            new("spark.sql.parquet.fieldId", MetadataValue.Long(11)),
+
+            // Round 2 (red-team): the VALUE-LENGTH domain. Every other value in this corpus is under
+            // ~30 characters, so a serializer that truncated a metadata VALUE at a fixed buffer
+            // (256/1024/4096 -- the stackalloc thresholds and pooled-buffer sizes real serializers
+            // use) shipped the whole suite GREEN. It survived footer/log BYTE parity because the
+            // truncation is SYMMETRIC -- both artifacts go through the same ToJson -- and it survived
+            // the value-fidelity guards below because nothing declared here was long enough to lose
+            // anything. Input-fixture variety elsewhere (ParquetWriterTests.MagnitudeLengths) cannot
+            // close it either: varying the INPUT runs no serializer and re-parses no artifact.
+            //
+            // A value past the largest plausible buffer, carried by a corpus whose consumers re-parse
+            // the committed artifact and assert value EQUALITY, is what makes truncation RED. Long
+            // metadata values are not exotic: generated-column expressions, view SQL and column
+            // comments reach kilobytes in real tables, and losing their tail is silent data loss in
+            // the committed schemaString.
+            //
+            // All three metadata SHAPES carry one. Today's serializer recurses through a single
+            // value-writing switch, so one long value would exercise the same code -- but a
+            // serializer that special-cases the flat case (or copies nested/array values through a
+            // separate bulk path) makes them independent lanes, and a per-shape truncation would
+            // then be invisible in the two shapes the corpus left short.
+            new("tenant.column.comment", MetadataValue.String(LongMetadataValue)),
+            new("tenant.lineage.sql", MetadataValue.Array(new[] { MetadataValue.String(LongMetadataValue) })),
+            new("tenant.lineage.provenance", MetadataValue.Nested(FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("expression", MetadataValue.String(LongMetadataValue)),
+            }))),
         };
 
         for (int i = 0; bulky.Count < 96; i++)
@@ -664,6 +780,72 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             new StructField("naïve", DataTypes.StringType, nullable: true),
         });
     }
+
+    /// <summary>
+    /// The length the corpus's long metadata values must reach: past the largest buffer a
+    /// serializer plausibly stack-allocates or pools, so a serializer that truncates a metadata
+    /// VALUE at a fixed size cannot round-trip one of them intact.
+    /// </summary>
+    /// <remarks>
+    /// CHOSEN, not derived -- and deliberately NOT read from <c>ParquetWriterTests</c>'s
+    /// <c>MinimumLongestString</c>/<c>MagnitudeLengths</c>, even though it matches the 4097 there. A
+    /// bound taken from the sweep this guard backstops would narrow whenever that sweep narrowed,
+    /// which is the shared-source defect this PR keeps finding; two chosen numbers in independent
+    /// files disagree loudly when either moves.
+    /// </remarks>
+    private const int LongMetadataValueLength = 4097;
+
+    /// <summary>
+    /// A realistic long metadata value -- a generated-column expression -- padded to
+    /// <see cref="LongMetadataValueLength"/> and terminated by a distinctive sentinel, so a
+    /// truncation at ANY fixed buffer (256/1024/4096) loses the tail and the failure message shows
+    /// which end went missing.
+    /// </summary>
+    private static readonly string LongMetadataValue = BuildLongMetadataValue();
+
+    private static string BuildLongMetadataValue()
+    {
+        const string head = "CASE WHEN région IS NULL THEN 'unknown' ELSE upper(région) END /* ";
+        const string tail = " */ -- END-OF-METADATA-VALUE";
+        return head + new string('m', LongMetadataValueLength - head.Length - tail.Length) + tail;
+    }
+
+    /// <summary>
+    /// Fails closed if the schema whose metadata is about to be checked for fidelity carries no
+    /// value long enough for a TRUNCATING serializer to be observable.
+    /// </summary>
+    /// <remarks>
+    /// The value-fidelity assertions in this file are only as strong as the longest value in the
+    /// corpus: with every value under a few dozen characters, a serializer truncating metadata
+    /// values at 256 (or 1024, or 4096) bytes reproduces every declared value exactly and ships
+    /// green, in BOTH artifacts, because the truncation is symmetric. So the corpus property the
+    /// oracle depends on is asserted here rather than assumed, and shrinking the corpus REDs this
+    /// instead of silently weakening every guard that consumes it.
+    /// </remarks>
+    private static void AssertCorpusCarriesALongMetadataValue(StructType schema)
+    {
+        int longest = schema
+            .SelectMany(f => f.Metadata.Values)
+            .Select(LongestStringIn)
+            .DefaultIfEmpty(0)
+            .Max();
+
+        Assert.True(
+            longest >= LongMetadataValueLength,
+            $"The corpus's longest metadata string VALUE is {longest} characters, below the "
+            + $"{LongMetadataValueLength} this oracle needs. Below that bound a serializer that "
+            + "truncates a metadata value at a fixed buffer round-trips every value here intact "
+            + "and ships green. Restore the long value; do not lower this bound.");
+    }
+
+    /// <summary>The longest string anywhere in a metadata value, including inside arrays and nested objects.</summary>
+    private static int LongestStringIn(MetadataValue value) => value.Kind switch
+    {
+        MetadataValueKind.String => value.AsString().Length,
+        MetadataValueKind.Array => value.AsArray().Select(LongestStringIn).DefaultIfEmpty(0).Max(),
+        MetadataValueKind.Nested => value.AsNested().Values.Select(LongestStringIn).DefaultIfEmpty(0).Max(),
+        _ => 0,
+    };
 
     private static MetadataValue ValueOfKind(MetadataValueKind kind, int i) => kind switch
     {

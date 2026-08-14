@@ -25,7 +25,8 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// <c>storage-delta-architecture.md</c> §5.4 (C-DECODE) requires the decode to fail closed and terminate: a
 /// corrupt Parquet <i>data-page header</i> can drive <c>Parquet.Net</c>'s synchronous decode into a
 /// non-terminating CPU loop that no exception handler or <c>CancellationToken</c> can interrupt (repro: this
-/// fuzz with <c>DELTASHARP_TEST_SEED=42</c>, byte-flip strategy, iteration 148). That non-termination is now
+/// fuzz with <c>DELTASHARP_TEST_SEED=35</c>, byte-flip strategy, iteration 14, against the current base cdc
+/// file; the pre-#730 repro was <c>seed=42, iteration=148</c>). That non-termination is now
 /// bounded at the shared reader by the wall-clock decode ceiling (<c>BoundedDecode</c>, #647/#699/#716): the
 /// decode races an aggregate per-read deadline and fails closed with a typed
 /// <see cref="StorageErrorKind.DecodeBudgetExceeded"/>. The pinned repro

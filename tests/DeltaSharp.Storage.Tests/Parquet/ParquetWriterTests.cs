@@ -303,12 +303,14 @@ public sealed class ParquetWriterTests
         // columns, this form is RED while the input-only form is GREEN 1659 -- the old form's kill
         // had been coming entirely from the caller.
         //
-        // Domain note: this ranges over column NAMES. Physical type, decimal precision and
-        // timestamp annotation are not expressible here and are pinned by the read-path guards
-        // instead -- measured, not assumed: ByteType->short is 12 RED, decimal(p)->p+1 is 16 RED,
-        // and flipping isAdjustedToUTC for timestamp_ntz is 2 RED. The narrowness is a division of
-        // labour, not a gap. The positional gap is the real one, and it is the LOG-side sibling
-        // call site, guarded in DeltaFooterLogSchemaParityTests rather than here.
+        // Domain note: this ranges over column NAMES and NULLABILITY. Physical type, decimal
+        // precision and timestamp annotation are not expressible here and are pinned by the
+        // read-path guards instead -- measured, not assumed: ByteType->short is 12 RED,
+        // decimal(p)->p+1 is 16 RED, and flipping isAdjustedToUTC for timestamp_ntz is 2 RED.
+        // Nullability WAS in that unexpressible set until #730; it is now checked directly below.
+        // The narrowness is a division of labour, not a gap. The positional gap is the real one,
+        // and it is the LOG-side sibling call site, guarded in DeltaFooterLogSchemaParityTests
+        // rather than here.
         string[] physical = reader.Schema.DataFields.Select(x => x.Name).ToArray();
         string[] redeclared = ((StructType)SchemaJson.FromJson(declared)).Select(x => x.Name).ToArray();
         string[] logical = schema.Select(x => x.Name).ToArray();
@@ -328,6 +330,38 @@ public sealed class ParquetWriterTests
                 + $"{logical.Length}."
                 + $"{Environment.NewLine}  handed:   {Truncate(string.Join(", ", logical))}"
                 + $"{Environment.NewLine}  declared: {Truncate(string.Join(", ", redeclared))}");
+        }
+
+        // #730: NULLABILITY, not only names. The physical/declared comparison above is NAME-ONLY,
+        // so a writer that emits a declared-NON-nullable column as physically OPTIONAL (or the
+        // reverse) produces a footer whose physical repetition contradicts its own schemaString,
+        // with nothing here to see it. That was not hypothetical: ParquetTypeMapping.CreateField
+        // mapped StringType/BinaryType through the reference-typed DataField<T>(name) ctor, which
+        // defaults IsNullable=true and IGNORED field.Nullable, so every "nullable":false string or
+        // binary column shipped physically OPTIONAL while the log declared it required. Both sides
+        // are derived from the artifact -- the physical Parquet field's repetition and the re-parsed
+        // schemaString's Nullable -- and must agree per column; the handed schema is then checked
+        // against the declaration too, so the property does not rest on caller discipline.
+        bool[] physicalNullable = reader.Schema.DataFields.Select(x => x.IsNullable).ToArray();
+        bool[] redeclaredNullable =
+            ((StructType)SchemaJson.FromJson(declared)).Select(x => x.Nullable).ToArray();
+        bool[] logicalNullable = schema.Select(x => x.Nullable).ToArray();
+        if (!physicalNullable.SequenceEqual(redeclaredNullable))
+        {
+            Assert.Fail(
+                "The written file DECLARES a column nullability its physical Parquet repetition "
+                + "does not carry -- the footer contradicts its own schemaString (#730)."
+                + $"{Environment.NewLine}  declared nullable: {NullabilityReport(redeclared, redeclaredNullable)}"
+                + $"{Environment.NewLine}  physical nullable: {NullabilityReport(physical, physicalNullable)}");
+        }
+
+        if (!redeclaredNullable.SequenceEqual(logicalNullable))
+        {
+            Assert.Fail(
+                "The written file DECLARES a column nullability different from the one it was "
+                + "HANDED (#730)."
+                + $"{Environment.NewLine}  handed nullable:   {NullabilityReport(logical, logicalNullable)}"
+                + $"{Environment.NewLine}  declared nullable: {NullabilityReport(redeclared, redeclaredNullable)}");
         }
 
         // AND IT MUST BE READABLE. A footer that only the writer can understand is a footer no
@@ -1083,6 +1117,44 @@ public sealed class ParquetWriterTests
     /// actually use -- <c>stackalloc</c> thresholds and pooled-buffer sizes -- because that is
     /// where truncation lives. A reviewer should treat this array as the weakest derivation here.
     /// </para>
+    /// <para>
+    /// VERDICT (#726, closed-as-documented; CORRECTED in round 2 after a red-team pass). String
+    /// magnitude has NO external ground truth to derive from, so this domain cannot be made derived
+    /// the way type support (writer acceptance), <c>MetadataValueKind</c> (<c>Enum.GetValues</c>),
+    /// escape forms (encoder output), codepoints (the UCD) and numeric boundaries (reflection) are.
+    /// The adjudication is therefore NOT to force an underivable derivation but to make the chosen
+    /// domain (a) explicit -- this comment -- and (b) load-bearing.
+    /// </para>
+    /// <para>
+    /// WHAT (b) ACTUALLY MEANS, because the earlier wording of this verdict OVER-CLAIMED and the
+    /// over-claim is worth recording. It said <c>SchemaDegreesOfFreedom_AreEachVaried</c> requires
+    /// the sweep's longest string to exceed the largest plausible fixed buffer, "so a 256-char
+    /// truncating serializer is killed". That is FALSE as stated for a metadata-VALUE truncation:
+    /// <c>SchemaDegreesOfFreedom_AreEachVaried</c> inspects the generated INPUT fixtures and asserts
+    /// they REACH <see cref="MinimumLongestString"/>. It serializes nothing and re-parses nothing,
+    /// so no truncating serializer can fail it. Input-fixture variety is a CORPUS property, not an
+    /// output property, and only an output property can catch an output defect.
+    /// </para>
+    /// <para>
+    /// The real catch is a serialized-then-RE-PARSED value-EQUALITY assertion over a corpus that
+    /// carries a value longer than the buffer:
+    /// <c>DeltaFooterLogSchemaParityTests</c>'s <c>*_PreserveEveryMetadataEntryTheCallerDeclared</c>
+    /// family, whose <c>HostileSchema</c> declares a metadata string value of 4097 characters (flat,
+    /// inside an array, and inside a nested object) and whose oracle parses the committed artifact
+    /// back and asserts <c>Assert.Equal(entry.Value, value)</c> against what the caller declared. A
+    /// serializer truncating a metadata value at 256, 1024 or 4096 goes RED there (measured). Note
+    /// what does NOT catch it, and why the mistake was easy to make: footer/log BYTE parity is blind
+    /// to it, because a truncation in the shared serializer is SYMMETRIC -- both artifacts lose the
+    /// same tail and still match each other, and so does any assertion comparing an artifact to a
+    /// fresh <c>SchemaJson.ToJson</c> of the same schema.
+    /// </para>
+    /// <para>
+    /// So this array's role is the honest, smaller one: it ensures the FIXTURES exercise long
+    /// strings in every position and depth of the wire grammar (which is what makes hostile-content
+    /// coverage real, and what the joint-cell requirement below is built on), and it is BACKED by
+    /// the round-trip value-fidelity pin above for the output property. Completeness of the bracket
+    /// set remains a judgement about plausible implementations, which is disclosed, not hidden.
+    /// </para>
     /// </summary>
     private static readonly int[] MagnitudeLengths = [1, 255, 256, 257, 1023, 1024, 4097];
 
@@ -1228,6 +1300,12 @@ public sealed class ParquetWriterTests
     private static string Truncate(string text) =>
         text.Length <= 400 ? text : text[..200] + $" …[{text.Length} chars]… " + text[^200..];
 
+    /// <summary>Renders each column with its nullability, so a per-column divergence is legible.</summary>
+    private static string NullabilityReport(string[] names, bool[] nullable) =>
+        Truncate(string.Join(
+            ", ",
+            names.Zip(nullable, (n, b) => $"{n}:{(b ? "null" : "req")}")));
+
     /// <summary>
     /// Collection sizes the constructive sweep emits.
     /// <para>
@@ -1265,6 +1343,13 @@ public sealed class ParquetWriterTests
     /// Chosen, and deliberately NOT <c>MagnitudeLengths.Max()</c>, for the reason given on
     /// <see cref="MinimumLargestCollection"/>: a requirement derived from the thing it audits
     /// agrees with it however that thing is narrowed.
+    /// <para>
+    /// This bounds the FIXTURES only. The matching OUTPUT-side pin -- a metadata value of the same
+    /// magnitude, serialized, re-parsed, and compared for equality with what the caller declared,
+    /// which is what a truncating serializer actually fails -- lives in
+    /// <c>DeltaFooterLogSchemaParityTests.LongMetadataValueLength</c>, chosen independently there so
+    /// the two numbers disagree loudly if either moves.
+    /// </para>
     /// </summary>
     private const int MinimumLongestString = 4097;
 
@@ -1417,6 +1502,15 @@ public sealed class ParquetWriterTests
     /// <c>true</c> and every collection under nine elements -- fails this test rather than waiting
     /// for a reviewer to notice. That is the axis-enumeration problem given the same treatment
     /// <c>UnicodeCategory</c> gave the codepoint problem: rooted in a definition outside the test.
+    /// </para>
+    /// <para>
+    /// SCOPE, stated because a verdict elsewhere in this file once overstated it (#726, round 2).
+    /// This guard is a claim about the CORPUS, not about the OUTPUT: it inspects the schemas this
+    /// file writes and asserts each axis takes enough distinct values. Nothing here serializes a
+    /// fixture and re-reads it, so no defect of the serializer -- a truncation, a dropped entry, a
+    /// mangled escape -- can fail this test. Its job is to keep the fixtures wide; the artifact
+    /// guards in this file and the end-to-end value-fidelity guards in
+    /// <c>DeltaFooterLogSchemaParityTests</c> are what turn a wide fixture into a caught defect.
     /// </para>
     /// </remarks>
     [Fact]

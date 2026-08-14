@@ -1027,6 +1027,35 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task PlaintextFooterEncryptedCheckpoint_SchemaMaterializationThrows_StillUnsupportedFeature()
+    {
+        // #717 survivor (4): the "classify BEFORE dispose" ordering in DeltaCheckpointReader.OpenAsync's
+        // failure-path catch. This is the ONLY checkpoint fixture whose reader is CONSTRUCTED (CreateAsync
+        // succeeds) and then throws at `_ = reader.Schema` — so it is the only one that reaches the catch with
+        // reader != null, runs DisposeQuietlyAsync(reader), and thereby depends on ClassifyUnreadableInput
+        // having ALREADY read the (still-open) input. The two existing failure-path fixtures make CreateAsync
+        // itself throw (reader == null, no dispose), which is exactly why the ordering survived mutation.
+        //
+        // RED-on-revert: moving ClassifyUnreadableInput(input) AFTER DisposeQuietlyAsync(reader) disposes the
+        // reader — which closes the input stream (CreateAsync was passed leaveStreamOpen: false) — so the probe
+        // reads a disposed stream, its IO-fault catch returns null, and the door reports MalformedAction
+        // instead of UnsupportedFeature. This assertion then fails, pinning the ordering.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema)
+            .Add("a.parquet", size: 1)
+            .ToParquetAsync();
+        byte[] encrypted = await ParquetTestHelpers.PlaintextFooterEncryptedButSchemaThrowsFileAsync(parquet);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(encrypted), default));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("ncrypt", error.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("malformed", error.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task EncryptedFooterCheckpoint_IsUnsupportedFeature_NotMalformed()
     {
         // FAILURE-path arm, encrypted-FOOTER mode (#649): the checkpoint is bracketed by the 'PARE' magic,
