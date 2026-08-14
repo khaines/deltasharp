@@ -673,6 +673,81 @@ internal sealed class ReplayedMetadataLog
     }
 
     /// <summary>
+    /// Reports whether the replay PROVABLY covered <paramref name="version"/> and, if so, yields the
+    /// reconstruction's PREVAILING metadata immediately BEFORE and AFTER that version — the state the table's
+    /// column-mapping / Change-Data-Feed configuration was in at each boundary of the version. Unlike
+    /// <see cref="TryGetProvenObservation"/> (which returns only a version's OWN <c>metaData</c> actions, empty
+    /// for an inheriting version), this DERIVES the prevailing state for EVERY covered version — including one
+    /// that carried no <c>metaData</c> and merely inherited the state — as the step function seeded at the
+    /// window-start lineage and advanced only at recorded transitions.
+    /// <para><b>Why a derived accessor, not a stored-pair lookup.</b> <c>_recorded</c> is SPARSE: an entry
+    /// exists only for a version whose <c>metaData</c> moved the prevailing state (see <see cref="Record"/>).
+    /// An inheriting version (no <c>metaData</c>, state unchanged) has NO entry — reading a stored pair would
+    /// yield "empty" and a consumer testing <c>IsEnabled(empty) == false</c> would score an inherited
+    /// CDF-ON version as OFF: a data-loss skip. This accessor instead returns the prevailing state carried
+    /// forward from the last recorded transition (or <see cref="_lineageAtWindowStart"/> below the first), so
+    /// an inheriting version reports the state it actually inherited.</para>
+    /// <para><see langword="false"/> means "not covered / observer inert — read the commit yourself"; it NEVER
+    /// means "the state was off". The chain the derivation walks was proven unbroken at <see cref="Seal"/>
+    /// (<see cref="EnsureLineageIsAccountedFor"/>), so the greatest recorded transition below
+    /// <paramref name="version"/> determines the state entering it.</para>
+    /// </summary>
+    /// <exception cref="DeltaProtocolException">Consumed before the window was sealed, or a recorded
+    /// observation contradicts the reconstruction it came from. Fails closed rather than skip.</exception>
+    internal bool TryGetProvenPrevailing(
+        long version, out MetadataAction? prevailingBefore, out MetadataAction? prevailingAfter)
+    {
+        prevailingBefore = null;
+        prevailingAfter = null;
+        if (!_sealed)
+        {
+            throw DeltaProtocolException.Inconsistent(
+                "A change-feed pre-range prevailing-metadata observation was consumed before the observed "
+                + "window was sealed, so its whole-window cross-checks have not run over the complete window; "
+                + "the read fails closed.");
+        }
+
+        if (_inert)
+        {
+            // #712: inert observer retained nothing → it can prove NO version's prevailing state. Fail-closed:
+            // the caller must read/scan, never treat an unproven version as off.
+            return false;
+        }
+
+        if (!HasCoverage || version < CoveredFromInclusive || version >= CoveredToExclusive)
+        {
+            return false; // Outside the proven interval — the caller MUST read the commit itself.
+        }
+
+        // Step function seeded at the window-start lineage and advanced only at recorded transitions.
+        // `_recordedVersions` is strictly ascending (Record) and the chain from `_lineageAtWindowStart` to
+        // `_lineageAtWindowEnd` was proven unbroken at Seal, so the PrevailingAfter of the greatest recorded
+        // version STRICTLY BELOW `version` is the state entering `version`.
+        int index = _recordedVersions.BinarySearch(version);
+        bool isRecorded = index >= 0;
+        int predecessorIndex = (isRecorded ? index : ~index) - 1;
+        MetadataAction? entering = predecessorIndex >= 0
+            ? _recorded[_recordedVersions[predecessorIndex]].PrevailingAfter
+            : _lineageAtWindowStart;
+
+        prevailingBefore = entering;
+        if (isRecorded)
+        {
+            ObservedCommit observed = _recorded[version];
+            EnsureObservationMatchesReplayedState(
+                version, observed.Metadata, observed.PrevailingBefore, observed.PrevailingAfter);
+            prevailingAfter = observed.PrevailingAfter;
+        }
+        else
+        {
+            // Unrecorded ⟹ no metaData and the state did not move across `version` → after == before.
+            prevailingAfter = entering;
+        }
+
+        return true;
+    }
+
+    /// <summary>
     /// Whole-window cross-check, run once. Because a <c>metaData</c> always REPLACES the prevailing metadata
     /// with the newly parsed instance, the lineage across the covered interval moved if and only if some
     /// covered version carried a <c>metaData</c> — and the last one must be the metadata the window ends on.

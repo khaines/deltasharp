@@ -407,6 +407,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// scan consumed is never misattributed as free; a closed two-value set (cardinality-safe).</summary>
     internal const string VacuumCdcScanCompletedKey = "deltasharp.vacuum.cdc_scan.completed";
 
+    /// <summary>#809: the bounded <c>reason</c> label for the VACUUM in-window cdc-scan skip decision — a
+    /// closed, low-cardinality set. On the SKIPPED counter the fixed value is <c>proven_cdf_off</c>; on the
+    /// SCANNED counter it is one of <c>cdf_present</c> / <c>unproven_coverage</c> / <c>unproven_inert</c> /
+    /// <c>seal_degraded</c> / <c>disabled</c>. Never a path or a version (metric-label-safe).</summary>
+    internal const string VacuumCdcScanReasonKey = "deltasharp.vacuum.cdc_scan.reason";
+
     /// <summary>The bounded <c>deltasharp.checkpoint.fallback.reason</c> metric label key sub-classifying a
     /// discarded checkpoint by why reconstruction fell back to JSON replay (<c>unsupported_feature</c>,
     /// <c>malformed</c>, <c>forged_multi_metadata</c>). A closed value set (metric-label-safe); the discarded
@@ -446,6 +452,8 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Counter<long> _vacuumFiles;
     private readonly Histogram<long> _vacuumCdcScanCommits;
     private readonly Histogram<double> _vacuumCdcScanDuration;
+    private readonly Counter<long> _vacuumCdcScanSkipped;
+    private readonly Counter<long> _vacuumCdcScanScanned;
     private readonly Histogram<double> _optimizeDuration;
     private readonly Counter<long> _optimizeCount;
     private readonly Counter<long> _optimizeFilesRemoved;
@@ -503,6 +511,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _vacuumCdcScanDuration = _deltaMeter.CreateHistogram<double>(
             "deltasharp.delta.vacuum.cdc_scan.duration", unit: "s",
             description: "Elapsed (monotonic) duration of VACUUM's Change-Data-Feed protection scan (the in-window commit-JSON reads that protect referenced _change_data/ files).");
+        _vacuumCdcScanSkipped = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.vacuum.cdc_scan.skipped", unit: "{scan}",
+            description: "VACUUM in-window Change-Data-Feed protection scans ELIDED because the log proved CDF inactive across the full in-window range (#809). Distinct counter (skip path only) — the cdc_scan.commits/.duration histograms are NOT recorded on a skip, so its aggregate is exactly the skip count.");
+        _vacuumCdcScanScanned = _deltaMeter.CreateCounter<long>(
+            "deltasharp.delta.vacuum.cdc_scan.scanned", unit: "{scan}",
+            description: "VACUUM in-window Change-Data-Feed protection scans that RAN (were not elided), tagged with the bounded reason the skip did not fire (#809): cdf_present / unproven_coverage / unproven_inert / seal_degraded / disabled.");
         _optimizeDuration = _deltaMeter.CreateHistogram<double>(
             "deltasharp.delta.optimize.duration", unit: "s",
             description: "Elapsed (monotonic) duration of a Delta OPTIMIZE, by terminal outcome.");
@@ -714,6 +728,24 @@ internal sealed class DeltaStorageTelemetry : IDisposable
             activity.SetTag(VacuumCdcScanDurationKey, durationSeconds * 1000);
             activity.SetTag(VacuumCdcScanCompletedKey, completed);
         }
+    }
+
+    /// <summary>#809: a skip elided the in-window cdc scan (log proved CDF inactive). Records the DISTINCT
+    /// skipped counter (never the scan histograms — a skip is not a zero-cost scan) with the fixed, bounded
+    /// reason <c>proven_cdf_off</c>. Value-type/path-free.</summary>
+    internal void RecordVacuumCdcScanSkipped(Activity? activity)
+    {
+        _vacuumCdcScanSkipped.Add(1, new KeyValuePair<string, object?>(VacuumCdcScanReasonKey, "proven_cdf_off"));
+        activity?.SetTag(VacuumCdcScanReasonKey, "proven_cdf_off");
+    }
+
+    /// <summary>#809: the scan RAN (skip did not fire); records the distinct scanned counter tagged with the
+    /// bounded <paramref name="reason"/> (a closed, low-cardinality set — see <see cref="_vacuumCdcScanScanned"/>)
+    /// so an operator can see WHY a scan was not elided (a coverage regression vs. genuinely-active CDF).</summary>
+    internal void RecordVacuumCdcScanScanned(Activity? activity, string reason)
+    {
+        _vacuumCdcScanScanned.Add(1, new KeyValuePair<string, object?>(VacuumCdcScanReasonKey, reason));
+        activity?.SetTag(VacuumCdcScanReasonKey, reason);
     }
 
     /// <summary>Starts the OPTIMIZE span if a listener samples the Delta source; returns

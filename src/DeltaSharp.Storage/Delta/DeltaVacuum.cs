@@ -105,6 +105,12 @@ internal sealed class DeltaVacuum
     private readonly DeltaStorageTelemetry _telemetry;
     private readonly TimeProvider _timeProvider;
 
+    // #809: non-optional kill-switch. Default OFF = today's exact null-observer reconstruction + unconditional
+    // in-window cdc scan (the correctness reference). When ON, VACUUM piggybacks an observer on its existing
+    // reconstruction and elides the scan only when the log PROVES CDF was inactive across the full in-window
+    // range; every uncertainty (un-proven coverage, inert observer, unaccountable lineage) falls back to SCAN.
+    private readonly bool _cdcScanSkipEnabled;
+
     /// <summary>Fires once (per process) when a policy with a weak safety threshold is first observed, so the
     /// "guard effectively disabled" warning is not repeated on every VACUUM.</summary>
     private static int s_weakThresholdWarned;
@@ -138,7 +144,8 @@ internal sealed class DeltaVacuum
         RetentionPolicy? policy = null,
         ILogger<DeltaVacuum>? logger = null,
         DeltaStorageTelemetry? telemetry = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        bool cdcScanSkipEnabled = false)
     {
         ArgumentNullException.ThrowIfNull(backend);
         _backend = backend;
@@ -147,6 +154,7 @@ internal sealed class DeltaVacuum
         _logger = logger ?? NullLogger<DeltaVacuum>.Instance;
         _telemetry = telemetry ?? DeltaStorageTelemetry.Shared;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _cdcScanSkipEnabled = cdcScanSkipEnabled;
 
         WarnIfWeakSafetyThreshold();
     }
@@ -338,8 +346,22 @@ internal sealed class DeltaVacuum
         // listings can diverge (eventual consistency, a transient partial list, or a concurrent log
         // operation), and a staler second listing that omits an in-window commit would drop that commit's
         // referenced `cdc` paths from the protected set, deleting a live change file (data loss, #489).
-        (Snapshot snapshot, DeltaLog.LogListing logListing) =
-            await _log.LoadSnapshotWithListingAsync(version: null, cancellationToken).ConfigureAwait(false);
+        // #809: when the skip is enabled, piggyback an UNSEALED metadata observer on this SAME reconstruction
+        // (no second replay) so the in-window cdc scan below can be elided when the log proves CDF was never
+        // active in-window. When disabled, this is the byte-for-byte null-observer reconstruction of today.
+        Snapshot snapshot;
+        DeltaLog.LogListing logListing;
+        ReplayedMetadataLog? cdcObserver = null;
+        if (_cdcScanSkipEnabled)
+        {
+            (snapshot, logListing, cdcObserver) =
+                await _log.LoadSnapshotWithListingAndObserverAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else
+        {
+            (snapshot, logListing) =
+                await _log.LoadSnapshotWithListingAsync(version: null, cancellationToken).ConfigureAwait(false);
+        }
 
         // Fail closed on a tail-truncated log listing (red-team #640): the table-root candidate pass above is
         // an independent, earlier listing that also enumerated `_delta_log/`. If it saw a version-bearing log
@@ -423,23 +445,56 @@ internal sealed class DeltaVacuum
         // returns its count only on success), so it is reported as 0 with a bounded `completed=false` terminal
         // tag; the success path reports the true count with `completed=true`.
         IReadOnlyCollection<string> protectedChangeDataPaths;
-        long scanTimestamp = Stopwatch.GetTimestamp();
-        int scanCommits = 0;
-        bool scanCompleted = false;
-        try
+
+        // #809: try the log-derived skip FIRST. It returns Skip only when the retained protocol history proves
+        // CDF was inactive at BOTH boundaries of EVERY in-window commit (the scan's exact complement, keyed on
+        // the scan's own logRetentionCutoffMillis); every uncertainty degrades to a scan reason. On Skip the
+        // protected set is provably empty and the scan is elided — its cost histograms are NOT recorded (a skip
+        // is not a zero-cost scan); the distinct skipped counter + EventId 4109 carry the signal instead.
+        int provenInWindowCommits = 0;
+        CdcScanDecision decision = cdcObserver is null
+            ? CdcScanDecision.ScanDisabled
+            : TryProveInWindowCdfNever(cdcObserver, logListing, logRetentionCutoffMillis, out provenInWindowCommits);
+        if (decision == CdcScanDecision.Skip)
         {
-            DeltaLog.InWindowChangeDataScan scan =
-                await _log.CollectInWindowChangeDataPathsAsync(logListing, logRetentionCutoffMillis, cancellationToken)
-                    .ConfigureAwait(false);
-            protectedChangeDataPaths = scan.Paths;
-            scanCommits = scan.CommitsScanned;
-            scanCompleted = true;
+            protectedChangeDataPaths = Array.Empty<string>();
+            _telemetry.RecordVacuumCdcScanSkipped(activity);
+            DeltaVacuumLog.VacuumCdcScanSkipped(
+                _logger, provenInWindowCommits, ProvenRangeSpan(logListing, logRetentionCutoffMillis));
         }
-        finally
+        else
         {
-            double scanSeconds = Stopwatch.GetElapsedTime(scanTimestamp).TotalSeconds;
-            _telemetry.RecordVacuumCdcScan(activity, scanCommits, scanSeconds, scanCompleted);
-            DeltaVacuumLog.VacuumCdcScanCompleted(_logger, scanCommits, scanSeconds * 1000, scanCompleted);
+            if (_cdcScanSkipEnabled)
+            {
+                _telemetry.RecordVacuumCdcScanScanned(activity, ScanReasonLabel(decision));
+            }
+
+            // #641 item 2: surface the cdc-scan cost (commit JSONs read + elapsed) on the vacuum activity and
+            // metrics so an operator can see/alert on a scan whose cost grows with delta.logRetentionDuration
+            // depth. The cost is recorded in a `finally` so a scan that THROWS or is CANCELLED mid-read still
+            // reports the wall-clock it consumed: the expensive commit-JSON I/O has already been spent whether
+            // or not the scan reached a result, so an absent signal would misattribute a costly failed scan as
+            // free. On the throwing/cancelled path the completed-commit count is unknown (the scan returns its
+            // count only on success), so it is reported as 0 with a bounded `completed=false` terminal tag; the
+            // success path reports the true count with `completed=true`.
+            long scanTimestamp = Stopwatch.GetTimestamp();
+            int scanCommits = 0;
+            bool scanCompleted = false;
+            try
+            {
+                DeltaLog.InWindowChangeDataScan scan =
+                    await _log.CollectInWindowChangeDataPathsAsync(logListing, logRetentionCutoffMillis, cancellationToken)
+                        .ConfigureAwait(false);
+                protectedChangeDataPaths = scan.Paths;
+                scanCommits = scan.CommitsScanned;
+                scanCompleted = true;
+            }
+            finally
+            {
+                double scanSeconds = Stopwatch.GetElapsedTime(scanTimestamp).TotalSeconds;
+                _telemetry.RecordVacuumCdcScan(activity, scanCommits, scanSeconds, scanCompleted);
+                DeltaVacuumLog.VacuumCdcScanCompleted(_logger, scanCommits, scanSeconds * 1000, scanCompleted);
+            }
         }
 
         // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,
@@ -463,6 +518,121 @@ internal sealed class DeltaVacuum
             deletedPaths,
             audit);
     }
+
+    // #809: the tri-state outcome of the in-window cdc-scan skip decision, preserved through to telemetry so
+    // an operator sees WHY a scan was not elided (a coverage regression vs. genuinely-active CDF vs. disabled).
+    private enum CdcScanDecision
+    {
+        Skip,             // proven CDF-off at both boundaries of every in-window commit → elide the scan.
+        ScanCdfPresent,   // CDF proven ON at a boundary → a cdc file may exist → scan.
+        ScanUnproven,     // an in-window version is below the observer's coverage floor → scan (fail-closed).
+        ScanUnprovenInert,// the observer went inert (#712 retention cap) → scan (fail-closed).
+        ScanSealDegraded, // sealing the observer's lineage failed → scan (fail-closed).
+        ScanDisabled,     // the skip kill-switch is OFF → unconditional scan (today's behavior).
+    }
+
+    /// <summary>
+    /// #809: the log-derived, fail-closed skip predicate. Returns <see cref="CdcScanDecision.Skip"/> ONLY when
+    /// the retained protocol/metadata history PROVES Change Data Feed was inactive — <c>IsEnabled</c> false —
+    /// at BOTH the prevailing-before and prevailing-after boundary of EVERY in-window commit. The in-window set
+    /// is the scan's EXACT complement (a commit is in-window unless its mtime is KNOWN and strictly below the
+    /// scan's own <paramref name="logRetentionCutoffMillis"/>; an unknown-mtime commit is in-window, matching
+    /// the scan's fail-safe). Any un-proven version (below the observer's coverage, or the observer inert), or a
+    /// failure to seal the observer's lineage, degrades to a scan reason — the observer-free scan is VACUUM's
+    /// correctness reference, so every uncertainty is safe to resolve by scanning. Derived SOLELY from the log
+    /// (proven prevailing metadata); never the candidate listing, never the current-snapshot enablement flag.
+    /// <para>Uses the property-only <see cref="ChangeDataFeedFeature.IsEnabled"/>: since a produced <c>cdc</c>
+    /// action requires <see cref="ChangeDataFeedFeature.IsActive"/> (writer feature AND property), proving the
+    /// PROPERTY off is a conservative superset proof that no cdc was produced — it can only ever cause an
+    /// unnecessary scan, never a wrong skip.</para>
+    /// </summary>
+    private static CdcScanDecision TryProveInWindowCdfNever(
+        ReplayedMetadataLog observer, DeltaLog.LogListing logListing, long logRetentionCutoffMillis,
+        out int provenInWindowCommits)
+    {
+        provenInWindowCommits = 0;
+        try
+        {
+            // Seal in the CONSUMER (the observer was returned unsealed): the lineage cross-check runs here, and
+            // an unaccountable lineage → fail-closed SCAN, never a thrown VACUUM.
+            observer.Seal();
+
+            int inWindow = 0;
+            foreach (long version in logListing.Commits)
+            {
+                if (IsAgedPastLogRetention(logListing, version, logRetentionCutoffMillis))
+                {
+                    continue; // not in-window (matches the scan's own skip) — nothing to prove.
+                }
+
+                if (!observer.TryGetProvenPrevailing(
+                        version, out MetadataAction? before, out MetadataAction? after))
+                {
+                    // Below the observer's coverage floor, or the observer went inert (#712) → un-proven.
+                    return observer.IsInert
+                        ? CdcScanDecision.ScanUnprovenInert
+                        : CdcScanDecision.ScanUnproven;
+                }
+
+                if (IsCdfPropertyOn(before) || IsCdfPropertyOn(after))
+                {
+                    return CdcScanDecision.ScanCdfPresent; // a cdc file may exist in-window → scan.
+                }
+
+                inWindow++;
+            }
+
+            provenInWindowCommits = inWindow;
+            return CdcScanDecision.Skip; // every in-window commit proven CDF-off at both boundaries.
+        }
+        catch (DeltaProtocolException)
+        {
+            // Seal or a per-version corroboration failed closed → SCAN (the correctness reference), never a
+            // thrown VACUUM. This is the seal-degrade backstop (also the forged-lineage backstop, §6).
+            return CdcScanDecision.ScanSealDegraded;
+        }
+    }
+
+    // The scan's EXACT in-window predicate, complemented: a commit is aged out (NOT in-window) iff its mtime is
+    // KNOWN and strictly below the cutoff — so an unknown-mtime commit is in-window (fail-safe), keyed on the
+    // scan's own logRetentionCutoffMillis (NOT the vacuum retention cutoff).
+    private static bool IsAgedPastLogRetention(
+        DeltaLog.LogListing logListing, long version, long logRetentionCutoffMillis) =>
+        logListing.CommitTimestamps.TryGetValue(version, out DateTime modified)
+        && DeltaTimestamps.ToEpochMillis(modified) < logRetentionCutoffMillis;
+
+    // Property-only CDF enablement on a proven prevailing metadata; null prevailing (no metadata yet) is off.
+    private static bool IsCdfPropertyOn(MetadataAction? metadata) =>
+        metadata is not null && ChangeDataFeedFeature.IsEnabled(metadata.Configuration);
+
+    // Bounded, value-type span of the in-window version range (for the path-free skip log), or 0 when empty.
+    private static long ProvenRangeSpan(DeltaLog.LogListing logListing, long logRetentionCutoffMillis)
+    {
+        long min = long.MaxValue;
+        long max = long.MinValue;
+        foreach (long version in logListing.Commits)
+        {
+            if (IsAgedPastLogRetention(logListing, version, logRetentionCutoffMillis))
+            {
+                continue;
+            }
+
+            min = Math.Min(min, version);
+            max = Math.Max(max, version);
+        }
+
+        return max >= min ? max - min + 1 : 0;
+    }
+
+    private static string ScanReasonLabel(CdcScanDecision decision) => decision switch
+    {
+        CdcScanDecision.ScanCdfPresent => "cdf_present",
+        CdcScanDecision.ScanUnproven => "unproven_coverage",
+        CdcScanDecision.ScanUnprovenInert => "unproven_inert",
+        CdcScanDecision.ScanSealDegraded => "seal_degraded",
+        CdcScanDecision.ScanDisabled => "disabled",
+        _ => "disabled",
+    };
 
     /// <summary>Deletes the <see cref="OrphanClassification.Deletable"/> candidates (idempotently, AC4)
     /// unless <paramref name="dryRun"/>, and builds the per-candidate audit (AC3) from the same

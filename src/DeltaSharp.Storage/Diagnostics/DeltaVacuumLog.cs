@@ -129,4 +129,18 @@ internal static partial class DeltaVacuumLog
     [LoggerMessage(EventId = 4108, EventName = "DeltaVacuumAbortedStaleListing", Level = LogLevel.Warning,
         Message = "Delta VACUUM aborted (fail-closed): the table root lists a _delta_log artifact at version {ListedVersion} but the _delta_log listing resolved only to version {ResolvedVersion} (stale/partial, tail-truncated); no file was deleted. Retry if the listing is merely stale; PERSISTENT recurrence indicates an inconsistent/forged log (a durably-orphaned version-bearing artifact) and warrants escalation, not blind retry.")]
     internal static partial void VacuumAbortedStaleListing(ILogger logger, long listedVersion, long resolvedVersion);
+
+    /// <remarks>
+    /// #809: the in-window Change-Data-Feed protection scan was ELIDED because the retained protocol/metadata
+    /// history PROVED (from the log — never the candidate listing, never the snapshot enablement flag) that CDF
+    /// was inactive at both boundaries of every in-window commit, so no <c>cdc</c> action can exist in-window
+    /// and the scan is provably redundant. A pure cost optimization over the always-correct unconditional scan.
+    /// The site is <b>value-type-only / path-free</b> (#653): it renders only the bounded proven in-window
+    /// commit count and the proven range span — never a path, version identity, or tenant token — and pins
+    /// <see cref="EventId"/> <b>4109</b> (next free in the 41xx VACUUM range). Distinct from
+    /// <see cref="VacuumCdcScanCompleted"/> so a skip is observable, not silent.
+    /// </remarks>
+    [LoggerMessage(EventId = 4109, EventName = "DeltaVacuumCdcScanSkipped", Level = LogLevel.Information,
+        Message = "Delta VACUUM elided the in-window change-data-feed protection scan: the log proved CDF inactive across all {InWindowCommits} in-window commit(s) (proven range span {ProvenSpan}).")]
+    internal static partial void VacuumCdcScanSkipped(ILogger logger, int inWindowCommits, long provenSpan);
 }
