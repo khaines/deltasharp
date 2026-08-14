@@ -218,6 +218,33 @@ public sealed class DeltaLogCheckpointTests : IDisposable
     }
 
     [Fact]
+    public async Task NonClassifierUnsupportedFeatureDuringCheckpointRead_Propagates_NotSwallowedAsEncryptionFallback()
+    {
+        // #771: the non-authoritative-checkpoint swallow is now gated on the encryption classifier's OWN
+        // verdict (ParquetEncryption.IsEncryptionClassifierVerdict), NOT on Kind == UnsupportedFeature alone.
+        // A DeltaStorageException with Kind == UnsupportedFeature raised WHILE READING the checkpoint part —
+        // but whose message is NOT one of the classifier's verdict constants (a backend/storage-layer signal,
+        // or a future classifier fault surfacing as this kind) — is NOT the "unusable derived artifact"
+        // encryption signal the swallow exists for. Masking it behind a silent full JSON replay would hide a
+        // genuinely unreadable table, so it must PROPAGATE (surface).
+        // RED-on-revert: widening the filter back to `when (ex.Kind == UnsupportedFeature)` swallows this into
+        // JSON replay and LoadSnapshotAsync stops throwing (the table would "read" on stale/partial state).
+        IStorageBackend backend = NewBackend();
+        await WriteJsonHistoryAsync(backend);
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        var unsupported = new UnsupportedReadCheckpointBackend(backend, ".checkpoint.parquet");
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new DeltaLog(unsupported).LoadSnapshotAsync());
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Equal(
+            UnsupportedReadCheckpointBackend.UnsupportedFeatureOnReadStream.Message, error.Message);
+    }
+
+    [Fact]
     public async Task StaleHint_ToMissingCheckpoint_FallsBackToListing()
     {
         IStorageBackend backend = NewBackend();

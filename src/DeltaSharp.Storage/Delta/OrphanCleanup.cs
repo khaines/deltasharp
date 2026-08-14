@@ -63,9 +63,12 @@ internal readonly record struct OrphanDecision(string Path, OrphanClassification
 /// different alphabet — while a directory listing always yields the raw disk key. Matching a raw candidate
 /// against only the raw log path would classify the still-active <c>a b.parquet</c> as an orphan and delete
 /// it. The protected sets are therefore the <b>union</b> of each log path and its
-/// <see cref="Uri.UnescapeDataString(string)"/> decoding, and the raw candidate key is tested against that
-/// union. This protects legacy-raw, current DeltaSharp-encoded, and Spark-encoded tables alike; it can only
-/// ever <i>over</i>-protect (a rare filename containing a literal <c>%</c> sequence that happens to decode to
+/// <see cref="Uri.UnescapeDataString(string)"/> decoding, and a candidate key is tested against that union
+/// under BOTH its raw form and its own decoding (#490) — so the comparison is canonical on BOTH sides. This
+/// protects legacy-raw, current DeltaSharp-encoded, and Spark-encoded tables alike, regardless of whether the
+/// LISTING yields the raw disk key (today's <c>LocalFileSystemBackend</c>) or a URI-ENCODED key (a future
+/// S3/ADLS/GCS backend that returns encoded listing keys); it can only ever <i>over</i>-protect (a rare
+/// filename containing a literal <c>%</c> sequence that happens to decode to
 /// another candidate's name), never over-delete.</para>
 ///
 /// <para><b>Referenced-path assumption (non-<c>add.path</c> references).</b> The active/tombstone protected
@@ -152,7 +155,7 @@ internal static class OrphanCleanup
         // encoding-robust matching so a Spark-encoded cdc path protects the raw disk key.
         ImmutableHashSet<string> referenced = protectedReferencedPaths is { Count: > 0 }
             ? BuildEncodingRobustSet(protectedReferencedPaths)
-            : ImmutableHashSet<string>.Empty;
+            : ImmutableHashSet.Create<string>(StringComparer.Ordinal);
 
         var decisions = new List<OrphanDecision>();
         foreach (OrphanCandidate candidate in candidates)
@@ -171,18 +174,18 @@ internal static class OrphanCleanup
         ImmutableHashSet<string> referenced,
         long retentionCutoffMillis)
     {
-        if (active.Contains(candidate.Path))
+        if (MatchesEncodingRobust(active, candidate.Path))
         {
             return OrphanClassification.Active; // an active data file is never an orphan.
         }
 
-        if (protectedTombstones.Contains(candidate.Path))
+        if (MatchesEncodingRobust(protectedTombstones, candidate.Path))
         {
             // removed within the retention window — a stale reader may still read it.
             return OrphanClassification.RetentionProtectedTombstone;
         }
 
-        if (referenced.Contains(candidate.Path))
+        if (MatchesEncodingRobust(referenced, candidate.Path))
         {
             // a _change_data/ file referenced by an in-window cdc action (#489) — never an active file
             // (INV C1), but a CDF read within the log-retention window still needs it.
@@ -196,6 +199,28 @@ internal static class OrphanCleanup
         }
 
         return OrphanClassification.Deletable;
+    }
+
+    /// <summary>Tests a raw disk candidate key against an encoding-robust protection set under BOTH its raw
+    /// form and its <see cref="Uri.UnescapeDataString(string)"/> decoding (#490). The set already carries each
+    /// log path in both raw and decoded forms (<see cref="BuildEncodingRobustSet"/>), which matches a raw
+    /// listing key against an encoded (Spark/Delta-protocol) log. This normalizes the LISTING side too, so the
+    /// comparison is canonical on BOTH sides: a future object-store backend (S3/ADLS/GCS) that returns
+    /// URI-ENCODED listing keys (e.g. <c>a%20b.parquet</c> for on-disk <c>a b.parquet</c>) still matches an
+    /// UNENCODED (DeltaSharp-written) log path. Decoding the candidate can only ADD a match, so this can only
+    /// ever over-protect (retain an orphan), never under-protect (delete a live file) — the monotonic
+    /// over-protect invariant is preserved. <see cref="StringComparer.Ordinal"/> throughout (paths are
+    /// byte-exact keys, never culture-folded).</summary>
+    private static bool MatchesEncodingRobust(ImmutableHashSet<string> protectionSet, string candidatePath)
+    {
+        if (protectionSet.Contains(candidatePath))
+        {
+            return true;
+        }
+
+        string decoded = Uri.UnescapeDataString(candidatePath);
+        return !string.Equals(decoded, candidatePath, StringComparison.Ordinal)
+            && protectionSet.Contains(decoded);
     }
 
     // The table-root-relative `.bin` sidecar path of every on-disk relative-path ('u') deletion vector in the

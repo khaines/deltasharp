@@ -337,7 +337,20 @@ namespace DeltaSharp.Storage.Delta;
 /// <para><b>Memory bound.</b> The covered set costs two <see langword="long"/>s regardless of history length;
 /// only a version that carried a <c>metaData</c> — or whose silence would contradict the replayed state —
 /// occupies a dictionary entry. Retention is therefore O(METADATA REVISIONS in the observed window), one entry
-/// for a normal table, NOT O(commits); and never the file actions, which dominate a commit's size.</para>
+/// for a normal table, NOT O(commits); and never the file actions, which dominate a commit's size.
+/// <b>The number of metadata revisions is written by the FOREIGN log author</b>, however, so an adversarial or
+/// merely pathological pre-range history (a <c>metaData</c> on every commit across a wide checkpoint interval)
+/// can make "revisions in the observed window" equal the whole pre-range commit count — an
+/// O(pre-range commits) memory-amplification vector per concurrent change-feed read. That worst case is
+/// therefore CAPPED at <see cref="MaxRetainedObservations"/> entries (#712): past the cap the observer goes
+/// <see cref="IsInert">inert</see>, releasing everything retained and reporting nothing covered, so the gate
+/// falls back to the pre-#697 full disk scan of the window — O(1) retention, O(pre-range commits) disk reads,
+/// fail-closed-safe. So the bound an adversarial log actually gets is O(min(revisions, cap)) = O(1). Note the
+/// cap bounds the retained observation COUNT (<see cref="MaxRetainedObservations"/> = 4096 entries), NOT bytes:
+/// each retained entry still holds that revision's <c>SchemaString</c>, which is separately bounded by
+/// <see cref="DeltaLog.MaxLogObjectBytes"/> (256 MiB per log object). The true residual is therefore
+/// O(cap × per-commit metadata size), not literally O(1) bytes — the "O(1)" above is a constant ENTRY COUNT
+/// independent of history length, which is the property that defeats the amplification vector.</para>
 ///
 /// <para><b>Scope of the guarantee.</b> An observer defect costs AVAILABILITY (a fail-closed read) or
 /// PERFORMANCE (a disk fallback), not COVERAGE, for any defect that leaves the reconstruction's own metadata
@@ -371,6 +384,24 @@ internal sealed class ReplayedMetadataLog
     private MetadataAction? _lineageAtWindowEnd;
     private bool _sealed;
 
+    // #712: retention cap. `_recorded` is O(metadata revisions in the observed window), which is normally
+    // small — but the number of revisions is written by the FOREIGN log author, so a hostile or merely
+    // pathological pre-range history (a metaData on every commit over a wide checkpoint interval) can drive it
+    // to O(pre-range commits), a memory-amplification vector per concurrent change-feed read. Once the count
+    // would exceed MaxRetainedObservations the observer goes INERT: it releases every retained observation and
+    // reports nothing covered, so the pre-range gate falls back to reading each commit from disk over the
+    // whole window. That is exactly the pre-#697 behavior — O(1) retention, O(commits) disk reads — and is
+    // fail-closed-safe: the gate validates every commit it reads, and consuming NO observation means no
+    // whole-window predicate is evaluated over a partial window (Seal skips the lineage check when inert,
+    // because nothing corroborates against it). The cap bounds only MEMORY; it never weakens coverage.
+    private bool _inert;
+
+    /// <summary>The maximum number of recorded observations retained before the observer goes inert and the
+    /// pre-range gate degrades to a full disk scan (#712). Generous for any legitimate table (metadata rarely
+    /// changes), while bounding an adversarial/pathological log's retention to O(1) rather than
+    /// O(pre-range commits).</summary>
+    internal const int MaxRetainedObservations = 4096;
+
     internal ReplayedMetadataLog(long exclusiveUpperBound) => _exclusiveUpperBound = exclusiveUpperBound;
 
     /// <summary>Whether the observed replay covered any version below the exclusive upper bound at all.</summary>
@@ -383,9 +414,16 @@ internal sealed class ReplayedMetadataLog
     /// <summary>One past the last version the observed replay covered.</summary>
     internal long CoveredToExclusive { get; private set; }
 
+    /// <summary>Whether the observer went INERT because its retained-observation count reached
+    /// <see cref="MaxRetainedObservations"/> (#712): it then retains nothing and reports every version NOT
+    /// covered, so the pre-range gate reads the whole window from disk (fail-closed-safe). Observable so a
+    /// retention regression is a test failure rather than a silent O(pre-range commits) allocation.</summary>
+    internal bool IsInert => _inert;
+
     /// <summary>How many covered versions occupy a dictionary entry — the memory bound made observable, so a
     /// regression that reverted to one entry per replayed version is a test failure rather than a silent
-    /// O(commits) allocation per concurrent change-feed read.</summary>
+    /// O(commits) allocation per concurrent change-feed read. Bounded by <see cref="MaxRetainedObservations"/>
+    /// (#712): past the cap the observer goes inert and this returns 0.</summary>
     internal int RecordedObservationCount => _recorded.Count;
 
     /// <summary>The ONE place a commit's <c>metaData</c> actions are extracted from its parsed actions — used
@@ -490,9 +528,35 @@ internal sealed class ReplayedMetadataLog
 
         if (metadata.Count > 0 || !ReferenceEquals(prevailingBefore, prevailingAfter))
         {
+            // #712 retention cap. Once already inert, retain nothing more; once the retained count would
+            // exceed the cap, go inert NOW — releasing everything retained so far — rather than grow to
+            // O(pre-range commits). The interval/lineage endpoints above still advance (they are O(1) longs),
+            // but no observation is retained and none will be served: TryGetProvenObservation reports every
+            // version NOT covered while inert, so the gate reads the whole window from disk (fail-closed-safe).
+            if (_inert)
+            {
+                return;
+            }
+
+            if (_recorded.Count >= MaxRetainedObservations)
+            {
+                EnterInertMode();
+                return;
+            }
+
             _recorded[version] = new ObservedCommit(metadata, prevailingBefore, prevailingAfter);
             _recordedVersions.Add(version);
         }
+    }
+
+    // Releases every retained observation and latches the observer inert (#712): from here it retains nothing
+    // and TryGetProvenObservation reports every version NOT covered, so the pre-range gate degrades to a full
+    // disk scan of the window. Fail-closed-safe — coverage is unchanged; only retention is bounded.
+    private void EnterInertMode()
+    {
+        _inert = true;
+        _recorded.Clear();
+        _recordedVersions.Clear();
     }
 
     /// <summary>
@@ -520,7 +584,18 @@ internal sealed class ReplayedMetadataLog
         // silently instead of re-throwing, and observations from a window whose lineage check had THROWN were
         // served. A gate whose failure path marks itself validated contradicts this type's own
         // phase-separation argument, so the flag is set only once the cross-checks have PASSED.
-        EnsureLineageIsAccountedFor();
+        //
+        // #712: when INERT the observer retained nothing and TryGetProvenObservation serves nothing, so there
+        // is no observation for the gate to trust — every pre-range version is read from disk and validated
+        // independently. The whole-window lineage check exists ONLY to make a defective observer's silence
+        // unfalsifiable; with no observation consumed there is nothing to corroborate, so the check is vacuous
+        // and is skipped. Skipping it is fail-closed-safe (coverage comes entirely from the disk scan) and
+        // necessary — it is computed over `_recorded`, which inert mode has cleared.
+        if (!_inert)
+        {
+            EnsureLineageIsAccountedFor();
+        }
+
         _sealed = true;
     }
 
@@ -541,6 +616,16 @@ internal sealed class ReplayedMetadataLog
                 "A change-feed pre-range validation observation was consumed before the observed window was "
                 + "sealed, so its whole-window cross-checks have not run over the complete window; the read "
                 + "fails closed.");
+        }
+
+        if (_inert)
+        {
+            // #712: the observer went inert (retention cap) and retained nothing, so it can prove coverage of
+            // NO version — the gate MUST read every version from disk. Returning false here (rather than
+            // falling through to the cleared `_recorded` lookup, which would report a covered-and-SILENT
+            // version and let the gate skip the disk read) is the fail-closed direction: inert means "read it
+            // yourself", never "there was nothing to see".
+            return false;
         }
 
         if (!HasCoverage || version < CoveredFromInclusive || version >= CoveredToExclusive)

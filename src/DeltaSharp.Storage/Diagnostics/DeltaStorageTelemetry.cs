@@ -126,6 +126,22 @@ internal enum CheckpointFallbackReason
     /// to JSON replay and reported under its own reason rather than mislabeled corrupt. It never negatively
     /// caches (the part is not proven bad, only oversized for this reader's eager decode).</summary>
     DecodeCeilingExceeded,
+
+    /// <summary>A classic multi-part checkpoint group at or below the resolved version was skipped at
+    /// SELECTION time — before any seed attempt — because it is INCOMPLETE (a crashed/interrupted or
+    /// partially-uploaded multi-part upload: at least one declared part is missing), and NO complete
+    /// checkpoint seeded the read, so reconstruction fell all the way back to full JSON replay (#787).
+    /// Distinct from a seed-time discard (<see cref="Malformed"/>/<see cref="UnsupportedFeature"/>): the
+    /// checkpoint was never opened, so no <see cref="DeltaProtocolException"/> was raised — the reason is
+    /// minted at the selection site. Emitted ONLY when the full-replay fallback actually occurred, so a
+    /// merely-mid-write newest checkpoint that is skipped while a complete OLDER checkpoint still seeds the
+    /// read (the benign concurrent-write transient) does NOT signal. Its operator symptom
+    /// (<c>CheckpointVersion == null</c>) is otherwise identical to a healthy table with no checkpoint at all —
+    /// a permanently failed multi-part upload would silently cost full replay on every read without this
+    /// signal. Carried at a lower log severity (Information, EventId 4405) than the Warning seed-time discards
+    /// so a persistent full-replay condition is discoverable without Warning noise on concurrent-write
+    /// transients (#787 Option A+B).</summary>
+    IncompleteMultipart,
 }
 
 /// <summary>
@@ -190,6 +206,14 @@ internal enum VacuumOutcome
 
     /// <summary>An unexpected/unclassified failure (fail-closed; nothing protected is deleted).</summary>
     Failure,
+
+    /// <summary>VACUUM aborted fail-closed because the <c>_delta_log</c> listing was tail-truncated
+    /// (stale/partial) — the table root listed a version-bearing log artifact beyond the version the snapshot
+    /// resolved to (#640 red-team). Distinct from the generic <see cref="Failure"/> so an operator can tell a
+    /// transient/retryable stale-listing abort from a real protocol failure on metrics/logs alone (#641 item
+    /// 4). Reclaiming under a stale listing could delete files referenced by the missing commit(s), so the run
+    /// is aborted and is retryable once the listing propagates.</summary>
+    AbortedStaleListing,
 }
 
 /// <summary>
@@ -362,6 +386,27 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     /// the candidate <i>path</i> is never a metric tag (unbounded — it lives only on the audit log).</summary>
     internal const string VacuumDecisionKey = "deltasharp.vacuum.decision";
 
+    /// <summary>The bounded activity-tag key (NOT the metric instrument name) for the number of in-window
+    /// commit JSONs VACUUM READ during its Change-Data-Feed protection scan (#489/#641 item 2). A single
+    /// non-negative count per VACUUM (never a per-commit tag), so it is cardinality-safe; it lets an operator
+    /// see/alert on the cdc-scan cost, which grows with <c>delta.logRetentionDuration</c> depth. The paired
+    /// METRIC instrument is separately named <c>deltasharp.delta.vacuum.cdc_scan.commits</c> (with the extra
+    /// <c>.delta</c> segment the meter prefix adds) — this constant is the span attribute key only.</summary>
+    internal const string VacuumCdcScanCommitsKey = "deltasharp.vacuum.cdc_scan.commits";
+
+    /// <summary>The bounded activity-tag key for the elapsed wall-clock of VACUUM's Change-Data-Feed
+    /// protection scan, in milliseconds (#641 item 2). Paired with <see cref="VacuumCdcScanCommitsKey"/> so a
+    /// dashboard can chart both the volume and the latency of the scan. Note the deliberate ms/s split: this
+    /// trace tag is milliseconds (<c>_ms</c> suffix), while the metric instrument
+    /// <c>deltasharp.delta.vacuum.cdc_scan.duration</c> records seconds (OTel base unit).</summary>
+    internal const string VacuumCdcScanDurationKey = "deltasharp.vacuum.cdc_scan.duration_ms";
+
+    /// <summary>The bounded terminal-status tag key for VACUUM's Change-Data-Feed protection scan: whether the
+    /// scan RAN TO COMPLETION (<see langword="true"/>) or was aborted by a throw/cancel mid-read
+    /// (<see langword="false"/>). Recorded on the span AND as a metric dimension so the wall-clock a failed
+    /// scan consumed is never misattributed as free; a closed two-value set (cardinality-safe).</summary>
+    internal const string VacuumCdcScanCompletedKey = "deltasharp.vacuum.cdc_scan.completed";
+
     /// <summary>The bounded <c>deltasharp.checkpoint.fallback.reason</c> metric label key sub-classifying a
     /// discarded checkpoint by why reconstruction fell back to JSON replay (<c>unsupported_feature</c>,
     /// <c>malformed</c>, <c>forged_multi_metadata</c>). A closed value set (metric-label-safe); the discarded
@@ -399,6 +444,8 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     private readonly Histogram<double> _vacuumDuration;
     private readonly Counter<long> _vacuumCount;
     private readonly Counter<long> _vacuumFiles;
+    private readonly Histogram<long> _vacuumCdcScanCommits;
+    private readonly Histogram<double> _vacuumCdcScanDuration;
     private readonly Histogram<double> _optimizeDuration;
     private readonly Counter<long> _optimizeCount;
     private readonly Counter<long> _optimizeFilesRemoved;
@@ -450,6 +497,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _vacuumFiles = _deltaMeter.CreateCounter<long>(
             "deltasharp.delta.vacuum.files", unit: "{file}",
             description: "VACUUM candidate files by retention decision (deletable / active / retention-protected / recently-staged).");
+        _vacuumCdcScanCommits = _deltaMeter.CreateHistogram<long>(
+            "deltasharp.delta.vacuum.cdc_scan.commits", unit: "{commit}",
+            description: "In-window commit JSONs read by VACUUM's Change-Data-Feed protection scan (#489). Grows with delta.logRetentionDuration depth; a commit known-aged past log retention is skipped and not counted.");
+        _vacuumCdcScanDuration = _deltaMeter.CreateHistogram<double>(
+            "deltasharp.delta.vacuum.cdc_scan.duration", unit: "s",
+            description: "Elapsed (monotonic) duration of VACUUM's Change-Data-Feed protection scan (the in-window commit-JSON reads that protect referenced _change_data/ files).");
         _optimizeDuration = _deltaMeter.CreateHistogram<double>(
             "deltasharp.delta.optimize.duration", unit: "s",
             description: "Elapsed (monotonic) duration of a Delta OPTIMIZE, by terminal outcome.");
@@ -640,6 +693,29 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         _vacuumFiles.Add(count, new KeyValuePair<string, object?>(VacuumDecisionKey, ToLabel(decision)));
     }
 
+    /// <summary>Records the cost of one VACUUM Change-Data-Feed protection scan (#489/#641 item 2): the
+    /// number of in-window commit JSONs actually read, the scan's elapsed duration, and whether the scan RAN
+    /// TO COMPLETION (<paramref name="completed"/>), onto BOTH the metric histograms and the low-cardinality
+    /// tags of the supplied VACUUM <paramref name="activity"/> (if sampled). One measurement per VACUUM (never
+    /// per commit), so it is allocation-light and cardinality-safe. Called from a <c>finally</c> so a scan
+    /// that threw or was cancelled mid-read still reports the wall-clock it consumed (with
+    /// <paramref name="completed"/> <see langword="false"/> and <paramref name="commitsScanned"/> 0, since the
+    /// completed count is unknown on the abort path); a genuine no-op scan records zero commits with
+    /// <paramref name="completed"/> <see langword="true"/>.</summary>
+    internal void RecordVacuumCdcScan(
+        Activity? activity, long commitsScanned, double durationSeconds, bool completed)
+    {
+        var completedTag = new KeyValuePair<string, object?>(VacuumCdcScanCompletedKey, completed);
+        _vacuumCdcScanCommits.Record(commitsScanned, completedTag);
+        _vacuumCdcScanDuration.Record(durationSeconds, completedTag);
+        if (activity is not null)
+        {
+            activity.SetTag(VacuumCdcScanCommitsKey, commitsScanned);
+            activity.SetTag(VacuumCdcScanDurationKey, durationSeconds * 1000);
+            activity.SetTag(VacuumCdcScanCompletedKey, completed);
+        }
+    }
+
     /// <summary>Starts the OPTIMIZE span if a listener samples the Delta source; returns
     /// <see langword="null"/> (a cheap no-op) otherwise. The caller sets low-cardinality attributes and
     /// status — never row data, column values, or a file path (checklist 09b redaction-by-omission).</summary>
@@ -787,6 +863,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         VacuumOutcome.Completed => "completed",
         VacuumOutcome.RejectedUnsafeRetention => "rejected_unsafe_retention",
         VacuumOutcome.Cancelled => "cancelled",
+        VacuumOutcome.AbortedStaleListing => "aborted_stale_listing",
         _ => "failure",
     };
 
@@ -846,6 +923,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
         CheckpointFallbackReason.DecoderSaturated => "decoder_saturated",
         CheckpointFallbackReason.NegativeCacheSkip => "negative_cache_skip",
         CheckpointFallbackReason.DecodeCeilingExceeded => "decode_ceiling_exceeded",
+        CheckpointFallbackReason.IncompleteMultipart => "incomplete",
         _ => "malformed",
     };
 

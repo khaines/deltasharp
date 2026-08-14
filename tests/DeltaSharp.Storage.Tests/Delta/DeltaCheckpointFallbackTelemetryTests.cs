@@ -34,6 +34,7 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     private const string BackendKey = "deltasharp.backend";
     private const string FallbackEvent = "DeltaCheckpointFallback";
     private const string ForgedEvent = "DeltaCheckpointForgedMultiMetadataRejected";
+    private const string SelectionSkipEvent = "DeltaCheckpointSelectionSkipped";
 
     private const string EmptySchemaUnescaped = """{"type":"struct","fields":[]}""";
 
@@ -158,6 +159,41 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     }
 
     [Fact]
+    public async Task PareEncryptedFooterCheckpoint_FallsBackToJsonReplay_WithUnsupportedFeatureReason()
+    {
+        // #771/#681 PARE (encrypted-FOOTER) arm. The sibling test above covers a PLAINTEXT-footer encrypted
+        // checkpoint; this covers the OTHER encryption family — an encrypted-footer file (PARE magic bracketing)
+        // the Parquet library refuses to open. The failure-path classifier identifies it as
+        // ParquetEncryption.EncryptedFooterEncryptionMessage, so the checkpoint door raises UnsupportedFeature
+        // and reconstruction must still fall back to JSON replay (a checkpoint is non-authoritative), producing
+        // the identical table and the bounded `unsupported_feature` fallback signal.
+        //
+        // RED-on-mutation: dropping the `|| ReferenceEquals(message, EncryptedFooterEncryptionMessage)` arm from
+        // ParquetEncryption.IsEncryptionClassifierVerdict makes the DeltaLog swallow gate reject THIS verdict —
+        // the UnsupportedFeature then escapes TrySeedFromCheckpointAsync and the whole table read FAILS instead
+        // of falling back. Without this test that arm is unpinned (all 2631 stay green when it is deleted).
+        IStorageBackend backend = NewBackend();
+        await WriteHistoryAsync(backend);
+        await DeltaTestHarness.WriteRawCheckpointAsync(backend, 1, ParquetTestHelpers.EncryptedFooterMagicFile());
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1);
+
+        (Snapshot snapshot, MeterCapture.Measurement metric, RecordingLogger<DeltaLog>.Entry log) =
+            await LoadWithCaptureAsync(backend);
+
+        // Fell back to JSON replay and reconstructed the identical table (no checkpoint claimed).
+        Assert.Null(snapshot.Metrics.CheckpointVersion);
+        Assert.Equal(2, snapshot.Metrics.ReplayedCommitCount);
+
+        Assert.Equal(1, metric.Value);
+        Assert.Equal("unsupported_feature", metric.Tags[ReasonKey]);
+
+        Assert.Equal(LogLevel.Warning, log.Level);
+        Assert.Equal(4400, log.EventId.Id);
+        Assert.Equal(1L, log.Field("Version"));
+        Assert.Equal("unsupported_feature", log.Field("Reason"));
+    }
+
+    [Fact]
     public async Task IntactCheckpoint_EmitsNoFallbackEvent()
     {
         IStorageBackend backend = NewBackend();
@@ -248,14 +284,16 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
     }
 
     [Fact]
-    public async Task IncompleteMultipartCheckpoint_EmitsNoFallbackSignal()
+    public async Task IncompleteMultipartCheckpoint_LeadingToFullReplay_EmitsIncompleteSelectionSkipSignal()
     {
         IStorageBackend backend = NewBackend();
         await WriteHistoryAsync(backend);
         // A partial 3-part checkpoint (parts 1 and 3 present, part 2 missing) is skipped at SELECTION, before
-        // any seed attempt — so it is intentionally NOT a seed-time discard and emits no fallback signal. This
-        // pins the counter's documented scope boundary (design §2.10.4) so the exclusion is a decision, not
-        // drift; the same holds for V2/UUID checkpoints and a failed _last_checkpoint hint read.
+        // any seed attempt, and NO complete checkpoint seeds the read — so reconstruction falls all the way
+        // back to full JSON replay (#787). That persistent full-replay condition is otherwise indistinguishable
+        // from a healthy no-checkpoint table (CheckpointVersion == null either way), so it now emits the
+        // dedicated selection-skip signal: the bounded `incomplete` metric reason + a lower-severity
+        // Information log (EventId 4405), NOT the Warning seed-time discard (4400/4401).
         await DeltaTestHarness.WritePartialMultipartCheckpointAsync(backend, 1, CheckpointAtV1(), parts: 3, partsToWrite: [1, 3]);
         await DeltaTestHarness.WriteLastCheckpointAsync(backend, 1, parts: 3);
 
@@ -267,9 +305,120 @@ public sealed class DeltaCheckpointFallbackTelemetryTests : IDisposable
             .LoadSnapshotAsync();
 
         Assert.Null(snapshot.Metrics.CheckpointVersion); // incomplete group skipped → full JSON replay
-        Assert.Empty(meters.ForInstrument(FallbackInstrument));
+        Assert.Equal(2, snapshot.Metrics.ReplayedCommitCount);
+
+        MeterCapture.Measurement metric = Assert.Single(meters.ForInstrument(FallbackInstrument));
+        Assert.Equal(1, metric.Value);
+        Assert.Equal("incomplete", metric.Tags[ReasonKey]);
+        // Cardinality invariant (design 09b): the counter carries EXACTLY the bounded reason tag — the skipped
+        // version is exemplar-only and never a metric label.
+        Assert.Single(metric.Tags);
+        Assert.DoesNotContain(TableVersionKey, metric.Tags.Keys);
+
+        // Lower severity than the Warning seed-time discards: Information (4405), and NOT the generic 4400
+        // Warning nor the 4401 forged-reject security signal (a spurious either here would be false noise).
+        RecordingLogger<DeltaLog>.Entry log = logger.Single(SelectionSkipEvent);
+        Assert.Equal(LogLevel.Information, log.Level);
+        Assert.Equal(4405, log.EventId.Id);
+        Assert.Equal(1L, log.Field("Version"));
         Assert.False(logger.Has(FallbackEvent));
         Assert.False(logger.Has(ForgedEvent));
+
+        // The Information line carries the same component/operation/backend correlation scope (design §7.2.1).
+        IReadOnlyList<KeyValuePair<string, object?>> scope = Assert.Single(logger.Scopes);
+        Assert.Equal("delta", ScopeValue(scope, ComponentKey));
+        Assert.Equal("reconstruct", ScopeValue(scope, OperationKey));
+        Assert.Equal("pvc", ScopeValue(scope, BackendKey));
+    }
+
+    [Fact]
+    public async Task IncompleteNewestCheckpoint_WithCompleteOlder_EmitsNoSelectionSkipSignal()
+    {
+        IStorageBackend backend = NewBackend();
+        await WriteHistoryAsync(backend); // v0, v1
+        await DeltaTestHarness.WriteCommitAsync(backend, 2, DeltaTestHarness.Add("c.parquet"));
+        // Complete OLDER checkpoint @1 seeds the read; the incomplete NEWEST @2 is a benign concurrent-write
+        // transient (a checkpoint mid-write) that must NOT warn — the read still seeds from a checkpoint, so
+        // CheckpointVersion is non-null and no full-replay fallback occurred (#787 Option A "be careful not to
+        // warn on the benign transient"). RED-on-revert: emitting the incomplete signal unconditionally
+        // (ignoring whether a checkpoint seeded) would fire here.
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 1, CheckpointAtV1());
+        await DeltaTestHarness.WritePartialMultipartCheckpointAsync(backend, 2, CheckpointAtV1(), parts: 3, partsToWrite: [1, 3]);
+
+        var logger = new RecordingLogger<DeltaLog>();
+        using var telemetry = new DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.DeltaMeter);
+
+        Snapshot snapshot = await new DeltaLog(backend, DeltaLog.MaxLogObjectBytes, logger, telemetry)
+            .LoadSnapshotAsync();
+
+        Assert.Equal(1, snapshot.Metrics.CheckpointVersion); // seeded from the complete older checkpoint
+        Assert.Empty(meters.ForInstrument(FallbackInstrument));
+        Assert.False(logger.Has(SelectionSkipEvent));
+        Assert.False(logger.Has(FallbackEvent));
+        Assert.False(logger.Has(ForgedEvent));
+    }
+
+    [Fact]
+    public async Task HealthyTableWithNoCheckpoint_EmitsNoSelectionSkipSignal()
+    {
+        // The full-replay symptom (CheckpointVersion == null) also occurs for a healthy table that simply has
+        // no checkpoint. That path has NO incomplete checkpoint group, so the selection-skip signal must NOT
+        // fire — otherwise every checkpoint-free table would emit a spurious `incomplete` (#787).
+        IStorageBackend backend = NewBackend();
+        await WriteHistoryAsync(backend);
+
+        var logger = new RecordingLogger<DeltaLog>();
+        using var telemetry = new DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.DeltaMeter);
+
+        Snapshot snapshot = await new DeltaLog(backend, DeltaLog.MaxLogObjectBytes, logger, telemetry)
+            .LoadSnapshotAsync();
+
+        Assert.Null(snapshot.Metrics.CheckpointVersion);
+        Assert.Empty(meters.ForInstrument(FallbackInstrument));
+        Assert.False(logger.Has(SelectionSkipEvent));
+        Assert.False(logger.Has(FallbackEvent));
+        Assert.False(logger.Has(ForgedEvent));
+    }
+
+    [Fact]
+    public async Task SeedDiscardWithUnrelatedIncompleteGroup_EmitsSingleFallback_NoIncompleteDoubleCount()
+    {
+        // #787 double-count guard. When the newest COMPLETE checkpoint ≤ target is selected then DISCARDED at
+        // seed (here @2 is complete-but-malformed), that discard already emits its own `malformed` fallback and
+        // leaves CheckpointVersion null. An UNRELATED older incomplete multi-part group (@1) must NOT then add a
+        // SECOND, spurious `incomplete` fallback for the SAME reconstruction — the cause of the full replay was
+        // the corrupt complete checkpoint, not the incomplete group. Exactly ONE fallback signal must fire.
+        //
+        // RED-on-revert: dropping the `&& !HasCompleteCheckpointAtOrBelow(listing, target)` gate makes the
+        // selection-skip also fire → TWO fallback measurements (malformed + incomplete) and a spurious
+        // DeltaCheckpointSelectionSkipped log — the Assert.Single on the meter and the Has(SelectionSkipEvent)
+        // assertion below both fail.
+        IStorageBackend backend = NewBackend();
+        await WriteHistoryAsync(backend); // v0, v1
+        await DeltaTestHarness.WriteCommitAsync(backend, 2, DeltaTestHarness.Add("c.parquet"));
+        // Newest checkpoint @2 is a COMPLETE (single-part) group that is corrupt → selected, seed fails → the
+        // `malformed` seed-time discard fallback.
+        await DeltaTestHarness.WriteRawCheckpointAsync(backend, 2, "not a parquet file"u8.ToArray());
+        // An UNRELATED older INCOMPLETE multi-part group @1 (parts 1 and 3 of 3, part 2 missing).
+        await DeltaTestHarness.WritePartialMultipartCheckpointAsync(backend, 1, CheckpointAtV1(), parts: 3, partsToWrite: [1, 3]);
+
+        var logger = new RecordingLogger<DeltaLog>();
+        using var telemetry = new DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.DeltaMeter);
+
+        Snapshot snapshot = await new DeltaLog(backend, DeltaLog.MaxLogObjectBytes, logger, telemetry)
+            .LoadSnapshotAsync();
+
+        Assert.Null(snapshot.Metrics.CheckpointVersion); // corrupt complete checkpoint discarded → full replay
+        Assert.Equal(3, snapshot.Metrics.ReplayedCommitCount);
+
+        // EXACTLY ONE fallback (the malformed seed-discard), never a second spurious `incomplete`.
+        MeterCapture.Measurement metric = Assert.Single(meters.ForInstrument(FallbackInstrument));
+        Assert.Equal("malformed", metric.Tags[ReasonKey]);
+        Assert.True(logger.Has(FallbackEvent));
+        Assert.False(logger.Has(SelectionSkipEvent)); // #787 double-count guard: no incomplete signal
     }
 
     [Fact]

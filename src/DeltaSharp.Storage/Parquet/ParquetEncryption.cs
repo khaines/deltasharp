@@ -46,6 +46,28 @@ internal static class ParquetEncryption
         + "magic). DeltaSharp cannot read encrypted Parquet files.";
 
     /// <summary>
+    /// Whether <paramref name="message"/> is one of this classifier's OWN unsupported-feature verdicts — the
+    /// <see cref="PlaintextFooterEncryptionMessage"/> or <see cref="EncryptedFooterEncryptionMessage"/>
+    /// constant this type mints when it POSITIVELY identifies a Parquet Modular Encryption file. Used by the
+    /// checkpoint door (<c>DeltaLog</c>/<c>DeltaCheckpointReader</c>) to gate the non-authoritative-checkpoint
+    /// swallow on the classifier's genuine verdict rather than on
+    /// <see cref="StorageErrorKind.UnsupportedFeature"/> alone (#771): a <see cref="StorageErrorKind.UnsupportedFeature"/>
+    /// that did NOT originate from this classifier — e.g. one a streamed backend raised mid-read — must SURFACE,
+    /// not be masked as an encrypted-checkpoint fallback. The comparison is by REFERENCE (<see cref="object.ReferenceEquals(object,object)"/>)
+    /// against the classifier's own message constants, which survive <see cref="System.Exception.Message"/> —
+    /// an exception rethrows the very same string instance the throw site passed. NOTE the reference gate does
+    /// NOT distinguish a hand-crafted duplicate LITERAL: because these are <c>const string</c> values they are
+    /// interned, so any same-valued string literal compiled into this assembly is already reference-equal to
+    /// them. What the reference gate DOES exclude is a same-valued message ASSEMBLED at runtime
+    /// (concatenated/formatted from other input), which is not interned — i.e. a non-classifier
+    /// <c>UnsupportedFeature</c> whose text merely coincides is rejected, while the classifier's own rethrown
+    /// constant is accepted.
+    /// </summary>
+    internal static bool IsEncryptionClassifierVerdict(string message) =>
+        ReferenceEquals(message, PlaintextFooterEncryptionMessage)
+        || ReferenceEquals(message, EncryptedFooterEncryptionMessage);
+
+    /// <summary>
     /// The FAILURE-path classifier both reader doors call when the Parquet library refused to open
     /// <paramref name="input"/>: returns the actionable unsupported-feature message when the input is
     /// positively identified as a Parquet Modular Encryption file (encrypted-footer <c>PARE</c> bracketing,

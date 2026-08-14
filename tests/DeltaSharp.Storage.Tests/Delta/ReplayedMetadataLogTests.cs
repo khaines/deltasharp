@@ -158,6 +158,67 @@ public sealed class ReplayedMetadataLogTests
     }
 
     [Fact]
+    public void APathologicalMetadataEveryCommitLog_CapsRetentionAndGoesInert_SoTheGateFallsBackToDiskScan()
+    {
+        // #712 (part 2, security-low). The number of metadata revisions is written by the FOREIGN log author,
+        // so a hostile/pathological pre-range history carrying a metaData on EVERY commit would otherwise
+        // retain one dictionary entry per commit — O(pre-range commits) memory per concurrent change-feed read.
+        // The retention cap bounds that: once the retained count would exceed MaxRetainedObservations the
+        // observer goes inert, releasing everything and reporting nothing covered so the gate reads the whole
+        // window from disk (fail-closed-safe, the pre-#697 behavior).
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: long.MaxValue);
+        long commits = ReplayedMetadataLog.MaxRetainedObservations * 2L;
+        MetadataAction prev = Meta("v-1");
+        for (long v = 0; v < commits; v++)
+        {
+            MetadataAction current = Meta("v" + v.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            log.Record(v, new[] { current }, prev, current); // a genuine metaData revision on every commit.
+            prev = current;
+        }
+
+        Assert.True(log.IsInert);
+        // Retention is bounded to O(1) — NOT O(pre-range commits) — regardless of how many revisions the
+        // foreign writer emitted. (Inert mode clears the retained set, so the observable count is 0.)
+        Assert.Equal(0, log.RecordedObservationCount);
+
+        // Inert ⇒ EVERY version is reported NOT covered, so the gate reads each commit from disk. Critically
+        // this is the fail-CLOSED direction: inert must never report a version covered-and-silent (which would
+        // let the gate skip the disk read on trust). Seal does NOT throw — with no observation consumed there
+        // is nothing to corroborate, so the whole-window lineage check is vacuous and skipped.
+        Sealed(log);
+        Assert.False(log.TryGetProvenObservation(0, out IReadOnlyList<MetadataAction> at0));
+        Assert.Empty(at0);
+        Assert.False(log.TryGetProvenObservation(commits - 1, out _));
+        Assert.False(log.TryGetProvenObservation(commits / 2, out _));
+    }
+
+    [Fact]
+    public void JustBelowTheRetentionCap_StaysActive_SoTheOptimizationStillAppliesForNormalTables()
+    {
+        // The cap must not bite a legitimate table: a window with exactly MaxRetainedObservations revisions
+        // stays active and every observation is still served (the reuse optimization applies), so the cap is a
+        // ceiling on adversarial retention, not a regression for normal histories.
+        var log = new ReplayedMetadataLog(exclusiveUpperBound: long.MaxValue);
+        int revisions = ReplayedMetadataLog.MaxRetainedObservations;
+        MetadataAction prev = Meta("seed");
+        for (int v = 0; v < revisions; v++)
+        {
+            MetadataAction current = Meta("v" + v.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            log.Record(v, new[] { current }, prev, current);
+            prev = current;
+        }
+
+        Assert.False(log.IsInert);
+        Assert.Equal(revisions, log.RecordedObservationCount);
+
+        Sealed(log);
+        Assert.True(log.TryGetProvenObservation(0, out IReadOnlyList<MetadataAction> first));
+        Assert.Single(first);
+        Assert.True(log.TryGetProvenObservation(revisions - 1, out IReadOnlyList<MetadataAction> last));
+        Assert.Single(last);
+    }
+
+    [Fact]
     public void AWholesaleFailureToRecordMetadata_IsCaughtByTheWindowLineageCheck()
     {
         // The per-version check needs an entry to contradict. This models an observer that produced NO entry

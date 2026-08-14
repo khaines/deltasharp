@@ -187,4 +187,111 @@ public sealed class OrphanCleanupTests : IDisposable
             new[] { new OrphanCandidate("enc removed.parquet", ModificationTimeMillis: 0) },
             retentionCutoffMillis: 1));
     }
+
+    [Fact]
+    public async Task UnencodedActiveLogPath_ProtectsEncodedListingCandidate()
+    {
+        // #490 (mirror of EncodedActiveLogPath_ProtectsUnencodedDiskCandidate). The prior test covers a
+        // Spark-ENCODED log path with a RAW listing key (today's LocalFileSystemBackend). This covers the
+        // OTHER direction the union must also handle: a DeltaSharp-UNENCODED log path with a URI-ENCODED
+        // listing key — the shape a future object-store backend (S3/ADLS/GCS) would produce if it returned
+        // encoded keys. The active file is recorded UNENCODED ("obj active.parquet"), but the (simulated
+        // encoding) listing yields "obj%20active.parquet". Decoding ONLY the log side would leave the union as
+        // {"obj active.parquet"}, which does not contain the encoded candidate key → the still-active file
+        // would be classified deletable → data loss. The candidate must be normalized too (raw ∪ decoded on
+        // BOTH sides).
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("obj active.parquet"));
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        Assert.Contains("obj active.parquet", snapshot.ActiveFiles.Select(a => a.Path)); // unencoded in the log
+
+        // mtime 0 is well below the cutoff, so absent the candidate-side normalization this would be deletable.
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("obj%20active.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1000));
+    }
+
+    [Fact]
+    public async Task UnencodedTombstoneWithinRetention_ProtectsEncodedListingCandidate()
+    {
+        // #490 companion: an UNENCODED tombstone path within the retention window must protect an ENCODED
+        // listing candidate too — the same two-sided normalization for the retention-protected-tombstone path.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("obj removed.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Remove("obj removed.parquet"));
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("obj%20removed.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1));
+    }
+
+    [Fact]
+    public async Task EncodedListingCandidate_Unreferenced_StaysDeletable()
+    {
+        // The candidate-side normalization must not OVER-protect a genuinely orphaned encoded key: against a
+        // snapshot whose protected set does not contain the candidate under EITHER form, an encoded, aged
+        // candidate is still deletable — decoding the candidate only adds match opportunities against the
+        // PROTECTION set, never fabricates one.
+        Snapshot snapshot = await BuildSnapshotAsync(); // active.parquet + removed.parquet only
+
+        IReadOnlyList<string> deletable = OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("orphan%20file.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1000);
+
+        Assert.Equal(new[] { "orphan%20file.parquet" }, deletable);
+    }
+
+    [Fact]
+    public async Task EncodedActiveLogPath_EncodedListingCandidate_IsNeverDeletable()
+    {
+        // #490 (encoded on BOTH sides — the future S3/ADLS/GCS shape). Here the log path is ITSELF stored
+        // percent-encoded ("obj%2520active.parquet" — a real filename embedding "%20", or a double-encoded
+        // key) AND a future object-store backend returns an already-encoded listing key
+        // ("obj%20active.parquet"). The encoding-robust union of the log path is
+        // {"obj%2520active.parquet", "obj%20active.parquet"} (raw ∪ decoded), so the encoded candidate matches
+        // via the RAW-EXACT branch of MatchesEncodingRobust — its own further decoding ("obj active.parquet")
+        // is NOT in the set. This pins that raw-exact branch: it is the SOLE protector here.
+        //
+        // RED-on-mutation (M1b): replacing MatchesEncodingRobust's body with
+        //   `return protectionSet.Contains(Uri.UnescapeDataString(candidatePath));`
+        // (decode-only, dropping the raw-exact branch) makes the candidate decode to "obj active.parquet",
+        // which is absent from the set → NOT protected → classified deletable → the live active file is lost.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("obj%2520active.parquet"));
+        Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();
+
+        Assert.Contains("obj%2520active.parquet", snapshot.ActiveFiles.Select(a => a.Path)); // encoded in the log
+
+        // mtime 0 is well below the cutoff, so absent the raw-exact branch this would be deletable.
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("obj%20active.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1000));
+    }
+
+    [Fact]
+    public async Task UnencodedCdcReferencedPath_ProtectsEncodedListingCandidate()
+    {
+        // #490/#489 for the ReferencedChangeData arm (the arm that EXISTS because #489 proved a cdc file can
+        // be silently deleted). An UNENCODED referenced cdc path ("_change_data/a b.parquet") must protect an
+        // ENCODED listing candidate ("_change_data/a%20b.parquet") via the same two-sided encoding-robust
+        // matching used for active/tombstone protection.
+        //
+        // RED-on-mutation: replacing `MatchesEncodingRobust(referenced, candidate.Path)` at the cdc arm with a
+        // raw `referenced.Contains(candidate.Path)` fails to decode the encoded candidate → the raw candidate
+        // key is absent from the referenced set → the still-referenced cdc file is classified deletable → the
+        // exact #489 data-loss the arm exists to prevent.
+        Snapshot snapshot = await BuildSnapshotAsync(); // active.parquet + removed.parquet only
+
+        Assert.Empty(OrphanCleanup.SelectDeletable(
+            snapshot,
+            new[] { new OrphanCandidate("_change_data/a%20b.parquet", ModificationTimeMillis: 0) },
+            retentionCutoffMillis: 1000,
+            protectedReferencedPaths: new[] { "_change_data/a b.parquet" }));
+    }
 }
