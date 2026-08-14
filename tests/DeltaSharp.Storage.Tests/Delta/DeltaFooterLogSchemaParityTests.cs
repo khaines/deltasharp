@@ -340,6 +340,9 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 
         // The evolution commit's log, parsed off disk. Every caller-declared entry must be present
         // verbatim; the commit is allowed to ADD delta.columnMapping.* and nothing else.
+        // "Verbatim" is only load-bearing against a TRUNCATING serializer while the corpus carries
+        // a value longer than any plausible fixed buffer, so that is asserted first (#726, round 2).
+        AssertCorpusCarriesALongMetadataValue(evolved);
         var logged = (StructType)SchemaJson.FromJson(written[^1].Declared);
         Assert.Equal(evolved.Count, logged.Count);
 
@@ -604,6 +607,11 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
 
     private static void AssertDeclaredPreservesCallerMetadata(StructType expectedSchema, string declared)
     {
+        // The oracle below is value EQUALITY over a re-parsed artifact, which is exactly what
+        // catches a truncating serializer -- but only if something in the corpus is long enough to
+        // be truncated. That precondition is asserted, not assumed (#726, round 2).
+        AssertCorpusCarriesALongMetadataValue(expectedSchema);
+
         var logged = (StructType)SchemaJson.FromJson(declared);
         Assert.Equal(expectedSchema.Count, logged.Count);
 
@@ -682,6 +690,15 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// value-shape strip, and a strip on any of the three enumerated namespaces are all RED here.
     /// </para>
     /// <para>
+    /// The VALUE-LENGTH domain is corpus content too (#726, round 2, red-team). The corpus carries a
+    /// metadata string value of <see cref="LongMetadataValueLength"/> characters -- flat, inside an
+    /// ARRAY, and inside a NESTED object -- because every guard in this file that checks value
+    /// FIDELITY is bounded by the longest value it is handed, and a serializer truncating metadata
+    /// values at a fixed buffer is invisible below that bound AND invisible to footer/log byte
+    /// parity (the truncation is symmetric: both artifacts go through the same serializer).
+    /// <see cref="AssertCorpusCarriesALongMetadataValue"/> stops that value being deleted quietly.
+    /// </para>
+    /// <para>
     /// The value kinds are enumerated from <see cref="MetadataValueKind"/> itself rather than
     /// listed, so a kind added later is carried here without anyone remembering to add it.
     /// </para>
@@ -718,6 +735,33 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             // that also conditions on value kind cannot slip past on the other lane.
             new("spark.sql.catalyst.charVarcharType", MetadataValue.String("varchar(32)")),
             new("spark.sql.parquet.fieldId", MetadataValue.Long(11)),
+
+            // Round 2 (red-team): the VALUE-LENGTH domain. Every other value in this corpus is under
+            // ~30 characters, so a serializer that truncated a metadata VALUE at a fixed buffer
+            // (256/1024/4096 -- the stackalloc thresholds and pooled-buffer sizes real serializers
+            // use) shipped the whole suite GREEN. It survived footer/log BYTE parity because the
+            // truncation is SYMMETRIC -- both artifacts go through the same ToJson -- and it survived
+            // the value-fidelity guards below because nothing declared here was long enough to lose
+            // anything. Input-fixture variety elsewhere (ParquetWriterTests.MagnitudeLengths) cannot
+            // close it either: varying the INPUT runs no serializer and re-parses no artifact.
+            //
+            // A value past the largest plausible buffer, carried by a corpus whose consumers re-parse
+            // the committed artifact and assert value EQUALITY, is what makes truncation RED. Long
+            // metadata values are not exotic: generated-column expressions, view SQL and column
+            // comments reach kilobytes in real tables, and losing their tail is silent data loss in
+            // the committed schemaString.
+            //
+            // All three metadata SHAPES carry one. Today's serializer recurses through a single
+            // value-writing switch, so one long value would exercise the same code -- but a
+            // serializer that special-cases the flat case (or copies nested/array values through a
+            // separate bulk path) makes them independent lanes, and a per-shape truncation would
+            // then be invisible in the two shapes the corpus left short.
+            new("tenant.column.comment", MetadataValue.String(LongMetadataValue)),
+            new("tenant.lineage.sql", MetadataValue.Array(new[] { MetadataValue.String(LongMetadataValue) })),
+            new("tenant.lineage.provenance", MetadataValue.Nested(FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("expression", MetadataValue.String(LongMetadataValue)),
+            }))),
         };
 
         for (int i = 0; bulky.Count < 96; i++)
@@ -736,6 +780,72 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
             new StructField("naïve", DataTypes.StringType, nullable: true),
         });
     }
+
+    /// <summary>
+    /// The length the corpus's long metadata values must reach: past the largest buffer a
+    /// serializer plausibly stack-allocates or pools, so a serializer that truncates a metadata
+    /// VALUE at a fixed size cannot round-trip one of them intact.
+    /// </summary>
+    /// <remarks>
+    /// CHOSEN, not derived -- and deliberately NOT read from <c>ParquetWriterTests</c>'s
+    /// <c>MinimumLongestString</c>/<c>MagnitudeLengths</c>, even though it matches the 4097 there. A
+    /// bound taken from the sweep this guard backstops would narrow whenever that sweep narrowed,
+    /// which is the shared-source defect this PR keeps finding; two chosen numbers in independent
+    /// files disagree loudly when either moves.
+    /// </remarks>
+    private const int LongMetadataValueLength = 4097;
+
+    /// <summary>
+    /// A realistic long metadata value -- a generated-column expression -- padded to
+    /// <see cref="LongMetadataValueLength"/> and terminated by a distinctive sentinel, so a
+    /// truncation at ANY fixed buffer (256/1024/4096) loses the tail and the failure message shows
+    /// which end went missing.
+    /// </summary>
+    private static readonly string LongMetadataValue = BuildLongMetadataValue();
+
+    private static string BuildLongMetadataValue()
+    {
+        const string head = "CASE WHEN région IS NULL THEN 'unknown' ELSE upper(région) END /* ";
+        const string tail = " */ -- END-OF-METADATA-VALUE";
+        return head + new string('m', LongMetadataValueLength - head.Length - tail.Length) + tail;
+    }
+
+    /// <summary>
+    /// Fails closed if the schema whose metadata is about to be checked for fidelity carries no
+    /// value long enough for a TRUNCATING serializer to be observable.
+    /// </summary>
+    /// <remarks>
+    /// The value-fidelity assertions in this file are only as strong as the longest value in the
+    /// corpus: with every value under a few dozen characters, a serializer truncating metadata
+    /// values at 256 (or 1024, or 4096) bytes reproduces every declared value exactly and ships
+    /// green, in BOTH artifacts, because the truncation is symmetric. So the corpus property the
+    /// oracle depends on is asserted here rather than assumed, and shrinking the corpus REDs this
+    /// instead of silently weakening every guard that consumes it.
+    /// </remarks>
+    private static void AssertCorpusCarriesALongMetadataValue(StructType schema)
+    {
+        int longest = schema
+            .SelectMany(f => f.Metadata.Values)
+            .Select(LongestStringIn)
+            .DefaultIfEmpty(0)
+            .Max();
+
+        Assert.True(
+            longest >= LongMetadataValueLength,
+            $"The corpus's longest metadata string VALUE is {longest} characters, below the "
+            + $"{LongMetadataValueLength} this oracle needs. Below that bound a serializer that "
+            + "truncates a metadata value at a fixed buffer round-trips every value here intact "
+            + "and ships green. Restore the long value; do not lower this bound.");
+    }
+
+    /// <summary>The longest string anywhere in a metadata value, including inside arrays and nested objects.</summary>
+    private static int LongestStringIn(MetadataValue value) => value.Kind switch
+    {
+        MetadataValueKind.String => value.AsString().Length,
+        MetadataValueKind.Array => value.AsArray().Select(LongestStringIn).DefaultIfEmpty(0).Max(),
+        MetadataValueKind.Nested => value.AsNested().Values.Select(LongestStringIn).DefaultIfEmpty(0).Max(),
+        _ => 0,
+    };
 
     private static MetadataValue ValueOfKind(MetadataValueKind kind, int i) => kind switch
     {
