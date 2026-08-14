@@ -65,6 +65,7 @@ public sealed class DeltaStorageTelemetryMappingTests
             [CheckpointFallbackReason.DecoderSaturated] = "decoder_saturated",
             [CheckpointFallbackReason.NegativeCacheSkip] = "negative_cache_skip",
             [CheckpointFallbackReason.DecodeCeilingExceeded] = "decode_ceiling_exceeded",
+            [CheckpointFallbackReason.IncompleteMultipart] = "incomplete",
         };
 
         foreach (CheckpointFallbackReason reason in Enum.GetValues<CheckpointFallbackReason>())
@@ -78,6 +79,38 @@ public sealed class DeltaStorageTelemetryMappingTests
 
         // The runtime fail-safe for an out-of-range cast stays the bounded `malformed` (never free-text).
         Assert.Equal("malformed", DeltaStorageTelemetry.ToLabel((CheckpointFallbackReason)999));
+    }
+
+    [Fact]
+    public void VacuumOutcome_MapsToBoundedLabel()
+    {
+        // Exhaustive net (#763-style) for the VACUUM terminal-outcome vocabulary: every declared
+        // VacuumOutcome must have an explicit, pinned label. The ToLabel switch ends in a `_ => "failure"`
+        // fail-safe, so a future member (e.g. a new fail-closed guard like aborted_stale_listing was) added
+        // WITHOUT its own arm would ship silently mapped to `failure` — bit-rot that would route a distinct,
+        // possibly retryable terminal into the alertable failure bucket. The Assert.True below fails the moment
+        // a member lacks a pinned expectation, forcing the author to add both a ToLabel arm and an entry here.
+        var expected = new Dictionary<VacuumOutcome, string>
+        {
+            [VacuumOutcome.DryRun] = "dry_run",
+            [VacuumOutcome.Completed] = "completed",
+            [VacuumOutcome.RejectedUnsafeRetention] = "rejected_unsafe_retention",
+            [VacuumOutcome.Cancelled] = "cancelled",
+            [VacuumOutcome.AbortedStaleListing] = "aborted_stale_listing",
+            [VacuumOutcome.Failure] = "failure",
+        };
+
+        foreach (VacuumOutcome outcome in Enum.GetValues<VacuumOutcome>())
+        {
+            Assert.True(
+                expected.ContainsKey(outcome),
+                $"VacuumOutcome.{outcome} has no pinned label — add a ToLabel arm and an expectation here "
+                + "rather than relying on the `_ => \"failure\"` fail-safe.");
+            Assert.Equal(expected[outcome], DeltaStorageTelemetry.ToLabel(outcome));
+        }
+
+        // The runtime fail-safe for an out-of-range cast stays the bounded `failure` (never free-text).
+        Assert.Equal("failure", DeltaStorageTelemetry.ToLabel((VacuumOutcome)999));
     }
 
     [Fact]

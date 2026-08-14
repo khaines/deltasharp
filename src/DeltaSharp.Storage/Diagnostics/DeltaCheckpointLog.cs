@@ -128,4 +128,27 @@ internal static partial class DeltaCheckpointLog
             + "suppressed in the decode negative cache (a persistently non-terminating checkpoint) or is being "
             + "re-probed by another load; reconstruction falls back to an older checkpoint or full JSON replay.")]
     internal static partial void CheckpointNegativeCacheSkip(ILogger logger, long version);
+
+    /// <summary>
+    /// A lower-severity signal (EventId 4405, <c>Information</c>) for a SELECTION-time checkpoint skip that led
+    /// to full JSON replay (#787): a classic multi-part checkpoint group at or below the resolved version was
+    /// INCOMPLETE (a crashed/interrupted or partially-uploaded multi-part upload), it was skipped before any
+    /// seed attempt, and no complete checkpoint seeded the read — so reconstruction fell all the way back to
+    /// full JSON replay. Distinct from the Warning seed-time discards (4400/4401): the checkpoint was never
+    /// opened (no <see cref="DeltaProtocolException"/>), and a permanently-failed multi-part upload is a
+    /// PERSISTENT full-replay condition whose only other symptom (<c>CheckpointVersion == null</c>) is
+    /// indistinguishable from a healthy table with no checkpoint. It rides <c>Information</c>, not
+    /// <c>Warning</c>, deliberately: the read still succeeds, and the selection skip can also occur benignly
+    /// (a checkpoint mid-write) — routing it here keeps a persistent condition discoverable via the sibling
+    /// <c>deltasharp.delta.checkpoint.fallbacks{reason=incomplete}</c> counter (the alertable rate instrument)
+    /// without adding Warning noise on concurrent-write transients. The caller only emits it when the
+    /// full-replay fallback actually occurred, so a mid-write newest checkpoint skipped while a complete OLDER
+    /// checkpoint still seeds the read does NOT fire. Renders only the skipped <b>version</b> (an integer,
+    /// safe) and takes no <see cref="System.Exception"/> object (§7.2.2 redaction-by-omission).
+    /// </summary>
+    [LoggerMessage(EventId = 4405, EventName = "DeltaCheckpointSelectionSkipped", Level = LogLevel.Information,
+        Message = "Delta checkpoint at version {Version} was skipped at selection because it is an incomplete "
+            + "multi-part checkpoint group, and no complete checkpoint seeded the read; reconstruction fell "
+            + "back to full JSON replay.")]
+    internal static partial void CheckpointSelectionSkipped(ILogger logger, long version);
 }

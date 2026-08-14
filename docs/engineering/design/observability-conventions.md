@@ -124,7 +124,13 @@ correlation key on a metric is a cardinality bomb:
 The `deltasharp.outcome` value set is **per-operation** (a closed set for each operation, never free text). The
 Delta **commit** path (`deltasharp.operation=commit`) uses the closed superset `success`, `skipped`,
 `conflict`, `contention`, `unknown_state`, `partial_transaction`, `cancelled`, `failure` — so a cancellation
-never inflates the failure SLI, and a fail-closed/unresolved outcome is never collapsed into `success`.
+never inflates the failure SLI, and a fail-closed/unresolved outcome is never collapsed into `success`. The
+Delta **VACUUM** path (`deltasharp.operation=vacuum`) uses its own closed superset `dry_run`, `completed`,
+`rejected_unsafe_retention`, `cancelled`, `aborted_stale_listing`, `failure` — where `aborted_stale_listing`
+(#640/#641) is a **distinct, retryable** fail-closed terminal (a tail-truncated `_delta_log` listing) kept
+apart from the generic `failure` so a stale-listing abort never pages as a protocol corruption; note that
+PERSISTENT recurrence of `aborted_stale_listing` is not transient and warrants escalation (an
+inconsistent/forged log), so it is deliberately *not* silently folded into `failure`.
 
 **Correlation / exemplar-only keys** — valid on **logs, span attributes, and metric exemplars**, but
 **never** a metric label, because each is unbounded over a run's or table's lifetime and would multiply a
@@ -450,8 +456,8 @@ boundary.
 | Scan volume / memory | Counter / Histogram | `deltasharp.scan.bytes`, `deltasharp.exec.memory.peak` | `By` | `ExecutionMetrics.BytesScanned`/`PeakMemoryBytes`/`SpilledBytes` | dotnet-runtime-performance-engineer |
 | Storage I/O | Counter / Histogram | `deltasharp.storage.io.bytes` (`direction`, `backend` tags), `deltasharp.storage.io.duration` | `By`, `s` | future storage layer | delta-storage-format-engineer |
 | Delta commit | Counter / Histogram | `deltasharp.delta.commit.count` (`deltasharp.outcome` tag), `deltasharp.delta.commit.duration`, `deltasharp.delta.commit.attempts` (`deltasharp.outcome` tag), `deltasharp.delta.commit.conflicts` (`deltasharp.conflict.class` tag), `deltasharp.delta.commit.transient_retries` | `{commit}`, `s`, `{attempt}`, `{conflict}`, `{retry}` | Delta log (#479) | delta-storage-format-engineer |
-| Delta VACUUM | Counter / Histogram | `deltasharp.delta.vacuum.count` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.duration` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.files` (`deltasharp.vacuum.decision` tag) | `{vacuum}`, `s`, `{file}` | Delta maintenance (#196) | delta-storage-format-engineer |
-| Delta snapshot reconstruction | Counter | `deltasharp.delta.checkpoint.fallbacks` (`deltasharp.checkpoint.fallback.reason` tag — `unsupported_feature`/`malformed`/`forged_multi_metadata`) | `{fallback}` | Delta log (#772, #763) | delta-storage-format-engineer |
+| Delta VACUUM | Counter / Histogram | `deltasharp.delta.vacuum.count` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.duration` (`deltasharp.outcome` tag), `deltasharp.delta.vacuum.files` (`deltasharp.vacuum.decision` tag), `deltasharp.delta.vacuum.cdc_scan.commits`, `deltasharp.delta.vacuum.cdc_scan.duration` (in-window CDF-protection scan cost, #489/#641) | `{vacuum}`, `s`, `{file}`, `{commit}`, `s` | Delta maintenance (#196, #641) | delta-storage-format-engineer |
+| Delta snapshot reconstruction | Counter | `deltasharp.delta.checkpoint.fallbacks` (`deltasharp.checkpoint.fallback.reason` tag — `unsupported_feature`/`malformed`/`forged_multi_metadata`/`incomplete`) | `{fallback}` | Delta log (#772, #763, #787) | delta-storage-format-engineer |
 | Shuffle | Counter / Histogram | `deltasharp.shuffle.bytes`, `deltasharp.shuffle.fetch.duration`, `deltasharp.shuffle.reresolve.count` | `By`, `s`, `{operation}` | future shuffle ([ADR-0004](../../adr/0004-shuffle-architecture.md)) | dotnet-distributed-execution-engineer |
 | Saturation / USE | UpDownCounter / ObservableGauge | `deltasharp.executor.active`, `deltasharp.exec.queue.depth`, `deltasharp.rpc.inflight`, `deltasharp.exec.memory.reserved` | `{executor}`, `{task}`, `{operation}`, `By` | future driver/executor + shuffle | cloud-native-site-reliability-engineer |
 | Runtime / GC | EventCounters | allocation rate, GC pause, thread-pool queue (`dotnet-counters`) | varies | .NET runtime | dotnet-runtime-performance-engineer |
@@ -481,17 +487,31 @@ Labels use the **metric-label-safe** set only — today the six bounded `DeltaSh
 `deltasharp.backend` and `deltasharp.conflict.class`, minted by the Delta commit path in #479), and the
 bounded `deltasharp.vacuum.decision` key (a closed four-value set — `deletable`, `active`,
 `retention_protected_tombstone`, `recently_staged` — minted by the Delta VACUUM path in #196; a candidate
-object path is **never** a metric tag and appears only on the audit log), and the bounded
+object path is **never** a metric tag and appears only on the audit log). The Delta VACUUM span additionally
+carries the bounded **activity-tag** keys `deltasharp.vacuum.cdc_scan.commits` (count of in-window commit
+JSONs read by the #489/#641 Change-Data-Feed protection scan), `deltasharp.vacuum.cdc_scan.duration_ms` (the
+scan's elapsed wall-clock), and `deltasharp.vacuum.cdc_scan.completed` (a bounded `true`/`false` terminal tag
+distinguishing a scan that ran to completion from one aborted by a throw/cancel mid-read, so a failed scan's
+cost is never misattributed as free). **Mind the ms/s split:** the trace tag is milliseconds (the `_ms`
+suffix), while the paired **metric** instrument (`deltasharp.delta.vacuum.cdc_scan.duration`, note the extra
+`.delta` segment the meter prefix adds, plus `deltasharp.delta.vacuum.cdc_scan.commits`) records **seconds**
+(the OpenTelemetry base unit) — the span-attribute key `deltasharp.vacuum.cdc_scan.commits` and the metric
+instrument `deltasharp.delta.vacuum.cdc_scan.commits` are deliberately similar but distinct names. And the
+bounded
 `deltasharp.checkpoint.fallback.reason` key (a closed set — `unsupported_feature`, `malformed`,
-`forged_multi_metadata` — minted by
-the snapshot-reconstruction fallback path in #772/#763; the discarded checkpoint's **version** is
+`forged_multi_metadata`, `incomplete` — minted by
+the snapshot-reconstruction fallback path in #772/#763/#787; the discarded/skipped checkpoint's **version** is
 correlation/exemplar-only and never a metric tag). The `deltasharp.delta.checkpoint.fallbacks` counter
-signals only a **selected checkpoint discarded while seeding** (a post-selection `unsupported_feature`/
+signals a **selected checkpoint discarded while seeding** (a post-selection `unsupported_feature`/
 `malformed` decode failure, or a `forged_multi_metadata` reject — the #671 cross-part identity forgery,
 distinguished at the guard site and logged under its own EventId 4401 because it is a security signal, not
-routine bit-rot); selection-time skips (an incomplete multi-part group, a V2/UUID checkpoint, or
-a failed `_last_checkpoint` hint) are not counted, and — per the no-op-by-default posture — the counter, not
-the (host-wiring-gated) Warning log, is the operator-observable artifact today. The
+routine bit-rot) OR a **selection-time skip that forced a full JSON replay** (`incomplete` — the newest
+usable checkpoint at or below the target is an incomplete multi-part group, so reconstruction fell back to a
+full replay; #787, logged under EventId 4405 at `Information`). The remaining selection-time skips (a V2/UUID
+checkpoint, or a failed `_last_checkpoint` hint) are intentionally **not** counted — they are benign
+(reconstruction proceeds from an older complete checkpoint or is a routine unsupported-layout skip). Per the
+no-op-by-default posture, the counter — not the (host-wiring-gated) log — is the operator-observable artifact
+today. The
 remaining storage, error-classification, and propagation instruments add their own bounded labels (a
 storage-I/O `direction` — `read`/`write` —, a sanitized error class, and a wire `protocol`), **documented
 here but not yet minted** in `DeltaSharpTelemetry` and added as `deltasharp.`-prefixed (or adopted OpenTelemetry

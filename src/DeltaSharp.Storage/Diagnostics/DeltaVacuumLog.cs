@@ -92,4 +92,41 @@ internal static partial class DeltaVacuumLog
     [LoggerMessage(EventId = 4106, EventName = "DeltaVacuumWeakSafetyThreshold", Level = LogLevel.Warning,
         Message = "Delta VACUUM retention policy has a weak safety threshold {ThresholdHours} h (below Delta's {DefaultHours} h default): the sub-threshold-retention guard is effectively disabled and a too-short retention can reclaim files a stale reader or recent tombstone still needs.")]
     internal static partial void VacuumWeakSafetyThreshold(ILogger logger, double thresholdHours, double defaultHours);
+
+    /// <remarks>
+    /// The Change-Data-Feed protection scan (#489) reads every retained, in-window commit JSON to protect the
+    /// <c>_change_data/</c> files they reference; its cost grows with <c>delta.logRetentionDuration</c> depth.
+    /// This <c>Information</c> lifecycle line reports the scan's volume and latency so an operator can correlate
+    /// a slow VACUUM with a deep log-retention window (the same signals also ride the vacuum activity as
+    /// bounded tags and the <c>deltasharp.delta.vacuum.cdc_scan.*</c> metrics, #641 item 2). Fields are bounded
+    /// counts/durations plus a bounded <c>completed</c> flag — never a path or a cdc key. The
+    /// <c>completed</c> flag is <see langword="false"/> when the scan THREW or was CANCELLED mid-read (the
+    /// wall-clock was still spent, but the commit count is unknown and reported as 0), so log-only incident
+    /// triage can tell a costly FAILED/cancelled scan apart from a benign zero-commit no-op.
+    /// </remarks>
+    [LoggerMessage(EventId = 4107, EventName = "DeltaVacuumCdcScanCompleted", Level = LogLevel.Information,
+        Message = "Delta VACUUM change-data-feed protection scan read {CommitsScanned} in-window commit(s) in {DurationMs} ms (completed={Completed}).")]
+    internal static partial void VacuumCdcScanCompleted(ILogger logger, int commitsScanned, double durationMs, bool completed);
+
+    /// <remarks>
+    /// The tail-truncated-log-listing fail-closed abort (#640 red-team): the table root listed a
+    /// version-bearing log artifact beyond the version the snapshot resolved to, so the single <c>_delta_log</c>
+    /// listing was stale/partial and reclaiming now could delete files referenced by the missing commit(s).
+    /// This is a domain outcome (a fail-closed guard), not a runtime fault, so it is a <c>Warning</c> — distinct
+    /// from the generic <c>Error</c> <see cref="VacuumFailed"/> — and the terminal is separately counted as
+    /// <c>outcome=aborted_stale_listing</c>. The <paramref name="listedVersion"/>/<paramref name="resolvedVersion"/>
+    /// fields are the two bounded version numbers (no path or untrusted token is ever rendered).
+    /// <para><b>Retryability is CONDITIONAL, not unconditional.</b> If the listing is merely STALE (an
+    /// object-store list-after-write lag), it self-heals and the run succeeds on retry. But a durably-orphaned
+    /// version-bearing artifact — a forged log, or a foreign writer's stray checkpoint left above the
+    /// resolvable version — will trip this guard on EVERY run and never resolve. Such PERSISTENT recurrence is
+    /// NOT a transient: it indicates an inconsistent/forged log and an unbounded storage-cost condition
+    /// (reclamation is blocked indefinitely), and warrants operator ESCALATION rather than blind retry. The
+    /// message says so explicitly so this non-alertable Warning bucket cannot silently hide a permanent fault.
+    /// (Attempt-bounding/auto-escalation is a deliberately un-implemented follow-up — the contract is only
+    /// reworded truthfully here.)</para>
+    /// </remarks>
+    [LoggerMessage(EventId = 4108, EventName = "DeltaVacuumAbortedStaleListing", Level = LogLevel.Warning,
+        Message = "Delta VACUUM aborted (fail-closed): the table root lists a _delta_log artifact at version {ListedVersion} but the _delta_log listing resolved only to version {ResolvedVersion} (stale/partial, tail-truncated); no file was deleted. Retry if the listing is merely stale; PERSISTENT recurrence indicates an inconsistent/forged log (a durably-orphaned version-bearing artifact) and warrants escalation, not blind retry.")]
+    internal static partial void VacuumAbortedStaleListing(ILogger logger, long listedVersion, long resolvedVersion);
 }

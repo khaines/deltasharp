@@ -221,7 +221,7 @@ internal sealed class DeltaVacuum
         using Activity? activity = _telemetry.StartVacuumActivity(_backend.Kind);
         try
         {
-            VacuumResult result = await RunAsync(retention, dryRun, unsafeOverride, cancellationToken)
+            VacuumResult result = await RunAsync(retention, dryRun, unsafeOverride, activity, cancellationToken)
                 .ConfigureAwait(false);
 
             double seconds = Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds;
@@ -254,6 +254,20 @@ internal sealed class DeltaVacuum
             DeltaVacuumLog.VacuumCanceled(_logger);
             throw;
         }
+        catch (DeltaProtocolException ex) when (ex.Kind == DeltaProtocolErrorKind.StaleLogListing)
+        {
+            // #641 item 4: a tail-truncated / stale _delta_log listing (the #640 fail-closed guard). This is a
+            // domain outcome, not a runtime fault; when the listing is merely stale it is RETRYABLE once the
+            // listing propagates. Record a DISTINCT terminal (aborted_stale_listing) so an operator watching
+            // metrics/logs can tell it apart from a generic Failure instead of paging on a false "log
+            // corruption". The structured, sanitized log line was already emitted at the throw site (where the
+            // two version numbers are in scope); it also warns that PERSISTENT recurrence indicates an
+            // inconsistent/forged log, not a transient — see DeltaVacuumLog.VacuumAbortedStaleListing.
+            _telemetry.RecordVacuumTerminal(
+                VacuumOutcome.AbortedStaleListing, Stopwatch.GetElapsedTime(startTimestamp).TotalSeconds);
+            SetOutcomeTag(activity, VacuumOutcome.AbortedStaleListing);
+            throw;
+        }
         catch (Exception ex)
         {
             _telemetry.RecordVacuumTerminal(
@@ -266,7 +280,8 @@ internal sealed class DeltaVacuum
     }
 
     private async Task<VacuumResult> RunAsync(
-        TimeSpan? requestedRetention, bool dryRun, bool unsafeOverride, CancellationToken cancellationToken)
+        TimeSpan? requestedRetention, bool dryRun, bool unsafeOverride, Activity? activity,
+        CancellationToken cancellationToken)
     {
         // CRITICAL-2 (TOCTOU): LIST BEFORE LOAD SNAPSHOT. Delta requires listing files before reading the
         // log so the snapshot is at least as new as the listing: any file the listing shows that is active
@@ -343,7 +358,11 @@ internal sealed class DeltaVacuum
         // fresh unpropagated commit's files are RecentlyStaged, never deleted).
         if (maxListedLogVersion > snapshot.Version)
         {
-            throw DeltaProtocolException.Inconsistent(string.Create(
+            // Emit the structured, sanitized abort line HERE (both bounded version numbers are in scope) so
+            // the log carries them as fields rather than an opaque pre-formatted detail string; the outer
+            // catch classifies the distinct aborted_stale_listing terminal but no longer re-logs.
+            DeltaVacuumLog.VacuumAbortedStaleListing(_logger, maxListedLogVersion, snapshot.Version);
+            throw DeltaProtocolException.StaleLogListing(string.Create(
                 CultureInfo.InvariantCulture,
                 $"VACUUM aborted: the table root lists a _delta_log artifact at version {maxListedLogVersion} " +
                 $"but the _delta_log listing resolved only to version {snapshot.Version}. The log listing is " +
@@ -387,12 +406,41 @@ internal sealed class DeltaVacuum
         // candidate would be protected-if-scanned yet skipped by any `_change_data/`-prefix predicate, and then
         // deleted (data loss). The only predicate that never under-protects is derived from the log itself, not
         // the candidate listing. Scanning unconditionally is the correctness reference; a SAFE scan-skip
-        // (gated on the retained protocol history ever declaring CDF, computed from the log — not candidate
-        // paths) is deferred to #641. The scan reuses `logListing` (the snapshot's own log view), so its
-        // protected set can never diverge from — or be staler than — the listing the snapshot was built on.
-        IReadOnlyCollection<string> protectedChangeDataPaths =
-            await _log.CollectInWindowChangeDataPathsAsync(logListing, logRetentionCutoffMillis, cancellationToken)
-                .ConfigureAwait(false);
+        // (gated on the retained protocol history ever declaring CDF over the FULL in-window range, computed
+        // from the log — not candidate paths, and not the current-snapshot enablement flag) remains an
+        // ACCEPTED, un-implemented follow-up (#641 item 3, tracked in #809): a pure cost optimization over an already
+        // fail-closed, single-listing scan, and the scan's cost is now observable (see the telemetry below).
+        // The scan reuses `logListing` (the snapshot's own log view), so its protected set can never diverge
+        // from — or be staler than — the listing the snapshot was built on.
+
+        // #641 item 2: surface the cdc-scan cost (commit JSONs read + elapsed) on the vacuum activity and
+        // metrics so an operator can see/alert on a scan whose cost grows with delta.logRetentionDuration
+        // depth. The cost is recorded in a `finally` so a scan that THROWS or is CANCELLED mid-read still
+        // reports the wall-clock it consumed: the expensive commit-JSON I/O has already been spent whether or
+        // not the scan reached a result, so an absent signal would misattribute a costly failed scan as free
+        // (or as "never reached" — the earlier claim here was wrong: a mid-scan throw DOES reach the scan yet
+        // recorded nothing). On the throwing/cancelled path the completed-commit count is unknown (the scan
+        // returns its count only on success), so it is reported as 0 with a bounded `completed=false` terminal
+        // tag; the success path reports the true count with `completed=true`.
+        IReadOnlyCollection<string> protectedChangeDataPaths;
+        long scanTimestamp = Stopwatch.GetTimestamp();
+        int scanCommits = 0;
+        bool scanCompleted = false;
+        try
+        {
+            DeltaLog.InWindowChangeDataScan scan =
+                await _log.CollectInWindowChangeDataPathsAsync(logListing, logRetentionCutoffMillis, cancellationToken)
+                    .ConfigureAwait(false);
+            protectedChangeDataPaths = scan.Paths;
+            scanCommits = scan.CommitsScanned;
+            scanCompleted = true;
+        }
+        finally
+        {
+            double scanSeconds = Stopwatch.GetElapsedTime(scanTimestamp).TotalSeconds;
+            _telemetry.RecordVacuumCdcScan(activity, scanCommits, scanSeconds, scanCompleted);
+            DeltaVacuumLog.VacuumCdcScanCompleted(_logger, scanCommits, scanSeconds * 1000, scanCompleted);
+        }
 
         // The single source of the deletion decision AND the audit reason (design §2.11.5): active files,
         // retention-protected tombstones, referenced change-data files, and recently-staged files are

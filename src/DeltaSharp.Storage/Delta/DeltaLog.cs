@@ -4,6 +4,7 @@ using System.Linq;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -500,6 +501,35 @@ internal sealed class DeltaLog
             state = new SnapshotState();
         }
 
+        // #787: signal a SELECTION-time skip that led to full JSON replay. When NO checkpoint seeded the read
+        // (`checkpointVersion is null`) yet the listing carried an INCOMPLETE multi-part checkpoint group ≤
+        // target (a crashed/interrupted or partially-uploaded upload skipped by SelectCheckpointsAsync before
+        // any seed attempt), the read fell all the way back to full JSON replay with no seed-time discard
+        // signal — a symptom otherwise indistinguishable from a healthy table with no checkpoint. Emitting
+        // ONLY when the fallback actually occurred is what avoids warning on the benign concurrent-write
+        // transient: a mid-write NEWEST checkpoint that is skipped while a complete OLDER checkpoint still
+        // seeds the read leaves `checkpointVersion` non-null, so this does not fire. V2/UUID checkpoints and a
+        // failed `_last_checkpoint` hint read are also selection-time skips but are NOT signalled here — a
+        // V2/UUID skip is a protocol-support decision (not a defect), and the hint is advisory and
+        // self-healing via listing-based selection; both are documented exclusions (design §2.10.4).
+        //
+        // #787 double-count guard: gate on there being NO complete checkpoint ≤ target. When a complete
+        // checkpoint WAS present but discarded at seed (corrupt/forged/encrypted — `checkpointVersion` stays
+        // null) that discard ALREADY emitted its own reason-specific fallback signal (malformed /
+        // unsupported_feature / forged_multi_metadata). An unrelated older incomplete group must NOT then add a
+        // second, spurious `incomplete` fallback for the SAME reconstruction: the actual cause of the
+        // full-replay was the corrupt complete checkpoint, not the incomplete group. The `incomplete` reason is
+        // reserved for the doc's condition — the newest USABLE checkpoint ≤ target is itself an incomplete
+        // multi-part group (no complete checkpoint existed to seed from).
+        if (checkpointVersion is null && !HasCompleteCheckpointAtOrBelow(listing, target))
+        {
+            long? skippedIncomplete = HighestIncompleteCheckpointAtOrBelow(listing, target);
+            if (skippedIncomplete is { } skippedVersion)
+            {
+                RecordCheckpointSelectionSkip(skippedVersion);
+            }
+        }
+
         long replayStart = checkpointVersion is { } c ? c + 1 : 0;
         int replayed = await ReplayContiguousAsync(
             state, replayStart, target, listing.Commits, replayObserver, cancellationToken).ConfigureAwait(false);
@@ -591,10 +621,11 @@ internal sealed class DeltaLog
     /// silently drop an in-window commit's <c>cdc</c> paths, under-protecting a live change file (#489).</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A retained commit is malformed or exceeds the read ceiling.</exception>
-    internal async Task<IReadOnlyCollection<string>> CollectInWindowChangeDataPathsAsync(
+    internal async Task<InWindowChangeDataScan> CollectInWindowChangeDataPathsAsync(
         LogListing listing, long logRetentionCutoffMillis, CancellationToken cancellationToken)
     {
         var paths = new HashSet<string>(StringComparer.Ordinal);
+        int commitsScanned = 0;
         foreach (long version in listing.Commits)
         {
             if (listing.CommitTimestamps.TryGetValue(version, out DateTime modified)
@@ -603,6 +634,7 @@ internal sealed class DeltaLog
                 continue; // known-aged past log retention → its cdc files are reclaimable, not protected.
             }
 
+            commitsScanned++; // count only the in-window commits actually READ (the scan's real I/O cost, #641).
             foreach (DeltaAction action in await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false))
             {
                 if (action is AddCdcFileAction cdc)
@@ -612,8 +644,16 @@ internal sealed class DeltaLog
             }
         }
 
-        return paths;
+        return new InWindowChangeDataScan(paths, commitsScanned);
     }
+
+    /// <summary>The result of <see cref="CollectInWindowChangeDataPathsAsync"/>: the protected
+    /// <c>_change_data/</c> paths AND the number of in-window commit JSONs actually READ to produce them. The
+    /// scan cost grows with <c>delta.logRetentionDuration</c> depth, so VACUUM surfaces
+    /// <see cref="CommitsScanned"/> as an operator cost signal (#641 item 2) — a commit known-aged past log
+    /// retention is skipped and is NOT counted, so this reflects real I/O, not the raw retained-commit count.</summary>
+    internal readonly record struct InWindowChangeDataScan(
+        IReadOnlyCollection<string> Paths, int CommitsScanned);
 
     /// <summary>
     /// Loads the snapshot at a change-feed range's <paramref name="rangeStartVersion"/> AND — in the SAME
@@ -664,6 +704,15 @@ internal sealed class DeltaLog
         // version target resolution landed on. They are equal for a valid explicit version (the resolver is
         // the identity there — only the timestamp path clamps), but that equality is an assumption, and if it
         // ever drifted the failure mode would be a silent COVERAGE hole, not a compile error. Assert it.
+        //
+        // #712 (M13): this guard is defense-in-depth against a FUTURE resolution drift, not an
+        // input-reachable path at HEAD. ResolveExplicitVersionTarget is the identity on an explicit version,
+        // and ReconstructAsync returns a snapshot whose Version IS the target it reconstructed (or fails
+        // closed on a gap/out-of-range), so no constructible listing/version makes startSnapshot.Version
+        // diverge from rangeStartVersion here — the mutant that deletes this branch cannot be killed by any
+        // input, exactly as the `!HasCoverage` guard in ReplayedMetadataLog cannot. It is retained (not
+        // deleted) because it is the ONLY thing that would keep the pre-range window co-extensive with the
+        // range if a later change made resolution clamp the start the way the timestamp path already does.
         if (startSnapshot.Version != rangeStartVersion)
         {
             throw DeltaProtocolException.Inconsistent(string.Create(
@@ -935,7 +984,8 @@ internal sealed class DeltaLog
                                 decoder: _checkpointDecoder,
                                 maxPartDecodedBytes: _checkpointMaxPartDecodedBytes).ConfigureAwait(false);
                         }
-                        catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature)
+                        catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.UnsupportedFeature
+                            && ParquetEncryption.IsEncryptionClassifierVerdict(ex.Message))
                         {
                             // Same non-authoritative rule as the DeltaProtocolException catch below, for a
                             // checkpoint that is a VALID Parquet file DeltaSharp cannot read (Parquet Modular
@@ -944,6 +994,15 @@ internal sealed class DeltaLog
                             // still falls back to JSON replay instead of failing the table read. (The data-file
                             // door's UnsupportedFeature is NOT swallowed anywhere: there the data IS
                             // authoritative.)
+                            //
+                            // Gated on the classifier's OWN verdict (#771), not on Kind alone. An
+                            // UnsupportedFeature is swallowed here ONLY when it is one of the encryption
+                            // classifier's own message constants (ParquetEncryption.IsEncryptionClassifierVerdict,
+                            // reference-identity). Any OTHER UnsupportedFeature — one a streamed backend read
+                            // raised mid-part, or any future classifier FAULT that surfaces as this Kind without
+                            // being a genuine encryption verdict — is NOT the "unusable derived artifact" signal
+                            // this swallow is for; masking it behind a silent full JSON replay would hide a
+                            // genuinely unreadable table, so it propagates uncaught.
                             //
                             // Scoped to THIS call — not the enclosing try — deliberately: the checkpoint READER
                             // is the only component whose UnsupportedFeature means "unusable derived artifact".
@@ -1080,9 +1139,12 @@ internal sealed class DeltaLog
     /// <para>Fires once per <b>selected checkpoint discarded while seeding</b> — i.e. per candidate the loop
     /// in <see cref="ReconstructAsync"/> tries and discards. A persistently unreadable checkpoint (e.g. an
     /// encrypted one, which does not self-heal) therefore re-emits on every snapshot load; the counter is the
-    /// rate instrument to alert on, and the per-load Warning is the human detail. Selection-time skips
-    /// (incomplete multi-part groups, V2/UUID checkpoints, a failed <c>_last_checkpoint</c> hint) are NOT a
-    /// seed-time discard and are intentionally not signalled here.</para></summary>
+    /// rate instrument to alert on, and the per-load Warning is the human detail. Selection-time skips are NOT
+    /// a seed-time discard and are not signalled through this Warning helper: an incomplete multi-part group
+    /// that leads to full JSON replay rides the dedicated lower-severity
+    /// <see cref="RecordCheckpointSelectionSkip"/> (Information, <c>reason=incomplete</c>, #787), while a
+    /// V2/UUID checkpoint skip (a protocol-support decision) and a failed <c>_last_checkpoint</c> hint read
+    /// (advisory, self-healing via listing-based selection) remain intentionally unsignalled.</para></summary>
     private void RecordCheckpointFallback(CheckpointFallbackReason reason, long version)
     {
         // The forged-reject reason has a dedicated emit path (RecordForgedCheckpoint) that pairs it with its
@@ -1156,6 +1218,60 @@ internal sealed class DeltaLog
         _telemetry.RecordDecodeNegativeCacheSkip(DecodeDoor.Checkpoint);
         using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
         DeltaCheckpointLog.CheckpointNegativeCacheSkip(_logger, version);
+    }
+
+    /// <summary>Emits the SELECTION-time checkpoint-skip signal (#787): the same bounded metric increment as
+    /// <see cref="RecordCheckpointFallback"/> but under the <see cref="CheckpointFallbackReason.IncompleteMultipart"/>
+    /// label (<c>incomplete</c>), paired with a distinct lower-severity log
+    /// (<see cref="DeltaCheckpointLog.CheckpointSelectionSkipped"/>, EventId 4405, <c>Information</c>) so a
+    /// PERSISTENT incomplete-multi-part upload that costs full JSON replay on every read is discoverable
+    /// without Warning noise on the benign concurrent-write transient. The caller emits it only when
+    /// reconstruction actually fell back to full JSON replay AND an incomplete checkpoint group ≤ target was
+    /// skipped at selection. Renders only the skipped <b>version</b>.</summary>
+    private void RecordCheckpointSelectionSkip(long version)
+    {
+        _telemetry.RecordCheckpointFallback(CheckpointFallbackReason.IncompleteMultipart);
+        using IDisposable? scope = _logger.BeginScope(_checkpointLogScope);
+        DeltaCheckpointLog.CheckpointSelectionSkipped(_logger, version);
+    }
+
+    /// <summary>The highest classic-checkpoint version at or below <paramref name="target"/> whose part group
+    /// is INCOMPLETE (a partially-uploaded / crashed multi-part upload), or <see langword="null"/> when every
+    /// checkpoint ≤ target is complete (or none exist). Used by <see cref="ReconstructAsync"/> to attribute a
+    /// full-JSON-replay fallback to a selection-time skip (#787). Reads only the already-obtained
+    /// <paramref name="listing"/>; issues no I/O.</summary>
+    private static long? HighestIncompleteCheckpointAtOrBelow(LogListing listing, long target)
+    {
+        long? highest = null;
+        foreach (KeyValuePair<long, CheckpointGroup> entry in listing.Checkpoints)
+        {
+            if (entry.Key <= target && !entry.Value.IsComplete)
+            {
+                highest = highest is { } current ? Math.Max(current, entry.Key) : entry.Key;
+            }
+        }
+
+        return highest;
+    }
+
+    /// <summary>Whether the listing contains at least one COMPLETE classic-checkpoint group at or below
+    /// <paramref name="target"/> (all its parts present — content corruption is irrelevant to this
+    /// group-completeness check). Used by <see cref="ReconstructAsync"/> to gate the #787 <c>incomplete</c>
+    /// selection-skip signal: when such a checkpoint existed but was discarded at seed (corrupt/forged/
+    /// encrypted), that discard already emitted its own reason-specific fallback, so an unrelated older
+    /// incomplete group must not double-count as <c>incomplete</c>. Reads only the already-obtained
+    /// <paramref name="listing"/>; issues no I/O.</summary>
+    private static bool HasCompleteCheckpointAtOrBelow(LogListing listing, long target)
+    {
+        foreach (KeyValuePair<long, CheckpointGroup> entry in listing.Checkpoints)
+        {
+            if (entry.Key <= target && entry.Value.IsComplete)
+            {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /// <summary>A cumulative DECODE-TIMEOUT wall-clock accumulator for a single reconstruction's candidate walk

@@ -459,14 +459,27 @@ internal static class DeltaCheckpointReader
             if (ParquetEncryption.IsPlaintextFooterEncrypted(reader.Metadata))
             {
                 await DisposeQuietlyAsync(reader).ConfigureAwait(false);
+                reader = null; // already disposed — keep the pass-through catch below from double-disposing.
                 throw DeltaStorageException.UnsupportedFeature(
                     ParquetEncryption.PlaintextFooterEncryptionMessage);
             }
 
             return reader;
         }
+        catch (DeltaStorageException) when (reader is not null)
+        {
+            // #771 defensive (latent today, live on the streamed-part future): the widened filter below
+            // excludes EVERY DeltaStorageException from reclassification, so a NON-classifier
+            // DeltaStorageException raised AFTER the reader opened — only reachable once checkpoint parts are
+            // streamed straight from the backend rather than fully buffered before OpenAsync (#698 FIX-5) —
+            // would otherwise escape this method with `reader`, and thus the input stream, undisposed. Dispose
+            // the still-open reader and rethrow UNMAPPED (the classifier's own success-path throw already
+            // nulled `reader`, so the reachable path never double-disposes and its behavior is unchanged).
+            await DisposeQuietlyAsync(reader).ConfigureAwait(false);
+            throw;
+        }
         catch (Exception ex) when (ex is not (OperationCanceledException or DeltaProtocolException)
-            && ex is not DeltaStorageException { Kind: StorageErrorKind.UnsupportedFeature })
+            && ex is not DeltaStorageException)
         {
             // Parquet Modular Encryption, FAILURE-path arm (#681). Encrypted-FOOTER mode (PARE magic) is
             // rejected by Parquet.Net at open, and a REAL plaintext-footer encryptor omits the encrypted
@@ -476,13 +489,20 @@ internal static class DeltaCheckpointReader
             // releases the input stream. Anything not positively identified keeps the fail-closed malformed
             // default — encryption is asserted, never guessed.
             //
-            // The filter excludes ONLY the exception this method itself re-raises (the SUCCESS-path
-            // UnsupportedFeature above, thrown inside this same try) — not DeltaStorageException as a whole.
-            // Excluding the whole type would be safe only while ReadAsync fully buffers each part into a
-            // MemoryStream before calling us; if checkpoint parts are ever streamed straight from the backend,
-            // a transient storage fault raised in here would escape UNMAPPED past DeltaLog's UnsupportedFeature
-            // -only fallback, turning a retryable blip into a failed table read instead of a JSON replay
-            // (#698 review FIX 5, same class as the DeltaLog swallow narrowing).
+            // The filter excludes EVERY DeltaStorageException from reclassification (#771), not merely the
+            // classifier's own SUCCESS-path UnsupportedFeature (thrown inside this same try, from
+            // IsPlaintextFooterEncrypted). Two kinds of DeltaStorageException can reach here and BOTH must
+            // propagate UNMAPPED rather than be re-wrapped into a corrupt-checkpoint verdict:
+            //   * the classifier's OWN encryption verdict — already classified, re-running the classifier over
+            //     it would be redundant; and
+            //   * a backend STORAGE fault raised mid-read, which is only reachable once checkpoint parts are
+            //     streamed straight from the backend instead of buffered by BufferAsync first (unreachable
+            //     today, #698 FIX-5 / #771). Reclassifying such a fault as `malformed` — or letting an
+            //     UnsupportedFeature that is NOT this classifier's verdict pose as the encryption sentinel —
+            //     would mask a genuine table-storage signal behind a silent JSON replay. It surfaces instead:
+            //     DeltaLog's swallow is now gated on the classifier's OWN verdict (ParquetEncryption
+            //     .IsEncryptionClassifierVerdict), so a non-classifier UnsupportedFeature fails the read.
+            // Only a RAW (Parquet.Net / lower-level) exception is reclassified below.
             string? unsupportedEncryption = ParquetEncryption.ClassifyUnreadableInput(input);
             if (reader is not null)
             {

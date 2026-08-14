@@ -43,6 +43,14 @@ internal enum DeltaProtocolErrorKind
     /// fail-closed (Delta "Append-only Tables"; #549). Distinct from <see cref="UnsupportedProtocol"/> — the
     /// feature IS supported, but the requested operation violates the table's append-only guarantee.</summary>
     AppendOnlyViolation,
+
+    /// <summary>A VACUUM tail-truncation guard (#640) observed the table root listing a version-bearing
+    /// <c>_delta_log</c> artifact <b>beyond</b> the version the snapshot's own log listing resolved to — the
+    /// log listing was stale/partial. Fail closed (reclaiming under it could delete files referenced by the
+    /// missing commit(s)). Distinct from <see cref="InconsistentLog"/> so the VACUUM terminal can label a
+    /// transient/RETRYABLE stale-listing abort separately from a genuine log corruption (#641 item 4); the
+    /// run succeeds once the listing propagates.</summary>
+    StaleLogListing,
 }
 
 /// <summary>
@@ -160,6 +168,16 @@ internal sealed class DeltaProtocolException : Exception
     /// known call sites by <c>StorageMessageHygieneTests</c>.</remarks>
     public static DeltaProtocolException Inconsistent(string message, Exception? innerException = null) =>
         new(DeltaProtocolErrorKind.InconsistentLog, message, innerException);
+
+    /// <summary>A VACUUM tail-truncated / stale <c>_delta_log</c> listing (#640 guard) — fail closed, but as a
+    /// distinct, RETRYABLE kind so the terminal is labelled apart from a genuine log inconsistency (#641 item
+    /// 4).</summary>
+    /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is accepted
+    /// fully-composed; any attacker-influenceable token (e.g. a version number) MUST be routed through
+    /// <see cref="DiagnosticText.Sanitize"/> by the caller before interpolation. The current caller
+    /// interpolates only two internally-derived <c>long</c> versions.</remarks>
+    public static DeltaProtocolException StaleLogListing(string message) =>
+        new(DeltaProtocolErrorKind.StaleLogListing, message, innerException: null);
 
     /// <summary>A time-travel target older than the earliest retained log (a log-cleanup retention gap).</summary>
     /// <remarks><b>Message hygiene obligation (#747):</b> the <paramref name="message"/> is

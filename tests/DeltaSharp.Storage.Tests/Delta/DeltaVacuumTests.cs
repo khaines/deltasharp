@@ -3,6 +3,7 @@ using System.Globalization;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -213,6 +214,27 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.Empty(result.DeletablePaths);
         Assert.NotNull(await _backend.HeadAsync("a b.parquet", CancellationToken.None));
         Assert.Equal(VacuumDecision.Active, result.Audit.Single(e => e.Path == "a b.parquet").Decision);
+    }
+
+    [Fact]
+    public async Task EncodedActiveLogPath_EncodedDiskFile_IsNeverDeleted()
+    {
+        // #490 (encoded on BOTH sides, end-to-end never-deleted-from-disk oracle). Twin of
+        // EncodedActiveLogPath_UnencodedDiskFile_IsNeverDeleted for the future object-store shape where the log
+        // stores an already-percent-encoded path ("obj%2520active.parquet") AND the listing yields an encoded
+        // key ("obj%20active.parquet"). The encoding-robust union protects the live file via the raw-exact
+        // branch; VACUUM must leave it on disk. This is a HeadAsync oracle, not just a unit-level classify.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("obj%2520active.parquet"));
+        await WriteDataFileAsync("obj%20active.parquet", Old); // encoded disk key, old mtime → deletable but for the log ref
+
+        VacuumResult result = await _vacuum.VacuumAsync(Retention);
+
+        Assert.DoesNotContain("obj%20active.parquet", result.DeletedPaths);
+        Assert.Empty(result.DeletablePaths);
+        Assert.NotNull(await _backend.HeadAsync("obj%20active.parquet", CancellationToken.None));
+        Assert.Equal(
+            VacuumDecision.Active, result.Audit.Single(e => e.Path == "obj%20active.parquet").Decision);
     }
 
     [Fact]
@@ -869,6 +891,235 @@ public sealed class DeltaVacuumTests : IDisposable
         Assert.Equal(new[] { "old-orphan.parquet" }, result.DeletedPaths.ToArray());
         Assert.Null(await _backend.HeadAsync("old-orphan.parquet", CancellationToken.None));
         Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task CdcScan_EmitsCommitsScannedAndDuration_OnMetricsActivityAndLog()
+    {
+        // #641 item 2 (scan-cost telemetry): the cdc protection scan reads every in-window commit JSON — a
+        // cost that grows with delta.logRetentionDuration depth — so VACUUM must surface it. Two in-window
+        // commits (v0 protocol+metadata, v1 add+cdc) are both read; the scan-cost signals must report 2
+        // commits on the metric histogram, the vacuum activity tags, AND the lifecycle log.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);
+
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaVacuum>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            policy: null, logger: logger, telemetry: telemetry, timeProvider: new FixedTimeProvider(Now));
+
+        await vacuum.VacuumAsync(Retention);
+
+        // Metric: the commits-scanned histogram records exactly the two in-window commits read, tagged with
+        // the success terminal (completed=true) — the SUCCESS-path counterpart to the abort-path pin below.
+        MeterCapture.Measurement commits =
+            Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.cdc_scan.commits"));
+        Assert.Equal(2d, commits.Value);
+        Assert.Equal(true, commits.Tags["deltasharp.vacuum.cdc_scan.completed"]);
+        MeterCapture.Measurement duration =
+            Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.cdc_scan.duration"));
+        Assert.Equal(true, duration.Tags["deltasharp.vacuum.cdc_scan.completed"]);
+
+        // Activity: the vacuum span carries the bounded scan-cost tags, including the success terminal.
+        System.Diagnostics.Activity activity = Assert.Single(activities.Stopped);
+        Assert.Equal(DeltaStorageTelemetry.VacuumActivityName, activity.OperationName);
+        Assert.Equal(2L, activity.GetTagItem("deltasharp.vacuum.cdc_scan.commits"));
+        Assert.NotNull(activity.GetTagItem("deltasharp.vacuum.cdc_scan.duration_ms"));
+        Assert.Equal(true, activity.GetTagItem("deltasharp.vacuum.cdc_scan.completed"));
+
+        // Log: the lifecycle line reports the scan volume AND the completed terminal — pinned by VALUE (the
+        // field), not mere emission.
+        RecordingLogger<DeltaVacuum>.Entry scanLog = logger.Single("DeltaVacuumCdcScanCompleted");
+        Assert.Equal(2, scanLog.Field("CommitsScanned"));
+        Assert.Equal(true, scanLog.Field("Completed"));
+    }
+
+    [Fact]
+    public async Task CdcScan_CancelledMidScan_StillRecordsCostWithCompletedFalse_AndCancelledTerminal()
+    {
+        // #641 item 2 abort-path telemetry (SRE Finding A / mutation V-A + V-B): the cdc protection scan's
+        // cost is recorded in a `finally`, so a scan that is CANCELLED mid-read must STILL report the
+        // wall-clock it consumed with a bounded `completed=false` terminal — the expensive commit-JSON I/O was
+        // already spent whether or not the scan reached a result, and an absent signal would misattribute a
+        // costly cancelled scan as free (or as a benign zero-commit no-op). We arm a cancellation on the
+        // SECOND read of v1.json: reconstruction reads it once, so the second read happens INSIDE the scan's
+        // try/finally (mid-scan, while reading an in-window commit) — after the try is entered.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);
+
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaVacuum>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+        using var cts = new CancellationTokenSource();
+        var backend = new CdcScanCancelingBackend(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            cts, targetCommitVersion: 1, cancelOnRead: 2);
+        var vacuum = new DeltaVacuum(
+            backend, policy: null, logger: logger, telemetry: telemetry, timeProvider: new FixedTimeProvider(Now));
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => vacuum.VacuumAsync(Retention, cancellationToken: cts.Token));
+
+        // The fault fired on the scan's RE-read of v1.json (2nd read), proving it happened inside the scan.
+        Assert.Equal(2, backend.TargetReads);
+
+        // (a) The scan-cost telemetry is STILL recorded on the cancel path, tagged completed=false. The
+        // completed count is unknown on the abort path, so it is reported as 0 (not the 2 the success path
+        // would report). Pinning the value AND the completed dimension is what kills mutations V-A (guarding
+        // the finally body with `if (scanCompleted)` drops this recording entirely) and V-B (hardcoding
+        // completed=true flips this dimension to true).
+        MeterCapture.Measurement commits =
+            Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.cdc_scan.commits"));
+        Assert.Equal(0d, commits.Value);
+        Assert.Equal(false, commits.Tags["deltasharp.vacuum.cdc_scan.completed"]);
+        MeterCapture.Measurement duration =
+            Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.cdc_scan.duration"));
+        Assert.Equal(false, duration.Tags["deltasharp.vacuum.cdc_scan.completed"]);
+
+        // (b) The span/activity tag carries completed=false on the abort path.
+        System.Diagnostics.Activity activity = Assert.Single(activities.Stopped);
+        Assert.Equal(false, activity.GetTagItem("deltasharp.vacuum.cdc_scan.completed"));
+
+        // The Fix-2 log field is pinned to false on the fault path (a costly cancelled scan is now
+        // distinguishable from a benign zero-commit no-op that reports completed=true).
+        RecordingLogger<DeltaVacuum>.Entry scanLog = logger.Single("DeltaVacuumCdcScanCompleted");
+        Assert.Equal(0, scanLog.Field("CommitsScanned"));
+        Assert.Equal(false, scanLog.Field("Completed"));
+
+        // (c) VACUUM terminates on the cancelled terminal (a cancellation is not a failure), and never a
+        // completion terminal.
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.count"));
+        Assert.Equal("cancelled", count.Tags["deltasharp.outcome"]);
+        Assert.Equal("cancelled", activity.GetTagItem("deltasharp.outcome"));
+        Assert.True(logger.Has("DeltaVacuumCanceled"));
+        Assert.False(logger.Has("DeltaVacuumCompleted"));
+    }
+
+    [Fact]
+    public async Task CdcScan_SkipsAgedCommits_ReportsOnlyInWindowCommitCount()
+    {
+        // #641 item 2 boundary: a commit aged strictly past delta.logRetentionDuration is skipped by the scan
+        // and must NOT inflate the commits-scanned signal — the count reflects real I/O, not raw retained
+        // commits. v0/v1 are in-window (read); v2's referencing commit is stamped just beyond the log window,
+        // so it is skipped → the scan reports 2, not 3.
+        DateTimeOffset justBeyond = Now - RetentionPolicyLogWindow - TimeSpan.FromMilliseconds(1);
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("active.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Add("second.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("second.parquet", Old);
+
+        using var telemetry = new DeltaStorageTelemetry();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        var vacuum = new DeltaVacuum(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent), (2, justBeyond)),
+            policy: null, logger: null, telemetry: telemetry, timeProvider: new FixedTimeProvider(Now));
+
+        await vacuum.VacuumAsync(Retention);
+
+        MeterCapture.Measurement commits =
+            Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.cdc_scan.commits"));
+        Assert.Equal(2d, commits.Value); // v0 + v1 read; v2 skipped as aged-past-log-retention.
+    }
+
+    [Fact]
+    public async Task TailTruncatedLogListing_RecordsDistinctAbortedStaleListingTerminal_NotGenericFailure()
+    {
+        // #641 item 4 (diagnosability): the tail-truncated-log-listing fail-closed abort must be observable as
+        // a DISTINCT, retryable terminal — outcome=aborted_stale_listing with a dedicated Warning log — rather
+        // than bucketed under the generic Error Failure, so an operator watching dashboards can self-diagnose
+        // and knows the run is retryable. The abort still throws a DeltaProtocolException (type unchanged), now
+        // carrying Kind=StaleLogListing.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+        await WriteDataFileAsync("active.parquet", Old);
+        await WriteDataFileAsync("_change_data/x.parquet", Old);
+
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaVacuum>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+        // Tear the single `_delta_log/` listing so it omits v1.json → the snapshot resolves to v0 while the
+        // untorn candidate root listing still sees v1.json → the tail-truncation guard trips.
+        var backend = new DivergentLogListingBackend(
+            DeltaTestHarness.WithCommitTimestamps(_backend, (0, Recent), (1, Recent)),
+            omitFromSecondLogListing: new[] { DeltaLogFiles.CommitPath(1) }, tearFromOrdinal: 1);
+        var vacuum = new DeltaVacuum(
+            backend, policy: null, logger: logger, telemetry: telemetry, timeProvider: new FixedTimeProvider(Now));
+
+        DeltaProtocolException ex =
+            await Assert.ThrowsAsync<DeltaProtocolException>(() => vacuum.VacuumAsync(Retention));
+        Assert.Equal(DeltaProtocolErrorKind.StaleLogListing, ex.Kind);
+
+        // Distinct terminal metric + span tag (not "failure").
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.count"));
+        Assert.Equal("aborted_stale_listing", count.Tags["deltasharp.outcome"]);
+        System.Diagnostics.Activity activity = Assert.Single(activities.Stopped);
+        Assert.Equal("aborted_stale_listing", activity.GetTagItem("deltasharp.outcome"));
+
+        // Distinct log line (the generic failure line must NOT fire for a stale-listing abort). Pinned to the
+        // sanitized structured fields + Warning level + EventId 4108 (repo checkpoint-log convention), so the
+        // two bounded version numbers are asserted as FIELDS, not embedded in an opaque detail string.
+        RecordingLogger<DeltaVacuum>.Entry abortLog = logger.Single("DeltaVacuumAbortedStaleListing");
+        Assert.Equal(LogLevel.Warning, abortLog.Level);
+        Assert.Equal(4108, abortLog.EventId.Id);
+        Assert.Equal(1L, abortLog.Field("ListedVersion"));   // table root listed v1.json
+        Assert.Equal(0L, abortLog.Field("ResolvedVersion")); // snapshot resolved only to v0
+        Assert.False(logger.Has("DeltaVacuumFailed"));
+
+        // Fail-closed: v1's live files are untouched on disk.
+        Assert.NotNull(await _backend.HeadAsync("active.parquet", CancellationToken.None));
+        Assert.NotNull(await _backend.HeadAsync("_change_data/x.parquet", CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task GenuineMalformedLog_RecordsFailureTerminal_NotAbortedStaleListing()
+    {
+        // #641 genuine-fault direction (companion to
+        // TailTruncatedLogListing_RecordsDistinctAbortedStaleListingTerminal_NotGenericFailure). A GENUINE
+        // malformed/inconsistent-log DeltaProtocolException (Kind=MalformedAction, NOT StaleLogListing) must
+        // route to the alertable generic `failure` bucket — NOT be relabeled the retryable
+        // `aborted_stale_listing`. v1's `add` line omits the required `path`, so snapshot reconstruction throws
+        // a malformed-action fault while loading, before the tail-truncation guard is even reached.
+        //
+        // RED-on-mutation (M4f): widening the stale-listing catch filter from
+        //   `when (ex.Kind == DeltaProtocolErrorKind.StaleLogListing)`
+        // to `when (ex.Kind != DeltaProtocolErrorKind.RetentionGap)` would swallow this genuine fault into the
+        // aborted_stale_listing terminal — outcome flips to "aborted_stale_listing", DeltaVacuumFailed stops
+        // firing, and DeltaVacuumAbortedStaleListing wrongly fires → an unbounded storage-cost/corruption
+        // condition routed away from the paged `failure` bucket.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, """{"add":{"dataChange":true}}"""); // malformed: no path
+
+        using var telemetry = new DeltaStorageTelemetry();
+        var logger = new RecordingLogger<DeltaVacuum>();
+        using var meters = new MeterCapture(telemetry.DeltaMeter, telemetry.StorageMeter);
+        using var activities = new ActivityCapture(telemetry.DeltaActivitySource);
+        var vacuum = new DeltaVacuum(
+            _backend, policy: null, logger: logger, telemetry: telemetry, timeProvider: new FixedTimeProvider(Now));
+
+        DeltaProtocolException ex =
+            await Assert.ThrowsAsync<DeltaProtocolException>(() => vacuum.VacuumAsync(Retention));
+        Assert.Equal(DeltaProtocolErrorKind.MalformedAction, ex.Kind); // a genuine fault, NOT a stale listing
+
+        // Generic failure terminal (metric + span tag), never the retryable aborted_stale_listing.
+        MeterCapture.Measurement count = Assert.Single(meters.ForInstrument("deltasharp.delta.vacuum.count"));
+        Assert.Equal("failure", count.Tags["deltasharp.outcome"]);
+        System.Diagnostics.Activity activity = Assert.Single(activities.Stopped);
+        Assert.Equal("failure", activity.GetTagItem("deltasharp.outcome"));
+
+        Assert.True(logger.Has("DeltaVacuumFailed"));
+        Assert.False(logger.Has("DeltaVacuumAbortedStaleListing"));
     }
 
     // ---- helpers ----
