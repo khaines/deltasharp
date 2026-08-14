@@ -13,7 +13,7 @@ namespace DeltaSharp.Storage.Delta;
 /// <para>The construction of a <see cref="PathDescription"/> is confined so the "described" claim cannot be
 /// forged. A <see cref="string"/> cannot be converted TO a <see cref="PathDescription"/> implicitly, so the
 /// accidental/copy-paste bare-string disclosure vector — silently handing a raw <c>add.path</c> where a
-/// described path is required — is a compile error; the primary constructor is banned by
+/// described path is required — is a compile error; the constructor is banned by
 /// <c>BannedSymbols.txt</c> (RS0030), so a direct <c>new PathDescription(raw)</c> is a build error
 /// EVERYWHERE except <see cref="DiagnosticText.DescribePath"/>'s single sanctioned, pragma-suppressed call
 /// site (#700/#696); and <see cref="Value"/> is get-only, so <c>existing with { Value = raw }</c> cannot
