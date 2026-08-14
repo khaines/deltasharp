@@ -10,6 +10,7 @@ using System.Xml.Linq;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Writing;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests;
@@ -734,6 +735,17 @@ public sealed class StorageExceptionToStringTests
         // repo's own log sites because they "never pass the exception object, its message, or its inner".
         // True today, but nothing made it stay true — and it is load-bearing for the "an in-repo analyzer
         // would have zero call sites to flag" reasoning. Six lines of reflection make it rot loudly.
+        //
+        // #810: this reflection sweep is, by design, scoped to [LoggerMessage] source-generated sites. The
+        // complementary gap — a DIRECT LoggerExtensions.Log*(…, Exception, …) call anywhere in a production
+        // assembly, which hands the exception object to a sink that can render or destructure it — is now
+        // closed at COMPILE TIME by the BannedSymbols.txt RS0030 bans on all 14 exception-taking
+        // LoggerExtensions overloads. That RS0030 enforcement (not this Storage-scoped sweep) is what makes the
+        // "zero call sites to flag" guarantee hold repo-wide across every src/ production assembly; a future
+        // direct exception-logging call fails the build. The residual primitives ILogger.Log<TState>(…,
+        // Exception, …) and LoggerMessage.Define cannot be symbol-banned (the source generator emits both), so
+        // they stay closed by the zero-direct-call-site convention. See
+        // BannedSymbols_BanEveryExceptionTakingLoggerExtensionsOverload, which proves the bans resolve.
         MethodInfo[] logSites = typeof(DeltaStorageException).Assembly.GetTypes()
             .SelectMany(type => type.GetMethods(
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.DeclaredOnly))
@@ -753,6 +765,53 @@ public sealed class StorageExceptionToStringTests
             .ToArray();
 
         Assert.Empty(offenders);
+    }
+
+    [Fact]
+    public void BannedSymbols_BanEveryExceptionTakingLoggerExtensionsOverload()
+    {
+        // #810: the #694 sweep above covers only [LoggerMessage] source-gen sites; the complementary compile-
+        // time control is the BannedSymbols.txt RS0030 ban on every direct LoggerExtensions.Log*(…, Exception,
+        // …) overload (a direct call would hand the exception object to the sink and re-leak the scrubbed
+        // inner). With ZERO live call sites the analyzer never fires, so build-green alone does NOT prove the
+        // ban IDs resolve — a mistyped/removed doc-ID is a SILENT no-op (BannedSymbols.txt's own header warns of
+        // this). Derive the required set by REFLECTION over the real API so this guard fails loudly if (a) a ban
+        // ID is typo'd/dropped, or (b) a future Microsoft.Extensions.Logging version adds a new exception-taking
+        // overload that would otherwise silently escape the ban. Mirrors the #455 telemetry
+        // TelemetryExceptionScrubbingGuardTests precedent this family extends. (The core ILogger.Log<TState> and
+        // LoggerMessage.Define residuals are NOT banned — the source generator emits both, so a symbol ban
+        // trips RS0030 on the generated code; see the BannedSymbols.txt rationale.)
+        MethodInfo[] exceptionOverloads = typeof(LoggerExtensions)
+            .GetMethods(BindingFlags.Public | BindingFlags.Static)
+            .Where(method => method.GetParameters().Any(p => p.ParameterType == typeof(Exception)))
+            .ToArray();
+
+        // 6 levels (Error/Warning/Information/Debug/Critical/Trace) × {no-EventId, EventId} + Log(level, ex, …)
+        // + Log(level, eventId, ex, …) = 14. A change here means the API surface moved — update the bans too.
+        Assert.Equal(14, exceptionOverloads.Length);
+
+        string bannedSymbols = File.ReadAllText(Path.Combine(RepositoryRoot(), "BannedSymbols.txt"));
+        string[] missing = exceptionOverloads
+            .Select(LoggerExtensionsDocumentationId)
+            .Where(docId => !bannedSymbols.Contains($"{docId};[security]", StringComparison.Ordinal))
+            .OrderBy(docId => docId, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.True(
+            missing.Length == 0,
+            "Exception-taking LoggerExtensions overload(s) not [security]-banned in BannedSymbols.txt (#810):\n"
+            + string.Join("\n", missing));
+    }
+
+    // The documentation-comment ID for a LoggerExtensions overload whose parameters are all non-generic,
+    // non-byref types (ILogger/EventId/LogLevel/Exception/String and the trailing params object[]), for which
+    // Type.FullName is already the doc-ID form (e.g. object[] → "System.Object[]"). Kept deliberately narrow to
+    // the shapes this guard scans; a future overload with a different parameter kind would trip Assert.Equal(14).
+    private static string LoggerExtensionsDocumentationId(MethodInfo method)
+    {
+        string parameters = string.Join(
+            ",", method.GetParameters().Select(parameter => parameter.ParameterType.FullName));
+        return $"M:{method.DeclaringType!.FullName}.{method.Name}({parameters})";
     }
 
     [Fact]
