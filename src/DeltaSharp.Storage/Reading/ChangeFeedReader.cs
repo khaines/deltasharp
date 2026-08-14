@@ -43,6 +43,16 @@ internal sealed class ChangeFeedReader
     private static readonly StructField ChangeTypeField =
         new(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false);
 
+    // The READ projection requests `_change_type` as NULLABLE (not the non-nullable output field above),
+    // deliberately: the storage reader's value-level required-lane guard (#807) would otherwise fail closed on
+    // a null `_change_type` with a generic storage message, pre-empting the CDF-domain check
+    // (ValidateChangeTypeColumn) that rejects a null/out-of-domain change-type with a PRECISE, path-free
+    // DeltaReadException (§5.2, #653). A well-formed cdc file's `_change_type` is always non-null (the writer
+    // stamps it REQUIRED), so a nullable read never materializes a null for a valid file; a foreign/tampered
+    // file's null is caught — with the better diagnostic — by ValidateChangeTypeColumn.
+    private static readonly StructField ChangeTypeReadField =
+        new(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: true);
+
     private static readonly StructField CommitVersionField =
         new(ChangeDataWriter.CommitVersionColumn, DataTypes.LongType, nullable: false);
 
@@ -1106,10 +1116,12 @@ internal sealed class ChangeFeedReader
         }
     }
 
-    // Appends the engine-synthesized `_change_type` field (StringType, non-nullable, NO column-mapping id — so
-    // the reader resolves it by name) to a physical data schema, forming the single-pass explicit-read
-    // projection (#658). Mirrors the writer's `ChangeDataWriter.AppendChangeTypeColumn`: the read projection
-    // must stay in lockstep with the cdc body layout the writer emits (data columns first, then `_change_type`).
+    // Appends the engine-synthesized `_change_type` field to a physical data schema, forming the single-pass
+    // explicit-read projection (#658). NO column-mapping id — so the reader resolves it by name. Requested as
+    // NULLABLE (ChangeTypeReadField): its null/domain validation is the CDF layer's job (ValidateChangeTypeColumn),
+    // not the storage required-lane guard (#807) — see ChangeTypeReadField. Mirrors the writer's
+    // `ChangeDataWriter.AppendChangeTypeColumn`: the read projection must stay in lockstep with the cdc body
+    // layout the writer emits (data columns first, then `_change_type`).
     private static StructType AppendChangeTypeColumn(StructType physicalDataSchema)
     {
         var fields = new List<StructField>(physicalDataSchema.Count + 1);
@@ -1118,7 +1130,7 @@ internal sealed class ChangeFeedReader
             fields.Add(physicalDataSchema[i]);
         }
 
-        fields.Add(ChangeTypeField);
+        fields.Add(ChangeTypeReadField);
         return new StructType(fields);
     }
 
