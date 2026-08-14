@@ -1412,9 +1412,12 @@ internal sealed class ParquetFileReader
         // built with honorReferenceNullability:false — BY CONSTRUCTION always-nullable for string/binary.
         // That is deliberate on the read path: a file this reader did not write (a foreign producer, or a
         // DeltaSharp file written before #730) may store a log-REQUIRED string/binary column as OPTIONAL,
-        // and those files must stay readable. The consequence — this guard is inert for string/binary — is
-        // a known, dispositioned residual (issue #807); it still bites for every value-typed column, whose
-        // physical repetition has always tracked the declared flag.
+        // and those files must stay readable. The consequence — this SCHEMA-level guard is inert for
+        // string/binary — is dispositioned (issue #807) by the VALUE-level required-lane guard at
+        // materialization (RejectNullInRequiredLane in ReadStringAsync/ReadBinaryAsync): an OPTIONAL
+        // string/binary column with no nulls still reads, but the first actual null in a required lane fails
+        // closed. This SCHEMA guard still bites for every value-typed column, whose physical repetition has
+        // always tracked the declared flag.
         if (fileField.IsNullable && !expected.IsNullable)
         {
             throw DeltaStorageException.SchemaMismatch(
@@ -1779,11 +1782,11 @@ internal sealed class ParquetFileReader
                     .ConfigureAwait(false);
                 break;
             case StringType:
-                await ReadStringAsync(rowGroup, fileField, vector, rowCount, cancellationToken)
+                await ReadStringAsync(rowGroup, fileField, requestedField, vector, rowCount, cancellationToken)
                     .ConfigureAwait(false);
                 break;
             case BinaryType:
-                await ReadBinaryAsync(rowGroup, fileField, vector, rowCount, cancellationToken)
+                await ReadBinaryAsync(rowGroup, fileField, requestedField, vector, rowCount, cancellationToken)
                     .ConfigureAwait(false);
                 break;
             default:
@@ -2072,6 +2075,7 @@ internal sealed class ParquetFileReader
     private static async Task ReadStringAsync(
         ParquetRowGroupReader rowGroup,
         DataField fileField,
+        StructField requestedField,
         MutableColumnVector vector,
         int rowCount,
         CancellationToken cancellationToken)
@@ -2087,6 +2091,7 @@ internal sealed class ParquetFileReader
             }
             else
             {
+                RejectNullInRequiredLane(requestedField);
                 vector.AppendNull();
             }
         }
@@ -2095,6 +2100,7 @@ internal sealed class ParquetFileReader
     private static async Task ReadBinaryAsync(
         ParquetRowGroupReader rowGroup,
         DataField fileField,
+        StructField requestedField,
         MutableColumnVector vector,
         int rowCount,
         CancellationToken cancellationToken)
@@ -2110,9 +2116,48 @@ internal sealed class ParquetFileReader
             }
             else
             {
+                RejectNullInRequiredLane(requestedField);
                 vector.AppendNull();
             }
         }
+    }
+
+    // #807 value-level required-lane guard for TOP-LEVEL scalar string/binary. ValidateFileField's SCHEMA-level
+    // nullability check (fileField.IsNullable && !expected.IsNullable) is structurally INERT for string/binary
+    // because `expected` is built with honorReferenceNullability:false — always-nullable by construction —
+    // deliberately, so a foreign / pre-#730 file that stores a log-required string/binary column as physically
+    // OPTIONAL still reads (the physical repetition alone is not authoritative). That tolerance must NOT extend
+    // to actual data: a physically-OPTIONAL string/binary column read into a requested non-nullable lane that
+    // materializes a NULL would hand a null to a consumer that trusts StructField.Nullable == false. Value types
+    // cannot reach here in that state — for them `expected.IsNullable` tracks the declared flag, so the schema
+    // guard already rejected the physically-optional case. So this only bites the string/binary gap, and only on
+    // a REAL null: an all-non-null OPTIONAL column still reads cleanly (preserving the foreign-file tolerance),
+    // while the FIRST null in a required lane fails closed rather than silently null-filling it.
+    //
+    // SCOPE: this covers only TOP-LEVEL scalar string/binary lanes (the ReadStringAsync/ReadBinaryAsync callers).
+    // NESTED string/binary (and value) leaves inside a struct/array/map go through NestedParquetColumnReader,
+    // whose leaf nullability is deliberately advisory and which has no equivalent guard — a required nested leaf
+    // backed by an OPTIONAL physical column can still silently null-fill. That is a dispositioned residual
+    // tracked by #813 (a correct fix there must be Dremel-aware: reject a leaf-null only when every ANCESTOR is
+    // present, not an ancestor-null).
+    //
+    // TIMING: unlike the value-type SCHEMA guard (which rejects before any batch is decoded), this fires
+    // mid-decode at the first offending value, which can be in a late row group — so earlier clean batches may
+    // already have been yielded. Reads are not transactional, so partial emission before a fail-closed rejection
+    // is acceptable; the invariant enforced is "no null is ever delivered INSIDE a required lane", not "reject
+    // before first output".
+    private static void RejectNullInRequiredLane(StructField requestedField)
+    {
+        if (requestedField.Nullable)
+        {
+            return;
+        }
+
+        throw DeltaStorageException.SchemaMismatch(
+            $"Column '{DiagnosticText.Sanitize(requestedField.Name)}': a required (non-nullable) "
+            + $"{DiagnosticText.DescribeType(requestedField.DataType)} column materialized a NULL from a "
+            + "physically OPTIONAL Parquet column; the read-time required-lane guard (#807) rejects rather than "
+            + "silently null-fill a non-nullable lane.");
     }
 
     // M2/RF-4b: the narrow set of exceptions the read path maps to a deterministic CorruptData — the

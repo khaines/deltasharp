@@ -46,7 +46,11 @@ namespace DeltaSharp.Storage.Parquet;
 ///   <c>[containerMaxDef, containerMaxDef + 1]</c> — closing the masquerade where a crafted footer declares a
 ///   scalar leaf repeated (a repeated primitive posing as struct rows) or over-nested (a phantom optional
 ///   level mis-classifying present vs null cells). Nullability stays advisory (both the required and optional
-///   definition level are accepted).</description></item>
+///   definition level are accepted). NOTE (#813): this advisory-nullability property means the #807 value-level
+///   required-lane guard (ParquetFileReader.RejectNullInRequiredLane) has NO nested analogue — a required
+///   (non-nullable) leaf backed by a physically-OPTIONAL column can still silently null-fill here. That is a
+///   dispositioned residual tracked by #813 (a fix must be Dremel-aware: reject a present-parent leaf-null only,
+///   never an ancestor-null).</description></item>
 ///   <item><description><b>Every leaf (streams).</b> Each reconstructed definition level lies in
 ///   <c>[0, leaf max def]</c> and each repetition level in <c>[0, leaf max rep]</c>
 ///   (<see cref="ValidateLevelRange"/>, covering BOTH streams); the declared value count is ceiling-bounded

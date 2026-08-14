@@ -55,9 +55,11 @@ internal static class ParquetTypeMapping
     /// choice in front of the compiler at every present and future call site.
     /// </para>
     /// <para>
-    /// The read path's asymmetry (its nullability guard cannot bite on a string/binary column while
-    /// the expected shape is built always-nullable) is a known, dispositioned residual: see
-    /// issue #807.
+    /// The read path's asymmetry (its SCHEMA-level nullability guard cannot bite on a string/binary column
+    /// while the expected shape is built always-nullable) is dispositioned (issue #807) by a VALUE-level
+    /// required-lane guard at materialization (<c>ParquetFileReader.RejectNullInRequiredLane</c>): a
+    /// physically-OPTIONAL string/binary column with no nulls still reads (foreign / pre-#730 tolerance), but
+    /// the first actual null read into a requested non-nullable lane fails closed.
     /// </para>
     /// </param>
     /// <exception cref="DeltaStorageException">
