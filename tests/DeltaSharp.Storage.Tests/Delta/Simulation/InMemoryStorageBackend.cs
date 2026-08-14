@@ -47,6 +47,13 @@ internal sealed class InMemoryStorageBackend : IStorageBackend
     /// label; the simulation asserts on the reconstructed log, not on this value.</summary>
     public StorageBackendKind Kind => StorageBackendKind.Pvc;
 
+    /// <summary>A stable per-instance table identity (this in-memory backend is its own table root). Distinct
+    /// across instances so the process-wide checkpoint negative cache never cross-suppresses two simulated
+    /// tables.</summary>
+    public string TableIdentity { get; } = string.Create(
+        System.Globalization.CultureInfo.InvariantCulture,
+        $"Pvc:mem:{System.Runtime.CompilerServices.RuntimeHelpers.GetHashCode(new object()):x}");
+
     /// <summary>When set, the CAS single-winner guarantee is <b>disabled</b> — every put "wins" and
     /// overwrites — to prove the Jepsen checker detects the resulting I2 (single-winner) violation.</summary>
     public bool DisableSingleWinner { get; set; }

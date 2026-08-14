@@ -23,7 +23,9 @@ jobs:
   build-test-format:
     name: build-test-format
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20 (not 15): the storage suite grew with the EPIC-05 DoS-hardening (bounded-decode) tests, so 15 min left
+    # no margin for CI runner variance (the Test step alone runs ~9-13 min and cancelled Format at the boundary).
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -74,7 +76,10 @@ jobs:
   coverage:
     name: coverage
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 20 (not 15): coverlet-instrumented collection over the grown EPIC-05 storage suite runs ~13-14 min,
+    # leaving no margin under 15 for CI runner variance (the job was cancelled at the boundary despite the
+    # line-threshold gate passing). Mirrors the build-test-format bump above.
+    timeout-minutes: 20
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

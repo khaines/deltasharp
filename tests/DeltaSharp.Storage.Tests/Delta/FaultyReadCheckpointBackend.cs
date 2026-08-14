@@ -27,6 +27,8 @@ internal sealed class FaultyReadCheckpointBackend : IStorageBackend
 
     public StorageBackendKind Kind => _inner.Kind;
 
+    public string TableIdentity => _inner.TableIdentity;
+
     public async ValueTask<Stream> OpenReadAsync(string path, CancellationToken cancellationToken)
     {
         if (path.Contains(_pathMarker, StringComparison.Ordinal))

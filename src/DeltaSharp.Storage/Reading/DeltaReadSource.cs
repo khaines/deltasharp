@@ -59,14 +59,32 @@ public sealed class DeltaReadSource : IDisposable
 {
     private readonly LocalFileSystemBackend _backend;
     private readonly DeltaLog _log;
-    private readonly ParquetFileReader _reader = new();
+    private readonly ParquetFileReader _reader;
     private readonly ChangeFeedReader _changeFeed;
 
     private DeltaReadSource(LocalFileSystemBackend backend)
+        : this(backend, new ParquetFileReader())
+    {
+    }
+
+    // Test seam (internal, additive — NOT on the public hot path): injects a pre-built ParquetFileReader so a
+    // test can wire a cap=1 pre-saturated data-file decoder and drive the DecoderSaturated → DeltaReadException
+    // facade mapping (DeltaReadSource.cs I8) through the REAL read path. Production always uses the default
+    // reader via ForLocalPath / the single-arg ctor.
+    internal DeltaReadSource(LocalFileSystemBackend backend, ParquetFileReader reader)
     {
         _backend = backend;
+        _reader = reader;
         _log = new DeltaLog(backend);
         _changeFeed = new ChangeFeedReader(backend, _log, _reader);
+    }
+
+    // Test seam companion to ForLocalPath: opens a read facade over a local table with an injected reader.
+    internal static DeltaReadSource ForLocalPathWithReader(string tablePath, ParquetFileReader reader)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(tablePath);
+        ArgumentNullException.ThrowIfNull(reader);
+        return new DeltaReadSource(new LocalFileSystemBackend(tablePath), reader);
     }
 
     /// <summary>Opens a read facade over a local-filesystem Delta table directory.</summary>
@@ -395,6 +413,18 @@ public sealed class DeltaReadSource : IDisposable
                 // OptimizeSchemaEvolutionException) rather than fabricating values or leaking a misleading
                 // corruption message.
                 throw new DeltaReadSchemaEvolutionException(add.Path, ex);
+            }
+            catch (DeltaStorageException ex) when (ex.Kind == StorageErrorKind.DecoderSaturated)
+            {
+                // I8 — the data-file decode door is at strand capacity (too many untrusted decodes already
+                // running past their deadline): the decode was rejected fail-fast WITHOUT starting. This is a
+                // TRANSIENT, RETRYABLE saturation, NOT proven corruption and NOT a decode-timeout — surface it
+                // as a public DeltaReadException the engine can back off and retry on, rather than letting a
+                // raw internal DeltaStorageException escape the facade untyped. Message hygiene (#653): name
+                // only the bounded storage-error KIND, never add.Path; the cause stays on the inner exception.
+                throw new DeltaReadException(
+                    $"An active data file could not be decoded because the bounded-decode worker is saturated "
+                    + $"(storage fault: {ex.Kind}); retry after backoff.", ex);
             }
         }
 

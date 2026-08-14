@@ -17,6 +17,36 @@ internal enum StorageErrorKind
     /// partial rows (design §2.9.1); the message names the defect.</summary>
     CorruptData,
 
+    /// <summary>An untrusted decode did not terminate within its wall-clock decode budget (design §5.4
+    /// C-DECODE) — Parquet.Net can be driven by a single crafted byte into effectively unbounded,
+    /// cancellation-ignoring CPU work (#647/#699/#716). Deliberately DISTINCT from <see cref="CorruptData"/>:
+    /// a wall-clock timeout is a resource/throttling fault, not proof the bytes are malformed, so it must not
+    /// be conflated with byte-level corruption (the same conflation #649/#655/#681 removed for encryption).
+    /// The bounded-decode policy (<see cref="BoundedDecode"/>) mints it at the timeout call site; the message
+    /// is fixed/sanitized (no untrusted byte content).</summary>
+    DecodeBudgetExceeded,
+
+    /// <summary>The bounded-decode worker for a door is at capacity — the stranded-decode residual (decodes
+    /// that ran past their deadline and were left running, charged at detach on their real retained footprint)
+    /// is already full, so a NEW untrusted decode is rejected fail-fast rather than pushing the residual past
+    /// its bound (design §5.4 C-DECODE; the per-door stranded residual budget + <c>strandCountCap</c>). Healthy
+    /// in-flight decodes are never charged here and never rejected. Deliberately DISTINCT from
+    /// <see cref="DecodeBudgetExceeded"/>: a timeout means <b>this</b> input's decode did not terminate;
+    /// saturation means <b>other</b> non-terminating decodes fill the door and this call was rejected WITHOUT
+    /// starting. It is a transient/resource condition — a caller may <b>retry</b> once capacity frees — never
+    /// proof the bytes are corrupt, and it is never negatively cached.</summary>
+    DecoderSaturated,
+
+    /// <summary>An untrusted decode's projected/cumulative RESOURCE footprint crossed an enforced eager-decode
+    /// ceiling (design §5.4 C-DECODE) — for the checkpoint reader, the CUMULATIVE per-part decoded/action bytes
+    /// crossed <c>MaxCheckpointPartDecodedBytes</c> across its row groups (Round-10 #4). Deliberately DISTINCT
+    /// from <see cref="CorruptData"/>: a resource ceiling is NOT proof the bytes are malformed — a legitimate
+    /// foreign (e.g. Spark) checkpoint part can genuinely decode past the ceiling — so it must not be mislabeled
+    /// corruption. It fails the part closed → the caller falls back to JSON replay (the checkpoint is
+    /// non-authoritative) without inventing state, and the reason is reported distinctly from a corrupt part.
+    /// The message is fixed/sanitized (only bounded declared scalars, no untrusted byte content).</summary>
+    DecodeCeilingExceeded,
+
     /// <summary>A structurally valid file whose column physical type or nullability does not match the
     /// requested engine type (design §2.9.1). Distinct from <see cref="CorruptData"/> so a schema/type
     /// disagreement is not conflated with byte-level corruption; the message names the mismatch.</summary>
@@ -127,6 +157,30 @@ internal sealed class DeltaStorageException : Exception
     /// any attacker-influenceable token must be sanitized by the caller before interpolation.</remarks>
     public static DeltaStorageException CorruptData(string defect, Exception? innerException = null) =>
         new(StorageErrorKind.CorruptData, defect, innerException);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.DecodeBudgetExceeded"/> error: an untrusted decode did
+    /// not terminate within its wall-clock budget (<see cref="BoundedDecode"/>, #647/#699/#716). Distinct
+    /// from <see cref="CorruptData"/> so a resource/throttling timeout is never conflated with byte-level
+    /// corruption. The <paramref name="message"/> MUST be fixed/sanitized — no untrusted byte content.</summary>
+    public static DeltaStorageException DecodeBudgetExceeded(string message) =>
+        new(StorageErrorKind.DecodeBudgetExceeded, message);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.DecoderSaturated"/> error: the bounded-decode worker for
+    /// this door is at capacity (too many untrusted decodes are already stranded past their deadline), so the
+    /// decode was rejected WITHOUT starting (<see cref="BoundedDecode"/>). A retryable resource condition,
+    /// distinct from <see cref="DecodeBudgetExceeded"/> and never conflated with corruption. The
+    /// <paramref name="message"/> MUST be fixed/sanitized — no untrusted byte content.</summary>
+    public static DeltaStorageException DecoderSaturated(string message, Exception? innerException = null) =>
+        new(StorageErrorKind.DecoderSaturated, message, innerException);
+
+    /// <summary>Creates a <see cref="StorageErrorKind.DecodeCeilingExceeded"/> error: an untrusted decode's
+    /// projected/cumulative resource footprint crossed an enforced eager-decode ceiling (Round-10 #4 — the
+    /// checkpoint cumulative per-part decoded/action ceiling). Distinct from <see cref="CorruptData"/> so a
+    /// legitimate-but-oversized foreign checkpoint part is not mislabeled corruption; the caller degrades to
+    /// JSON replay. The <paramref name="message"/> MUST be fixed/sanitized — only bounded declared scalars,
+    /// no untrusted byte content.</summary>
+    public static DeltaStorageException DecodeCeilingExceeded(string message) =>
+        new(StorageErrorKind.DecodeCeilingExceeded, message);
 
     /// <summary>Creates a <see cref="StorageErrorKind.SchemaMismatch"/> error naming the mismatch.
     /// <para><b>Message hygiene obligation (#747):</b> same contract as

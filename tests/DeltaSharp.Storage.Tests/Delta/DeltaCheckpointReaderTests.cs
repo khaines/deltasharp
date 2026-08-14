@@ -401,6 +401,42 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task CumulativePerPartCeiling_Seam_CrossingPart_FailsClosed_AsDecodeCeilingExceeded_NotMalformed()
+    {
+        // Round-10 #4 — the cumulative per-PART decode ceiling, exercised through the new maxPartDecodedBytes
+        // seam. A VALID checkpoint whose per-ROW-GROUP decode is within maxDecodedBytes but whose cumulative
+        // across-row-group decode crosses a (tiny, injected) per-part ceiling must fail closed as a DISTINCT
+        // resource/decode-ceiling fault — DeltaStorageException(DecodeCeilingExceeded) — NOT as
+        // DeltaProtocolException corruption (a resource ceiling mislabelled as Malformed wrongly rejected legit
+        // foreign Spark parts as corrupt). RED if the throw at the cumulative crossing reverts to
+        // DeltaProtocolException.Malformed, or if the maxPartDecodedBytes seam is dropped.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2).Metadata("t", EmptySchema).Add("f.parquet", size: 1)
+            .ToParquetAsync();
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default, maxPartDecodedBytes: 10));
+
+        Assert.Equal(StorageErrorKind.DecodeCeilingExceeded, ex.Kind);
+        Assert.Contains("cumulative", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task CumulativePerPartCeiling_Seam_LegitPartUnderCeiling_DecodesCleanly()
+    {
+        // The seam's inverse: a valid checkpoint decoded under the PRODUCTION cumulative ceiling (the default
+        // maxPartDecodedBytes) decodes cleanly — the ceiling only bites a genuine crossing, never a normal part.
+        byte[] parquet = await new CheckpointFixture()
+            .Protocol(1, 2).Metadata("t", EmptySchema).Add("f.parquet", size: 1)
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions =
+            await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        Assert.Contains(actions, a => a is AddFileAction);
+    }
+
+    [Fact]
     public async Task DecodeCeiling_RejectsRowGroup_ViaAbsoluteBound()
     {
         // A normal checkpoint decoded under a tiny injected per-row-group ceiling trips the ABSOLUTE
@@ -1313,5 +1349,157 @@ public sealed class DeltaCheckpointReaderTests
         await DeltaCheckpointReader.DisposeQuietlyAsync(reader);
 
         Assert.Equal(1, reader.DisposeCount);
+    }
+
+    [Fact]
+    public void DeriveSizeAwareBudget_ClampsToFloorForSmallParts_AndIsMonotonicNonDecreasing()
+    {
+        // High #6 + Round-8 #4 + Round-10 #11 — direct proof the per-part budget derives from a DECODED-bytes
+        // estimate (compressed × bounded expansion) clamped to the per-PART decoded ceiling (8 GiB — Round-10 #4),
+        // then divided by the floor throughput, floored at 30 s and CAPPED at 128 s (Round-10 #11 — the budget-
+        // time cap is DECOUPLED from the larger cumulative RESOURCE ceiling), NOT the arithmetically-inert
+        // compressed÷decoded the Round-5 code used (which always collapsed to the floor), and NOT the per-ROW-
+        // GROUP 1 GiB ceiling the Round-5 code clamped the basis to (which capped the budget at 32 s < the real
+        // decode of a foreign 200–500 MiB Spark part → deterministic timeout → strike → 24h suppression →
+        // unreadable table). This test pins FOUR properties of the pure derivation:
+        //   (1) FLOOR CLAMP — a tiny part still gets at least the default budget (never zero/negative).
+        //   (2) MONOTONE NON-DECREASING — a larger part never gets a SMALLER budget than a smaller one.
+        //   (3) CEILING CLAMP — an enormous / overflowing compressed length saturates its DECODED estimate to
+        //       the enforced per-PART decoded-bytes ceiling (8 GiB) and never overflows to a negative TimeSpan.
+        //   (4) 128 s BUDGET CAP (Round-10 #11) — even an 8 GiB decoded basis (which would derive 256 s at the
+        //       32 MiB/s floor) is capped at 128 s, decoupled from the cumulative resource ceiling.
+        var sizes = new long[]
+        {
+            0L,
+            4L * 1024, // 4 KiB
+            1L * 1024 * 1024, // 1 MiB
+            16L * 1024 * 1024, // 16 MiB
+            64L * 1024 * 1024, // 64 MiB
+            256L * 1024 * 1024, // 256 MiB
+            DeltaCheckpointReader.MaxCheckpointPartBytes, // 512 MiB — the enforced per-part buffer ceiling
+            long.MaxValue, // overflow guard
+        };
+
+        TimeSpan previous = TimeSpan.MinValue;
+        foreach (long size in sizes)
+        {
+            TimeSpan budget = DeltaCheckpointReader.DeriveSizeAwareBudget(size);
+
+            // (1) never below the floor and never a non-positive budget.
+            Assert.True(budget >= BoundedDecode.DefaultBudget, $"size={size}: budget {budget} < floor {BoundedDecode.DefaultBudget}");
+            Assert.True(budget > TimeSpan.Zero, $"size={size}: budget {budget} must be positive");
+
+            // (2) monotone non-decreasing in the part's compressed length.
+            Assert.True(budget >= previous, $"size={size}: budget {budget} decreased below previous {previous}");
+            previous = budget;
+
+            // (3)+(4) never above the 128 s cap (which is itself well below the defensive MaxBudget).
+            Assert.True(budget <= TimeSpan.FromSeconds(128), $"size={size}: budget {budget} > the 128 s cap");
+            Assert.True(budget <= BoundedDecode.MaxBudget, $"size={size}: budget {budget} > ceiling {BoundedDecode.MaxBudget}");
+        }
+
+        // A small part collapses to the FLOOR exactly (the decoded estimate is well under the throughput floor).
+        Assert.Equal(BoundedDecode.DefaultBudget, DeltaCheckpointReader.DeriveSizeAwareBudget(4L * 1024));
+
+        // STRICT-SCALING (Round-8 test charge) — a 256 MiB part gets a STRICTLY LARGER budget than a 4 MiB part:
+        // 256 MiB × 8 = 2 GiB decoded / 32 MiB/s = 64s, vs 4 MiB → floor (30s). This is the property that would
+        // silently regress if the basis reverted to the compressed length or the collapse-to-floor arithmetic.
+        Assert.True(
+            DeltaCheckpointReader.DeriveSizeAwareBudget(256L * 1024 * 1024) > DeltaCheckpointReader.DeriveSizeAwareBudget(4L * 1024 * 1024),
+            "a 256 MiB part must derive a strictly larger budget than a 4 MiB part (decoded-bytes basis scales with size).");
+        Assert.Equal(TimeSpan.FromSeconds(64), DeltaCheckpointReader.DeriveSizeAwareBudget(256L * 1024 * 1024));
+
+        // (4) THE 128 s CAP is the operative upper bound (Round-10 #11): a compressed length whose ×8 decoded
+        // estimate saturates to the 8 GiB per-PART ceiling would derive 8 GiB / 32 MiB/s = 256 s, but is CAPPED
+        // at 128 s — decoupled from the (larger) cumulative resource ceiling. RED if the cap is removed (the
+        // budget would jump to 256 s) or reverted to the MaxBudget clamp.
+        Assert.Equal(TimeSpan.FromSeconds(128), DeltaCheckpointReader.DeriveSizeAwareBudget(long.MaxValue));
+        Assert.True(DeltaCheckpointReader.DeriveSizeAwareBudget(long.MaxValue) < BoundedDecode.MaxBudget,
+            "the 128 s cap holds the budget well below the defensive MaxBudget clamp.");
+    }
+
+    [Fact]
+    public async Task MultiPart_I7_EachPartDecodesUnderItsOwnBudget_Part2NotStarvedByPart1()
+    {
+        // I7 behavioral (Round-8 test charge) — a multi-part checkpoint decodes EACH part under its OWN
+        // size-aware budget, NEVER a shrinking aggregate remainder shared across parts (which would hand a later
+        // part a starved budget and seed a healthy-but-slow part into the negative cache as "known-bad" →
+        // permanent JSON replay → an unreadable table). Proven two ways:
+        //   (1) BEHAVIORAL — a 2-part checkpoint where part 1 is substantially larger than part 2 decodes BOTH
+        //       parts in order and reconstructs every action, so part 2 (processed SECOND) is not dropped/starved
+        //       by part 1's decode.
+        //   (2) STATELESS BUDGET — the per-part budget derivation is a PURE function of THAT part's bytes: part 2's
+        //       budget is identical whether or not part 1 was derived first, and it equals its standalone budget.
+        //       A shared-remainder design would make part 2's budget a function of part 1's consumption — RED here.
+        var fixture = new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata("t", EmptySchema);
+        for (int i = 0; i < 64; i++)
+        {
+            fixture.Add($"big-{i:D3}.parquet", size: 1000 + i);
+        }
+
+        fixture.Add("small.parquet", size: 7);
+
+        byte[][] parts = await fixture.ToPartsAsync(parts: 2);
+        Assert.Equal(2, parts.Length);
+
+        // (1) BOTH parts decode under their own budget (decodeBudget:null → DeriveSizeAwareBudget per part). Record
+        // the ACTUAL budget each part's RunAsync receives via the onPartBudget seam — not a test re-derivation — so
+        // this is the real value threaded into the bounded decode, closing the "pure-static tautology" gap.
+        var all = new List<DeltaAction>();
+        var observedBudgets = new List<TimeSpan>();
+        foreach (byte[] part in parts)
+        {
+            all.AddRange(await DeltaCheckpointReader.ReadAsync(
+                new MemoryStream(part), default, decodeBudget: null,
+                onPartBudget: observedBudgets.Add));
+        }
+
+        Assert.Equal(65, all.OfType<AddFileAction>().Count()); // every action across BOTH parts survived
+        Assert.Single(all.OfType<ProtocolAction>());
+        Assert.Single(all.OfType<MetadataAction>());
+
+        // Each RECORDED budget equals the size-aware budget of THAT part's own bytes — never a residual of the
+        // prior part. RED under a shared-remainder design (part 2's recorded budget would depend on part 1).
+        Assert.Equal(2, observedBudgets.Count);
+        Assert.Equal(DeltaCheckpointReader.DeriveSizeAwareBudget(parts[0].Length), observedBudgets[0]);
+        Assert.Equal(DeltaCheckpointReader.DeriveSizeAwareBudget(parts[1].Length), observedBudgets[1]);
+
+        // (2) The per-part budget is stateless: part 2's budget does not depend on part 1 having been derived
+        // first (no shrinking remainder). Larger part 1 ⇒ larger-or-equal budget than the smaller part 2.
+        TimeSpan part1Budget = DeltaCheckpointReader.DeriveSizeAwareBudget(parts[0].Length);
+        TimeSpan part2First = DeltaCheckpointReader.DeriveSizeAwareBudget(parts[1].Length);
+        _ = DeltaCheckpointReader.DeriveSizeAwareBudget(parts[0].Length); // "consume" part 1 again
+        TimeSpan part2AfterPart1 = DeltaCheckpointReader.DeriveSizeAwareBudget(parts[1].Length);
+
+        Assert.Equal(part2First, part2AfterPart1); // part 2's budget is invariant — NOT a residual of part 1
+        Assert.True(part2AfterPart1 > TimeSpan.Zero, "part 2 must always get a positive, viable budget of its own.");
+        Assert.True(part1Budget >= part2AfterPart1, "the larger part 1 must derive a budget ≥ the smaller part 2's.");
+    }
+
+    [Fact]
+    public void Consts_CheckpointDecodedCeilings_MatchTheirDerivation()
+    {
+        // Specialist Medium (Round-13): pin the checkpoint decoded-bytes ceilings against silent literal drift.
+        // The MaxCheckpointPartDecodedBytes doc claims it is DERIVED as
+        // max(MaxCheckpointPartBytes × CheckpointDecodedExpansionFactor,
+        //     CheckpointCumulativeRowGroupFloorMultiple × MaxCheckpointRowGroupDecodedBytes)
+        // but the const is a hard literal — this test makes that derivation load-bearing so the literal cannot
+        // drift from the two contributing ceilings (the floor term currently wins: 8 × 1 GiB = 8 GiB).
+        long derivedPartDecoded = Math.Max(
+            DeltaCheckpointReader.MaxCheckpointPartBytes
+                * (long)DeltaCheckpointReader.CheckpointDecodedExpansionFactorForTest,
+            DeltaCheckpointReader.CheckpointCumulativeRowGroupFloorMultiple
+                * DeltaCheckpointReader.MaxCheckpointRowGroupDecodedBytes);
+        Assert.Equal(DeltaCheckpointReader.MaxCheckpointPartDecodedBytes, derivedPartDecoded);
+
+        // The checkpoint DOOR footprint (BoundedDecode.CheckpointMaxFootprintBytes) is the isolated buffered part
+        // copy (≤ MaxCheckpointPartBytes) PLUS the cumulative per-part decoded arrays (≤ MaxCheckpointPartDecoded
+        // Bytes). Pin that too so the two doors' literal footprint cannot drift from the reader ceilings it
+        // mirrors (the BoundedDecode literal is held locally to avoid cross-type static-init order dependence).
+        Assert.Equal(
+            BoundedDecode.CheckpointMaxFootprintBytes,
+            DeltaCheckpointReader.MaxCheckpointPartBytes + DeltaCheckpointReader.MaxCheckpointPartDecodedBytes);
     }
 }

@@ -21,6 +21,18 @@ internal interface IStorageBackend
     /// inner backend's kind so instrumentation reflects the real store.</summary>
     StorageBackendKind Kind { get; }
 
+    /// <summary>A process-wide-STABLE identity for the table this backend is rooted at, safe to use as a
+    /// cross-instance cache key (the checkpoint decode negative cache, #647/#699/#716). Because a fresh backend
+    /// is constructed per scan/resolve, this MUST be stable across instances that target the SAME table root
+    /// (so the negative cache actually hits) yet distinct across different tables (so a poisoned checkpoint in
+    /// one table never suppresses a healthy checkpoint in another). It is a <b>required</b> member with <b>no
+    /// default</b> (a default <c>RuntimeHelpers.GetHashCode(this)</c> would silently reinstate the
+    /// "cache never hits" Critical for any future backend that forgot to override it, and a recycled instance
+    /// hash could cross-suppress two tables): every backend — including a decorator, which must forward its
+    /// inner backend's identity — states it explicitly. A test backend that does not participate in
+    /// cross-instance dedup may return any stable, per-root-distinct string.</summary>
+    string TableIdentity { get; }
+
     /// <summary>Opens a read stream over <c>[offset, offset + length)</c> of <paramref name="path"/> —
     /// the range GET used for Parquet footers and selective row-group reads (design §2.9.1).</summary>
     /// <exception cref="DeltaStorageException">The path escapes the root

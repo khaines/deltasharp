@@ -61,6 +61,10 @@ public sealed class DeltaStorageTelemetryMappingTests
             [CheckpointFallbackReason.UnsupportedFeature] = "unsupported_feature",
             [CheckpointFallbackReason.Malformed] = "malformed",
             [CheckpointFallbackReason.ForgedMultiMetadata] = "forged_multi_metadata",
+            [CheckpointFallbackReason.DecodeTimeout] = "decode_timeout",
+            [CheckpointFallbackReason.DecoderSaturated] = "decoder_saturated",
+            [CheckpointFallbackReason.NegativeCacheSkip] = "negative_cache_skip",
+            [CheckpointFallbackReason.DecodeCeilingExceeded] = "decode_ceiling_exceeded",
         };
 
         foreach (CheckpointFallbackReason reason in Enum.GetValues<CheckpointFallbackReason>())
@@ -85,5 +89,28 @@ public sealed class DeltaStorageTelemetryMappingTests
         Assert.Equal("protocol_changed", DeltaStorageTelemetry.ToConflictClass(DeltaConflictKind.ProtocolChanged));
         Assert.Equal("concurrent_transaction", DeltaStorageTelemetry.ToConflictClass(DeltaConflictKind.ConcurrentTransaction));
         Assert.Equal("concurrent_write", DeltaStorageTelemetry.ToConflictClass((DeltaConflictKind)999));
+    }
+
+    [Fact]
+    public void DecodeStage_MapsToBoundedLabel()
+    {
+        // The bounded decode.stage discriminator (design §7.3 / #647). stage=open (footer parse) and
+        // stage=whole (a checkpoint decoding the WHOLE pre-buffered part in one shot) are also asserted at their
+        // REAL emission sites, but every arm is pinned here so a future stage added without its own label
+        // (falling into the switch's fail-safe) turns this red. stage=metadata is the DV footer row-group scan;
+        // stage=row_group is a column-chunk decode.
+        Assert.Equal("open", DeltaStorageTelemetry.ToLabel(DecodeStage.Open));
+        Assert.Equal("metadata", DeltaStorageTelemetry.ToLabel(DecodeStage.Metadata));
+        Assert.Equal("row_group", DeltaStorageTelemetry.ToLabel(DecodeStage.RowGroup));
+        Assert.Equal("whole", DeltaStorageTelemetry.ToLabel(DecodeStage.Whole));
+    }
+
+    [Fact]
+    public void DecodeDoor_MapsToBoundedLabel()
+    {
+        // The two bounded decode doors: the data-file door (Pool + per-operation deadline + byte-aware cap) and
+        // the checkpoint door (dedicated thread over a pre-buffered byte[]).
+        Assert.Equal("data_file", DeltaStorageTelemetry.ToLabel(DecodeDoor.DataFile));
+        Assert.Equal("checkpoint", DeltaStorageTelemetry.ToLabel(DecodeDoor.Checkpoint));
     }
 }

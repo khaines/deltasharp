@@ -173,8 +173,11 @@ public sealed class StorageExceptionToStringTests
     /// </summary>
     private static readonly string[] StorageLogSiteSignatures =
     [
+        "DeltaCheckpointLog.CheckpointDecodeTimeout(ILogger logger, Int64 version)",
+        "DeltaCheckpointLog.CheckpointDecoderSaturated(ILogger logger, Int64 version)",
         "DeltaCheckpointLog.CheckpointFallback(ILogger logger, Int64 version, String reason)",
         "DeltaCheckpointLog.CheckpointForgedMultiMetadataRejected(ILogger logger, Int64 version)",
+        "DeltaCheckpointLog.CheckpointNegativeCacheSkip(ILogger logger, Int64 version)",
         "DeltaCommitLog.CommitCanceled(ILogger logger, Int64 version, Int32 attempts)",
         "DeltaCommitLog.CommitCompleted(ILogger logger, Int64 version, Int32 attempts, Double durationMs)",
         "DeltaCommitLog.CommitConflict(ILogger logger, Int32 attempt, Int64 targetVersion, String conflictClass)",
@@ -186,6 +189,7 @@ public sealed class StorageExceptionToStringTests
         "DeltaCommitLog.CommitStarted(ILogger logger, Int64 targetVersion, String backend)",
         "DeltaCommitLog.CommitTransientRetry(ILogger logger, Int32 retry)",
         "DeltaCommitLog.CommitUnknownState(ILogger logger, Int64 version)",
+        "DeltaDecodeLog.DoorUnderProvisioned(ILogger logger, String door, Int64 maxFootprintBytes, Int64 residualBudgetBytes, Int64 processMemoryBytes)",
         "DeltaDeleteLog.DeleteAborted(ILogger logger, String exceptionType)",
         "DeltaDeleteLog.DeleteCanceled(ILogger logger)",
         "DeltaDeleteLog.DeleteCompleted(ILogger logger, Int64 readVersion, Int64 committedVersion, Int64 rowsDeleted, Int32 filesWithDeletionVector, Double durationMs)",
@@ -420,6 +424,7 @@ public sealed class StorageExceptionToStringTests
             nameof(ConcurrentAppendException),
             nameof(ConcurrentDeleteReadException),
             nameof(ConcurrentTransactionException),
+            nameof(DecodeCapacityExhaustedException),
             nameof(DeltaCommitContentionException),
             nameof(DeltaConcurrentModificationException),
             nameof(DeltaConstraintDependentColumnException),

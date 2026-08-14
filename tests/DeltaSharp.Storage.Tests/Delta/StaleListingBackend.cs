@@ -30,6 +30,8 @@ internal sealed class StaleListingBackend : IStorageBackend
 
     public StorageBackendKind Kind => _inner.Kind;
 
+    public string TableIdentity => _inner.TableIdentity;
+
     public ValueTask<Stream> ReadRangeAsync(string path, long offset, long length, CancellationToken cancellationToken) =>
         _inner.ReadRangeAsync(path, offset, length, cancellationToken);
 

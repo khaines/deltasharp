@@ -23,18 +23,25 @@ internal sealed record ParquetDecodeLimits
     /// stay well under this, so a higher declared ratio is a decompression bomb.</summary>
     public const long DefaultMaxDecompressionRatio = 1000;
 
-    /// <summary>Creates decode limits, validating both bounds are usable (a non-positive ceiling or a ratio
-    /// below 1 would disable or invert the guard).</summary>
+    /// <summary>Creates decode limits, validating the bounds are usable (a non-positive ceiling, a ratio
+    /// below 1, or a non-positive time budget would disable or invert a guard).</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="maxRowGroupDecodedBytes"/> is not
-    /// positive, or <paramref name="maxDecompressionRatio"/> is less than 1.</exception>
+    /// positive, <paramref name="maxDecompressionRatio"/> is less than 1, or <paramref name="decodeTimeBudget"/>
+    /// (when supplied) is not positive or exceeds <see cref="BoundedDecode.MaxBudget"/> (a budget that large
+    /// disables the DoS control and is rejected as a misconfiguration).</exception>
     public ParquetDecodeLimits(
         long maxRowGroupDecodedBytes = DefaultMaxRowGroupDecodedBytes,
-        long maxDecompressionRatio = DefaultMaxDecompressionRatio)
+        long maxDecompressionRatio = DefaultMaxDecompressionRatio,
+        TimeSpan? decodeTimeBudget = null)
     {
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxRowGroupDecodedBytes);
         ArgumentOutOfRangeException.ThrowIfLessThan(maxDecompressionRatio, 1);
+        TimeSpan budget = decodeTimeBudget ?? BoundedDecode.DefaultBudget;
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(budget.Ticks, nameof(decodeTimeBudget));
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(budget, BoundedDecode.MaxBudget, nameof(decodeTimeBudget));
         MaxRowGroupDecodedBytes = maxRowGroupDecodedBytes;
         MaxDecompressionRatio = maxDecompressionRatio;
+        DecodeTimeBudget = budget;
     }
 
     /// <summary>The absolute per-row-group eager-decode memory ceiling (bytes), applied to both the declared
@@ -45,6 +52,24 @@ internal sealed record ParquetDecodeLimits
     /// a higher declared ratio is rejected as a decompression bomb.</summary>
     public long MaxDecompressionRatio { get; }
 
+    /// <summary>The wall-clock deadline for a SINGLE data-file decode OPERATION. It is a PER-OPERATION budget,
+    /// NOT an aggregate per-read one: the open (<c>ParquetReader.CreateAsync</c> + footer materialization), the
+    /// footer row-group-metadata scan (<c>GetRowCountAsync</c>), and EACH row-group decode are bounded
+    /// INDEPENDENTLY, each measured from that one operation's EXECUTION start (never spanning the streaming
+    /// iterator's <c>yield return</c> suspension or the consumer time between <c>MoveNextAsync</c> calls, so
+    /// consumer/back-pressure time is never charged). A slow legitimate consumer therefore never trips it, and
+    /// each operation gets the full budget rather than a shrinking shared remainder. Worst-case retained memory
+    /// is bounded instead by the charge-at-detach stranded-residual model of the data-file
+    /// <see cref="BoundedDecode"/> door (a strand of a non-terminating decode charges its real projected
+    /// footprint against the door's residual budget). Parquet.Net 6.0.3 can be driven into non-terminating,
+    /// cancellation-ignoring work by one corrupted byte (#647/#699), so on expiry the operation fails closed
+    /// with <see cref="StorageErrorKind.DecodeBudgetExceeded"/> (a resource fault distinct from
+    /// <see cref="StorageErrorKind.CorruptData"/> — a wall-clock stall is not proof the bytes are corrupt)
+    /// rather than hanging. Defaults to <see cref="BoundedDecode.DefaultBudget"/>. NOTE: today this is set only
+    /// from tests — the production config seam that would let an operator lower it per latency-sensitive tier is
+    /// tracked in #803; do not rely on a per-tier override until that lands.</summary>
+    public TimeSpan DecodeTimeBudget { get; }
+
     /// <summary>The safe defaults used when no limits are supplied.</summary>
     public static ParquetDecodeLimits Default { get; } =
         new(DefaultMaxRowGroupDecodedBytes, DefaultMaxDecompressionRatio);
@@ -52,5 +77,6 @@ internal sealed record ParquetDecodeLimits
     /// <summary>A concise, invariant-culture description for diagnostics.</summary>
     public override string ToString() => string.Create(
         CultureInfo.InvariantCulture,
-        $"ParquetDecodeLimits(maxRowGroupDecodedBytes={MaxRowGroupDecodedBytes}, maxDecompressionRatio={MaxDecompressionRatio})");
+        $"ParquetDecodeLimits(maxRowGroupDecodedBytes={MaxRowGroupDecodedBytes}, "
+        + $"maxDecompressionRatio={MaxDecompressionRatio}, decodeTimeBudget={DecodeTimeBudget})");
 }
