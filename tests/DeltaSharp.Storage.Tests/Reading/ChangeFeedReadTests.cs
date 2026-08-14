@@ -2470,9 +2470,11 @@ public sealed class ChangeFeedReadTests : IDisposable
         // physically NULL in a row fails closed, but the surfaced message must NOT echo the attacker-controllable
         // cdc PATH (§5.1, mirrors #516) — Storage cannot redact (SecretRedaction is Core-internal), so the path
         // is DROPPED. Author a DELETE at a sentinel cdc path, then overwrite it with a body carrying one null
-        // `_change_type` (authored `nullable: true` so the writer emits an OPTIONAL column; because Parquet models
-        // strings as nullable, the non-null-requested `_change_type` read still surfaces the null → the null
-        // check fires — never a schema-mismatch). `id`/`name` match v2's schema A so EE-08 passes first.
+        // `_change_type` (authored `nullable: true` so the writer emits an OPTIONAL column). The read projection
+        // requests `_change_type` NULLABLE (ChangeTypeReadField, #807), so the null is surfaced to — and rejected
+        // by — the CDF-domain ValidateChangeTypeColumn (a precise, path-free DeltaReadException), NOT pre-empted
+        // by the storage required-lane guard's generic SchemaMismatch. `id`/`name` match v2's schema A so EE-08
+        // passes first.
         await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
         var backend = new LocalFileSystemBackend(_root);
         await NewCdfDelete(backend, CdcPathSentinel).DeleteAsync(WhereId(id => id == 1));   // v2 cdc at sentinel path

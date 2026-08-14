@@ -50,6 +50,14 @@ internal sealed class ChangeFeedReader
     // DeltaReadException (§5.2, #653). A well-formed cdc file's `_change_type` is always non-null (the writer
     // stamps it REQUIRED), so a nullable read never materializes a null for a valid file; a foreign/tampered
     // file's null is caught — with the better diagnostic — by ValidateChangeTypeColumn.
+    //
+    // INVARIANT (do not tighten to nullable:false): this field MUST stay nullable so ValidateChangeTypeColumn
+    // (not the storage guard) owns change-type validation — the Explicit_CdcNullChangeType_… regression test
+    // pins that. Consequences of the nullable read that are covered elsewhere: (1) a null is rejected per batch
+    // by ValidateChangeTypeColumn before yield; (2) an ABSENT `_change_type` is no longer fail-closed at the
+    // reader (nullable + nullFillMissingColumns would null-fill it) — presence is fail-closed UPSTREAM by
+    // ValidateExplicitCdcSchemaAsync (EE-08), which runs before the read; if that gate is ever reordered, the
+    // null-fill is still caught by ValidateChangeTypeColumn.
     private static readonly StructField ChangeTypeReadField =
         new(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: true);
 
