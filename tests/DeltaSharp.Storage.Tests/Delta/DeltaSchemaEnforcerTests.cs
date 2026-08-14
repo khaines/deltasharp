@@ -1,4 +1,5 @@
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
@@ -19,6 +20,34 @@ public sealed class DeltaSchemaEnforcerTests
     private static StructField Field(string name, DataType type, bool nullable) => new(name, type, nullable);
 
     private static StructType Schema(params StructField[] fields) => new(fields);
+
+    // ---- #702: NullType ("void") reachability through the Delta WRITE door -----------------------------
+
+    // VERDICT (#702, CORRECTED at Round-1 review): the pre-review claim — that a NullType column cannot reach
+    // a committed metaData.schemaString because ParquetTypeMapping.CreateField rejects it first — was FALSE.
+    // CreateField is a PER-FILE guard; a ZERO-FILE create (an empty write to a fresh path) stages no file at
+    // all, so neither CreateField nor DeltaTableWriter.ValidateStagedWriteSchema (which iterates the staged
+    // file list) ever runs, and the declared schema went straight into version 0 as "type":"void" — a table
+    // DeltaSharp itself then refused to read. See
+    // DeltaWriteSchemaEligibilityTests.ZeroFileCreate_WithVoidColumn_CommitsNothing for the end-to-end repro.
+    //
+    // The door is now closed at DeltaWriteSchemaEligibility.EnsureCommittable, invoked on every path that
+    // builds a metaData action, INDEPENDENT of the staged-file count. DeltaSchemaEnforcer.Reconcile is still
+    // not the guard (a CREATE at version 0 bypasses it entirely). Read-side tolerance is deliberately
+    // unchanged (SchemaJson.FromJson still accepts "void"/"null"), so a schemaString another engine wrote —
+    // delta-rs 1.6.2 maps "void" to Arrow Null — still round-trips.
+    //
+    // This test keeps the per-file guard honest; the write-schema door itself is pinned end-to-end by
+    // DeltaWriteSchemaEligibilityTests.
+    [Fact]
+    public void NullTypeColumn_IsAlsoRejectedByThePerFileParquetGuard()
+    {
+        DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
+            () => ParquetTypeMapping.CreateField(new StructField("n", DataTypes.NullType, nullable: true)));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
+        Assert.Contains("is not supported", ex.Message, StringComparison.Ordinal);
+    }
 
     // ---- AC1: reject-before-commit, classified by DeltaSchemaMismatchKind (mode = None) ----------------
 

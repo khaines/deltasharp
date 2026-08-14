@@ -651,6 +651,12 @@ internal sealed class DeltaTableWriter
         CancellationToken cancellationToken)
     {
         ImmutableArray<string> metadataPartitionArray = metadataPartitionColumns.ToImmutableArray();
+
+        // #702: gate the DECLARED write schema BEFORE the schemaString is serialized and before any action is
+        // built — independent of `files.Count`, because a ZERO-FILE create reaches no per-file guard (neither
+        // ParquetTypeMapping.CreateField nor ValidateStagedWriteSchema) and would otherwise commit an
+        // unreadable `"type":"void"` column at version 0. Fail-closed: nothing is written.
+        DeltaWriteSchemaEligibility.EnsureCommittable(writeSchema);
         ValidatePartitionCoverage(files, validationPartitionColumns.ToImmutableArray());
 
         long createdTime = _timeProvider.GetUtcNow().ToUnixTimeMilliseconds();
@@ -944,6 +950,10 @@ internal sealed class DeltaTableWriter
             ColumnMapping.EvolveNameModeMapping(
                 mergedSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource);
 
+        // #702: gate the mapped evolved schema before it becomes a schemaString (same door as the none-mode
+        // LogicalEvolution branch above — column mapping changes a column's NAME, never its eligibility).
+        DeltaWriteSchemaEligibility.EnsureCommittable(mappedEvolvedSchema);
+
         StructType evolvedPhysical =
             ColumnMapping.MapWriteSchemaToPhysical(writeSchema, mappedEvolvedSchema, mode);
         ImmutableArray<string> evolvedPhysicalParts =
@@ -1028,6 +1038,9 @@ internal sealed class DeltaTableWriter
     private Task<DeltaCommitResult> CommitSchemaChangeAsync(
         Snapshot snapshot, StructType newSchema, ImmutableArray<string>? partitionColumns, CancellationToken cancellationToken)
     {
+        // #702: the post-ALTER schema is a DECLARED commit schema like any other — gate it before the
+        // schemaString is built (a metadata-only ALTER stages no files at all, so no per-file guard runs).
+        DeltaWriteSchemaEligibility.EnsureCommittable(newSchema);
         MetadataAction metadata = snapshot.Metadata with { SchemaString = SchemaJson.ToJson(newSchema) };
         if (partitionColumns is { } updated)
         {
@@ -1088,8 +1101,18 @@ internal sealed class DeltaTableWriter
     // The metaData action that commits a logical-schema evolution in NONE mode (and the truncate path): the
     // merged logical schema, all other metadata fields preserved; null when there is no evolution. Name-mode
     // evolution instead re-emits a MAPPED schema + bumped maxColumnId config (ResolveWrite's #541 branch).
-    private static MetadataAction? LogicalEvolution(MetadataAction metadata, StructType? mergedSchema) =>
-        mergedSchema is null ? null : metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
+    // #702: the merged schema is gated before it is serialized (an evolution that ADDS a void column is
+    // refused fail-closed, exactly like a create that declares one).
+    private static MetadataAction? LogicalEvolution(MetadataAction metadata, StructType? mergedSchema)
+    {
+        if (mergedSchema is null)
+        {
+            return null;
+        }
+
+        DeltaWriteSchemaEligibility.EnsureCommittable(mergedSchema);
+        return metadata with { SchemaString = SchemaJson.ToJson(mergedSchema) };
+    }
 
     // AC2: remove EVERY prior active file + add the new files in one atomic version, scoped WholeTable so
     // any concurrent add/remove aborts the overwrite (it depends on the entire active set). The optional
@@ -1167,6 +1190,11 @@ internal sealed class DeltaTableWriter
         ArgumentNullException.ThrowIfNull(readSnapshot);
         ArgumentNullException.ThrowIfNull(writeSchema);
         ArgumentNullException.ThrowIfNull(partitionColumns);
+
+        // #702: the replacement schema is a DECLARED commit schema — gate it here, at the top of the PLAN, so
+        // the rejection lands before the write door stages a single byte (the door stages against the plan's
+        // physical schema). Covers both the mapped and none-mode branches below.
+        DeltaWriteSchemaEligibility.EnsureCommittable(writeSchema);
 
         ImmutableArray<string> partitionArray = partitionColumns.ToImmutableArray();
         ColumnMappingMode mode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
