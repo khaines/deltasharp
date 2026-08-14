@@ -146,9 +146,11 @@ UnresolvedFileRelation(string format, string path,
   pure descriptor (AC2).
 - Render: `'UnresolvedRelation parquet [<redacted path>], options=[k1, k2, …]` (a visible scan node —
   AC4). To avoid leaking credentials the moment a node is stringified (Explain #179, logging), the
-  render shows option **keys only** (never values) and a **redacted path** — userinfo passwords and
-  credential-bearing query-string values (SAS `?sig=`, presigned-URL signatures, `token`/`secret`/…)
-  are masked as `<redacted>` by `SecretRedaction.RedactPath`. The same redaction is applied to the
+  render shows option **keys only** (never values) and a **redacted path** — the entire userinfo (any
+  `scheme://<userinfo>@` credential, whether colon-delimited, colon-less, or carrying an interior `?`/`#`,
+  except the ADLS/WASB `container@account` bucket-identity) and credential-bearing query-string values
+  (SAS `?sig=`, presigned-URL signatures, `token`/`secret`/`jwt`/…) are masked as `<redacted>` by
+  `SecretRedaction.RedactPath`. The same redaction is applied to the
   EPIC-05 analysis diagnostic.
 - Its `Options`/`UserSchema` are what EPIC-05's reader will consume; recording them on the node (not
   acting on them) is exactly Spark's lazy `DataFrameReader` behaviour.

@@ -158,6 +158,28 @@ internal static class DiagnosticText
     /// a log line even though every element is individually bounded.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// <b>#751 — items are quoted so the separator is unambiguous.</b> A raw join renders a single item named
+    /// <c>a, b, c</c> byte-identically to the three items <c>a</c>, <c>b</c>, <c>c</c>. To make the list
+    /// self-describing this method quotes an item — CSV / RFC&#160;4180 style — <b>iff</b> it contains the
+    /// separator or a double quote: it is wrapped in <c>"</c>…<c>"</c> and every embedded <c>"</c> is doubled
+    /// (<c>""</c>). A raw (unquoted) item therefore never contains the separator and never contains a quote, so
+    /// the reader's grammar — <em>a token that begins with <c>"</c> is quoted and runs to the next un-doubled
+    /// <c>"</c>; otherwise it is literal</em> — parses the list back without ambiguity. The overwhelmingly
+    /// common case (clean identifiers, protocol keys, column names) contains neither and is rendered exactly as
+    /// before, so this changes no golden output for well-formed tokens.
+    /// </para>
+    /// <para>
+    /// Quoting is applied <b>after</b> <see cref="Sanitize"/>, so the per-item content bound is preserved and
+    /// the <b>item-count</b> bound is preserved — <b>not</b> a fixed aggregate-width bound: the rendered width
+    /// grows by at most the RFC&#160;4180 escape overhead, at most <c>2·L + 2</c> per item (each of the item's
+    /// <c>L</c> sanitized characters may be a quote that doubles, plus the two surrounding quotes). The
+    /// <c>… (+N more)</c> elision marker is a fixed structural suffix, not a list item, so it is never quoted;
+    /// to keep that marker unforgeable an ITEM that begins with <c>…</c> (U+2026) is force-quoted by
+    /// <see cref="EscapeItem"/>, so an attacker-authored item literally named <c>… (+7 more)</c> renders
+    /// <c>"… (+7 more)"</c> — byte-distinct from the bare structural marker.
+    /// </para>
+    /// <para>
     /// <b>Both bounds are caller-supplied on purpose.</b> This primitive owns the ALGORITHM; the calling layer
     /// owns its POSTURE — the per-item length cap and the item count cap are the layer's policy, and only the
     /// layer knows what a legitimate list looks like there (a Delta reader/writer feature set is not a SQL
@@ -167,6 +189,7 @@ internal static class DiagnosticText
     /// it, so its declared constant is provably the one in force on every path. Adding a default here would
     /// re-create exactly the silent-drift hazard the shared primitive exists to eliminate: two independent
     /// constants, one name, and no signal when they diverge.
+    /// </para>
     /// </remarks>
     /// <param name="tokens">The untrusted tokens to render. When not already an
     /// <see cref="IReadOnlyList{T}"/>, at most <paramref name="maxItems"/> tokens are materialized; the
@@ -195,7 +218,7 @@ internal static class DiagnosticText
                     builder.Append(separator);
                 }
 
-                builder.Append(Sanitize(list[i], maxItemLength));
+                builder.Append(EscapeItem(Sanitize(list[i], maxItemLength), separator));
             }
 
             if (list.Count > shown)
@@ -222,7 +245,7 @@ internal static class DiagnosticText
                     lazyBuilder.Append(separator);
                 }
 
-                lazyBuilder.Append(Sanitize(token, maxItemLength));
+                lazyBuilder.Append(EscapeItem(Sanitize(token, maxItemLength), separator));
                 lazyShown++;
             }
             else
@@ -237,6 +260,84 @@ internal static class DiagnosticText
         }
 
         return lazyBuilder.ToString();
+    }
+
+    /// <summary>
+    /// #751 — the pre-truncated sibling of <see cref="SanitizeAndJoin"/>. The caller has ALREADY capped the
+    /// materialized list to <paramref name="shown"/> (so a huge schema is never fully materialized) and knows
+    /// the real <paramref name="total"/>; this sanitizes and RFC&#160;4180-quotes each shown item exactly as
+    /// <see cref="SanitizeAndJoin"/> does (via the same <see cref="EscapeItem"/>), then elides against the true
+    /// total. Routing through the shared <see cref="EscapeItem"/> is the point: a hostile foreign column named
+    /// <c>a, b</c> gets the SAME quoting here as everywhere else, so it can no longer render identically to two
+    /// columns, and a forged <c>… (+N more)</c> item is force-quoted too.
+    /// </summary>
+    /// <param name="shown">The already-truncated items to render (each sanitized and quoted here).</param>
+    /// <param name="total">The real total item count, used only to compute the elision suffix.</param>
+    /// <param name="maxItemLength">The per-item length cap handed to <see cref="Sanitize"/>.</param>
+    /// <param name="separator">The separator placed between rendered items.</param>
+    internal static string SanitizeAndJoinCounted(
+        IReadOnlyList<string> shown, int total, int maxItemLength, string separator = ", ")
+    {
+        ArgumentNullException.ThrowIfNull(shown);
+        ArgumentNullException.ThrowIfNull(separator);
+        ArgumentOutOfRangeException.ThrowIfNegative(maxItemLength);
+
+        var builder = new StringBuilder();
+        for (int i = 0; i < shown.Count; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(separator);
+            }
+
+            builder.Append(EscapeItem(Sanitize(shown[i], maxItemLength), separator));
+        }
+
+        if (total > shown.Count)
+        {
+            builder.Append(separator).Append(CultureInfo.InvariantCulture, $"… (+{total - shown.Count} more)");
+        }
+
+        return builder.ToString();
+    }
+
+    /// <summary>
+    /// #751 — quotes a <b>sanitized</b> item so an embedded separator or quote cannot be mistaken for a list
+    /// boundary, <b>and so a forged elision marker cannot masquerade as the structural one</b>. CSV /
+    /// RFC&#160;4180 semantics: the item is wrapped in <c>"</c>…<c>"</c> and every embedded <c>"</c> is
+    /// doubled, but <b>only</b> when it contains the separator or a quote, <b>or begins with <c>…</c></b>
+    /// (U+2026, the elision marker's lead character) — a clean identifier is returned verbatim (the SAME
+    /// instance), so the common case allocates nothing and its golden output is unchanged. Applied after
+    /// <see cref="Sanitize"/>, so it operates on already-bounded, U+FFFD-scrubbed content (control characters
+    /// are neutralized upstream, never a quoting trigger here) and the per-item bound is preserved.
+    /// </summary>
+    private static string EscapeItem(string sanitized, string separator)
+    {
+        // Force-quote an item that STARTS with the elision lead char '…' (U+2026): the structural
+        // "… (+N more)" marker is appended bare (never through EscapeItem), so quoting any '…'-leading item
+        // makes a forged "… (+7 more)" render as "\"… (+7 more)\"" — byte-distinct from the real marker.
+        bool needsQuoting = sanitized.Contains('"')
+            || sanitized.StartsWith('…')
+            || (separator.Length > 0 && sanitized.Contains(separator, StringComparison.Ordinal));
+        if (!needsQuoting)
+        {
+            return sanitized;
+        }
+
+        var builder = new StringBuilder(sanitized.Length + 2);
+        builder.Append('"');
+        foreach (char c in sanitized)
+        {
+            if (c == '"')
+            {
+                builder.Append('"');
+            }
+
+            builder.Append(c);
+        }
+
+        builder.Append('"');
+        return builder.ToString();
     }
 
     /// <summary>

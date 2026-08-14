@@ -98,7 +98,20 @@ internal enum StorageErrorKind
 /// <c>_delta_log</c>) MUST be routed through <see cref="DiagnosticText.Sanitize"/> — or a
 /// stronger drop/minimization — BEFORE interpolation. The sweep test in
 /// <c>StorageHygieneSweepTests</c> covers call sites known as of <c>76d2c8e</c>; new call sites carry the
-/// same obligation.
+/// same obligation. Coverage is cross-checked by the source-scan guard
+/// <c>StorageExceptionProducerInventoryGuardTests</c> (with the checked-in
+/// <c>storage-exception-producer-inventory.tsv</c>), which — <b>for the interpolated-string-hole shape it
+/// walks</b> — fails CI when a producer token is neither hygiene-wrapped (semantic-model-resolved to an
+/// allowlisted sanitizing method on a <c>DiagnosticText</c> type — never the raw-echoing
+/// <c>DescribeWithoutInner</c> — or <c>LocalFileSystemBackend.Redact</c>) nor auto-cleared as a bounded value
+/// type (integral/float/decimal/enum/<c>Guid</c>/<c>DateTime</c>/<c>DateTimeOffset</c>/<c>TimeSpan</c>,
+/// cleared with no inventory row) nor classified in the site-keyed
+/// <c>(file, type, member, token)</c> inventory (#749). It is an audit prompt for that shape, not a proof of hygiene for every shape; the
+/// log-routing doc's "known blind spots" list (message-into-a-local, <c>+</c>/<c>string.Format</c>/
+/// <c>StringBuilder</c> composition, a non-<c>*Exception</c> helper, whole-message pass-through, a
+/// tenant-derived numeric/temporal/<c>Guid</c> value auto-cleared as BOUNDED, same-site
+/// reclassification) remain reviewer obligations. The <c>sanitized-upstream</c>/<c>fixed</c> classification
+/// is an unverified provenance claim (strongest for parameter tokens).
 /// </remarks>
 internal sealed class DeltaStorageException : Exception
 {

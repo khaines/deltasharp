@@ -234,6 +234,41 @@ The **commit file publication is the atomic boundary** — the exact analogue of
 "materialize-then-commit is atomic" rule ([write-door.md](write-door.md)): a mid-write fault leaves
 orphan data files (never active) but no partial log; an acknowledged commit is durable.
 
+> **Compat / migration note — partition-directory key encoding (#708).** As of #708 the Hive-style
+> partition directory segment (`col=value/`) is built by `DeltaWriteEncoding.HivePartitionSegment`, which
+> percent-encodes **both** the partition column NAME and the value with `Uri.EscapeDataString` (previously
+> only the value was encoded). This is a **directory-injection hardening**: a hostile logical column name
+> such as `a/b` or `a=b` can no longer fabricate spurious path segments or a second `=` inside the segment.
+> Consequences and invariants:
+> - **`add.path` is a literal object key, not a URI.** The read path never decodes it
+>   (`DeltaReadSource.cs:310,362`); partition membership is authoritative from **`add.partitionValues`**
+>   (keyed on the raw logical name/value), never inferred from the directory string. Encoding the path
+>   therefore changes only the on-disk layout, not table semantics.
+> - **Known deviation, not Spark parity.** `Uri.EscapeDataString` uses a different alphabet than Spark's
+>   `escapePathName` (a 128-entry ASCII bitset that cannot escape non-ASCII), so a DeltaSharp table whose
+>   partition names/values contain characters outside the RFC-3986 unreserved set is **not currently
+>   round-trippable** with Spark/delta-rs. The correct two-layer fix (physical segment via Spark's alphabet
+>   + URI-encoded `add.path`, decoded on read) is tracked by **#806**.
+> - **Legacy raw-key directories remain readable.** Tables written **before** #708 carry raw, unencoded
+>   keys/values. `OrphanCleanup` protects the **union** `{raw} ∪ {UnescapeDataString(raw)}` of each log
+>   path, so legacy-raw, current-encoded, and Spark-encoded layouts are all classified correctly and never
+>   over-deleted.
+> - **Mixed layouts are expected and benign.** After an `OPTIMIZE` on a legacy table, old raw-key
+>   directories and new percent-encoded ones coexist under the same table root. `DeltaOptimize.BuildOutputPath`
+>   and `DeltaWriteTarget.DataFilePath` produce **identical** prefixes for the same `(column, value)`, so
+>   freshly-written and compacted outputs agree; only the pre-#708 files differ, and membership is unaffected.
+> - **Consequence for prefix-keyed tooling.** External lifecycle / erasure / GDPR tooling that enumerates or
+>   deletes by directory-prefix on the **raw** logical name must be updated to key on the percent-encoded
+>   segment (or, preferably, drive off `add.partitionValues` rather than the path), since new writes no longer
+>   land under the raw-name prefix for non-unreserved names.
+> - **Failure signal is silent under-deletion, not an error.** A prefix-keyed DSAR / retention / erasure job
+>   that still enumerates by the **raw** logical-name prefix does **not** fault — it simply matches nothing
+>   under the new encoded prefix and **silently under-deletes** (a compliance miss, not a crash). Detection:
+>   scan `add.partitionValues` for any name/value carrying a character outside the RFC-3986 unreserved set
+>   (i.e. any name/value where `EscapeDataString(raw) != raw`); during the legacy-window sweep, enumerate the
+>   **union** `{raw, EscapeDataString(raw)}` so both pre-#708 raw-key and post-#708 encoded directories are
+>   covered.
+
 ### 2.6 Public (packable) API surface — kept minimal
 
 Only user-facing types cross into `DeltaSharp.Core`/`DeltaSharp.Abstractions` (must compile on `net8.0`

@@ -1040,11 +1040,27 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     // undelimited branch 4, which is residual R1 below: "name=Alice Taylor" at the very end of a message
     // renders as "name=<value> Taylor". That partial-match shape is exactly why branch order matters.
     //
-    // Residual, tracked in #704 and deliberately NOT changed here so that issue stays self-contained: the
-    // lookbehind class does not include a quote or string-start, so a RELATIVE key (the shape an object-store
-    // backend will produce) is not matched. Unreachable in-tree today — Resolve/ResolveRelative both
-    // Path.Combine + GetFullPath, so every framework message carries an absolute path and root-stripping
-    // always leaves the remainder behind a separator.
+    // #704, SETTLED. The lookbehind class of branches 1 and 4 does not include a quote or string-start, so a
+    // RELATIVE key (the shape an object-store backend produces) is not matched by those branches. That case
+    // is now covered instead by the RIGHTWARD-evidence branches 5 and 6 (MECHANISM 7 below): a relative
+    // `key=value` at string start or after a quote redacts whenever a following `/` (branch 5) or a `\`
+    // anywhere (branch 6) proves a path continues. Pinned by Redact_RootlessRelativePath_RedactsTheFirstSegmentToo.
+    //
+    // This RETIRES the absolute-path precondition as a load-bearing dependency: the recognizer no longer
+    // needs "a framework message embeds the absolute path so root-stripping leaves the remainder behind a
+    // separator" to fire on an object-store key. The only relative shape that still declines is a BARE
+    // `key=value` carrying no path evidence anywhere (`k=v`, `k=v.parquet`) -- residual R4 -- which is
+    // deliberately indistinguishable from an operator diagnostic (`errno=13`, `retries=5`) and must decline
+    // to keep those verbatim. Pinned by Redact_BareKeyValueWithNoPathEvidence_IsLeftAlone.
+    //
+    // #704(b), THE QUERY-STRING `?` DECISION, RECORDED. The key classes deliberately do NOT exclude `?`, so a
+    // query-string `key=value` (e.g. `/objects?prefix=data`, `/obj?X-Amz-Signature=...`) is treated as a Hive
+    // segment and its value redacted. This is chosen, not accidental: a presigned-URL credential
+    // (`X-Amz-Signature`, `X-Amz-Credential`, `X-Amz-Security-Token`, `sig`) arrives as a query parameter and
+    // MUST be redacted, and redacting a benign parameter (`prefix=`, `versionId=`, `uploadId=`) is a
+    // diagnosability-only cost in the same SAFE direction as the ACCEPTED OVER-REDACTION below -- never a
+    // disclosure. Excluding `?` would trade a credential leak for that context, which is the wrong way round.
+    // Pinned by Redact_QueryStringKeyValue_IsRedacted_TheChosenSafeDirection.
     //
     // Branches are ordered most-anchored first.
     //
@@ -1097,7 +1113,14 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //       branch 3's key closes R2 and reopens errno=13 on both quote spellings, which is a trade, not a
     //       free win. Confined in practice to a message naming a partition DIRECTORY, since a data file
     //       appends "/part-<guid>.parquet" and so supplies the separator branch 1 needs. This is a
-    //       monotonicity regression against 9220b66 and is tracked by #714.
+    //       monotonicity regression against 9220b66 and is tracked by #714. As of #708 the WRITE-PATH half is
+    //       retired FOR NEW WRITES: DeltaWriteEncoding.HivePartitionSegment now percent-encodes the partition
+    //       column NAME as well as the value, so a DeltaSharp-authored add.path key WRITTEN AFTER #708 can no
+    //       longer carry a quote or whitespace and cannot produce this shape. R2 remains reachable via a
+    //       FOREIGN add.path (a key alphabet DeltaSharp does not control) AND via a LEGACY DeltaSharp-authored
+    //       add.path written BEFORE #708 (raw, unencoded keys) -- the encoding retires the residual for NEW
+    //       writes only, not retroactively -- which is why Redact_MonotonicityMatrix still asserts
+    //       declinedR2 > 0: the recognizer must handle both foreign and legacy input forever.
     //
     // R3 -- {quote INSIDE the value} -- is closed for the balanced quoting a framework message emits; an
     // unclosed opening quote belongs to R1 instead.

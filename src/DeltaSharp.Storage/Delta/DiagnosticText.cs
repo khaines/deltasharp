@@ -601,28 +601,13 @@ internal static class DiagnosticText
         _ => type.TypeName,
     };
 
-    // SanitizeAndJoin elides against the LIST it is given; here the list is pre-truncated (so the full schema
-    // is never materialized), so the elision count comes from the real total instead.
-    private static string SanitizeAndJoinCounted(IReadOnlyList<string> shown, int total)
-    {
-        var builder = new StringBuilder();
-        for (int i = 0; i < shown.Count; i++)
-        {
-            if (i > 0)
-            {
-                builder.Append(", ");
-            }
-
-            builder.Append(Sanitize(shown[i], DefaultMaxLength));
-        }
-
-        if (total > shown.Count)
-        {
-            builder.Append(CultureInfo.InvariantCulture, $", … (+{total - shown.Count} more)");
-        }
-
-        return builder.ToString();
-    }
+    // #751 — forward to the shared primitive's SanitizeAndJoinCounted so a pre-truncated schema listing gets
+    // the SAME RFC-4180 quoting (via SharedDiagnosticText.EscapeItem) as every other list render: a hostile
+    // foreign column named `a, b` is quoted and cannot masquerade as two columns, and a forged `… (+N more)`
+    // item is force-quoted too. The list is pre-truncated (the full schema is never materialized), so the
+    // elision count comes from the real total rather than the shown list's length.
+    private static string SanitizeAndJoinCounted(IReadOnlyList<string> shown, int total) =>
+        SharedDiagnosticText.SanitizeAndJoinCounted(shown, total, DefaultMaxLength);
 
     /// <summary>
     /// Renders <paramref name="exception"/> as <c>{TypeName}: {Message}</c> (optionally followed by

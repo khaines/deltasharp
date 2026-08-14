@@ -150,4 +150,51 @@ public class TypeCoercionTests
         TypeCoercion.EnsureCoercible(src, dst); // widening int→long inside the array does not throw
         Assert.True(TypeCoercion.CanCoerce(src, dst));
     }
+
+    // #707: at the throw site source/target CAN be a non-atomic StructType (adjudicated by predicate), whose
+    // SimpleString recursively appends every nested field name verbatim. The MESSAGE must echo the bounded
+    // KIND and neutralize the schema path, even though the exact type stays on the typed channel.
+    [Fact]
+    public void NonAtomicSource_MessageEchoesBoundedKind_NotRecursiveFieldNames()
+    {
+        // A wide hostile struct with newline-injecting field names, coerced (as an array element) to int so
+        // the failing source is the struct itself.
+        var fields = new StructField[64];
+        for (int i = 0; i < fields.Length; i++)
+        {
+            fields[i] = new StructField(
+                string.Create(System.Globalization.CultureInfo.InvariantCulture, $"secret_col_{i}\r\nINJECTED"),
+                StringType.Instance);
+        }
+
+        var hostile = new StructType(fields);
+        TypeCoercionException ex = Assert.Throws<TypeCoercionException>(() =>
+            TypeCoercion.EnsureCoercible(new ArrayType(hostile), new ArrayType(IntegerType.Instance)));
+
+        // The message names the bounded kind, never a nested field name, and is short + control-char free.
+        Assert.Contains("'struct'", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret_col_", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.True(ex.Message.Length < 256, $"message was {ex.Message.Length} chars; expected bounded.");
+
+        // The exact type is still recoverable on the typed channel.
+        Assert.StartsWith("struct<", ex.SourceType, StringComparison.Ordinal);
+    }
+
+    // #707: the expression PATH is built from foreign field names, so it must be sanitized in the message.
+    [Fact]
+    public void HostileFieldNameInPath_IsNeutralizedInTheMessage()
+    {
+        var src = new StructType(new[] { new StructField("a\r\nb\u2028c", IntegerType.Instance) });
+        var dst = new StructType(new[] { new StructField("a\r\nb\u2028c", StringType.Instance) });
+        TypeCoercionException ex = Assert.Throws<TypeCoercionException>(() =>
+            TypeCoercion.EnsureCoercible(src, dst));
+
+        // The raw path survives on the typed channel; the message is neutralized.
+        Assert.Contains("\r\n", ex.Path!, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', ex.Message);
+        Assert.DoesNotContain('\n', ex.Message);
+        Assert.DoesNotContain('\u2028', ex.Message);
+    }
 }

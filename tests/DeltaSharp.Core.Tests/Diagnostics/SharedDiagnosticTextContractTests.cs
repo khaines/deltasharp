@@ -512,4 +512,328 @@ public sealed class SharedDiagnosticTextContractTests
         Assert.Throws<ArgumentOutOfRangeException>(
             () => SharedDiagnosticText.SanitizeAndJoin(input, maxItemLength: -1, maxItems: 16));
     }
+
+    // ---- #751: unambiguous separator escaping ----------------------------------------------------------
+
+    [Fact]
+    public void SanitizeAndJoin_ItemContainingTheSeparator_IsQuotedSoItCannotBeMistakenForThreeItems()
+    {
+        // The defect this issue closes: a single item named "a, b, c" was byte-identical to three items.
+        // With CSV-style quoting the one item is wrapped, so a reader can tell them apart.
+        string threeItems = SharedDiagnosticText.SanitizeAndJoin(
+            ["a", "b", "c"], maxItemLength: 32, maxItems: 16);
+        string oneItem = SharedDiagnosticText.SanitizeAndJoin(
+            ["a, b, c"], maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal("a, b, c", threeItems);      // clean items are untouched (no golden churn)
+        Assert.Equal("\"a, b, c\"", oneItem);      // the embedded-separator item is quoted
+        Assert.NotEqual(threeItems, oneItem);      // the ambiguity is gone
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_ItemContainingAQuote_HasItsQuotesDoubledAndIsWrapped()
+    {
+        // CSV / RFC 4180 escaping: an embedded quote is doubled and the item is wrapped, so the closing
+        // quote of the token is always the next UN-doubled quote.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["say \"hi\""], maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal("\"say \"\"hi\"\"\"", rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_CleanItems_AreReturnedVerbatim_NoQuoting()
+    {
+        // A raw (unquoted) item never contains the separator or a quote — that is the whole invariant that
+        // makes the grammar unambiguous. Verify ordinary identifiers pass through untouched.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["col_a", "col.b", "feature-x"], maxItemLength: 32, maxItems: 16);
+
+        Assert.Equal("col_a, col.b, feature-x", rendered);
+        Assert.DoesNotContain('"', rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_ControlCharsInItem_AreNeutralizedBeforeQuoting()
+    {
+        // Sanitize runs first, so CR/LF/NEL/U+2028/U+2029 become U+FFFD; quoting only decides how the
+        // already-neutralized content is delimited. An item bearing a separator AND a control char is both
+        // neutralized and quoted.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["a, \r\nb"], maxItemLength: 32, maxItems: 16);
+
+        Assert.DoesNotContain('\r', rendered);
+        Assert.DoesNotContain('\n', rendered);
+        Assert.Equal("\"a, \uFFFD\uFFFDb\"", rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_QuotingIsAppliedAfterTheItemBound_ContentStaysBounded()
+    {
+        // Per-item bound is preserved: Sanitize caps the CONTENT at maxItemLength; quoting adds only the
+        // bounded escape overhead (<= 2*content + 2). The separator survives the cap here, so the bounded
+        // content is quoted — never the full 50-plus-char item.
+        string longItem = "a, " + new string('x', 50);
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            [longItem], maxItemLength: 10, maxItems: 16);
+
+        // 10 chars of content ("a, xxxxxxx"), then the truncation ellipsis, all wrapped.
+        Assert.Equal("\"a, xxxxxxx…\"", rendered);
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_OverflowMarker_IsNeverQuoted_AndStaysDistinctFromQuotedItems()
+    {
+        // The elision marker is a structural suffix, not an item, so it renders bare. Even when the shown
+        // items are quoted (they contain separators), the "… (+N more)" tail is verbatim and countable.
+        string[] items = Enumerable.Range(0, 20)
+            .Select(i => string.Create(CultureInfo.InvariantCulture, $"v{i}, x"))
+            .ToArray();
+
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(items, maxItemLength: 32, maxItems: 16);
+
+        Assert.Contains("\"v0, x\"", rendered);              // shown items are quoted
+        Assert.EndsWith("… (+4 more)", rendered);            // marker bare and un-quoted
+        Assert.DoesNotContain("\"… (+4 more)\"", rendered);
+    }
+
+    [Theory]
+    [InlineData(1, 16)]
+    [InlineData(5, 2)]
+    [InlineData(40, 16)]
+    public void SanitizeAndJoin_QuotedItems_RenderIdenticallyOnFastAndLazyPaths(int tokenCount, int maxItems)
+    {
+        // The escaping must be path-independent — the #767 fast/lazy equivalence extends to quoted output.
+        string[] tokens = Enumerable.Range(0, tokenCount)
+            .Select(i => string.Create(CultureInfo.InvariantCulture, $"n{i}, \"q\""))
+            .ToArray();
+        IEnumerable<string> lazy = tokens.Select(x => x);
+
+        string fast = SharedDiagnosticText.SanitizeAndJoin(tokens, maxItemLength: 32, maxItems: maxItems);
+        string slow = SharedDiagnosticText.SanitizeAndJoin(lazy, maxItemLength: 32, maxItems: maxItems);
+
+        Assert.Equal(fast, slow);
+    }
+
+    // ---- #751 Round-1: forged elision marker, injectivity, and the escape-overhead ceiling ----
+
+    [Fact]
+    public void SanitizeAndJoin_ForgedElisionMarkerItem_IsQuoted_SoItCannotMasqueradeAsTheStructuralMarker()
+    {
+        // The elision marker "… (+N more)" is appended bare. An item literally named "… (+7 more)" would,
+        // without the '…'-lead force-quote, render byte-identically to the structural marker. It must render
+        // quoted and therefore distinguishable.
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            ["real", "… (+7 more)"], maxItemLength: 64, maxItems: 16);
+
+        Assert.Equal("real, \"… (+7 more)\"", rendered);
+        Assert.Contains("\"… (+7 more)\"", rendered);   // the forged item is quoted
+    }
+
+    [Fact]
+    public void SanitizeAndJoin_ForgedMarker_WithARealElision_StaysDistinctFromTheStructuralMarker()
+    {
+        // A forged "… (+N more)" item shown alongside a genuine elision: the forged one is quoted, the
+        // structural tail is bare — so a reader can still tell the real count from the impostor.
+        string[] items =
+        [
+            "… (+99 more)",
+            .. Enumerable.Range(0, 20).Select(i => string.Create(CultureInfo.InvariantCulture, $"c{i}")),
+        ];
+
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(items, maxItemLength: 64, maxItems: 4);
+
+        Assert.StartsWith("\"… (+99 more)\"", rendered);   // impostor item: quoted
+        Assert.EndsWith("… (+17 more)", rendered);         // structural marker: bare
+        Assert.DoesNotContain("\"… (+17 more)\"", rendered);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(5)]
+    [InlineData(64)]
+    public void SanitizeAndJoin_EscapeOverhead_NeverExceeds_TwoTimesContentPlusTwo_PerItem(int length)
+    {
+        // The rendered width bound the XML remark states: a single item's render grows by at most the
+        // RFC-4180 escape overhead (<= 2*L + 2). The worst case is a non-empty all-quotes item: every one of
+        // L characters doubles, plus the two wrapping quotes, so the render is EXACTLY 2*L + 2. An EMPTY item
+        // needs no quoting (no separator/quote/'…'), so it stays 0 — still within the ceiling.
+        string allQuotes = new('"', length);
+
+        string rendered = SharedDiagnosticText.SanitizeAndJoin(
+            [allQuotes], maxItemLength: 4096, maxItems: 16);
+
+        Assert.True(
+            rendered.Length <= (2 * length) + 2,
+            $"render width {rendered.Length} exceeded the 2*L+2 ceiling for L={length}.");
+        if (length > 0)
+        {
+            Assert.Equal((2 * length) + 2, rendered.Length);   // non-empty all-quotes hits the ceiling exactly
+        }
+    }
+
+    [Theory]
+    [InlineData("a, b")]           // separator-bearing name
+    [InlineData("say \"hi\"")]     // quote-bearing name
+    [InlineData("… (+7 more)")]    // forged elision-marker lead
+    public void SanitizeAndJoinCounted_QuotesHostileItem_AndAppendsStructuralElision(string hostile)
+    {
+        // #751 C1(a): SanitizeAndJoinCounted must (a) RFC-4180 QUOTE a hostile item (separator-bearing,
+        // quote-bearing, or '…'-lead) so it cannot masquerade as two columns / as the structural marker, AND
+        // (b) append the STRUCTURAL "… (+N more)" tail BARE when total > shown.Count. total 9 - shown 2 = 7.
+        // Dropping the EscapeItem quoting (SharedDiagnosticText / DiagnosticText.cs:~293) turns this red.
+        var shown = new[] { hostile, "clean" };
+
+        string rendered = SharedDiagnosticText.SanitizeAndJoinCounted(shown, total: 9, maxItemLength: 64);
+
+        string quoted = "\"" + hostile.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
+        Assert.StartsWith(quoted + ", clean", rendered);   // hostile item quoted, clean item verbatim
+        Assert.EndsWith(", … (+7 more)", rendered);          // structural elision appended BARE
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(7)]
+    [InlineData(11)]
+    [InlineData(20)]
+    [InlineData(42)]
+    [InlineData(99)]
+    public void SanitizeAndJoin_IsInjective_ParseReversesJoin_OverAHostileAlphabet(int seed)
+    {
+        // Round-trip / injectivity property (#751): for any list whose length does not force an elision,
+        // parse(join(items)) == items.Select(Sanitize). The corpus is drawn from the adversarial alphabet
+        // that motivated quoting — the separator, a quote, the elision-marker shape, control characters, and
+        // boundary lengths — so a regression in the escaping turns this red.
+        const int maxItemLength = 24;
+        string[] alphabet =
+        [
+            "clean", "col.b", "feature-x", "", "a", ",", ", ", "\"", "a, b", "say \"hi\"",
+            "… (+7 more)", "…leading", "a\r\nb", "x\u2028y", new string('z', 40), new string('"', 12),
+            "trailing…", "a,b,c",
+        ];
+
+        var rng = new Random(seed);
+        int count = rng.Next(1, 12);
+        string[] raw = Enumerable.Range(0, count).Select(_ => alphabet[rng.Next(alphabet.Length)]).ToArray();
+
+        // maxItems >= count so no structural elision marker is appended and the render is fully reversible.
+        string joined = SharedDiagnosticText.SanitizeAndJoin(raw, maxItemLength, maxItems: count, separator: ", ");
+
+        string[] expected = raw.Select(r => SharedDiagnosticText.Sanitize(r, maxItemLength)).ToArray();
+        string[] parsed = ParseRfc4180(joined, ", ");
+
+        Assert.Equal(expected, parsed);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(7)]
+    [InlineData(11)]
+    [InlineData(20)]
+    [InlineData(42)]
+    [InlineData(99)]
+    public void SanitizeAndJoin_ForcedElision_AppendsExactlyOneStructuralMarker_WithTheRealHiddenCount(int seed)
+    {
+        // #751 C2 second leg: when maxItems < count a STRUCTURAL "… (+N more)" marker IS appended (exactly
+        // one, at the tail, BARE), and N is the REAL hidden count (count - maxItems). The '…'-lead force-quote
+        // still holds: any shown item literally leading with '…' renders quoted, so the structural marker is
+        // the ONLY bare "… (+N more)" — an oracle a regression in the force-quote or the elision count breaks.
+        const int maxItemLength = 24;
+        string[] alphabet =
+        [
+            "clean", "col.b", "feature-x", "a", "a, b", "say \"hi\"", "… (+7 more)", "…leading",
+            "a\r\nb", new string('z', 40), "trailing…", "a,b,c",
+        ];
+
+        var rng = new Random(seed);
+        int count = rng.Next(3, 16);
+        int maxItems = rng.Next(1, count);   // strictly fewer shown than present -> forced elision
+        string[] raw = Enumerable.Range(0, count).Select(_ => alphabet[rng.Next(alphabet.Length)]).ToArray();
+
+        string joined = SharedDiagnosticText.SanitizeAndJoin(raw, maxItemLength, maxItems, separator: ", ");
+
+        string marker = string.Create(CultureInfo.InvariantCulture, $"… (+{count - maxItems} more)");
+        Assert.EndsWith(", " + marker, joined);
+
+        // Exactly ONE occurrence of the BARE structural marker: a forged '…'-lead item renders quoted
+        // ("\"…"), so it never matches the unquoted ", …" boundary. Count bare-marker occurrences.
+        int occurrences = CountOccurrences(joined, ", " + marker);
+        Assert.Equal(1, occurrences);
+    }
+
+    private static int CountOccurrences(string haystack, string needle)
+    {
+        int n = 0;
+        for (int i = haystack.IndexOf(needle, StringComparison.Ordinal);
+            i >= 0;
+            i = haystack.IndexOf(needle, i + 1, StringComparison.Ordinal))
+        {
+            n++;
+        }
+
+        return n;
+    }
+
+    // A minimal RFC-4180 reader for the SanitizeAndJoin grammar: a field beginning with '"' is quoted and
+    // runs to the next UN-doubled '"' (each "" unescaping to one "); any other field runs to the next
+    // separator. Used only to PROVE injectivity of the join — the production code never parses these.
+    private static string[] ParseRfc4180(string text, string separator)
+    {
+        var fields = new List<string>();
+        int i = 0;
+        while (true)
+        {
+            if (i < text.Length && text[i] == '"')
+            {
+                var sb = new StringBuilder();
+                i++;
+                while (i < text.Length)
+                {
+                    if (text[i] == '"')
+                    {
+                        if (i + 1 < text.Length && text[i + 1] == '"')
+                        {
+                            sb.Append('"');
+                            i += 2;
+                            continue;
+                        }
+
+                        i++;   // closing quote
+                        break;
+                    }
+
+                    sb.Append(text[i]);
+                    i++;
+                }
+
+                fields.Add(sb.ToString());
+            }
+            else
+            {
+                int next = text.IndexOf(separator, i, StringComparison.Ordinal);
+                if (next < 0)
+                {
+                    fields.Add(text[i..]);
+                    return [.. fields];
+                }
+
+                fields.Add(text[i..next]);
+                i = next;
+            }
+
+            if (i >= text.Length)
+            {
+                return [.. fields];
+            }
+
+            // Consume the separator between fields.
+            if (string.CompareOrdinal(text, i, separator, 0, separator.Length) == 0)
+            {
+                i += separator.Length;
+            }
+        }
+    }
 }

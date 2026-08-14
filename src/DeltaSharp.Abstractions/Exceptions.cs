@@ -1,3 +1,6 @@
+using System.Globalization;
+using DeltaSharp.Diagnostics;
+
 namespace DeltaSharp.Types;
 
 /// <summary>
@@ -74,26 +77,71 @@ public sealed class TypeCoercionException : Exception
     {
     }
 
-    /// <summary>The source type that could not be coerced; non-null for path-aware throws.</summary>
+    /// <summary>The source type that could not be coerced; non-null for path-aware throws.
+    /// <para><b>Privacy channel (#707):</b> for a non-atomic type this is the recursive
+    /// <see cref="DataType.SimpleString"/>, which appends every nested <b>foreign schema field name</b>
+    /// verbatim — potential personal data / an un-neutralized foreign-name echo. It is deliberately kept off
+    /// the rendered <see cref="Exception.Message"/>/<c>ToString</c> (which echo the bounded
+    /// <see cref="DataType.TypeName"/> kind instead) and exposed here only for an <b>entitled</b> owner. A
+    /// consumer that logs or destructures this property owns its own data-minimization; do not forward it to
+    /// an untrusted sink.</para></summary>
     public string? SourceType { get; private init; }
 
-    /// <summary>The target type the source could not be coerced to; non-null for path-aware throws.</summary>
+    /// <summary>The target type the source could not be coerced to; non-null for path-aware throws.
+    /// <para><b>Privacy channel (#707):</b> for a non-atomic type this is the recursive
+    /// <see cref="DataType.SimpleString"/>, which appends every nested <b>foreign schema field name</b>
+    /// verbatim — potential personal data / an un-neutralized foreign-name echo. It is deliberately kept off
+    /// the rendered <see cref="Exception.Message"/>/<c>ToString</c> (which echo the bounded
+    /// <see cref="DataType.TypeName"/> kind instead) and exposed here only for an <b>entitled</b> owner. A
+    /// consumer that logs or destructures this property owns its own data-minimization; do not forward it to
+    /// an untrusted sink.</para></summary>
     public string? TargetType { get; private init; }
 
-    /// <summary>The dotted expression path to the offending element; non-null for path-aware throws.</summary>
+    /// <summary>The dotted expression path to the offending element; non-null for path-aware throws.
+    /// <para><b>Privacy channel (#707):</b> this raw path is built from <b>foreign schema field names</b>
+    /// (dotted/<c>element</c>/<c>key</c>/<c>value</c> segments) — potential personal data. It is deliberately
+    /// kept off the rendered <see cref="Exception.Message"/>/<c>ToString</c> (which carry the
+    /// sanitized, length-bounded path via <c>DiagnosticText.Sanitize</c>) and exposed here only for an
+    /// <b>entitled</b> owner. A consumer that logs or destructures this property owns its own
+    /// data-minimization; do not forward it to an untrusted sink.</para></summary>
     public string? Path { get; private init; }
 
     /// <summary>
     /// Builds an exception naming the source type, target type, and expression path. The path
     /// uses dotted/<c>element</c>/<c>key</c>/<c>value</c> segments so nested mismatches are precise.
     /// </summary>
+    /// <remarks>
+    /// #707 — adjudicated <b>by predicate</b>: at the throw site (<c>TypeCoercion.EnsureCoercible</c> →
+    /// <c>TryCoerce</c>) the recursion descends into element/key/value/field types, so <paramref name="source"/>
+    /// and <paramref name="target"/> <b>can be a non-atomic</b> <see cref="StructType"/>/<see cref="ArrayType"/>/
+    /// <see cref="MapType"/> — e.g. coercing <c>array&lt;struct&lt;…&gt;&gt;</c> to <c>array&lt;int&gt;</c>
+    /// fails with a struct on one side. <see cref="StructType.SimpleString"/> recursively appends every nested
+    /// field name verbatim, so echoing it raw is an unbounded, un-neutralized foreign-name echo (the #705/#686
+    /// defect class). The <paramref name="path"/> is likewise built from foreign schema field names.
+    /// <para>
+    /// So the <b>message</b> echoes the bounded <em>kind</em> (<see cref="DataType.TypeName"/>) for a
+    /// non-atomic type — structurally bounded, not merely capped — and the safe atomic
+    /// <see cref="DataType.SimpleString"/> otherwise (keeping e.g. <c>decimal(10,2)</c> precision), and the
+    /// path is sanitized and length-bounded. The exact raw types/path remain on the typed
+    /// <see cref="SourceType"/>/<see cref="TargetType"/>/<see cref="Path"/> channel for a caller entitled to
+    /// them.
+    /// </para>
+    /// </remarks>
     public static TypeCoercionException ForPath(DataType source, DataType target, string path) =>
-        new($"Cannot coerce '{source.SimpleString}' to '{target.SimpleString}' at '{path}'.")
+        new(string.Create(
+            CultureInfo.InvariantCulture,
+            $"Cannot coerce '{DescribeTypeForMessage(source)}' to '{DescribeTypeForMessage(target)}' at " +
+            $"'{DiagnosticText.Sanitize(path)}'."))
         {
             SourceType = source.SimpleString,
             TargetType = target.SimpleString,
             Path = path,
         };
+
+    // #707: echo the bounded KIND for a non-atomic type (SimpleString would recurse over foreign field
+    // names); the atomic SimpleString is safe and short, so it survives verbatim to keep decimal precision.
+    private static string DescribeTypeForMessage(DataType type) =>
+        type is ArrayType or MapType or StructType ? type.TypeName : type.SimpleString;
 }
 
 /// <summary>

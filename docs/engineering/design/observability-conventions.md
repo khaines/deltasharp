@@ -291,8 +291,10 @@ rendering it**, not by a redactor:
 - **Paths → the redactor for that layer.** In the **Core plan/logical** layer, route every data-source path
   through the existing centralized primitive `SecretRedaction.RedactPath`
   (`src/DeltaSharp.Core/Plans/Logical/SecretRedaction.cs`) before it enters a log line, an exception
-  message, or any diagnostic. It is a best-effort textual mask that redacts `userinfo` passwords and the
-  values of credential-bearing **query-string** parameters (`?sig=`/`&token=`/`&X-Amz-Signature=`, …). Do
+  message, or any diagnostic. It is a best-effort textual mask that redacts the entire `userinfo`
+  credential (colon-delimited, colon-less, or carrying an interior `?`/`#`, except the ADLS/WASB
+  `container@account` bucket-identity) and the values of credential-bearing **query-string** parameters
+  (`?sig=`/`&token=`/`&X-Amz-Signature=`/`&jwt=`, …). Do
   not re-implement it *within Core's reach*. It is the same primitive already applied when plan trees,
   `Explain` output, and analysis diagnostics render a path (`src/DeltaSharp.Core/Analysis/AnalysisException.cs`,
   `src/DeltaSharp.Executor/Physical/SinkRegistry.cs`,

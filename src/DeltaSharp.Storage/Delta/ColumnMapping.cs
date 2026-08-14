@@ -166,6 +166,13 @@ internal static class ColumnMapping
     // physical name is "col-<uuid>" = 40 bytes; a logical partition name is typically far shorter) while
     // guaranteeing >=127 bytes of headroom for "=value". A crafted ~300-byte name is rejected fail-closed at
     // commit/load instead of failing a later partitioned write at the path-resolution/confined-root guard.
+    //
+    // RESIDUAL (#806): this bound is on the RAW name in UTF-8 bytes, but since #708 the NAME is ALSO
+    // Uri.EscapeDataString-encoded into the segment (previously only the value was). An all-non-ASCII 128-byte
+    // name expands to ~384 encoded characters (each byte -> "%XX"), which can exceed NAME_MAX for the ENCODED
+    // segment even though the raw name passes this check. Tightening the budget to the ENCODED length (or
+    // adopting Spark's escapePathName alphabet) is tracked with the broader path-encoding parity work under
+    // #806; today the fail-closed direction is a later confined-root/path-resolution guard, not disclosure.
     private const int MaxPathSegmentNameBytes = 128;
 
     // Judges whether <segment> is a SAFE single filesystem path segment — the shared core of the
@@ -382,12 +389,14 @@ internal static class ColumnMapping
     /// <para><b>Not a gap — the name→path dimension is complete across all modes (#572 R7).</b> Every
     /// metaData-controlled name that becomes a filesystem path segment is safe-segment + length validated: the
     /// mapped physicalName (name/id, here); the logical partition name (none, at the committer). A partition
-    /// <b>value</b> is percent-encoded (<c>Uri.EscapeDataString</c>) into its directory segment, so a
-    /// slash/traversal/control value is neutralised at write time (it is data, not committed metaData); the
+    /// <b>name AND value</b> are percent-encoded (<c>Uri.EscapeDataString</c>) into the directory segment
+    /// (since #708 the NAME too, not only the value), so a slash/traversal/control character in either is
+    /// neutralised at write time (the value is data, not committed metaData); the
     /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>
     /// legality imposes nothing (Parquet.Net 6.0.3 round-trips ANY column name verbatim — empirically verified),
     /// so the binding constraint on a physical name is uniformly the partition-directory path, not the
-    /// footer.</para>
+    /// footer. (Note: the length bound is on the RAW name; the ENCODED-length residual for an all-non-ASCII
+    /// name is tracked under #806 — see <c>MaxPathSegmentNameBytes</c>.)</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A nested (non-leaf) mapped column, a missing/empty physical
     /// name, an unsafe (non-path-segment) physical name, a duplicate physical name, a missing id, a

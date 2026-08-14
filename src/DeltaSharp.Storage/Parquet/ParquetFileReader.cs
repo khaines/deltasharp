@@ -1779,9 +1779,12 @@ internal sealed class ParquetFileReader
                     .ConfigureAwait(false);
                 break;
             default:
+                // #705 predicate: ResolveFileFields diverts Array/Map/Struct to NestedParquetColumnReader before
+                // this switch, so requestedField.DataType is scalar here. DescribeType bounds a future non-atomic
+                // kind rather than recursing into raw nested field names.
                 throw DeltaStorageException.UnsupportedFeature(
                     $"Parquet read for column '{DiagnosticText.Sanitize(requestedField.Name)}' of type "
-                    + $"'{requestedField.DataType.SimpleString}' is not supported.");
+                    + $"'{DiagnosticText.DescribeType(requestedField.DataType)}' is not supported.");
         }
     }
 
@@ -1884,9 +1887,11 @@ internal sealed class ParquetFileReader
 
             default:
                 // Unreachable: ValidateFileField only admits the sanctioned widenings handled above.
+                // #705 predicate: both operands are scalar (widening is scalar-only); DescribeType bounds a
+                // future non-atomic kind rather than recursing into raw nested field names.
                 throw DeltaStorageException.SchemaMismatch(
                     $"Column '{DiagnosticText.Sanitize(requestedField.Name)}': cannot promote physical type "
-                    + $"'{physicalType.SimpleString}' to requested '{requestedField.DataType.SimpleString}'.");
+                    + $"'{DiagnosticText.DescribeType(physicalType)}' to requested '{DiagnosticText.DescribeType(requestedField.DataType)}'.");
         }
     }
 

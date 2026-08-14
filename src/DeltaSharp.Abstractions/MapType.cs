@@ -26,7 +26,7 @@ public sealed class MapType : DataType
         if (keyType is NullType or MapType)
         {
             throw new SchemaValidationException(
-                $"Map key type '{keyType.SimpleString}' is not supported; "
+                $"Map key type '{keyType.TypeName}' is not supported; "
                 + "map keys must not be the null type or a map type.");
         }
 

@@ -57,14 +57,16 @@ internal readonly record struct OrphanDecision(string Path, OrphanClassification
 ///
 /// <para><b>Path-encoding robustness (data-loss critical).</b> Delta's protocol URI-encodes the file paths
 /// stored in the log (<c>add.path</c>/<c>remove.path</c>): a file literally named <c>a b.parquet</c> on disk
-/// is recorded as <c>a%20b.parquet</c> in the log. DeltaSharp writes unencoded paths (its own tables
-/// round-trip), but a Spark-written / Delta-protocol table has encoded log paths, while a directory listing
-/// always yields the raw disk key. Matching a raw candidate against only the raw log path would classify the
-/// still-active <c>a b.parquet</c> as an orphan and delete it. The protected sets are therefore the
-/// <b>union</b> of each log path and its <see cref="Uri.UnescapeDataString(string)"/> decoding, and the raw
-/// candidate key is tested against that union. This protects both DeltaSharp-unencoded and Spark-encoded
-/// tables; it can only ever <i>over</i>-protect (a rare filename containing a literal <c>%</c> sequence that
-/// happens to decode to another candidate's name), never over-delete.</para>
+/// is recorded as <c>a%20b.parquet</c> in the log. As of #708 DeltaSharp writes <b>percent-encoded</b> Hive
+/// keys AND values (<c>Uri.EscapeDataString</c> on both the partition column name and the value), but tables
+/// written BEFORE #708 carry raw unencoded keys, and a Spark-written / Delta-protocol table encodes with a
+/// different alphabet — while a directory listing always yields the raw disk key. Matching a raw candidate
+/// against only the raw log path would classify the still-active <c>a b.parquet</c> as an orphan and delete
+/// it. The protected sets are therefore the <b>union</b> of each log path and its
+/// <see cref="Uri.UnescapeDataString(string)"/> decoding, and the raw candidate key is tested against that
+/// union. This protects legacy-raw, current DeltaSharp-encoded, and Spark-encoded tables alike; it can only
+/// ever <i>over</i>-protect (a rare filename containing a literal <c>%</c> sequence that happens to decode to
+/// another candidate's name), never over-delete.</para>
 ///
 /// <para><b>Referenced-path assumption (non-<c>add.path</c> references).</b> The active/tombstone protected
 /// sets are built from <c>add.path</c> and <c>remove.path</c>. Two classes of file are referenced by

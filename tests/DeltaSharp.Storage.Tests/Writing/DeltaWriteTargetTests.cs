@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage;
@@ -217,6 +218,166 @@ public sealed class DeltaWriteTargetTests : IDisposable
         Assert.Equal(
             new (string?, long, string?)[] { ("EU", 2L, "bob"), ("US", 9L, "zoe") },
             Sorted(rows));
+    }
+
+    // ---------------------------------------------------------------- #708 hostile partition column name
+
+    [Fact]
+    public async Task Append_PartitionColumnNameWithSpaceAndQuote_IsPercentEncodedInPath_AndRoundTrips()
+    {
+        // #708: a legal-but-hostile partition column name (space AND quote) must be percent-encoded into
+        // add.path (BOTH key and value), yet round-trip correctly on read because partition truth lives in
+        // add.partitionValues, not in the directory string. This also retires the write-path half of the
+        // Hive-redaction residual #714 (a DeltaSharp-authored key can no longer carry a quote or whitespace).
+        const string hostileColumn = "my col'x";
+        var schema = new StructType(new[]
+        {
+            new StructField(hostileColumn, DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+
+        MutableColumnVector partition = ColumnVectors.Create(DataTypes.StringType, 2);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 2);
+        AppendString(partition, "east");
+        id.AppendValue(1L);
+        AppendString(partition, "west");
+        id.AppendValue(2L);
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { partition, id }, 2);
+
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(schema, new[] { hostileColumn }, new[] { batch });
+
+        Snapshot snapshot = await LoadSnapshotAsync();
+        Assert.Equal(2, snapshot.ActiveFiles.Length);
+
+        foreach (AddFileAction add in snapshot.ActiveFiles)
+        {
+            // The physical directory is percent-encoded: neither the raw space nor the raw quote survive.
+            Assert.DoesNotContain(' ', add.Path);
+            Assert.DoesNotContain('\'', add.Path);
+            Assert.Contains("my%20col%27x=", add.Path, StringComparison.Ordinal);
+
+            // Partition truth is preserved under the RAW logical column name in add.partitionValues.
+            Assert.True(add.PartitionValues.ContainsKey(hostileColumn));
+
+            // The value directory is also encoded, and the physical file exists at exactly add.path.
+            string full = Path.Combine(_root, add.Path);
+            Assert.True(File.Exists(full), $"expected data file at encoded path {add.Path}");
+        }
+
+        Assert.Equal(
+            new[] { "east", "west" },
+            snapshot.ActiveFiles
+                .Select(a => a.PartitionValues[hostileColumn])
+                .OrderBy(v => v, StringComparer.Ordinal));
+    }
+
+    // ---------------------------------------------------------------- #708 segment integrity (D4)
+
+    [Theory]
+    [InlineData("a/b")]     // a raw '/' would fabricate a spurious path segment
+    [InlineData("a=b")]     // a raw '=' would fabricate a second Hive key/value split
+    [InlineData("région")]  // a non-ASCII name (Uri.EscapeDataString differs from Spark escapePathName)
+    public void HivePartitionSegment_HostileColumnName_IsSingleInjectionSafeSegment(string column)
+    {
+        // #708: a legal-but-hostile partition column NAME must render as exactly ONE directory segment with
+        // exactly ONE structural '=' (the Hive key/value separator) and no embedded '/'. The encoding is a
+        // directory-injection hardening, NOT parity with Spark's escapePathName alphabet (see #806).
+        //
+        // NOTE: a raw ".." is NOT neutralized by this ENCODER (Uri.EscapeDataString treats '.' as unreserved,
+        // so ".." survives verbatim) — the '..' path-climb control is the committer guard
+        // EnsureNoneModePartitionNamesSafe / FindUnsafePathSegmentReason, tested separately, not this encoder.
+        string segment = DeltaWriteEncoding.HivePartitionSegment(column, "v");
+
+        Assert.DoesNotContain('/', segment);                 // no fabricated sub-directory
+        Assert.Equal(1, segment.Count(c => c == '='));       // exactly one structural key/value split
+        // The raw hostile name never appears verbatim in the segment (each of these rows is percent-encoded,
+        // so this assertion is DISCRIMINATING — it fails if the name encoding is removed).
+        Assert.DoesNotContain(column, segment, StringComparison.Ordinal);
+        // The value half is intact.
+        Assert.EndsWith("=v", segment, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Append_PartitionValueWithSlash_LandsOneDirDeep_AndRoundTrips()
+    {
+        // #708 end-to-end: a partition VALUE literally containing "a/b" must land the data file exactly ONE
+        // directory deep (the '/' is percent-encoded, not a real separator), and partition truth must key on
+        // the RAW logical value "a/b" in add.partitionValues — never on the encoded directory string. (A
+        // hostile partition NAME containing '/' is separately rejected in none mode by the commit guard
+        // EnsureNoneModePartitionNamesSafe; HivePartitionSegment encoding is the defense-in-depth second layer
+        // for the chars that guard permits, and the sole layer for VALUES.)
+        var schema = new StructType(new[]
+        {
+            new StructField("region", DataTypes.StringType, nullable: true),
+            new StructField("id", DataTypes.LongType, nullable: false),
+        });
+
+        MutableColumnVector partition = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        AppendString(partition, "a/b");
+        id.AppendValue(1L);
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { partition, id }, 1);
+
+        using DeltaWriteTarget target = Target();
+        await target.AppendAsync(schema, new[] { "region" }, new[] { batch });
+
+        Snapshot snapshot = await LoadSnapshotAsync();
+        AddFileAction add = Assert.Single(snapshot.ActiveFiles);
+
+        // Exactly one '/' in the relative path: it separates the single partition directory from the file
+        // name. The '/' inside the VALUE was encoded to %2F and did NOT fabricate a second directory.
+        Assert.Equal(1, add.Path.Count(c => c == '/'));
+        Assert.Contains("region=a%2Fb/", add.Path, StringComparison.Ordinal);
+        Assert.DoesNotContain("region=a/b", add.Path, StringComparison.Ordinal);
+
+        // Partition truth keys on the RAW logical value, not the encoded directory.
+        Assert.Equal("a/b", add.PartitionValues["region"]);
+
+        // The physical file exists at exactly add.path (one directory deep).
+        Assert.True(File.Exists(Path.Combine(_root, add.Path)), $"expected data file at {add.Path}");
+    }
+
+    [Theory]
+    [InlineData("my col'x", "east")] // space + quote in the name
+    [InlineData("région", "nord")]   // non-ASCII name AND value
+    [InlineData("a=b", "c=d")]       // '=' in both name and value
+    public void DataFilePath_And_BuildOutputPath_ProduceIdenticalPartitionPrefix(string column, string value)
+    {
+        // #708 differential parity: the write path (DeltaWriteTarget.DataFilePath) and the compaction path
+        // (DeltaOptimize.BuildOutputPath) MUST compose an identical partition-directory prefix for the same
+        // (column, value), so a freshly-written and a compacted output share the same on-disk layout. Both
+        // are the single source of truth DeltaWriteEncoding.HivePartitionSegment; this pins that neither side
+        // drifts to a private encoding. BuildOutputPath is invoked via its non-public surface by reflection.
+        var partitionValues = System.Collections.Immutable.ImmutableSortedDictionary
+            .CreateRange(new[] { new KeyValuePair<string, string?>(column, value) });
+
+        string writePath = DeltaWriteTarget.DataFilePath(
+            new[] { column }, partitionValues, "TOKEN");
+        string writePrefix = writePath[..(writePath.LastIndexOf('/') + 1)];
+
+        string optimizePrefix = InvokeBuildOutputPathPrefix(partitionValues, ImmutableArray.Create(column));
+
+        Assert.Equal(writePrefix, optimizePrefix);
+        // And both agree with the shared primitive (the only encoder either side is allowed to use).
+        Assert.Equal(
+            DeltaWriteEncoding.HivePartitionSegment(column, value) + "/", writePrefix);
+    }
+
+    // Invokes the private DeltaOptimize.BuildOutputPath and returns just the partition-directory prefix
+    // (everything up to and including the last '/'), decoupling the parity assertion from the file-name nonce.
+    private string InvokeBuildOutputPathPrefix(
+        System.Collections.Immutable.ImmutableSortedDictionary<string, string?> partitionValues,
+        ImmutableArray<string> partitionColumns)
+    {
+        var backend = new LocalFileSystemBackend(_root);
+        var optimize = new DeltaOptimize(
+            backend, new DeltaLog(backend), compactedFileNameFactory: () => "TOKEN");
+        var method = typeof(DeltaOptimize).GetMethod(
+            "BuildOutputPath",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        string path = (string)method.Invoke(optimize, new object[] { partitionValues, partitionColumns })!;
+        return path[..(path.LastIndexOf('/') + 1)];
     }
 
     // ---------------------------------------------------------------- unpartitioned
