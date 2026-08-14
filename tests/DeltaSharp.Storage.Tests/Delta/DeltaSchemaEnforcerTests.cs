@@ -43,7 +43,8 @@ public sealed class DeltaSchemaEnforcerTests
     public void NullTypeColumn_IsAlsoRejectedByThePerFileParquetGuard()
     {
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(new StructField("n", DataTypes.NullType, nullable: true)));
+            () => ParquetTypeMapping.CreateField(
+                new StructField("n", DataTypes.NullType, nullable: true), honorReferenceNullability: false));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, ex.Kind);
         Assert.Contains("is not supported", ex.Message, StringComparison.Ordinal);
