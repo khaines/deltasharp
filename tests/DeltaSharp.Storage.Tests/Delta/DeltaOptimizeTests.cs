@@ -116,6 +116,13 @@ public sealed class DeltaOptimizeTests : IDisposable
     // monotonically increasing counter yields a stable, reproducible directory name with NO nondeterministic
     // identity source (the banned Guid.NewGuid / Random / DateTime). Each root is also pre-cleaned in the
     // constructor so a directory left behind by a crashed prior run can never leak into a later test.
+    //
+    // #566: the counter alone is only per-PROCESS unique, so two concurrent same-host `dotnet test`
+    // invocations of this class both start at seq 1 and collide on the SAME temp root, cross-contaminating
+    // each other's tables. Environment.ProcessId is folded into the name to make the root cross-process
+    // unique: it is stable within a process (so the name stays reproducible for a given run) yet distinct
+    // across concurrent processes, and — unlike Guid.NewGuid / Random / DateTime — it is not a banned
+    // nondeterministic identity source.
     private static int _sequence;
 
     private readonly string _root;
@@ -126,7 +133,9 @@ public sealed class DeltaOptimizeTests : IDisposable
         int seq = System.Threading.Interlocked.Increment(ref _sequence);
         _root = Path.Combine(
             Path.GetTempPath(),
-            "optimize-tests-" + seq.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            string.Create(
+                System.Globalization.CultureInfo.InvariantCulture,
+                $"optimize-tests-p{System.Environment.ProcessId}-{seq}"));
         if (Directory.Exists(_root))
         {
             Directory.Delete(_root, recursive: true);
@@ -148,6 +157,16 @@ public sealed class DeltaOptimizeTests : IDisposable
     }
 
     // ---------------------------------------------------------------- AC1: compact → one commit
+
+    // #566 guard: the per-test temp root MUST fold Environment.ProcessId into its name so two concurrent
+    // same-host `dotnet test` invocations of this class do not both start at seq 1 and collide on the SAME
+    // root (cross-contaminating each other's tables). Mirrors OperatorSpillTests' deltasharp-spill-{pid}-
+    // pin: removing the `p{ProcessId}` fold makes this assert go RED.
+    [Fact]
+    public void TempRoot_FoldsProcessId_ForCrossProcessUniqueness()
+    {
+        Assert.Contains($"p{System.Environment.ProcessId}", _root);
+    }
 
     [Fact]
     public async Task Optimize_WritesOptimizeCommitInfo()

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Unit tests for DeltaSharp.Abstractions (#706). Multi-targets net8.0;net10.0 to MATCH the assembly
+    under test (ADR-0014) — the shared message-hygiene primitive DeltaSharp.Diagnostics.DiagnosticText
+    ships on both TFMs, so its primary astral/boundary guard suite must run on both, not only the
+    net10.0 slice a Storage-owned test project could exercise. The xUnit toolchain, coverage collector,
+    NuGet lock-file policy, and deterministic-seed harness are inherited from tests/Directory.Build.props
+    (STORY-00.5.1). Not packable. The InternalsVisibleTo grant is auto-injected by Directory.Build.props
+    (the "$(MSBuildProjectName).Tests" rule), so no visibility wiring is needed here.
+  -->
+  <PropertyGroup>
+    <TargetFrameworks>net8.0;net10.0</TargetFrameworks>
+    <RootNamespace>DeltaSharp.Abstractions.Tests</RootNamespace>
+    <AssemblyName>DeltaSharp.Abstractions.Tests</AssemblyName>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../../src/DeltaSharp.Abstractions/DeltaSharp.Abstractions.csproj" />
+  </ItemGroup>
+
+</Project>

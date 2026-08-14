@@ -58,6 +58,14 @@ T:System.Security.Cryptography.HMACSHA1;[security] HMAC-SHA1 builds a MAC on the
 M:DeltaSharp.SqlParseException.#ctor(System.String);[security] SqlParseException(string) can interpolate a raw lexeme into a diagnostic message, bypassing SqlParser.Describe kind-rendering and the EchoedTokenMaxLength cap (#687). Build diagnostics through SqlParseException.Syntax/Unsupported/NestingTooDeep/ConstraintNestingTooDeep; RS0030 has NO exemption here — a new fixed-prose diagnostic needs a no-source-text factory (the NestingTooDeep/ConstraintNestingTooDeep pattern), not a pragma.
 M:DeltaSharp.SqlParseException.#ctor(System.String,System.Exception);[security] SqlParseException(string, Exception) can interpolate a raw lexeme into a diagnostic message, bypassing SqlParser.Describe kind-rendering and the EchoedTokenMaxLength cap (#687). Build diagnostics through SqlParseException.Syntax/Unsupported/NestingTooDeep/ConstraintNestingTooDeep; RS0030 has NO exemption here — a new fixed-prose diagnostic needs a no-source-text factory (the NestingTooDeep/ConstraintNestingTooDeep pattern), not a pragma.
 
+// === Path-disclosure hygiene: force every PathDescription through the partition-value-dropping renderer
+// (#696/#700) so no raw Hive-encoded add.path (partition VALUES and all) can reach a diagnostic message or
+// a LoggerMessage sink. A string does NOT convert to PathDescription implicitly (the copy-paste bare-string
+// vector is a compile error) and Value is get-only (with { Value = raw } cannot re-init a described path);
+// this ban closes the last vector — a direct new PathDescription(raw). RS0030's SOLE sanctioned exemption is
+// DiagnosticText.DescribePath's suppressed call site (#700). See sql-door.md / the PathDescription docstring. ===
+M:DeltaSharp.Storage.Delta.PathDescription.#ctor(System.String);[security] Construct a PathDescription ONLY via DiagnosticText.DescribePath, so the #696 partition-value-disclosure control (drop Hive partition VALUES before a path reaches a diagnostic/LoggerMessage sink) is provably applied; a direct `new PathDescription(raw)` forges a "described" path from an unsanitized string. RS0030's sole sanctioned exemption is DescribePath's suppressed call site (#700).
+
 // === Telemetry tenant-scrubbing: an exception recorded onto a span/Activity captures its raw
 // exception.message as a span attribute, and DeltaSharp diagnostics deliberately name the resource
 // (AnalysisException.TableOrViewNotFound embeds the table identifier; SinkDescriptor/EXPLAIN render
