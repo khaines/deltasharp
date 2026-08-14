@@ -30,7 +30,7 @@ reads, **coverage-neutral by construction** and preserving the gate's two hard c
 
 1. **Deterministic "earliest offending version" error** (#690). Today the sequential in-ascending-order loop
    makes first-failure == earliest offender for free. Under concurrency, failures complete out of order, so the
-   surfaced version must come from an explicit **min-offending-version reduction** — never first-failure-wins —
+   surfaced version must come from an explicit **min-faulting-version reduction** — never first-failure-wins —
    so the reported version is identical regardless of GET-completion order or the concurrency bound.
 2. **Fail-closed ordering.** The gate still completes **in full** before any change row is yielded; a partial or
    failed read fails the whole gate closed. Concurrency changes only *how fast* the reads happen, never
@@ -59,19 +59,18 @@ graph TD
     C --> D{Per pre-range version v < start}
     D -->|observer PROVES v<br/>#712 in-memory| E[Validate from observed metaData<br/>no I/O — RECORD verdict]
     D -->|below-floor / un-observed| F[Bounded-concurrency fan-out<br/>read v.json + validate — RECORD verdict]
-    Bl -->|RECORD verdict| G[Min-offending-version reduction<br/>spans ALL three sources]
+    Bl -->|RECORD fault| G[Min-FAULTING-version reduction<br/>spans ALL three sources<br/>offense OR infra fault]
     E --> G
     F --> G
-    G --> Dr[Drain: await every scheduled task]
+    G --> Dr[Drain: await + observe every task]
     Dr -->|all clean| H[Gate passes → yield change rows]
-    Dr -->|any offender| I[Throw the MIN offending version's<br/>captured exception #690]
-    Dr -->|infra fault| J[Fail gate CLOSED<br/>observed after drain, not a #690 offender]
+    Dr -->|min faulting version| I[Throw its captured exception<br/>offense #690 or infra — FAIL CLOSED<br/>on the normal path, never from finally]
 ```
 
 The change from today is **local**: the `foreach (long version in listing.Commits)` loop keeps its exact
 membership predicate and per-version validation, but (a) the **disk-read branch** is executed as a bounded
 fan-out, and (b) **every** validation source — the disk reads, the in-memory observer-proven versions, and the
-baseline-at-`earliest` — **records** its verdict into a single **min-offending-version reduction** rather than
+baseline-at-`earliest` — **records** its verdict into a single **min-faulting-version reduction** rather than
 throwing inline. The gate surfaces a failure only **after the full drain**, so no offender's version depends on
 GET-completion order.
 
@@ -102,50 +101,60 @@ GETs.)
 > observer version could pre-empt a still-in-flight *lower* stray's offense — a latency-dependent #690 break.
 > Recording all sources into the reduction and throwing only after the drain removes that hazard by construction.
 
-### 2.3 Deterministic min-offending-version reduction (the crux)
+### 2.3 Deterministic min-faulting-version reduction (the crux)
 
-Under concurrency, per version there are two disjoint outcome classes. **Fail-closed offenses** — an **identity
-mismatch** (`ColumnMappingIdentityNotImmutable`, an `Unsupported` protocol error), a **malformed commit**
-(`DeltaProtocolException.Malformed` — unparseable JSON / schemaString / >1 `metaData`), or a **read-ceiling /
-object-too-large** fault (`DeltaProtocolException.Inconsistent`) — are attributable to a specific version and
-feed the min reduction. **Infra faults** — a transient `IOException` / `DeltaStorageException` / a foreign-token
-`OperationCanceledException` — are **not** a #690 "offending version"; they are handled separately (below).
-#690 pins that the surfaced offense **names the earliest offending version**. Today's in-order sequential throw
-satisfies this incidentally; a naive fan-out that lets the first-completing failure propagate (e.g.
-`Parallel.ForEachAsync`'s default first-exception-cancels behaviour) is **non-deterministic** — the reported
-version would depend on GET latency, so two identical reads of a forged table could name different versions.
-That is both a test-contract break (#690) and a subtle **information-consistency** weakness (§6).
+Under concurrency, per version there is at most **one** outcome, and any non-clean outcome fails the gate
+closed. Two *kinds* of fault exist. **Offenses** — an **identity mismatch** (`ColumnMappingIdentityNotImmutable`,
+an `Unsupported` protocol error), a **malformed commit** (`DeltaProtocolException.Malformed` — unparseable JSON
+/ schemaString / >1 `metaData`), or a **read-ceiling / object-too-large** fault
+(`DeltaProtocolException.Inconsistent`) — a version the gate could *read* but which fails validation.
+**Infra faults** — a transient `IOException` / `DeltaStorageException` / a foreign-token
+`OperationCanceledException` — a version the gate could *not* read at all. #690 pins that the surfaced failure
+**names the earliest offending version**. Crucially, **today's sequential ascending loop fails closed at the
+FIRST fault of *either* kind** — an `IOException` at v=5 throws immediately, before v=10 is ever read — so the
+faithful, deterministic contract is a single reduction over **both** kinds keyed on version, **not** a
+two-slot "offenses beat infra faults" scheme (which would falsely name a *higher* offense while a *lower*
+version was unreadable, and would fail to stop the scan at the earlier fault — an I/O storm and a bound = 1
+read-set divergence from today, per the design red-team).
 
-**Contract.** The gate surfaces the failure of the **numerically smallest offending version across ALL three
-validation sources** (baseline-at-`earliest`, observer-proven, disk-read) **and all fail-closed kinds**,
-deterministically, independent of completion order and of the concurrency bound (including bound = 1).
-Mechanically:
+**Contract.** The gate surfaces the captured exception of the **numerically smallest FAULTING version across
+ALL three validation sources** (baseline-at-`earliest`, observer-proven, disk-read) **and BOTH fault kinds**
+(offense or infra), deterministically, independent of completion order and of the concurrency bound (including
+bound = 1). The exception surfaced is exactly what occurred *at that smallest faulting version* — an offense
+surfaces its `ColumnMappingIdentityNotImmutable` / `Malformed` / `Inconsistent`; an infra fault surfaces its
+`IOException` etc. (so an infra fault is **never mislabelled as a #690 identity offense**, yet it is **never
+swallowed** and it **does** count as a fault for the min). Mechanically:
 
 - Every validation site — the baseline, each observer-proven version, and each fan-out task — **catches its own**
-  fail-closed exception (never lets it escape, so no sibling-cancelling `AggregateException` and no inline throw)
-  and offers `(version, exception)` to a shared **min reduction**.
-- The reduction keeps the offender with the **smallest version** as **one atomic unit**. Because `(version,
+  exception (offense or infra; never lets it escape, so no sibling-cancelling `AggregateException` and no inline
+  throw) and offers `(version, exception)` to a shared **min-faulting-version reduction**.
+- The reduction keeps the fault with the **smallest version** as **one atomic unit**. Because `(version,
   exception)` is a *pair* (a `long` and an `Exception` reference), a compare-and-set on the `long` alone would
   tear (thread A publishes `min=5` then thread B lowers `min=3` while A's exception store wins → `(min=3,
   exception-for-5)`). The reduction therefore updates the pair atomically — either a `lock` around the
-  compare-and-update (offenders are rare — a forged table only — and the happy path never enters it, so
+  compare-and-update (faults are rare — a forged/failing table only — and the happy path never enters it, so
   contention is nil), or an `Interlocked.CompareExchange` on a single reference to an immutable
-  `sealed record Offender(long Version, Exception Ex)` in a min-CAS loop. Versions are unique, so ties are
-  impossible.
+  `sealed record Fault(long Version, Exception Ex)` in a min-CAS loop. Versions are unique and one outcome per
+  version, so ties are impossible.
+- The current min-faulting-version **also arms the skip (§2.4)**: once a fault at `X` is recorded, versions
+  `> X` need not be launched — matching today's fast-fail (today stops reading at the first fault) and
+  preventing an infra fault from triggering a full-history scan.
 - After the fan-out **drains** (every scheduled task awaited and its result observed — never abandoned), the gate
-  re-throws the min offender's **captured exception**, preserving its original type and path-free message (#653).
-  Otherwise the gate passes.
-- **Ordering across kinds is by version only** — a malformed commit at v=5 outranks an identity mismatch at
-  v=9. This is the honest generalisation of "earliest offending version": the earliest version that fails the
-  gate *for any reason* is surfaced.
+  re-throws the min faulting version's **captured exception**, preserving its original type and path-free
+  message (#653). Otherwise the gate passes. **This re-throw happens on the normal completion path (in the
+  `try`, after `await WhenAll`), never from a `finally`** — so it can never overwrite a propagating caller
+  `OperationCanceledException` (§2.6).
+- **Ordering across kinds is by version only** — a fault (of either kind) at v=5 outranks any fault at v=9.
+  This is the honest generalisation of "earliest offending version": the earliest version that fails the gate
+  *for any reason* is surfaced, exactly as today's ascending scan would.
 
-> **Infra faults fail the gate CLOSED without becoming a #690 offender.** A non-offense read fault (transient
-> IO, storage-object vanished, an OCE bearing a token that is neither the caller's nor an internal one) must
-> **not** be swallowed (that would fail *open*) and must **not** be mislabelled as an offending version at that
-> version (that would corrupt #690). It is captured into a **separate** infra-fault slot; after the drain, the
-> gate throws the min *offender* if one exists (an infra fault never masks a smaller genuine offense), otherwise
-> it re-throws the infra fault (fail-closed, observed deterministically after all siblings complete). This keeps
-> the reduction's version semantics clean while never yielding a change row on any fault.
+> **Why unify rather than prioritise offenses.** An infra fault at v=5 means v=5 is *unreadable* — the gate
+> cannot know whether v=5 is an offender. Claiming a *higher* readable offense at v=10 is "the earliest
+> offending version" is false (v=5's status is unknown) and diverges from today (which throws the v=5 IO error
+> and never reaches v=10). Unifying makes the surfaced version the smallest *faulting* version — always
+> fail-closed, always deterministic, always ≤ today's surfaced version, and it arms the skip so a transient
+> fault fast-fails instead of scanning the whole history. A lower genuine offense is **never** masked by a
+> higher infra fault (min by version), and vice-versa.
 
 > **Relationship to today's order (a deliberate #690 tightening).** Today the baseline validates `earliest`
 > **before** the ascending loop, and `earliest` (the checkpoint floor) typically sits *above* the surviving
@@ -158,23 +167,26 @@ Mechanically:
 
 ### 2.4 Safe early-skip (pruning) — skip not-yet-started only, never cancel in-flight
 
-Validating all ~10k versions even after an early offender is found is wasteful, but **in-flight** cancellation
-is where determinism (and safety) breaks. Chosen rule: once an offender at version `X` is recorded, the
+Validating all ~10k versions even after an early fault is found is wasteful (and, for an infra fault, would
+turn a transient failure into a full-history scan), but **in-flight** cancellation is where determinism (and
+safety) breaks. Chosen rule: once a fault (an offense **or** an infra fault) at version `X` is recorded, the
 scheduler **skips launching** any **not-yet-started** task whose version is **strictly `> X`** — it never
 cancels an already-running read. Versions `≤ X` that are not yet started, and all in-flight reads, **run to
 completion**. Rationale:
 
-- A version `> X` cannot lower the min, so never starting it changes cost, never the verdict. A skipped version
-  is provably `> X ≥ final-min`, so it is neither an offender-of-record nor a masked smaller offense.
+- A version `> X` cannot lower the min-faulting-version, so never starting it changes cost, never the verdict.
+  A skipped version is provably `> X ≥ final-min`, so it is neither a fault-of-record nor a masked smaller
+  fault. This is what makes bound = 1 stop at the first fault exactly like today's fast-fail (§8), and prevents
+  an infra fault from provoking an I/O storm.
 - **No in-flight read is cancelled** (the earlier draft cancelled `> X` in-flight reads via a shared linked
   CTS — rejected: a single `Cancel()` cancels *every* linked read, including versions `< X` that must complete,
   and it reintroduces a caller-vs-internal-token disambiguation hazard). By skipping only *not-yet-started*
   tasks, the **only** cancellation token in the whole gate is the **caller's** (§2.6) — there is no internal
   prune token, so a caller cancel can never be misclassified/swallowed.
 - On a bounded fan-out with `B ≫ bound`, the overwhelming majority of tasks are queued (not yet started) when an
-  early offender lands, so skip-not-yet-started captures essentially all of the short-circuit's saving without
-  cancelling anything. The `>` is **strict** (a version `== X` is the offender itself, already recorded; a
-  version `< X` must run). (Pinned by AC-3 / §3.5: an off-by-one `≥` would skip a smaller offender at `< X`.)
+  early fault lands, so skip-not-yet-started captures essentially all of the short-circuit's saving without
+  cancelling anything. The `>` is **strict** (a version `== X` is the fault itself, already recorded; a
+  version `< X` must run). (Pinned by AC-3 / §3.5: an off-by-one `≥` would skip a smaller fault at `< X`.)
 
 Skipping is a pure optimisation layered on §2.3; with skipping disabled the result is identical, only slower.
 The correctness proof rests on §2.3, not on §2.4.
@@ -213,11 +225,18 @@ The correctness proof rests on §2.3, not on §2.4.
   — with no internal token to confuse it with — can never be swallowed. (This retires the earlier draft's
   fragile "distinguish prune-OCE from caller-OCE by token identity", which was unsound under a linked CTS since
   both cases carry the linked token.)
-- **Drain guarantee.** The method awaits **every** admitted task (via `Task.WhenAll` over the task list inside a
-  `try` whose `finally` also drains on the exception path) before returning or throwing, and **observes every
-  task's result** — tasks never fault outward (fail-closed offenses and infra faults are both caught into their
-  reduction/infra slot and the task completes normally or cancelled), so there is no
-  `TaskScheduler.UnobservedTaskException`. No read is left running past the gate — no orphaned GET, no post-gate
+- **Drain guarantee, and re-throw OUTSIDE the `finally`.** The gate awaits **every** admitted task and
+  **observes every task's result** — tasks never fault outward (offenses and infra faults are both caught into
+  the min-faulting-version reduction and the task completes normally or cancelled), so there is no
+  `TaskScheduler.UnobservedTaskException`. The structure is: a `try` that schedules, `await Task.WhenAll(list)`,
+  and then — **on the normal completion path, still inside the `try`** — throws the min faulting version's
+  captured exception if one exists; a `finally` that (a) **drains** any already-admitted tasks if the `try`
+  exited early (e.g. a caller cancel from `WaitAsync` mid-schedule) and (b) disposes the semaphore **after** the
+  drain. The `finally` **never throws the reduction's exception** — if it did, a propagating caller
+  `OperationCanceledException` would be silently overwritten (a swallowed caller cancel, per the design
+  red-team). So a caller cancel always wins: it propagates out of the `try`, the `finally` only drains +
+  disposes, and the gate fails closed yielding nothing. The min-fault throw is reached only when the fan-out
+  completed without a caller cancel. No read is left running past the gate — no orphaned GET, no post-gate
   exception escaping into a later yield. This preserves "the gate completes before any change row is yielded"
   under concurrency (§3.4, AC-4).
 - **Resource hygiene.** `sem.Release()` is in a `finally` on every task path (no semaphore leak on offense,
@@ -293,14 +312,22 @@ change-feed read's observable results on any conforming table.
 - **No orphaned reads after a failure/cancel.** After the gate throws (offender) or the caller cancels, assert
   **no** GET completes after the method returns (a backend that records completion timestamps vs the method's
   return) — the drain awaited every admitted task. Guards a post-gate GET leaking into a later yield.
-- **Transient / infra fault → fail CLOSED, not swallowed, not a #690 offender.** Inject a transient `IOException`
-  (or `DeltaStorageException`) on one below-floor read: assert the whole gate **fails closed** (throws, yields
-  zero rows, the fault is **not** swallowed). And in a table that *also* has a genuine identity offender at a
-  **lower** version, assert the gate still surfaces that **lower identity offender** (the infra fault neither
-  masks nor pre-empts the min, and is not mislabelled as an offense at its own version).
-- **Caller cancellation fails closed.** A caller `CancellationToken` cancelled mid-fan-out throws
-  `OperationCanceledException` from the gate and yields nothing. (There is no internal prune token to
-  misclassify it against — §2.6.)
+- **Infra fault at the MIN version → its own exception surfaces (unified reduction).** Inject a transient
+  `IOException` on the below-floor read at `v=5` and a genuine identity offense at `v=10`: assert the gate throws
+  the **`v=5` `IOException`** (the smallest *faulting* version), **not** `ColumnMappingIdentityNotImmutable(10)`
+  — because v=5 is unreadable, so v=10 cannot be claimed "earliest". The gate fails closed, yields zero rows,
+  and (bound = 1) reads **stop at v=5** — assert **no read of v=10 or any version `> 5`** occurs (guards the
+  infra-fault I/O-storm / bound=1 read-set divergence). The infra exception is **not** swallowed and **not**
+  relabelled as an identity offense.
+- **Lower genuine offense outranks a higher infra fault.** Symmetric case: identity offense at `v=3` + infra
+  `IOException` at `v=5`: the gate surfaces **`v=3`'s identity offense** (the smaller faulting version), at all
+  bounds — the infra fault never masks or pre-empts a smaller genuine offense.
+- **Caller cancellation fails closed and is NEVER overwritten by the reduction throw.** A caller
+  `CancellationToken` cancelled mid-fan-out (including mid-`WaitAsync` while offenders are already recorded)
+  throws `OperationCanceledException` from the gate and yields nothing — assert the surfaced exception is the
+  **`OperationCanceledException`**, *not* a min-faulting-version exception (guards the "re-throw from `finally`
+  overwrites the caller cancel" hazard; §2.3/§2.6 put the reduction throw on the normal path, never in
+  `finally`). There is no internal token to misclassify the caller cancel against (§2.6).
 
 ### 3.5 Bounded concurrency respected (AC-2), skip-pruning & resource hygiene
 - **Max in-flight == min(bound, belowFloorCount).** A gating backend (each GET blocks on a barrier and records
@@ -389,9 +416,10 @@ change-feed read's observable results on any conforming table.
      (the existing #712 invariant is untouched).
   2. **Fail-closed on every fault.** Any below-floor read that fails (malformed, read-ceiling, identity
      mismatch) fails the whole gate closed via the reduction; an **infra fault** (transient IO / storage /
-     foreign-token OCE) fails the gate closed as an infra error observed after the drain (never swallowed, never
-     mislabelled as a #690 offender — §2.3); a skip-pruned version is provably `> min` and never started, so it
-     cannot mask a smaller offender; a *caller* cancel fails the whole gate closed (yields nothing).
+     foreign-token OCE) feeds the **same min-faulting-version reduction** and is thrown fail-closed after the
+     drain (never swallowed, never mislabelled as a #690 identity offense — §2.3); a skip-pruned version is
+     provably `> min` and never started, so it cannot mask a smaller fault; a *caller* cancel fails the whole
+     gate closed (yields nothing) and is never overwritten by the reduction throw (§2.6).
   3. **No fail-open primitive introduced.** The rejected alternatives (listing-presence, `metaData`-only,
      cross-read cache — §1) are **not** used; the gate still reads and fully parses each below-floor commit's
      own JSON, exactly as today.
@@ -421,11 +449,10 @@ graph LR
     subgraph Gate
       S[Bounded fan-out reader<br/>SemaphoreSlim bound]
       V[ValidateHistoricalIdentity pure]
-      R[Min-offending-version reduction<br/>ALL sources: baseline + observer + disk]
+      R[Min-FAULTING-version reduction<br/>ALL sources: baseline + observer + disk<br/>offense OR infra fault]
     end
     L -->|read + full parse, per version| S --> V --> R
-    R -->|min offender| X[Throw #690 earliest version]
-    R -->|infra fault| Y[Fail CLOSED after drain]
+    R -->|min faulting version exists| X[Throw its captured exception<br/>offense #690 or infra — FAIL CLOSED]
     R -->|all clean| P[Gate passes → yield]
 ```
 
@@ -433,7 +460,7 @@ graph LR
 |---|---|---|---|
 | **Tampering→mismapped-rows** | A forged pre-range commit swaps column-mapping identity below the checkpoint floor | Every below-floor commit's own JSON is read + validated (coverage-neutral set §2.2, exactly-once §3.2); mismatch → fail closed | None (unchanged from today) |
 | **Repudiation / non-determinism** | Concurrency makes the surfaced offending version latency-dependent → #690 contract flaps, and an attacker can steer *which* version is named — including across the observer/baseline/disk branches | **Min-offending-version reduction spanning ALL sources** (§2.3): every branch records (never throws inline); the smallest offending version across all sources and fault kinds is surfaced deterministically at any bound | None |
-| **Elevation (fail-open via swallowed fault)** | An infra fault (transient IO / foreign-token OCE) on a below-floor read is swallowed → an unvalidated version silently passes | Infra faults are captured and **re-thrown fail-closed after the drain**, never swallowed, never masking a smaller genuine offender (§2.3) | None |
+| **Elevation (fail-open via swallowed fault)** | An infra fault (transient IO / foreign-token OCE) on a below-floor read is swallowed → an unvalidated version silently passes | Infra faults feed the **same min-faulting-version reduction** as offenses (§2.3): the gate always throws the smallest faulting version's exception after the drain — an infra fault is **never swallowed** (fail-closed) and never masks a smaller genuine offense | None |
 | **DoS (fan-out amplification)** | Unbounded fan-out exhausts the backend connection pool / amplifies a slow-dependency stall | `SemaphoreSlim(bound)` ceiling + producer-gated admission (§2.5); bound configurable, default 16; a small gate issues only its few reads | Accepted (bounded, operator-tunable) |
 | **DoS (memory)** | ≤ bound commit buffers + ≤ bound live tasks held concurrently (vs 1 today), each buffer ≤ read ceiling | Peak = bound × `maxLogObjectBytes`; task graph bounded by producer-gated admission (§2.5); both bounded/configurable; called out §4/§8 | Accepted (bounded) |
 | **Elevation (fail-open via cancellation)** | A cancelled read silently passes a version that should have failed | Pruning **skips only not-yet-started** versions `> current-min` and **never cancels an in-flight read** (§2.4); the **only** cancellation token is the caller's, which fails the whole gate closed — so there is no internal token to misclassify a caller cancel against (retires the token-identity hazard) | None |
@@ -466,12 +493,15 @@ graph LR
 - **Kill-switch (non-optional, tested).** The concurrency bound is configurable and **`bound = 1` restores the
   sequential read set + ascending order** of today. This is the rollback lever and is **test-required** (a test
   asserts bound = 1 is identical in read set, per-version read count, and ascending order-of-read to the
-  pre-change gate). Default = 16. **One deliberate refinement to state honestly:** for a *single-offender* table
-  (every existing #671/#690 test, and every realistic forged table) the surfaced error is **identical** to
-  today at every bound. Only for a *pathological multi-offender* forged log where an offending baseline/observer
-  version at the floor coexists with a lower offending sub-floor stray does the redesign name the **numeric
-  minimum** (a deterministic #690 tightening) rather than today's baseline-first order — §2.3. This is a
-  strictly-safer, better-defined behaviour on an already-fail-closed path, not a regression.
+  pre-change gate). Default = 16. **Fast-fail preserved:** because a fault of *either* kind arms the skip
+  (§2.4), bound = 1 stops reading at the first faulting version exactly like today's sequential loop (an infra
+  fault does not provoke a full-history scan). **One deliberate refinement to state honestly:** for a
+  *single-fault* table (every existing #671/#690 test, and every realistic forged/failing table) the surfaced
+  error is **identical** to today at every bound. Only for a *pathological multi-fault* forged log where an
+  offending baseline/observer version at the floor coexists with a lower offending sub-floor stray does the
+  redesign name the **numeric minimum** (a deterministic #690 tightening) rather than today's baseline-first
+  order — §2.3. This is a strictly-safer, better-defined behaviour on an already-fail-closed path, not a
+  regression.
 - **Rollback.** Set the bound to 1 (or revert the change) → today's sequential gate. No data/metadata
   migration; no persisted state.
 - **Risk register.** Top risk = a concurrency bug that (a) drops or double-reads a version — **structurally
@@ -485,31 +515,39 @@ graph LR
   deterministic-min (AC-3) green under latency skew and across bounds — including the **cross-branch**
   (observer-high vs disk-low, and inverse), **baseline-vs-sub-floor-stray**, and mixed-fault-kind cases;
   max-in-flight == min(bound, belowFloorCount) (AC-2) green; fail-closed ordering + no-orphaned-read +
-  **transient-infra-fault-fails-closed** (AC-4) green; caller-cancel-fails-closed green; **skip-prune `>` strict
-  + lower-offender-not-skipped** green; **semaphore-replenishment** green; bound = 1 sequential equivalence
-  green; virtual-time `waves == ceil(B/bound) ± 1` + peak-memory `≈ min(bound,B) × maxLogObjectBytes` green with
-  `GET count == B` unchanged; telemetry wired path-free.
+  **infra-fault-at-min-version-surfaces-its-own-exception + no-I/O-storm (bound=1 stops at first fault) +
+  lower-offense-outranks-higher-infra-fault** (AC-4) green; **caller-cancel-fails-closed AND is not overwritten
+  by the reduction throw** green; **skip-prune `>` strict + lower-fault-not-skipped** green;
+  **semaphore-replenishment** green; bound = 1 sequential equivalence green; virtual-time
+  `waves == ceil(B/bound) ± 1` + peak-memory `≈ min(bound,B) × maxLogObjectBytes` green with `GET count == B`
+  unchanged; telemetry wired path-free.
 
 ---
 
 ## 9 · Open questions & decisions
 
-1. **Reduction scope & determinism (RESOLVED — global min across ALL sources).** A latency-ordered first-failure
-   throw breaks #690 and adds a side channel; and an inline throw on the observer/baseline branches can pre-empt
-   a smaller in-flight disk offender. Decision: **every** validation source (baseline-at-`earliest`,
-   observer-proven, disk-read) **records** its fail-closed verdict into one min reduction (never throws inline);
-   the gate throws the **numerically smallest offending version across all sources and fault kinds** after the
-   full drain. This is the true global minimum — identical to today on every single-offender table, a
-   deliberate deterministic tightening on the multi-offender forged case (§8).
-2. **Reduction atomicity (RESOLVED — pair updated atomically).** The `(version, exception)` offender is updated
-   as **one unit** — a `lock` around the compare-and-update (offenders are rare, happy path never enters it, so
-   contention is nil) or `Interlocked.CompareExchange` on an immutable `record Offender(long Version, Exception
+1. **Reduction scope & determinism (RESOLVED — global min-FAULTING-version across ALL sources).** A
+   latency-ordered first-failure throw breaks #690 and adds a side channel; and an inline throw on the
+   observer/baseline branches can pre-empt a smaller in-flight disk fault. Decision: **every** validation source
+   (baseline-at-`earliest`, observer-proven, disk-read) **records** its fault verdict into one reduction (never
+   throws inline); the gate throws the exception of the **numerically smallest faulting version across all
+   sources and both fault kinds** after the full drain. This is the true global minimum — identical to today on
+   every single-fault table, a deliberate deterministic tightening on the multi-fault forged case (§8).
+2. **Reduction atomicity (RESOLVED — pair updated atomically).** The `(version, exception)` fault is updated
+   as **one unit** — a `lock` around the compare-and-update (faults are rare, happy path never enters it, so
+   contention is nil) or `Interlocked.CompareExchange` on an immutable `record Fault(long Version, Exception
    Ex)` in a min-CAS loop — never a CAS on the `long` with a separate exception store (which would tear and
    surface the wrong version's exception).
-3. **Infra vs offense faults (RESOLVED — split).** Identity-mismatch / malformed / read-ceiling → the min
-   reduction (attributed by version). Any other read fault (transient IO / storage / foreign-token OCE) →
-   captured in a **separate infra slot**, re-thrown **fail-closed after the drain**, never swallowed, never
-   attributed as a #690 offending version, never masking a smaller genuine offender.
+3. **Infra vs offense faults (RESOLVED — UNIFIED into one min-faulting-version reduction).** Both kinds feed
+   **one** reduction keyed on version: offenses (identity-mismatch / malformed / read-ceiling) and infra faults
+   (transient IO / storage / foreign-token OCE) each record `(version, its own exception)`. The gate surfaces
+   the exception of the **numerically smallest faulting version**, and a fault of *either* kind arms the skip
+   (§2.4). An infra fault is surfaced with **its own** exception type (never relabelled as a #690 identity
+   offense) and is **never swallowed**, but it **does** count as a fault — so it (a) fast-fails the scan like
+   today (no I/O storm, bound = 1 read-set-identical) and (b) is correctly surfaced when it is the smallest
+   faulting version (rejecting the earlier "offenses always beat infra faults" scheme, which would falsely name
+   a higher readable offense while a lower version was *unreadable*, per the design red-team). A lower genuine
+   offense still outranks a higher infra fault, and vice-versa — strictly by version.
 4. **Pruning & cancellation (RESOLVED — skip not-yet-started only; caller is the sole token).** Pruning **skips
    launching** not-yet-started tasks with version **strictly `> current-min`**; it **never cancels an in-flight
    read**. Consequently the gate has **no internal cancellation token** — the caller's is the only one, so a
