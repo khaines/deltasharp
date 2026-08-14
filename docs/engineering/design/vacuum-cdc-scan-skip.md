@@ -185,13 +185,12 @@ No public API change.
   set-alignment trap.)
 - **Un-proven in-window version → SCAN (fail-closed).** Window extends below coverage (checkpoint-seeded deep
   retention) or observer inert: scan even though the *snapshot* flag is CDF-off.
-- **Forged / non-conforming cdc-without-enablement → SCAN vs SKIP divergence (residual).** The unconditional
+- **Forged / non-conforming cdc-without-enablement → accepted residual (§6 / §9 Q3b).** The unconditional
   scan protects **any** `AddCdcFileAction.Path` regardless of metadata; the skip *infers* cdc-absence from
-  proven enablement, so it assumes `cdc ⟹ CDF-active-at-that-version` (true for a DeltaSharp-written log). A
-  test pins that a conforming toggled/inherited table is co-extensive; the forged case is an explicit residual
-  (§6) — the differential oracle corpus (§3.3) MUST include a forged cdc-without-enablement table so this
-  divergence is measured, and the decision (accept residual vs. keep scanning on any protocol anomaly) is
-  made by evidence.
+  proven enablement, so it assumes `cdc ⟹ CDF-active-at-that-version` (true for any spec-conforming writer;
+  only a forged/corrupt log diverges, which is already outside VACUUM's log-trust envelope). A test pins that a
+  conforming toggled/inherited table is co-extensive; the §3.3 differential corpus includes a forged
+  cdc-without-enablement table so the divergence is **measured**, corroborating the accepted-residual decision.
 - **Double-encoded / non-canonical cdc candidate → never deleted (AC-2).** Such a table has an in-window
   CDF-on (or un-proven) version → scan → protected; the skip is path-agnostic.
 
@@ -284,7 +283,7 @@ is explicitly outside the predicate's trust boundary.
 | **In-window set skew** | Unknown-mtime commit protected by the scan but excluded by a `>= cutoff` predicate | Predicate uses the scan's **exact complement** `NOT(known AND mtime<cutoff)` → superset-or-equal | None |
 | **Elevation (coverage gap)** | In-window versions below the checkpoint-seed replay floor are invisible | Un-proven → fail-closed **scan** | None (conservative) |
 | **DoS (observer inert)** | `>` `MaxRetainedObservations` retained metadata revisions make the observer inert (#712) | Inert → un-proven → scan; note the **binding** limit for never-CDF tables is the checkpoint seed floor, not the inert cap (a metadata-stable table records almost nothing) | Accepted |
-| **Tampering (forged cdc-without-enablement)** | A non-conforming/forged log carries a `cdc` action while prevailing enablement is off; scan protects, skip infers-absent → deletes | The skip assumes `cdc ⟹ CDF-active-at-that-version` (holds for a DeltaSharp-written log). Differential oracle (§3.3) includes a forged corpus; decision = accept residual OR keep scanning on any protocol anomaly | **Real residual** — must be adjudicated with evidence before ship (§9 Q3b) |
+| **Tampering (forged cdc-without-enablement)** | A non-conforming/forged log carries a `cdc` action while prevailing enablement is off; scan protects, skip infers-absent → deletes | `cdc ⟹ CDF-active` holds for any spec-conforming writer; only a forged/corrupt log diverges, and VACUUM's core delete decisions **already** trust log conformance (a forged `remove` mis-deletes regardless) — so the skip adds no trust beyond VACUUM's existing envelope. Differential oracle (§3.3) includes a forged corpus to measure it | **Accepted residual** (§9 Q3b); conservative "scan on any protocol anomaly" lever available if forged-log resistance is later elevated for VACUUM |
 | **Repudiation** | A skip is silent | Distinct **skipped** telemetry + log (§7) recording the decision | None |
 
 ---
@@ -337,11 +336,18 @@ is explicitly outside the predicate's trust boundary.
    prevailing metadata. Since cdc-produced ⟹ `IsActive` ⟹ property==true, proving the property off is a
    conservative superset proof (property-only can only cause an *unnecessary* scan, never a wrong skip). The
    observer discards `protocol` actions, so a writer-feature check is neither available there nor needed.
-   **(3b) Forged cdc-without-enablement residual (OPEN — must adjudicate before ship).** The unconditional scan
-   protects any cdc path regardless of metadata; the skip assumes `cdc ⟹ CDF-active`. For a conforming
-   DeltaSharp-written log this holds; a forged/foreign log could diverge (§6). Decide with the forged-corpus
-   differential oracle: accept the residual (document it), or keep scanning whenever the proven protocol shows
-   any anomaly.
+   **(3b) Forged cdc-without-enablement residual (RESOLVED — accept, within VACUUM's existing trust envelope).**
+   The unconditional scan protects any cdc path regardless of metadata; the skip assumes
+   `cdc ⟹ CDF-active-at-that-version`. That assumption holds for **any spec-conforming log** — a `cdc`/
+   `AddCdcFileAction` is only emitted when CDF is active (DeltaSharp gates on `ChangeDataFeedFeature.IsActive`;
+   Spark/delta-rs likewise). The only producer of cdc-without-enablement is a **forged/corrupt log**, and VACUUM's
+   *core* delete decisions already trust log conformance — a forged log can mis-delete a live file via a forged
+   `remove` or an omitted `add` regardless of this scan. So the skip introduces **no trust beyond VACUUM's
+   existing envelope**; the scan's incidental extra conservatism on cdc paths is not a security property relied
+   on elsewhere. **Decision: accept the residual**, documented in §6, and include a forged cdc-without-enablement
+   table in the §3.3 differential corpus so the divergence is *measured* (not assumed). The conservative
+   alternative (fall back to scanning whenever the proven history is not cleanly CDF-never) is recorded as an
+   available lever should a future threat model elevate forged-log resistance for VACUUM specifically.
 4. **Benefit scope (RESOLVED — honestly scoped).** The saving materializes on **full-replay** reconstructions
    (or windows above the checkpoint), **not** on checkpoint-seeded deep-retention tables (the in-window range is
    below the replay floor). Quantify how often real never-CDF tables reconstruct via full replay; extending
