@@ -322,6 +322,12 @@ change-feed read's observable results on any conforming table.
 - **Lower genuine offense outranks a higher infra fault.** Symmetric case: identity offense at `v=3` + infra
   `IOException` at `v=5`: the gate surfaces **`v=3`'s identity offense** (the smaller faulting version), at all
   bounds — the infra fault never masks or pre-empts a smaller genuine offense.
+- **Infra-vs-infra determinism (no offense present).** Two infra faults — `IOException@v=5` + `IOException@v=8`,
+  no offense anywhere — under **injected skew** making `v=8` complete first, at bounds {1, 4, 32} and read K
+  times: assert the gate always surfaces **`v=5`'s `IOException`** (the smallest faulting version) with identical
+  type across repetitions, and (bound = 1) that **no read of any version `> 5`** occurs. Kills a first-wins /
+  latency-ordered infra capture (e.g. a stray `Volatile.Write` field) that bypasses the unified min-by-version
+  reduction — the infra path must be as deterministic as the offense path.
 - **Caller cancellation fails closed and is NEVER overwritten by the reduction throw.** A caller
   `CancellationToken` cancelled mid-fan-out (including mid-`WaitAsync` while offenders are already recorded)
   throws `OperationCanceledException` from the gate and yields nothing — assert the surfaced exception is the
