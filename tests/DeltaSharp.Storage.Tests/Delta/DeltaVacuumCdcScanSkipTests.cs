@@ -178,6 +178,59 @@ public sealed class DeltaVacuumCdcScanSkipTests : IDisposable
         Assert.True(counting.CommitReadsOf(1) >= 2, $"expected the scan to re-read commit 1 (reads={counting.CommitReadsOf(1)})");
     }
 
+    [Fact]
+    public async Task EmptyInWindowSet_AllAgedOut_Skips_ProtectsNothing()
+    {
+        // Every commit is aged past log retention (none stamped in-window), so the in-window set is EMPTY. The
+        // skip fires vacuously (nothing to prove) and is equivalent to the unconditional scan, which also finds
+        // no in-window cdc. Both protect nothing; the aged cdc file is correctly reclaimable.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/x.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+        await WriteDataFileAsync("_change_data/x.parquet", OldFile);
+
+        // Build with NO in-window stamps → both commits keep their aged (real) mtime → aged out of the window.
+        (DeltaVacuum vacuum, _) = Build(skipEnabled: true);
+        VacuumResult result = await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        (DeltaVacuum control, _) = Build(skipEnabled: false);
+        VacuumResult scan = await control.VacuumAsync(Retention, dryRun: true);
+
+        // Aged cdc file is in-window for NEITHER, so it is a deletion candidate in BOTH (co-extensive).
+        Assert.Equal(
+            scan.DeletablePaths.OrderBy(p => p, StringComparer.Ordinal),
+            result.DeletablePaths.OrderBy(p => p, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task CandidateInvariance_SkipDecisionIgnoresCandidateListing()
+    {
+        // The skip predicate is derived SOLELY from the log — never the candidate listing. Adding a stray
+        // `_change_data/` orphan candidate (referenced by no cdc action) must NOT change the skip decision on a
+        // never-CDF table: it still skips, and the stray is reclaimed exactly as under the unconditional scan.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+        await WriteDataFileAsync("_change_data/stray.parquet", OldFile); // referenced by nothing → reclaimable
+
+        (DeltaVacuum skipVacuum, CountingStorageBackend skipCounting) = Build(skipEnabled: true, 0, 1);
+        VacuumResult skipped = await skipVacuum.VacuumAsync(Retention, dryRun: true);
+
+        (DeltaVacuum control, CountingStorageBackend scanCounting) = Build(skipEnabled: false, 0, 1);
+        VacuumResult scan = await control.VacuumAsync(Retention, dryRun: true);
+
+        // The stray _change_data/ candidate is reclaimable under BOTH (identical decision), proving the skip
+        // never consulted the candidate listing to decide, and the scan was still elided.
+        Assert.Contains("_change_data/stray.parquet", skipped.DeletablePaths);
+        Assert.Equal(
+            scan.DeletablePaths.OrderBy(p => p, StringComparer.Ordinal),
+            skipped.DeletablePaths.OrderBy(p => p, StringComparer.Ordinal));
+        Assert.True(
+            skipCounting.CommitReadsOf(1) < scanCounting.CommitReadsOf(1),
+            "expected the scan to be elided regardless of the candidate listing");
+    }
+
     private sealed class FixedTimeProvider : TimeProvider
     {
         private readonly DateTimeOffset _now;
