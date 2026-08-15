@@ -257,13 +257,15 @@ public sealed class NestedParquetReadTests
         Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    public class ArrayRow {
+    public class ArrayRow
+    {
         public int Id { get; set; }
         public string[]? Arr { get; set; }
     }
 
     [Fact]
-    public async Task Array_RequiredElement_EmptyList_ShouldNotReject() {
+    public async Task Array_RequiredElement_EmptyList_ShouldNotReject()
+    {
         var rows = new List<ArrayRow> {
             new() { Id = 1, Arr = new string[] { "a", "b" } },
             new() { Id = 2, Arr = Array.Empty<string>() },
