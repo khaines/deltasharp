@@ -45,12 +45,13 @@ namespace DeltaSharp.Storage.Parquet;
 ///   element / map key / map value 1) and its <c>MaxDefinitionLevel</c> sits in
 ///   <c>[containerMaxDef, containerMaxDef + 1]</c> — closing the masquerade where a crafted footer declares a
 ///   scalar leaf repeated (a repeated primitive posing as struct rows) or over-nested (a phantom optional
-///   level mis-classifying present vs null cells). Nullability stays advisory (both the required and optional
-///   definition level are accepted). NOTE (#813): this advisory-nullability property means the #807 value-level
-///   required-lane guard (ParquetFileReader.RejectNullInRequiredLane) has NO nested analogue — a required
-///   (non-nullable) leaf backed by a physically-OPTIONAL column can still silently null-fill here. That is a
-///   dispositioned residual tracked by #813 (a fix must be Dremel-aware: reject a present-parent leaf-null only,
-///   never an ancestor-null).</description></item>
+///   level mis-classifying present vs null cells). Nullability of the leaf's OWN value is enforced by the
+///   #813 required-lane guard (<see cref="RejectNullInRequiredNestedLeaf"/>): a required (non-nullable) leaf
+///   backed by a physically-OPTIONAL column that materializes a LEAF-ATTRIBUTABLE null (every ancestor
+///   container present, only the leaf's own value null — Dremel level <c>leaf max def − 1</c>) fails closed,
+///   the nested analogue of #807's flat <c>RejectNullInRequiredLane</c>, extended to ALL leaf types. An
+///   ANCESTOR null (a null struct / absent list element / null map entry — a lower definition level) is
+///   legitimate and accepted, so container-null nesting still reads.</description></item>
 ///   <item><description><b>Every leaf (streams).</b> Each reconstructed definition level lies in
 ///   <c>[0, leaf max def]</c> and each repetition level in <c>[0, leaf max rep]</c>
 ///   (<see cref="ValidateLevelRange"/>, covering BOTH streams); the declared value count is ceiling-bounded
@@ -260,6 +261,7 @@ internal static class NestedParquetColumnReader
             // floor of 0 (every row yields a cell: a value, a null field, or a null belonging to a null struct).
             (MutableColumnVector child, int[]? def, _, int numValues) = await ReadScalarLeafAsync(
                 rowGroup, leaf, field.DataType, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+            RejectNullInRequiredNestedLeaf(def, leaf, field.DataType, field.Nullable);
             if (numValues != rowCount)
             {
                 throw DeltaStorageException.CorruptData(
@@ -371,6 +373,7 @@ internal static class NestedParquetColumnReader
         (MutableColumnVector elements, int[]? def, int[]? rep, int numValues) = await ReadScalarLeafAsync(
             rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, budget, cancellationToken)
             .ConfigureAwait(false);
+        RejectNullInRequiredNestedLeaf(def, elementLeaf, requested.ElementType, requested.ContainsNull);
 
         // A1 (defense in depth): every top-level row emits at least one element-level slot (a real element, or
         // a placeholder for a null/empty list), so the element leaf's declared value count is >= the row count.
@@ -438,6 +441,7 @@ internal static class NestedParquetColumnReader
         (MutableColumnVector values, int[]? valueDef, int[]? valueRep, _) = await ReadScalarLeafAsync(
             rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, cancellationToken)
             .ConfigureAwait(false);
+        RejectNullInRequiredNestedLeaf(valueDef, valueLeaf, requested.ValueType, requested.ValueContainsNull);
 
         // F1: the value child is consumed positionally against the KEY-driven entry structure (offsets/nulls
         // below come from the key leaf alone). If a crafted/corrupt file gave the value a divergent per-entry
@@ -754,6 +758,41 @@ internal static class NestedParquetColumnReader
         }
 
         return (child, def, rep, numValues);
+    }
+
+    // #813: a required (non-nullable) nested leaf lane must not silently absorb a LEAF-ATTRIBUTABLE null — a
+    // null where every ancestor container is PRESENT and only the leaf's own value is null. In Dremel terms
+    // that is a physically-OPTIONAL leaf (<paramref name="leaf"/>.<c>IsNullable</c>) whose reconstructed
+    // definition level is exactly one below its max (<c>MaxDefinitionLevel - 1</c>): the def level truncates at
+    // the FIRST undefined optional from the root, so a value one below max means every shallower optional is
+    // defined and only the DEEPEST — the leaf's own — is not. A LOWER level is an ANCESTOR null (a null struct
+    // / absent list element / null map entry), which is legitimate and must NOT be rejected. Extends the flat
+    // guard <c>RejectNullInRequiredLane</c> (#807) Dremel-aware into the nested path, covering ALL leaf types
+    // (the flat schema-level check has no nested analogue — <see cref="NestedParquetColumnReader"/>'s leaf
+    // nullability was advisory). Path-free (#653/#665): the message names only the sanitized leaf path + type.
+    private static void RejectNullInRequiredNestedLeaf(
+        int[]? def, DataField leaf, DataType requestedType, bool requestedNullable)
+    {
+        // A nullable request accepts nulls; a physically-REQUIRED leaf can only be nulled by an ancestor (never
+        // leaf-attributable); no definition stream means a fully-required path (no nulls at all).
+        if (requestedNullable || !leaf.IsNullable || def is null)
+        {
+            return;
+        }
+
+        int leafNullLevel = leaf.MaxDefinitionLevel - 1;
+        foreach (int d in def)
+        {
+            if (d == leafNullLevel)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}': a required (non-nullable) "
+                    + $"{DiagnosticText.DescribeType(requestedType)} leaf materialized a NULL from a physically "
+                    + "OPTIONAL Parquet column while every ancestor container was present; the read-time "
+                    + "required-lane guard (#813, extending #807) rejects rather than silently null-fill a "
+                    + "non-nullable nested lane.");
+            }
+        }
     }
 
     // Validates that every reconstructed Dremel level in <paramref name="levels"/> falls in the closed range

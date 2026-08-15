@@ -175,6 +175,89 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task Struct_RequiredStringLeaf_PresentStructNullField_FailsClosed()
+    {
+        // #813: a present struct with a NULL string field is a LEAF-ATTRIBUTABLE null. Requesting that leaf as
+        // required (nullable:false) must fail closed — the exact #807 top-level failure class, one nesting level
+        // down. Row 2 (S present, B=null) is the violation; row 3 (S null) is an ANCESTOR null and must NOT be
+        // what triggers it.
+        var rows = new List<StructRow>
+        {
+            new() { Id = 1, S = new Inner { A = 10, B = "x" } },
+            new() { Id = 2, S = new Inner { A = 20, B = null } }, // present struct, null field → leaf-attributable
+            new() { Id = 3, S = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("S", new StructType(new[]
+            {
+                new StructField("B", DataTypes.StringType, nullable: false), // REQUIRED string leaf
+            }), nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("#813", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Struct_RequiredStringLeaf_OnlyAncestorNull_DoesNotReject()
+    {
+        // The discriminating negative: when the ONLY nulls in a required leaf lane come from a null ANCESTOR
+        // (a null struct), the guard must NOT fire — an ancestor-null is legitimate. Here B is non-null whenever
+        // S is present, so no leaf-attributable null exists; the read succeeds and B.IsNull tracks the null S.
+        var rows = new List<StructRow>
+        {
+            new() { Id = 1, S = new Inner { A = 10, B = "x" } },
+            new() { Id = 2, S = null }, // ancestor (struct) null → B null via the ancestor, NOT leaf-attributable
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("S", new StructType(new[]
+            {
+                new StructField("B", DataTypes.StringType, nullable: false), // REQUIRED — but no leaf-null exists
+            }), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        ColumnVector b = s.Child("B");
+        Assert.Equal("x", Utf8(b, 0));
+        Assert.True(b.IsNull(1)); // null because the whole struct is null (ancestor null), accepted
+    }
+
+    [Fact]
+    public async Task Struct_RequiredValueLeaf_PresentStructNullField_FailsClosed()
+    {
+        // #813 is broader than string/binary: a required VALUE-typed nested leaf (int) is exposed too, because
+        // the nested path had no nullability guard at all. Present struct with a null int field → leaf-attributable
+        // → required request must fail closed.
+        var rows = new List<AllNullableRow>
+        {
+            new() { Id = 1, S = new AllNullableInner { A = 10, B = "x" } },
+            new() { Id = 2, S = new AllNullableInner { A = null, B = "y" } }, // present struct, null int field
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("S", new StructType(new[]
+            {
+                new StructField("A", DataTypes.IntegerType, nullable: false), // REQUIRED int leaf
+            }), nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Struct_DecodesLongDoubleBoolLeaves()
     {
         var rows = new List<WideRow>
