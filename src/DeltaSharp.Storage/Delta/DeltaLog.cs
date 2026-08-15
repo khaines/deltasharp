@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Runtime.ExceptionServices;
 using DeltaSharp.Diagnostics;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Diagnostics;
@@ -43,8 +44,14 @@ internal sealed class DeltaLog
     /// object fails closed rather than driving an unbounded read, mirroring the checkpoint part cap.</summary>
     internal const long MaxLogObjectBytes = 256L * 1024 * 1024;
 
+    // #808: default bounded-concurrency fan-out for the below-floor CDF pre-range identity scan. 16 balances
+    // latency hiding against object-store connection-pool pressure (issue #808 range 16–32). A bound of 1
+    // restores today's sequential read set + ascending order (the kill-switch).
+    internal const int DefaultPreRangeScanConcurrency = 16;
+
     private readonly IStorageBackend _backend;
     private readonly long _maxLogObjectBytes;
+    private readonly int _preRangeScanConcurrency;
     private readonly ILogger<DeltaLog> _logger;
     private readonly DeltaStorageTelemetry _telemetry;
     private readonly TimeProvider _timeProvider;
@@ -128,10 +135,12 @@ internal sealed class DeltaLog
         TimeSpan? checkpointDecodeBudget = null,
         TimeProvider? timeProvider = null,
         BoundedDecoder? checkpointDecoder = null,
-        long checkpointMaxPartDecodedBytes = DeltaCheckpointReader.MaxCheckpointPartDecodedBytes)
+        long checkpointMaxPartDecodedBytes = DeltaCheckpointReader.MaxCheckpointPartDecodedBytes,
+        int preRangeScanConcurrency = DefaultPreRangeScanConcurrency)
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(checkpointMaxPartDecodedBytes, nameof(checkpointMaxPartDecodedBytes));
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(preRangeScanConcurrency, nameof(preRangeScanConcurrency));
         if (checkpointDecodeBudget is { } budget)
         {
             // Fail fast on a misconfigured operator budget with an explicit paramName — never as a raw
@@ -148,6 +157,7 @@ internal sealed class DeltaLog
         _timeProvider = timeProvider ?? TimeProvider.System;
         _checkpointDecoder = checkpointDecoder ?? BoundedDecode.CheckpointDecoder;
         _checkpointMaxPartDecodedBytes = checkpointMaxPartDecodedBytes;
+        _preRangeScanConcurrency = preRangeScanConcurrency;
 
         // One-shot startup Warning (Round-13) for an under-provisioned door. The process-global door fields have
         // no ILogger in scope at static-field init, so the first DeltaLog construction that reaches a logger
@@ -834,19 +844,27 @@ internal sealed class DeltaLog
         ColumnMappingIdentity endIdentity = BuildIdentity(endMetadata);
         IReadOnlyList<MetadataAction>? earliestVersionMetadataFromBaseline = null;
 
-        // Baseline: the identity as of the earliest reconstructable version — compacted from a checkpoint when
-        // the creation commit has aged out, so a checkpoint-baked identity that no surviving commit re-expresses
-        // is still caught. Reconstructed from the SAME listing (no second LIST, #691). This baseline exists
-        // ONLY when the reconstructable floor precedes the range: when earliest >= start the floor sits inside
-        // [start, end], where the reader's own per-version identity check already covers it, so there is no
-        // pre-range baseline to establish here. The surviving-commit loop below still runs in BOTH cases.
+        // #808: ALL validation sources (baseline, observer-proven, disk-read) record their fault verdict into
+        // ONE min-FAULTING-version reduction rather than throwing inline; the gate surfaces the exception of the
+        // numerically smallest faulting version (offense OR infra) AFTER the fan-out drains — never inline, so
+        // no source can pre-empt a smaller in-flight disk fault, and the reported version is order-independent
+        // (#690 deterministic). "Earliest offending version" generalised: today's sequential ascending loop
+        // fails closed at the FIRST fault of either kind, so min-by-version is faithful.
+        var fault = new MinFaultReduction();
+
+        // Baseline (in-memory): the identity as of the earliest reconstructable version — compacted from a
+        // checkpoint when the creation commit has aged out, so a checkpoint-baked identity that no surviving
+        // commit re-expresses is still caught. Reconstructed from the SAME listing (no second LIST, #691). This
+        // baseline exists ONLY when the reconstructable floor precedes the range; when earliest >= start the
+        // floor sits inside [start, end], where the reader's own per-version check covers it. Records into the
+        // reduction (never inline throw). The surviving-commit partition below still runs in BOTH cases.
         if (earliest < rangeStartVersion)
         {
             var baselineReplayed = new ReplayedMetadataLog(earliest + 1);
             Snapshot earliestSnapshot = await LoadSnapshotFromListingAsync(
                 listing, earliest, Stopwatch.GetTimestamp(), baselineReplayed, cancellationToken).ConfigureAwait(false);
             baselineReplayed.Seal();
-            ValidateHistoricalIdentity(earliest, earliestSnapshot.Metadata, endIdentity);
+            RecordIdentityCheck(fault, earliest, earliestSnapshot.Metadata, endIdentity);
 
             if (baselineReplayed.TryGetProvenObservation(
                 earliest, out IReadOnlyList<MetadataAction> observedEarliestMetadata))
@@ -855,16 +873,16 @@ internal sealed class DeltaLog
             }
         }
 
-        // Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing identity at any
-        // version before the range is forged — a change-and-change-back reverted before start, a SURVIVING
-        // commit whose JSON persists strictly below the reconstructable floor (below a compacting checkpoint),
-        // or the floor commit's OWN metaData. We validate every pre-range commit's own `metaData` here and skip
-        // ONLY in-range versions (>= start, the reader's per-version check). Critically we do NOT skip
-        // `version == earliest`: the baseline above validated the RECONSTRUCTED snapshot at `earliest`, which for
-        // a checkpoint floor is the checkpoint's BAKED identity — NOT `<earliest>.json`'s own declaration. A
-        // forged log can bake a clean identity into the checkpoint at V while `V.json` declares a swapped one;
-        // only reading `<V>.json` here catches it. When the floor commit's JSON has aged out, `earliest` is not
-        // in `listing.Commits`, so there is nothing extra to read and the baseline alone covers it.
+        // Partition the pre-range commits into IN-MEMORY (baseline-reuse / observer-proven, validated inline
+        // and recorded) and DISK-READ (below the replay floor / un-observed — the O(retained) serialised cost
+        // #808 fans out). Every retained commit's metaData REPLACES the metadata (Delta semantics); a differing
+        // identity at any version before the range is forged. We validate every pre-range commit's own
+        // `metaData` and skip ONLY in-range versions (>= start, the reader's per-version check). Critically we
+        // do NOT skip `version == earliest`: the baseline above validated the RECONSTRUCTED snapshot at
+        // `earliest` (for a checkpoint floor, the checkpoint's BAKED identity — NOT `<earliest>.json`'s own
+        // declaration), so reading `<earliest>.json` here catches a forged bake. The membership set is
+        // IDENTICAL to today's — only the read SCHEDULE of the disk-read subset changes (coverage-neutral).
+        var diskReadVersions = new List<long>();
         foreach (long version in listing.Commits)
         {
             if (version >= rangeStartVersion)
@@ -872,26 +890,213 @@ internal sealed class DeltaLog
                 continue; // in-range versions are covered by the reader's per-version identity check.
             }
 
-            cancellationToken.ThrowIfCancellationRequested();
+            if (version == earliest && earliestVersionMetadataFromBaseline is not null)
+            {
+                RecordIdentityChecks(fault, version, earliestVersionMetadataFromBaseline, endIdentity);
+            }
+            else if (TryGetProvenObservationRecording(fault, alreadyReplayed, version, out IReadOnlyList<MetadataAction> observed))
+            {
+                RecordIdentityChecks(fault, version, observed, endIdentity);
+            }
+            else if (!fault.HasFaultBelow(version))
+            {
+                // Not proven in-memory: a disk read is required. (An observation-corroboration fault at this
+                // version is already recorded by TryGetProvenObservationRecording above; a smaller in-memory
+                // fault means this larger version can never be the min, so it need not be read.)
+                diskReadVersions.Add(version);
+            }
+        }
 
-            // #691: the start-snapshot reconstruction on THIS listing already read (and fully parsed) this
-            // commit; reuse its metaData actions rather than issuing a second GET for the same immutable
-            // object. The observation is consumable ONLY when the replay PROVABLY covered this version and its
-            // record is corroborated by the reconstruction's own metadata lineage (see ReplayedMetadataLog);
-            // anything else — a version the replay never reached (always the case for a sub-floor stray or a
-            // commit below the seeding checkpoint) — falls back to the disk read below. An observer defect can
-            // therefore cost a fail-closed read or an extra GET, but can NEVER shrink this validation set.
-            IReadOnlyList<MetadataAction> versionMetadata =
-                (version == earliest && earliestVersionMetadataFromBaseline is not null)
-                    ? earliestVersionMetadataFromBaseline
-                    : alreadyReplayed.TryGetProvenObservation(version, out IReadOnlyList<MetadataAction> observed)
-                    ? observed
-                    : ReplayedMetadataLog.MetadataActionsOf(
-                        await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false));
+        // Fan out the disk reads with bounded concurrency, recording each verdict/fault into the same reduction.
+        await FanOutPreRangeDiskReadsAsync(diskReadVersions, fault, endIdentity, cancellationToken).ConfigureAwait(false);
 
-            foreach (MetadataAction metadata in versionMetadata)
+        // Surface the min faulting version's exception on the NORMAL completion path (after the fan-out drained)
+        // — never from a `finally`, so a propagating caller OperationCanceledException is never overwritten.
+        fault.ThrowIfAny();
+    }
+
+    /// <summary>
+    /// #808: bounded-concurrency fan-out of the below-floor pre-range disk reads. Producer-gated
+    /// <see cref="SemaphoreSlim"/> (bounds the live task graph, not just in-flight GETs); each task reads +
+    /// validates one commit and RECORDS any fault (offense or infra) into the shared min reduction, never
+    /// throwing outward except a caller cancellation. Skip-not-yet-started pruning: once a fault at <c>X</c> is
+    /// recorded, versions strictly <c>&gt; X</c> are not launched (they can never lower the min) — no in-flight
+    /// read is ever cancelled, so the caller's token is the only cancellation token. Every launched task is
+    /// drained before the semaphore is disposed.
+    /// </summary>
+    private async Task FanOutPreRangeDiskReadsAsync(
+        List<long> versions, MinFaultReduction fault, ColumnMappingIdentity endIdentity,
+        CancellationToken cancellationToken)
+    {
+        if (versions.Count == 0)
+        {
+            return;
+        }
+
+        versions.Sort(); // ascending — bound=1 reproduces today's sequential read order; prune is monotone.
+        var semaphore = new SemaphoreSlim(_preRangeScanConcurrency);
+        var tasks = new List<Task>(versions.Count);
+        try
+        {
+            foreach (long version in versions)
+            {
+                if (fault.HasFaultBelow(version))
+                {
+                    continue; // skip-not-yet-started: a smaller fault is already recorded → this can't be the min.
+                }
+
+                await semaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+
+                if (fault.HasFaultBelow(version))
+                {
+                    // A smaller fault landed while we waited on the semaphore; abandon this version.
+                    semaphore.Release();
+                    continue;
+                }
+
+                long captured = version;
+                tasks.Add(ReadValidateReleaseAsync(captured, fault, semaphore, endIdentity, cancellationToken));
+            }
+
+            await Task.WhenAll(tasks).ConfigureAwait(false);
+        }
+        finally
+        {
+            // Drain every launched task before disposing the semaphore — even if the schedule loop or WhenAll
+            // exited early (a caller cancel from WaitAsync). Faults are already recorded; a caller-cancel OCE is
+            // swallowed HERE only for the drain and re-surfaces from the try's WhenAll (never overwritten).
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Every per-task offense/infra fault is captured into `fault`; the only outward throw is a
+                // caller-cancel OCE, which the try's await already propagates.
+            }
+
+            semaphore.Dispose();
+        }
+    }
+
+    private async Task ReadValidateReleaseAsync(
+        long version, MinFaultReduction fault, SemaphoreSlim semaphore, ColumnMappingIdentity endIdentity,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            IReadOnlyList<MetadataAction> metadata = ReplayedMetadataLog.MetadataActionsOf(
+                await ReadCommitActionsAsync(version, cancellationToken).ConfigureAwait(false));
+            RecordIdentityChecks(fault, version, metadata, endIdentity);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw; // caller cancellation fails the WHOLE gate closed — never recorded as a per-version fault.
+        }
+        catch (Exception ex)
+        {
+            // Offense (DeltaProtocolException: identity mismatch / malformed / read-ceiling) OR infra fault
+            // (transient IO / storage / foreign-token OCE) → unified into the min-faulting-version reduction,
+            // surfaced with its OWN exception if it is the smallest faulting version. Never swallowed.
+            fault.Record(version, ex);
+        }
+        finally
+        {
+            semaphore.Release();
+        }
+    }
+
+    // Validates a single reconstructed metadata against the end identity, recording any fault (never throwing).
+    private static void RecordIdentityCheck(
+        MinFaultReduction fault, long version, MetadataAction metadata, ColumnMappingIdentity endIdentity)
+    {
+        try
+        {
+            ValidateHistoricalIdentity(version, metadata, endIdentity);
+        }
+        catch (DeltaProtocolException ex)
+        {
+            fault.Record(version, ex);
+        }
+    }
+
+    // Validates every metaData a version declared, recording the first fault at that version (never throwing).
+    private static void RecordIdentityChecks(
+        MinFaultReduction fault, long version, IReadOnlyList<MetadataAction> metadataList,
+        ColumnMappingIdentity endIdentity)
+    {
+        try
+        {
+            foreach (MetadataAction metadata in metadataList)
             {
                 ValidateHistoricalIdentity(version, metadata, endIdentity);
+            }
+        }
+        catch (DeltaProtocolException ex)
+        {
+            fault.Record(version, ex);
+        }
+    }
+
+    // Wraps the observer read so an observation-corroboration failure (DeltaProtocolException) is recorded at
+    // its version rather than thrown inline; returns false (→ disk read) when the version is not observer-proven.
+    private static bool TryGetProvenObservationRecording(
+        MinFaultReduction fault, ReplayedMetadataLog observer, long version,
+        out IReadOnlyList<MetadataAction> observed)
+    {
+        try
+        {
+            return observer.TryGetProvenObservation(version, out observed);
+        }
+        catch (DeltaProtocolException ex)
+        {
+            fault.Record(version, ex);
+            observed = Array.Empty<MetadataAction>();
+            return true; // fault recorded; do NOT also disk-read this version.
+        }
+    }
+
+    // #808: the min-faulting-version reduction. Keeps the (version, exception) of the smallest faulting version
+    // as ONE atomic unit (a lock over the pair, never a torn long-CAS + separate exception store); faults are
+    // rare (a forged/failing table only) and the happy path never enters it, so contention is nil.
+    private sealed class MinFaultReduction
+    {
+        private readonly object _gate = new();
+        private long _minVersion = long.MaxValue;
+        private Exception? _exception;
+
+        internal void Record(long version, Exception exception)
+        {
+            lock (_gate)
+            {
+                if (version < _minVersion)
+                {
+                    _minVersion = version;
+                    _exception = exception;
+                }
+            }
+        }
+
+        // A fault strictly below `version` is already recorded (skip-not-yet-started arming).
+        internal bool HasFaultBelow(long version)
+        {
+            lock (_gate)
+            {
+                return _minVersion < version;
+            }
+        }
+
+        internal void ThrowIfAny()
+        {
+            Exception? ex;
+            lock (_gate)
+            {
+                ex = _exception;
+            }
+
+            if (ex is not null)
+            {
+                ExceptionDispatchInfo.Capture(ex).Throw();
             }
         }
     }

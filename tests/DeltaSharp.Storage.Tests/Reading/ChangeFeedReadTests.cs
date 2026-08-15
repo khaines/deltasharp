@@ -1597,6 +1597,60 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Cdf_TwoSubFloorOffenders_NamesTheMinimumVersion_Deterministically()
+    {
+        // #808: the below-floor pre-range identity scan is fanned out with bounded concurrency, so multiple
+        // offending sub-floor commits complete in latency (not version) order. The min-FAULTING-version
+        // reduction must surface the NUMERICALLY smallest offending version regardless of completion order — a
+        // first-failure-wins fan-out would name whichever finished first. Two forged sub-floor commits (v1, v2)
+        // below a compacting checkpoint@3 both offend; the gate must deterministically name version 1.
+        string SchemaJson(int idForId, int idForName) =>
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForId + ",\"delta.columnMapping.physicalName\":\"col-A\"}},"
+            + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":" + idForName + ",\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+        var config = new[]
+        {
+            ("delta.columnMapping.mode", "id"),
+            ("delta.columnMapping.maxColumnId", "2"),
+            ("delta.enableChangeDataFeed", "true"),
+        };
+        string MetaLine(int idForId, int idForName) =>
+            "{\"metaData\":{\"id\":\"rt\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + "\"schemaString\":" + JsonSerializer.Serialize(SchemaJson(idForId, idForName))
+            + ",\"partitionColumns\":[],\"configuration\":{"
+            + "\"delta.columnMapping.mode\":\"id\",\"delta.columnMapping.maxColumnId\":\"2\","
+            + "\"delta.enableChangeDataFeed\":\"true\"}}}";
+        using var backend = new LocalFileSystemBackend(_root);
+        // checkpoint@3 bakes clean identity X (id→1, name→2, == end); earliest reconstructable == 3 == start.
+        await DeltaTestHarness.WriteCheckpointAsync(backend, 3, new CheckpointFixture()
+            .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+            .Metadata("rt", SchemaJson(1, 2), partitionColumns: null, configuration: config));
+        await DeltaTestHarness.WriteLastCheckpointAsync(backend, 3);
+        // Two SURVIVING sub-floor commits (< earliest=3), BOTH forging swapped identities → both offend.
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000001.json",
+            Encoding.UTF8.GetBytes(MetaLine(2, 1) + "\n"), CancellationToken.None); // v1: id↔name swapped
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000002.json",
+            Encoding.UTF8.GetBytes(MetaLine(9, 8) + "\n"), CancellationToken.None); // v2: different forged ids
+        await backend.PutIfAbsentAsync(
+            "_delta_log/00000000000000000003.json",
+            Encoding.UTF8.GetBytes(MetaLine(1, 2) + "\n"), CancellationToken.None); // v3: benign identity X
+
+        // Run it repeatedly: the surfaced version must be invariant to fan-out completion order.
+        for (int i = 0; i < 5; i++)
+        {
+            DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+                async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(3, 3)));
+            Assert.Contains("column-mapping identity", ex.Message, StringComparison.Ordinal);
+            Assert.Matches(@"version 1\b", ex.Message);                            // the MINIMUM offender
+            Assert.DoesNotMatch(@"version 2\b", ex.Message);                       // never the higher offender
+        }
+    }
+
+    [Fact]
     public async Task Cdf_PartitionColumnChangeBeforeStart_FailsClosed()
     {
         // #671 partition-membership arm (reliability-chaos R2 HIGH + red-team): identity includes the
