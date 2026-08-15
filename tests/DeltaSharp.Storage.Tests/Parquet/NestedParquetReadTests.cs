@@ -257,6 +257,150 @@ public sealed class NestedParquetReadTests
         Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
+    public class ArrayRow {
+        public int Id { get; set; }
+        public string[]? Arr { get; set; }
+    }
+
+    [Fact]
+    public async Task Array_RequiredElement_EmptyList_ShouldNotReject() {
+        var rows = new List<ArrayRow> {
+            new() { Id = 1, Arr = new string[] { "a", "b" } },
+            new() { Id = 2, Arr = Array.Empty<string>() },
+            new() { Id = 3, Arr = null }
+        };
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[] {
+            new StructField("Arr", new ArrayType(DataTypes.StringType, containsNull: false), nullable: true)
+        });
+        var batch = await ReadSingleAsync(bytes, requested);
+        Assert.NotNull(batch);
+    }
+
+    [Fact]
+    public async Task List_RequiredElement_NullInPresentList_FailsClosed()
+    {
+        // #813 list-element guard site (keys on ArrayType.ContainsNull): a null element in a PRESENT list is
+        // leaf-attributable; requesting the element as required (containsNull:false) must fail closed.
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?> { 10, 20 } },
+            new() { Id = 2, Arr = new List<int?> { 30, null } }, // present list, null element → leaf-attributable
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: false), nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Contains("#813", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task List_RequiredElement_NullOrEmptyList_DoesNotReject()
+    {
+        // Discriminating negative for the list site: a NULL list and an EMPTY list are ancestor-level nulls, not
+        // element-attributable — a required element request must still read them.
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?> { 10, 20 } },
+            new() { Id = 2, Arr = null },            // null list (ancestor)
+            new() { Id = 3, Arr = new List<int?>() }, // empty list (ancestor-level)
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: false), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested); // succeeds — no leaf-attributable null
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        Assert.True(arr.IsNull(1));            // null list
+        Assert.Equal(0, arr.ElementLength(2)); // empty list
+    }
+
+    [Fact]
+    public async Task Map_RequiredValue_NullInPresentEntry_FailsClosed()
+    {
+        // #813 map-value guard site (keys on MapType.ValueContainsNull): a null value in a PRESENT entry is
+        // leaf-attributable; a required-value (valueContainsNull:false) request must fail closed.
+        var rows = new List<MapRow>
+        {
+            new() { Id = 1, M = new Dictionary<string, int?>(StringComparer.Ordinal) { ["a"] = 1, ["b"] = null } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: false),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Map_RequiredValue_NullOrEmptyMap_DoesNotReject()
+    {
+        // Discriminating negative for the map site: a NULL map and an EMPTY map are ancestor-level; a required
+        // value request must still read them.
+        var rows = new List<MapRow>
+        {
+            new() { Id = 1, M = new Dictionary<string, int?>(StringComparer.Ordinal) { ["a"] = 1 } },
+            new() { Id = 2, M = null },                                                    // null map
+            new() { Id = 3, M = new Dictionary<string, int?>(StringComparer.Ordinal) },    // empty map
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: false),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested); // succeeds
+        var m = Assert.IsType<MapColumnVector>(batch.Column("M"));
+        Assert.True(m.IsNull(1)); // null map
+    }
+
+    [Fact]
+    public async Task Struct_RequiredPhysicallyRequiredLeaf_AncestorNull_DoesNotReject()
+    {
+        // The load-bearing `!leaf.IsNullable` gate: a physically-REQUIRED leaf (int A) under an optional struct
+        // can only be nulled by the ANCESTOR (a null struct), whose definition level ALIASES maxDef-1 (because
+        // the required leaf adds no +1). The guard must NOT fire — IsNullable reports own-optionality, so the
+        // gate skips a physically-required leaf. Requesting A as non-nullable must still read the null-struct row.
+        var rows = new List<StructRow>
+        {
+            new() { Id = 1, S = new Inner { A = 10, B = "x" } },
+            new() { Id = 2, S = null }, // null struct → A null via ancestor; A is physically required
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("S", new StructType(new[]
+            {
+                new StructField("A", DataTypes.IntegerType, nullable: false), // required, physically-required leaf
+            }), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested); // succeeds — ancestor-null not over-rejected
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        Assert.Equal(10, s.Child("A").GetValue<int>(0));
+        Assert.True(s.Child("A").IsNull(1)); // null via the null struct (ancestor), accepted
+    }
+
     [Fact]
     public async Task Struct_DecodesLongDoubleBoolLeaves()
     {
