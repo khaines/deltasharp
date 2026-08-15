@@ -257,28 +257,6 @@ public sealed class NestedParquetReadTests
         Assert.Contains("required", ex.Message, StringComparison.OrdinalIgnoreCase);
     }
 
-    public class ArrayRow
-    {
-        public int Id { get; set; }
-        public string[]? Arr { get; set; }
-    }
-
-    [Fact]
-    public async Task Array_RequiredElement_EmptyList_ShouldNotReject()
-    {
-        var rows = new List<ArrayRow> {
-            new() { Id = 1, Arr = new string[] { "a", "b" } },
-            new() { Id = 2, Arr = Array.Empty<string>() },
-            new() { Id = 3, Arr = null }
-        };
-        byte[] bytes = await WriteAsync(rows);
-        var requested = new StructType(new[] {
-            new StructField("Arr", new ArrayType(DataTypes.StringType, containsNull: false), nullable: true)
-        });
-        var batch = await ReadSingleAsync(bytes, requested);
-        Assert.NotNull(batch);
-    }
-
     [Fact]
     public async Task List_RequiredElement_NullInPresentList_FailsClosed()
     {

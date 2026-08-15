@@ -1,13 +1,16 @@
 <Project>
+
   <!--
     Central Package Management (EPIC-01 / FEAT-01.2). All NuGet versions are declared
     here so dependency changes are visible to review and SCA tooling. Projects
     reference packages with <PackageReference Include="..."/> and no Version attribute.
   -->
+
   <PropertyGroup>
     <ManagePackageVersionsCentrally>true</ManagePackageVersionsCentrally>
     <CentralPackageTransitivePinningEnabled>true</CentralPackageTransitivePinningEnabled>
   </PropertyGroup>
+
   <ItemGroup>
     <!-- ADR-0002 "Arrow at the edges": the Arrow-backed ColumnVector (STORY-02.2.1, #135)
          wraps Apache.Arrow primitive/variable arrays so Parquet/Flight interop is zero-copy.
@@ -45,6 +48,7 @@
          in the shared framework (System.Diagnostics.DiagnosticSource) and need no package. -->
     <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
   </ItemGroup>
+
   <ItemGroup>
     <!-- Test toolchain. -->
     <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
@@ -59,6 +63,7 @@
          See docs/engineering/design/quality-gates.md. -->
     <PackageVersion Include="coverlet.collector" Version="10.0.1" />
   </ItemGroup>
+
   <!-- lane:01.5 (FEAT-01.5 / #127 STORY-01.5.1, #128 STORY-01.5.2) — API-governance
        analyzers. PublicApiAnalyzers tracks the public surface baseline of packable
        libraries; BannedApiAnalyzers enforces the AOT/trim/determinism/security policy on
@@ -74,4 +79,5 @@
          hand-rolled masker. Test-only; never a production/runtime dependency. -->
     <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
   </ItemGroup>
+
 </Project>
