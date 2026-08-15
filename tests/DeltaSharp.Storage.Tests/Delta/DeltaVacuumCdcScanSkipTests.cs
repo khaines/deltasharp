@@ -1,5 +1,6 @@
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
+using Microsoft.Extensions.Logging;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -50,9 +51,17 @@ public sealed class DeltaVacuumCdcScanSkipTests : IDisposable
             timestamps[i] = (inWindowVersions[i], Recent);
         }
 
-        var counting = new CountingStorageBackend(DeltaTestHarness.WithCommitTimestamps(_backend, timestamps));
+        return BuildWithStamps(skipEnabled, timestamps);
+    }
+
+    // As Build, but with EXPLICIT per-commit listed mtimes — used to place a commit at a chosen point relative
+    // to the two cutoffs (log-retention vs vacuum retention) or to age a recorded transition below the window.
+    private (DeltaVacuum Vacuum, CountingStorageBackend Counting) BuildWithStamps(
+        bool skipEnabled, (long Version, DateTimeOffset Modified)[] stamps, ILogger<DeltaVacuum>? logger = null)
+    {
+        var counting = new CountingStorageBackend(DeltaTestHarness.WithCommitTimestamps(_backend, stamps));
         var vacuum = new DeltaVacuum(
-            counting, policy: null, logger: null, telemetry: null,
+            counting, policy: null, logger: logger, telemetry: null,
             timeProvider: new FixedTimeProvider(Now), cdcScanSkipEnabled: skipEnabled);
         return (vacuum, counting);
     }
@@ -230,6 +239,143 @@ public sealed class DeltaVacuumCdcScanSkipTests : IDisposable
             skipCounting.CommitReadsOf(1) < scanCounting.CommitReadsOf(1),
             "expected the scan to be elided regardless of the candidate listing");
     }
+
+    [Fact]
+    public async Task TwoCutoffGap_CdfOnCommit_BetweenCutoffs_Scans_AndProtectsCdc()
+    {
+        // The predicate MUST key on the LOG-retention cutoff (delta.logRetentionDuration ~30d), NOT the vacuum
+        // deleted-file-retention cutoff (~7d). A CDF-on/cdc commit whose mtime lands strictly BETWEEN the two
+        // cutoffs is in-window for the scan (log retention) — a predicate keyed on the vacuum cutoff would age
+        // it out, all-off SKIP, and delete the live change file. Stamp v1 at now−14d (inside [now−30d, now−7d)).
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.MetadataWithConfig(("delta.enableChangeDataFeed", "true")),
+            DeltaTestHarness.Cdc("_change_data/gap.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+        await WriteDataFileAsync("_change_data/gap.parquet", OldFile);
+
+        (DeltaVacuum vacuum, _) = BuildWithStamps(
+            skipEnabled: true,
+            new[] { (0L, Recent), (1L, Now.AddDays(-14)), (2L, Recent) }); // v1 between the two cutoffs
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        Assert.DoesNotContain("_change_data/gap.parquet", result.DeletablePaths);
+    }
+
+    [Fact]
+    public async Task CutoffEqualityBoundary_MtimeExactlyAtLogRetentionCutoff_Scans_AndProtectsCdc()
+    {
+        // Boundary: the scan keeps a commit whose mtime is EXACTLY at the log-retention cutoff in-window (its
+        // skip is `mtime < cutoff`, strict). The predicate's complement must use the same strict `<`, so a
+        // mtime == cutoff commit is in-window for the predicate too. A `<=` off-by-one would shrink the
+        // predicate set below the scan's → wrong skip. Stamp v1 exactly at now − 30d (the log-retention cutoff).
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.MetadataWithConfig(("delta.enableChangeDataFeed", "true")),
+            DeltaTestHarness.Cdc("_change_data/edge.parquet"));
+        await DeltaTestHarness.WriteCommitAsync(_backend, 2, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+        await WriteDataFileAsync("_change_data/edge.parquet", OldFile);
+
+        // The default log retention is 30 days; place v1's mtime exactly on that cutoff.
+        (DeltaVacuum vacuum, _) = BuildWithStamps(
+            skipEnabled: true,
+            new[] { (0L, Recent), (1L, Now.AddDays(-30)), (2L, Recent) });
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        Assert.DoesNotContain("_change_data/edge.parquet", result.DeletablePaths);
+    }
+
+    [Fact]
+    public async Task BelowCoverage_CheckpointSeeded_SubFloorCdcCommit_Scans_AndProtectsCdc()
+    {
+        // Benefit-envelope boundary (§2.4) + a critical fail-closed guard. A compacting checkpoint@2 seeds the
+        // reconstruction's replay floor at v3, so the observer covers only [3, latest]. A SURVIVING sub-floor
+        // commit v1.json (below the floor) enabled CDF and wrote a cdc file. It is in-window (recent mtime) but
+        // BELOW coverage → TryGetProvenPrevailing returns false → ScanUnproven → SCAN → the cdc file is
+        // protected. A mutant that skipped when the in-window set extends below coverage would delete it.
+        await DeltaTestHarness.WriteCheckpointAsync(_backend, 2, new CheckpointFixture()
+            .Protocol(1, 2)
+            .Metadata(id: "t", schemaString: EmptySchemaUnescaped)); // checkpoint bakes CDF-off state
+        await DeltaTestHarness.WriteLastCheckpointAsync(_backend, 2);
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.MetadataWithConfig(("delta.enableChangeDataFeed", "true")),
+            DeltaTestHarness.Cdc("_change_data/below.parquet")); // surviving sub-floor cdc commit
+        await DeltaTestHarness.WriteCommitAsync(_backend, 3, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+        await WriteDataFileAsync("_change_data/below.parquet", OldFile);
+
+        (DeltaVacuum vacuum, _) = Build(skipEnabled: true, 1, 3);
+        VacuumResult result = await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        Assert.DoesNotContain("_change_data/below.parquet", result.DeletablePaths);
+
+        // Differential: identical to the null-observer unconditional-scan control.
+        (DeltaVacuum control, _) = Build(skipEnabled: false, 1, 3);
+        VacuumResult scan = await control.VacuumAsync(Retention, dryRun: true);
+        Assert.Equal(
+            scan.DeletablePaths.OrderBy(p => p, StringComparer.Ordinal),
+            result.DeletablePaths.OrderBy(p => p, StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public async Task InheritedCdfOn_EnablerAgedOutBelowLow_FullReplay_Scans_AndProtectsCdc()
+    {
+        // Derive-prevailing path (ii): full replay (observer covers [0, latest]), CDF enabled at an AGED-OUT
+        // recorded transition vₑ=0 that is below the in-window low end, and every in-window commit (v1) merely
+        // INHERITS CDF-on with no metaData of its own. The step function must carry v0's recorded CDF-on
+        // forward to the inheriting in-window v1 → SCAN → protect. A mutant that reads _lineageAtWindowStart
+        // plus only the in-window records (dropping the recorded transition at v0 < lo) would wrongly skip.
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0, DeltaTestHarness.Protocol(),
+            DeltaTestHarness.MetadataWithConfig(("delta.enableChangeDataFeed", "true")));
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 1, DeltaTestHarness.Add("active.parquet"), DeltaTestHarness.Cdc("_change_data/inh.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+        await WriteDataFileAsync("_change_data/inh.parquet", OldFile);
+
+        // v0 (the CDF-on enabler) is AGED OUT (below the log-retention cutoff), so it is NOT in the in-window
+        // set — yet the observer still recorded its transition; only v1 is in-window and inherits.
+        (DeltaVacuum vacuum, _) = BuildWithStamps(
+            skipEnabled: true, new[] { (0L, Now.AddDays(-60)), (1L, Recent) });
+
+        VacuumResult result = await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        Assert.DoesNotContain("_change_data/inh.parquet", result.DeletablePaths);
+    }
+
+    [Fact]
+    public async Task Skip_LogsDeltaVacuumCdcScanSkipped_AndNotTheScanCompletedEvent()
+    {
+        // Pin skip-for-the-RIGHT-reason: a proven skip emits the distinct EventId 4109
+        // DeltaVacuumCdcScanSkipped log (value-type-only) and does NOT emit the scan-completed event; the
+        // in-window-commit count field matches. Guards a mutant that keeps read-counts but flips the decision.
+        await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
+        await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("active.parquet"));
+        await WriteDataFileAsync("active.parquet", OldFile);
+
+        var logger = new RecordingLogger<DeltaVacuum>();
+        (DeltaVacuum vacuum, _) = BuildWithStamps(
+            skipEnabled: true, new[] { (0L, Recent), (1L, Recent) }, logger);
+        await vacuum.VacuumAsync(Retention, dryRun: true);
+
+        Assert.True(logger.Has("DeltaVacuumCdcScanSkipped"), "expected the proven skip to log EventId 4109");
+        Assert.False(logger.Has("DeltaVacuumCdcScanCompleted"), "a skip must NOT log the scan-completed event");
+        Assert.Equal(2, Convert.ToInt32(logger.Single("DeltaVacuumCdcScanSkipped").Field("InWindowCommits")));
+
+        // A non-CDF table with the skip OFF logs the scan-completed event, never the skipped event.
+        var scanLogger = new RecordingLogger<DeltaVacuum>();
+        (DeltaVacuum control, _) = BuildWithStamps(
+            skipEnabled: false, new[] { (0L, Recent), (1L, Recent) }, scanLogger);
+        await control.VacuumAsync(Retention, dryRun: true);
+        Assert.True(scanLogger.Has("DeltaVacuumCdcScanCompleted"));
+        Assert.False(scanLogger.Has("DeltaVacuumCdcScanSkipped"));
+    }
+
+    private const string EmptySchemaUnescaped = """{"type":"struct","fields":[]}""";
 
     private sealed class FixedTimeProvider : TimeProvider
     {
