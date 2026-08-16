@@ -890,6 +890,10 @@ internal sealed class DeltaLog
                 continue; // in-range versions are covered by the reader's per-version identity check.
             }
 
+            // Preserve today's per-iteration cancellation responsiveness: a no-checkpoint table replays every
+            // pre-range version in-memory here (the fan-out set is then empty and never observes the token).
+            cancellationToken.ThrowIfCancellationRequested();
+
             if (version == earliest && earliestVersionMetadataFromBaseline is not null)
             {
                 RecordIdentityChecks(fault, version, earliestVersionMetadataFromBaseline, endIdentity);
@@ -954,8 +958,8 @@ internal sealed class DeltaLog
                     continue;
                 }
 
-                long captured = version;
-                tasks.Add(ReadValidateReleaseAsync(captured, fault, semaphore, endIdentity, cancellationToken));
+                // Pass the loop variable directly — it is a per-iteration argument copy, not a captured closure.
+                tasks.Add(ReadValidateReleaseAsync(version, fault, semaphore, endIdentity, cancellationToken));
             }
 
             await Task.WhenAll(tasks).ConfigureAwait(false);
