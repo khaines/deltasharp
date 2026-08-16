@@ -54,10 +54,12 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         + "\"delta.enableChangeDataFeed\":\"true\"}}}";
 
     // Builds a checkpoint@floor (clean identity X, CDF on) with `subFloorCount` surviving sub-floor commits
-    // (v1..v{floor-1}); a forged version in `forged` swaps identity. The range-start commit v{floor} is benign.
-    private async Task BuildAsync(int floor, int subFloorCount, params long[] forged)
+    // (v1..v{floor-1}); a forged version in `forged` swaps identity; a version in `malformed` is written as
+    // unparseable garbage (a distinct fault KIND). The range-start commit v{floor} is benign.
+    private async Task BuildAsync(int floor, int subFloorCount, long[]? forged = null, long[]? malformed = null)
     {
-        var forgedSet = new HashSet<long>(forged);
+        var forgedSet = new HashSet<long>(forged ?? Array.Empty<long>());
+        var malformedSet = new HashSet<long>(malformed ?? Array.Empty<long>());
         using var backend = new LocalFileSystemBackend(_root);
         await DeltaTestHarness.WriteCheckpointAsync(backend, floor, new CheckpointFixture()
             .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
@@ -70,10 +72,12 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         await DeltaTestHarness.WriteLastCheckpointAsync(backend, floor);
         for (long v = 1; v <= subFloorCount; v++)
         {
-            string line = forgedSet.Contains(v) ? MetaLine(2, 1) : MetaLine(1, 2);
+            byte[] bytes = malformedSet.Contains(v)
+                ? Encoding.UTF8.GetBytes("{ this is not valid delta commit json \n")
+                : Encoding.UTF8.GetBytes((forgedSet.Contains(v) ? MetaLine(2, 1) : MetaLine(1, 2)) + "\n");
             await backend.PutIfAbsentAsync(
                 "_delta_log/" + v.ToString("D20", System.Globalization.CultureInfo.InvariantCulture) + ".json",
-                Encoding.UTF8.GetBytes(line + "\n"), CancellationToken.None);
+                bytes, CancellationToken.None);
         }
 
         // The range start (== floor) benign commit so the resolved range has a readable start version.
@@ -380,6 +384,43 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         // because it would never reach the fan-out disk-read of the lower v1.
     }
 
+    [Fact]
+    public async Task MalformedCommitAtMinVersion_FailsClosed_UnifiedWithIdentityOffenses()
+    {
+        // A malformed (unparseable) commit is a DISTINCT fault kind. At the LOW/min version (v2) with an identity
+        // offense at a HIGH version (v4), the unified min-by-version reduction must fail closed on the malformed
+        // v2 (not surface the v4 identity offense) and, at bound=1, read no version > v2.
+        await BuildAsync(floor: 6, subFloorCount: 5, forged: new long[] { 4 }, malformed: new long[] { 2 });
+        (CdfPreRangeConcurrencyProbeBackend probe, Exception? error) = await RunAsync(floor: 6, bound: 1);
+
+        Assert.NotNull(error); // fails closed on the malformed commit rather than passing an unvalidated version
+        Assert.DoesNotMatch(@"version 4\b", DescribeChain(error!)); // the higher identity offense never wins
+        Assert.DoesNotContain(probe.CommitVersionsRead, v => v is > 2 and < 6); // pruned past the min
+    }
+
+    [Fact]
+    public async Task BaselineBranchOffense_RecordsAndIsOutrankedByALowerDiskOffender()
+    {
+        // The baseline (checkpoint-baked identity at the reconstructable floor) is the third fault source. A
+        // forged checkpoint bake at v3 records an offense@3 via the in-memory RecordIdentityCheck branch. (a)
+        // baseline-only → the gate surfaces v3; (b) baseline + a lower forged sub-floor disk stray at v1 → the
+        // min-by-version reduction across the BASELINE and DISK branches surfaces v1. A baseline verdict thrown
+        // INLINE would surface v3 in case (b) instead of the lower v1.
+        (CdfPreRangeConcurrencyProbeBackend _, Exception? baselineOnly) = await RunBaselineCrossBranchAsync(
+            bound: 16, forgeDiskV1: false);
+        Assert.NotNull(baselineOnly);
+        Assert.Matches(@"version 3\b", DescribeChain(baselineOnly!)); // the baseline branch is a live offense source
+
+        Dispose();
+        Directory.CreateDirectory(_root);
+
+        (CdfPreRangeConcurrencyProbeBackend _, Exception? crossBranch) = await RunBaselineCrossBranchAsync(
+            bound: 16, forgeDiskV1: true);
+        Assert.NotNull(crossBranch);
+        Assert.Matches(@"version 1\b", DescribeChain(crossBranch!));   // lower disk offender outranks the baseline
+        Assert.DoesNotMatch(@"version 3\b", DescribeChain(crossBranch!));
+    }
+
     // Flattens an exception chain (message + type names) so an assertion is robust to the CDF read wrapping the
     // gate's surfaced exception.
     private static string DescribeChain(Exception ex)
@@ -391,6 +432,33 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         }
 
         return sb.ToString();
+    }
+
+    // Builds a table whose CDF range starts ABOVE a FORGED checkpoint floor: the baseline reconstructed at the
+    // floor (v3) carries a swapped identity → an offense recorded via the in-memory baseline branch; v4 restores
+    // the clean identity (observer-proven, benign) and v5 (range start, clean) fixes the end identity. Optionally
+    // a lower sub-floor stray v1 is forged (a DISK offender) to pit the baseline branch against a lower disk fault.
+    private async Task<(CdfPreRangeConcurrencyProbeBackend Probe, Exception? Error)> RunBaselineCrossBranchAsync(
+        int bound, bool forgeDiskV1)
+    {
+        using (var seed = new LocalFileSystemBackend(_root))
+        {
+            await DeltaTestHarness.WriteCheckpointAsync(seed, 3, new CheckpointFixture()
+                .Protocol(3, 7, new[] { "columnMapping" }, new[] { "columnMapping", "changeDataFeed" })
+                .Metadata("rt", SchemaJson(2, 1), partitionColumns: null, configuration: new[] // FORGED baked identity
+                {
+                    ("delta.columnMapping.mode", "id"),
+                    ("delta.columnMapping.maxColumnId", "2"),
+                    ("delta.enableChangeDataFeed", "true"),
+                }));
+            await DeltaTestHarness.WriteLastCheckpointAsync(seed, 3);
+            await WriteCommitAsync(seed, 1, forgeDiskV1 ? MetaLine(2, 1) : MetaLine(1, 2)); // sub-floor disk stray
+            await WriteCommitAsync(seed, 2, MetaLine(1, 2)); // sub-floor stray, clean
+            await WriteCommitAsync(seed, 4, MetaLine(1, 2)); // observer-proven, restores the clean identity
+            await WriteCommitAsync(seed, 5, MetaLine(1, 2)); // range start, clean → end identity X
+        }
+
+        return await ResolveCrossBranchAsync(bound);
     }
 
     // Builds a table whose CDF range starts ABOVE the reconstructable checkpoint floor, so a pre-range commit is
@@ -416,6 +484,12 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
             await WriteCommitAsync(seed, 5, MetaLine(1, 2)); // range start, clean → end identity X
         }
 
+        return await ResolveCrossBranchAsync(bound);
+    }
+
+    // Resolves + drains the CDF range [5,5] over a fresh probe at the given fan-out bound, capturing any error.
+    private async Task<(CdfPreRangeConcurrencyProbeBackend Probe, Exception? Error)> ResolveCrossBranchAsync(int bound)
+    {
         var inner = new LocalFileSystemBackend(_root);
         var probe = new CdfPreRangeConcurrencyProbeBackend(inner);
         var log = new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: bound);
