@@ -36,7 +36,7 @@
          not via Parquet.Net.) These packages enter the SBOM/SCA scope for DeltaSharp.Storage; the
          sca-policy `expectedProjects` already covers DeltaSharp.Storage, so they are scanned by the
          supply-chain gate. -->
-    <PackageVersion Include="Parquet.Net" Version="6.0.3" />
+    <PackageVersion Include="Parquet.Net" Version="6.1.0" />
     <!-- STORY-05.3 observability (#479): Microsoft.Extensions.Logging.Abstractions supplies
          ILogger<T>, the [LoggerMessage] source generator (allocation-free structured logging,
          checklist 09a), EventId, and LogLevel for DeltaSharp.Storage's commit-path telemetry.
@@ -46,14 +46,14 @@
          GA baseline (10.0.0) so locked-mode restore stays reproducible across SDK patches
          (same rationale as the ILLink pin in Directory.Build.props). Meter/ActivitySource live
          in the shared framework (System.Diagnostics.DiagnosticSource) and need no package. -->
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.10" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- Test toolchain. -->
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="3.1.5" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0" />
     <!-- Coverage collection (FEAT-00.2 / #106 STORY-00.2.3). coverlet.collector is the
          xunit-integrated data collector invoked by the "XPlat Code Coverage" collector; it
          instruments the already-built assemblies at test-run time (no rebuild required) and
@@ -77,7 +77,7 @@
          library (not an analyzer) to parse production source with a real C# parser for the #455
          telemetry-leak guard (TelemetryExceptionScrubbingGuardTests) — retiring a bug-prone
          hand-rolled masker. Test-only; never a production/runtime dependency. -->
-    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="4.14.0" />
+    <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="5.6.0" />
   </ItemGroup>
 
 </Project>
