@@ -200,6 +200,37 @@ internal sealed class DeltaLog
         return (snapshot, listing);
     }
 
+    /// <summary>
+    /// VACUUM-only (#809): <see cref="LoadSnapshotWithListingAsync"/> that ALSO piggybacks an
+    /// <b>UNSEALED</b> <see cref="ReplayedMetadataLog"/> observer over the <b>same</b> reconstruction — never a
+    /// second replay — so VACUUM's in-window cdc-scan skip (#641 item 3) can prove the retained protocol
+    /// history's Change-Data-Feed enablement from the very log view the snapshot was built on.
+    /// <para><b>Returned UNSEALED, deliberately.</b> Sealing runs a fail-closed lineage cross-check
+    /// (<see cref="ReplayedMetadataLog.Seal"/> → <see cref="DeltaProtocolException"/> on an unaccountable
+    /// lineage). If this method sealed, an unaccountable lineage would turn a currently-succeeding VACUUM into
+    /// a hard failure — a new failure surface. Instead this stays a PURE PRODUCER (byte-identical
+    /// reconstruction, no new throw), and VACUUM performs <c>Seal()</c> + the skip query inside its own
+    /// predicate <c>try/catch</c> that degrades a <see cref="DeltaProtocolException"/> to a fail-closed SCAN —
+    /// safe, because the observer-free scan is VACUUM's correctness reference (mirrors the reconstruct →
+    /// seal-in-consumer boundary of <see cref="LoadChangeFeedStartSnapshotAsync"/>).</para>
+    /// <para>The observer covers <c>[replayStart, latest]</c>; an in-window version below the reconstruction's
+    /// replay floor (a checkpoint-seeded deep-retention table) is reported un-proven, so VACUUM scans it —
+    /// the skip fires only on full-replay / above-checkpoint reconstructions (the honest benefit envelope).</para>
+    /// </summary>
+    internal async Task<(Snapshot Snapshot, LogListing Listing, ReplayedMetadataLog Observer)>
+        LoadSnapshotWithListingAndObserverAsync(CancellationToken cancellationToken = default)
+    {
+        long start = Stopwatch.GetTimestamp();
+        LogListing listing = await ListLogAsync(cancellationToken).ConfigureAwait(false);
+        // Size the observer to the full reconstructed range [replayStart, latest]. VACUUM always loads latest
+        // (version == null resolves to RequireLatest), so exclusiveUpperBound = latest + 1 records every
+        // replayed version through the snapshot the scan protects.
+        var observer = new ReplayedMetadataLog(RequireLatest(listing) + 1);
+        Snapshot snapshot = await LoadSnapshotFromListingAsync(listing, null, start, observer, cancellationToken)
+            .ConfigureAwait(false);
+        return (snapshot, listing, observer);
+    }
+
     /// <summary>Resolves and reconstructs a snapshot from an <b>already-obtained</b> <see cref="LogListing"/> —
     /// <see cref="LoadSnapshotWithListingAsync"/> minus the <c>_delta_log</c> LIST — so a caller holding a
     /// listing can load a second snapshot (or drive a listing-derived scan) without re-listing (#691).

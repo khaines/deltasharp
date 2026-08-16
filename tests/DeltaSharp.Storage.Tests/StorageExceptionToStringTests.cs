@@ -209,6 +209,7 @@ public sealed class StorageExceptionToStringTests
         "DeltaVacuumLog.VacuumAbortedStaleListing(ILogger logger, Int64 listedVersion, Int64 resolvedVersion)",
         "DeltaVacuumLog.VacuumCandidateDecisionCore(ILogger logger, String candidateDescription, String decision, Boolean deleted)",
         "DeltaVacuumLog.VacuumCdcScanCompleted(ILogger logger, Int32 commitsScanned, Double durationMs, Boolean completed)",
+        "DeltaVacuumLog.VacuumCdcScanSkipped(ILogger logger, Int32 inWindowCommits, Int64 provenSpan)",
         "DeltaVacuumLog.VacuumCompleted(ILogger logger, Int64 version, Int32 candidateCount, Int32 deletableCount, Int32 deletedCount, Boolean dryRun, Double durationMs)",
         "DeltaVacuumLog.VacuumFailed(ILogger logger, String exceptionType)",
         "DeltaVacuumLog.VacuumRejectedRetention(ILogger logger, Double requestedHours, Double thresholdHours)",
