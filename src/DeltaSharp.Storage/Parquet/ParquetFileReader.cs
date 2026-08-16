@@ -2136,10 +2136,11 @@ internal sealed class ParquetFileReader
     //
     // SCOPE: this covers only TOP-LEVEL scalar string/binary lanes (the ReadStringAsync/ReadBinaryAsync callers).
     // NESTED string/binary (and value) leaves inside a struct/array/map go through NestedParquetColumnReader,
-    // whose leaf nullability is deliberately advisory and which has no equivalent guard — a required nested leaf
-    // backed by an OPTIONAL physical column can still silently null-fill. That is a dispositioned residual
-    // tracked by #813 (a correct fix there must be Dremel-aware: reject a leaf-null only when every ANCESTOR is
-    // present, not an ancestor-null).
+    // whose leaf-own nullability is now enforced by the Dremel-aware analogue
+    // NestedParquetColumnReader.RejectNullInRequiredNestedLeaf (#813): a required nested leaf backed by a
+    // physically-OPTIONAL column that materializes a LEAF-ATTRIBUTABLE null (every ancestor present, only the
+    // leaf's own value null) fails closed there, while an ancestor-null (null struct / absent element / null
+    // map entry) is accepted.
     //
     // TIMING: unlike the value-type SCHEMA guard (which rejects before any batch is decoded), this fires
     // mid-decode at the first offending value, which can be in a late row group — so earlier clean batches may
