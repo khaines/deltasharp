@@ -255,16 +255,25 @@ public sealed class BoundedDecodeTests
         var disposed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var resource = new ObservableDisposable(disposed);
 
+        // Gate the work so it can NEVER win the in-budget race: it blocks until the test releases it AFTER the
+        // deadline has been observed. This makes the "late win" deterministic under any thread-pool load — the
+        // prior version raced a 400 ms `Thread.Sleep` against a 100 ms budget, which flaked when pool starvation
+        // delayed the WhenAny continuation past 400 ms (both the work and the deadline had completed, so the code
+        // took the in-budget branch and never threw).
+        using var release = new ManualResetEventSlim(false);
+
         var thrown = await Assert.ThrowsAsync<DeltaStorageException>(() =>
             decoder.RunAsync<ObservableDisposable>(
-                _ => { Thread.Sleep(TimeSpan.FromMilliseconds(400)); return Task.FromResult(resource); },
+                _ => { release.Wait(TimeSpan.FromSeconds(30)); return Task.FromResult(resource); },
                 TimeSpan.FromMilliseconds(100),
                 static _ => DeltaStorageException.DecodeBudgetExceeded("late win"),
                 CancellationToken.None,
                 onAbandonedResult: r => r.Dispose()));
         Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, thrown.Kind);
 
-        // The late (post-deadline) success is disposed via the hook — not leaked.
+        // The deadline has fired and the decode has DETACHED (abandonment armed) — now release the work so it
+        // completes as a post-deadline success and is disposed via the hook, not leaked.
+        release.Set();
         Task completed = await Task.WhenAny(disposed.Task, Task.Delay(Watchdog));
         Assert.True(completed == disposed.Task, "the abandoned successful result was not disposed within the watchdog.");
         Assert.True(resource.IsDisposed);
