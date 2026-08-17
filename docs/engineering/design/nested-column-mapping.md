@@ -1,6 +1,11 @@
 # Nested (struct/array/map) column mapping
 
-> **Status:** Draft
+> **Status:** Draft — **BLOCKED (round-1 RFL).** The opus-5 design council (PR #826) found #676 is blocked
+> on **#713** (DeltaSharp cannot write nested Parquet), exposes a latent `BuildFieldIdMap` nested-name
+> collision, and interacts with `ColumnMappingIdentity` (which relies on nested mapping being unsupported).
+> This draft's synthetic-node id model (§2.2/§2.5/§9.2) is **incorrect** — Delta assigns ids to `StructField`s
+> at every depth, never to array-`element`/map-`key`/`value`. Needs a re-scope to `struct<scalars>` and
+> sequencing behind #713. See PR #826's review for the full findings and recommended path.
 > **Issue:** [#676](https://github.com/khaines/deltasharp/issues/676) — Delta column mapping: nested
 > (struct/array/map) column mapping — recursive leaf field-id/physical-name assignment + resolution
 > **Author:** design-doc skill (orchestrated)
