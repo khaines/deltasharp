@@ -46,11 +46,15 @@ internal sealed class DeltaLog
 
     // #808/#821: the DEFAULT bounded-concurrency fan-out for the below-floor CDF pre-range identity scan scales
     // with the storage backend's parallelism tolerance (see SuggestedPreRangeScanConcurrency). The bound only
-    // affects the read SCHEDULE — never the validated set or the surfaced error (coverage-neutrality and the
-    // deterministic min-faulting-version contract are bound-independent, proven by #808's battery). An explicit
-    // ctor override remains authoritative; a bound of 1 restores today's sequential read set + ascending order
-    // (the kill-switch). Cloud object stores hide per-GET latency behind many parallel connections and reward a
-    // high fan-out (#808 range 16–32); a single-spindle PVC / local FS is thrashed well below that.
+    // affects the read SCHEDULE — never the VERDICT (fail-closed vs pass) or the surfaced MIN faulting version:
+    // the minimum offending version is always read (skip-not-yet-started prunes only versions ABOVE an
+    // already-recorded fault) and surfaced, so a forged table always fails closed with the same version at any
+    // bound. (On a faulting table a lower bound may prune more SUPRA-min reads — a benign read-set difference,
+    // identical to today's behaviour between explicit bounds 4 and 32; on a clean table the read set is
+    // bound-independent. All proven by the #808 battery.) An explicit ctor override remains authoritative; a
+    // bound of 1 restores today's sequential read set + ascending order (the kill-switch). Cloud object stores
+    // hide per-GET latency behind many parallel connections and reward a high fan-out (#808 range 16–32); a
+    // single-spindle PVC / local FS is thrashed well below that.
     internal const int CloudPreRangeScanConcurrency = 32;
     internal const int PvcPreRangeScanConcurrency = 4;
     internal const int DefaultPreRangeScanConcurrency = 16; // neutral fallback for an unmapped backend kind
@@ -938,9 +942,10 @@ internal sealed class DeltaLog
     /// seek thrash while still hiding syscall latency. An unmapped future kind falls back to the neutral #808
     /// middle (never unbounded). This only sets the DEFAULT read <b>schedule</b>: an explicit
     /// <c>preRangeScanConcurrency</c> ctor override is authoritative, <c>1</c> is the exact sequential
-    /// kill-switch, and coverage-neutrality + the deterministic min-faulting-version contract are
-    /// bound-independent (proven by the #808 battery), so this can never change the validated set or the
-    /// surfaced error.
+    /// kill-switch, and the VERDICT (fail-closed vs pass) and the surfaced MIN faulting version are
+    /// bound-independent (the minimum offending version is always read and surfaced; a lower bound only prunes
+    /// more supra-min reads on a faulting table — proven by the #808 battery), so this can never let a forged
+    /// table pass nor change which version is reported.
     /// </summary>
     internal static int SuggestedPreRangeScanConcurrency(StorageBackendKind kind) => kind switch
     {
