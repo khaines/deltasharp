@@ -566,10 +566,19 @@ graph LR
    strictly after the drain.
 6. **Concurrency primitive & memory (see 5).** Peak concurrent commit buffers = bound × `maxLogObjectBytes` and
    ≤ bound live tasks; both bounded/configurable; documented §4/§6/§8. No mitigation owed beyond the bound.
-7. **Default bound (RESOLVED — 16, configurable 16–32 per #691).** 16 balances latency hiding against
-   connection-pool pressure; operators can raise to 32; 1 is the sequential kill-switch. Open sub-item: whether
-   the default should scale with a detected backend parallelism hint — deferred (a static default meets the
-   #808 target; a hint is a follow-up).
+7. **Default bound (RESOLVED — backend-derived; explicit override authoritative).** The default now scales with
+   the storage backend's parallelism tolerance (#821): cloud object stores (S3/ADLS/GCS) →
+   `CloudPreRangeScanConcurrency = 32`, a Kubernetes PVC / local single-spindle FS → `PvcPreRangeScanConcurrency
+   = 4`, and any unmapped future kind falls back to the neutral `DefaultPreRangeScanConcurrency = 16`. An
+   explicit `preRangeScanConcurrency` ctor override remains authoritative and `1` is the exact sequential
+   kill-switch. The bound only sets the read *schedule* — the **verdict** (fail-closed vs pass) and the surfaced
+   **minimum** faulting version are bound-independent: the minimum offending version is always read
+   (skip-not-yet-started prunes only versions *above* an already-recorded fault) and surfaced, so a forged table
+   always fails closed with the same version at any bound. On a faulting table a lower bound may prune more
+   *supra-min* reads (a benign read-set difference, identical to the behaviour between explicit bounds 4 and 32);
+   on a clean table the read set is bound-independent — both proven by the #808 battery. A backend-derived
+   default therefore can never let a forged table pass or change which version is reported. (Delivered by #821;
+   see `DeltaLog.SuggestedPreRangeScanConcurrency`.)
 8. **Perf gate rigor (RESOLVED — efficiency floor + split time model + instrumented peak).** The wall-clock arm
    asserts `waves == ceil(B/bound) ± 1` (an efficiency floor, not mere monotonicity) on a virtual-time backend;
    peak memory is measured by an instrumented high-water backend (not `MemoryDiagnoser`, which is cumulative and

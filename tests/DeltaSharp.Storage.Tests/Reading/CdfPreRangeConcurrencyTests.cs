@@ -92,7 +92,7 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         CancellationToken cancellationToken = default)
     {
         var inner = new LocalFileSystemBackend(_root);
-        var probe = new CdfPreRangeConcurrencyProbeBackend(inner);
+        var probe = new CdfPreRangeConcurrencyProbeBackend(inner) { InFlightFloorExclusive = floor };
         configure?.Invoke(probe);
         var log = new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: bound);
         var reader = new ChangeFeedReader(probe, inner.TableIdentity, log, new ParquetFileReader());
@@ -116,6 +116,174 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         }
 
         return (probe, error);
+    }
+
+    // #821: drives the CDF read over a probe whose reported backend Kind is `kind`; when `explicitBound` is null
+    // the DeltaLog derives its fan-out bound from the backend kind (the behaviour under test), otherwise the
+    // explicit override is used.
+    private async Task<(CdfPreRangeConcurrencyProbeBackend Probe, Exception? Error)> RunKindAsync(
+        int floor, StorageBackendKind kind, int? explicitBound, Action<CdfPreRangeConcurrencyProbeBackend>? configure = null)
+    {
+        var inner = new LocalFileSystemBackend(_root);
+        var probe = new CdfPreRangeConcurrencyProbeBackend(inner) { KindOverride = kind, InFlightFloorExclusive = floor };
+        configure?.Invoke(probe);
+        DeltaLog log = explicitBound is { } bound
+            ? new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: bound)
+            : new DeltaLog(probe, DeltaLog.MaxLogObjectBytes); // null → derive from backend kind
+        var reader = new ChangeFeedReader(probe, inner.TableIdentity, log, new ParquetFileReader());
+
+        Exception? error = null;
+        try
+        {
+            DeltaChangeFeedInfo info = await reader.ResolveAsync(
+                DeltaChangeFeedRange.FromVersion(floor, floor), CancellationToken.None).ConfigureAwait(false);
+            await foreach (ColumnBatch _ in reader.ReadAsync(info, CancellationToken.None).ConfigureAwait(false))
+            {
+            }
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            probe.MarkGateReturned();
+        }
+
+        return (probe, error);
+    }
+
+    [Fact]
+    public void SuggestedPreRangeScanConcurrency_MapsBackendKindToItsParallelismTolerance()
+    {
+        // #821: cloud object stores reward a high fan-out; a single-spindle PVC/local FS is thrashed below it.
+        Assert.Equal(DeltaLog.CloudPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.S3));
+        Assert.Equal(DeltaLog.CloudPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.Adls));
+        Assert.Equal(DeltaLog.CloudPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.Gcs));
+        Assert.Equal(DeltaLog.PvcPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.Pvc));
+        Assert.True(DeltaLog.CloudPreRangeScanConcurrency > DeltaLog.PvcPreRangeScanConcurrency);
+
+        // Fallback: an out-of-range (unmapped) kind uses the neutral default — never 0 or unbounded.
+        Assert.Equal(DeltaLog.DefaultPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency((StorageBackendKind)999));
+
+        // Exhaustiveness guard: every DEFINED kind must map to a DELIBERATE (non-fallback) tolerance, so a future
+        // StorageBackendKind that silently falls through to the neutral default breaks this test and forces a
+        // conscious per-kind mapping decision.
+        foreach (StorageBackendKind kind in Enum.GetValues<StorageBackendKind>())
+        {
+            int bound = DeltaLog.SuggestedPreRangeScanConcurrency(kind);
+            Assert.True(
+                bound == DeltaLog.CloudPreRangeScanConcurrency || bound == DeltaLog.PvcPreRangeScanConcurrency,
+                $"StorageBackendKind.{kind} falls to the neutral fallback; map it to a deliberate parallelism tolerance.");
+        }
+    }
+
+    [Fact]
+    public async Task ForgedTable_FailsClosedWithTheSameMinVersion_AcrossBackendDerivedDefaults()
+    {
+        // The bound only changes the read SCHEDULE. A forged sub-floor table must FAIL CLOSED with the SAME
+        // minimum offending version regardless of the backend-derived default (PVC=4 vs cloud=32): the minimum
+        // offending version is always read (skip-not-yet-started prunes only versions ABOVE an already-recorded
+        // fault) and surfaced. A lower bound may prune more SUPRA-min reads — a benign read-set difference,
+        // identical to #808's behaviour between explicit bounds 4 and 32 — but the VERDICT and the surfaced
+        // error identity are bound-independent, so the derived default can never let a forged table pass.
+        await BuildAsync(floor: 6, subFloorCount: 5, forged: new long[] { 2, 4 });
+        (CdfPreRangeConcurrencyProbeBackend _, Exception? ePvc) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.Pvc, explicitBound: null);
+
+        Dispose();
+        Directory.CreateDirectory(_root);
+        await BuildAsync(floor: 6, subFloorCount: 5, forged: new long[] { 2, 4 });
+        (CdfPreRangeConcurrencyProbeBackend _, Exception? eCloud) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: null);
+
+        Assert.NotNull(ePvc);  // both fail closed
+        Assert.NotNull(eCloud);
+        Assert.Matches(@"version 2\b", DescribeChain(ePvc!));   // the numeric minimum offender, on both
+        Assert.Matches(@"version 2\b", DescribeChain(eCloud!));
+        Assert.DoesNotMatch(@"version 4\b", DescribeChain(ePvc!));
+        Assert.DoesNotMatch(@"version 4\b", DescribeChain(eCloud!));
+    }
+
+    [Fact]
+    public async Task DefaultBound_ScalesWithBackendKind_CloudFansOutWiderThanPvc()
+    {
+        // With NO explicit override, the default fan-out bound is derived from the backend kind. Five sub-floor
+        // reads distinguish the two: a PVC backend caps at 4 (PvcPreRangeScanConcurrency); a cloud backend's
+        // bound (32) exceeds the count so all five run concurrently. This proves the default is backend-derived,
+        // not a fixed global constant.
+        void Slow(CdfPreRangeConcurrencyProbeBackend p)
+        {
+            for (long v = 1; v <= 5; v++)
+            {
+                p.Delay(v, TimeSpan.FromMilliseconds(60));
+            }
+        }
+
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend pvc, Exception? ePvc) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.Pvc, explicitBound: null, Slow);
+        Assert.Null(ePvc);
+        Assert.Equal(DeltaLog.PvcPreRangeScanConcurrency, pvc.MaxInFlightCommits); // capped at 4
+
+        Dispose();
+        Directory.CreateDirectory(_root);
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend cloud, Exception? eCloud) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: null, Slow);
+        Assert.Null(eCloud);
+        Assert.Equal(5, cloud.MaxInFlightCommits); // min(32, 5 sub-floor) → all five concurrent, wider than PVC
+    }
+
+    [Fact]
+    public async Task ExplicitOverride_IsAuthoritative_OverTheBackendDerivedDefault()
+    {
+        // An explicit preRangeScanConcurrency wins over the (cloud=32) backend default.
+        void Slow(CdfPreRangeConcurrencyProbeBackend p)
+        {
+            for (long v = 1; v <= 5; v++)
+            {
+                p.Delay(v, TimeSpan.FromMilliseconds(60));
+            }
+        }
+
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend probe, Exception? error) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: 2, Slow);
+        Assert.Null(error);
+        Assert.Equal(2, probe.MaxInFlightCommits); // the override, not the cloud default of 32
+    }
+
+    [Fact]
+    public async Task KillSwitch_ExplicitOne_IsSequential_RegardlessOfBackendKind()
+    {
+        void Slow(CdfPreRangeConcurrencyProbeBackend p)
+        {
+            for (long v = 1; v <= 5; v++)
+            {
+                p.Delay(v, TimeSpan.FromMilliseconds(60));
+            }
+        }
+
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend probe, Exception? error) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: 1, Slow);
+        Assert.Null(error);
+        Assert.Equal(1, probe.MaxInFlightCommits); // 1 is the exact sequential kill-switch even on a cloud backend
+    }
+
+    [Fact]
+    public void ExplicitBound_IsValidated_ButNullDefaultDerivesWithoutThrowing()
+    {
+        using var inner = new LocalFileSystemBackend(_root);
+        var probe = new CdfPreRangeConcurrencyProbeBackend(inner);
+        ArgumentOutOfRangeException zero = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: 0));
+        Assert.Equal("preRangeScanConcurrency", zero.ParamName); // the pre-range guard fired, not another arg
+        ArgumentOutOfRangeException negative = Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: -1));
+        Assert.Equal("preRangeScanConcurrency", negative.ParamName);
+        _ = new DeltaLog(probe, DeltaLog.MaxLogObjectBytes); // null default → derives from kind, never throws
     }
 
     [Fact]

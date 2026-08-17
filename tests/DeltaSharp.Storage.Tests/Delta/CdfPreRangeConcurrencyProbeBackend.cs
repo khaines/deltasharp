@@ -60,7 +60,17 @@ internal sealed class CdfPreRangeConcurrencyProbeBackend : IStorageBackend
 
     public void MarkGateReturned() => _gateReturned = true;
 
-    public StorageBackendKind Kind => _inner.Kind;
+    /// <summary>#821: overrides the reported backend kind so a test can drive the backend-derived default
+    /// fan-out bound (cloud vs PVC) without a real cloud backend. Null forwards the inner backend's kind.</summary>
+    public StorageBackendKind? KindOverride { get; set; }
+
+    /// <summary>When set, only sub-floor commit reads (<c>version &lt; InFlightFloorExclusive</c>) count toward
+    /// the in-flight peak, so <see cref="MaxInFlightCommits"/> measures ONLY the pre-range fan-out concurrency
+    /// and is never perturbed by the range-start (floor) commit read, which is issued outside the fan-out
+    /// semaphore. Null counts every commit read (the default).</summary>
+    public long? InFlightFloorExclusive { get; set; }
+
+    public StorageBackendKind Kind => KindOverride ?? _inner.Kind;
 
     public string TableIdentity => _inner.TableIdentity;
 
@@ -75,6 +85,7 @@ internal sealed class CdfPreRangeConcurrencyProbeBackend : IStorageBackend
             return await _inner.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
         }
 
+        bool trackInFlight = InFlightFloorExclusive is not { } floorExclusive || version < floorExclusive;
         lock (_gate)
         {
             _commitOpens.Add(path);
@@ -83,8 +94,11 @@ internal sealed class CdfPreRangeConcurrencyProbeBackend : IStorageBackend
                 _commitOpensAfterGateReturned++;
             }
 
-            _inFlightCommits++;
-            _maxInFlightCommits = Math.Max(_maxInFlightCommits, _inFlightCommits);
+            if (trackInFlight)
+            {
+                _inFlightCommits++;
+                _maxInFlightCommits = Math.Max(_maxInFlightCommits, _inFlightCommits);
+            }
         }
 
         try
@@ -105,7 +119,10 @@ internal sealed class CdfPreRangeConcurrencyProbeBackend : IStorageBackend
         {
             lock (_gate)
             {
-                _inFlightCommits--;
+                if (trackInFlight)
+                {
+                    _inFlightCommits--;
+                }
             }
         }
     }
