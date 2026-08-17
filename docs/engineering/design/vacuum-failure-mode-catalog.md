@@ -41,11 +41,11 @@ as a metric dimension). Source: `DeltaStorageTelemetry.VacuumOutcome`.
 
 | Outcome | Meaning | Operator action | Retryable? |
 |---|---|---|---|
-| `DryRun` | Listed the deletion-eligible paths without deleting anything (AC1). | Informational; review the plan. | n/a |
-| `Completed` | Reclaimed the deletion-eligible files idempotently (AC4). | None. | n/a |
-| `RejectedUnsafeRetention` | Requested retention was below the safety threshold and the unsafe override was not enabled → rejected **before any selection** (AC2). | Raise retention, or explicitly opt into the unsafe override *only* if you understand the stale-reader risk. | Yes, after fixing config. |
+| `DryRun` | Listed the deletion-eligible paths without deleting anything. | Informational; review the plan. | n/a |
+| `Completed` | Reclaimed the deletion-eligible files idempotently. | None. | n/a |
+| `RejectedUnsafeRetention` | Requested retention was below the safety threshold and the unsafe override was not enabled → rejected **before any selection**. | Raise retention, or explicitly opt into the unsafe override *only* if you understand the stale-reader risk. | Yes, after fixing config. |
 | `Cancelled` | Cancelled via `CancellationToken` before a terminal outcome. **Not a failure.** | None; re-run when ready. | Yes. |
-| `AbortedStaleListing` | Aborted fail-closed because the `_delta_log` listing was **tail-truncated** (the table root listed a version-bearing log artifact *beyond* the version the snapshot resolved to). See §4. | Wait for the listing to propagate, then re-run. | **Yes** — transient. |
+| `AbortedStaleListing` | Aborted fail-closed because the `_delta_log` listing was **tail-truncated** (the table root listed a version-bearing log artifact *beyond* the version the snapshot resolved to). See §4. | Retry **if the listing is merely stale**; if the guard **recurs on every run**, escalate — see §4.1. | **Conditional** — stale-listing lag is transient; **persistent recurrence is not** (a durably-orphaned / forged log). |
 | `Failure` | An unexpected/unclassified failure. **Fail-closed: nothing protected is deleted.** | Inspect logs; treat as a real fault, not routine. | Depends on cause. |
 
 > **Why `AbortedStaleListing` is a distinct terminal (not `Failure`):** from metrics/logs alone an operator must
@@ -89,8 +89,16 @@ be **safely skipped** only when the retained protocol history over the full in-w
   `VacuumAbortedStaleListing(maxListedLogVersion, snapshot.Version)` line (both bounded version numbers as
   fields, not an opaque string) and throw `DeltaProtocolException.StaleLogListing`.
 - **Why:** reclaiming under a stale listing could delete files referenced by the not-yet-visible commit(s).
-- **Operator action:** **retryable** — re-run once the listing propagates.
-- **Source:** `DeltaVacuum.cs` (`maxListedLogVersion > snapshot.Version` guard; `VacuumAbortedStaleListing`).
+- **Operator action:** retryable **only if the listing is merely stale** (object-store list-after-write lag —
+  it self-heals and the run succeeds on retry). **Persistent recurrence is NOT transient:** a durably-orphaned
+  version-bearing artifact — a forged log, or a foreign writer's stray checkpoint left above the resolvable
+  version — trips this guard on **every** run and never resolves. That is an inconsistent/forged-log integrity
+  condition (and an unbounded storage-cost condition, since reclamation is blocked indefinitely) and warrants
+  operator **escalation, not blind retry**. (Attempt-bounding / auto-escalation is a deliberately un-implemented
+  follow-up; the contract today is the distinct terminal + the structured log line so an operator can see the
+  recurrence and decide.)
+- **Source:** `DeltaVacuum.cs` (`maxListedLogVersion > snapshot.Version` guard); `DeltaVacuumLog.cs`
+  (`VacuumAbortedStaleListing`, EventId 4108 — the retry-vs-escalate wording is verbatim there).
 
 ### 4.2 Unsafe retention below threshold → `RejectedUnsafeRetention`
 
@@ -126,7 +134,7 @@ references them is absent from the single listing it consults.
 - It is **pre-existing and not introduced by #640** — the identical loss exists on the parent commit; #640
   strictly **narrows** the surface.
 
-### 5.3 Why it is bounded (and effectively unreachable in practice)
+### 5.3 Why it is bounded (reachable only under a catastrophic list-inconsistent store fault)
 
 - **Recency-window bound:** a fresh, unpropagated commit's files are `RecentlyStaged` (§3) and **never deleted**.
   The residual can only bite an **old, long-propagated** commit.
@@ -173,13 +181,21 @@ so the epic's two inherent residuals are discoverable from one place.
 
 ## 8 · Observability quick-reference
 
-| Signal | Meaning |
-|---|---|
-| `VacuumOutcome` label (§2) | terminal outcome — watch for `AbortedStaleListing` (retryable) vs `Failure` (real fault). |
-| `deltasharp.vacuum.cdc_scan.commits` / `.duration_ms` | in-window cdc-scan cost (grows with `delta.logRetentionDuration` depth) — [#641](https://github.com/khaines/deltasharp/issues/641) item 2. |
-| `deltasharp.vacuum.cdc_scan.completed` / `.reason` | whether/why the cdc scan ran or was skipped ([#809](https://github.com/khaines/deltasharp/issues/809)). |
-| `referenced_change_data` protection counter | how many `_change_data/` files were protected by the in-window scan. |
-| `VacuumAbortedStaleListing` log line | structured `maxListedLogVersion` + `snapshot.Version` fields for §4.1 self-diagnosis. |
+> **Two surfaces, don't confuse them.** The **metric instruments** (on the `DeltaSharp.Delta` meter — what you
+> query/alert on) are named `deltasharp.delta.vacuum.cdc_scan.*`; the **activity/span tags** (on the vacuum
+> span) are named `deltasharp.vacuum.cdc_scan.*`. They overlap in stem but differ in prefix **and units**.
+
+| Signal | Surface | Meaning |
+|---|---|---|
+| `VacuumOutcome` label (§2) | metric label | terminal outcome — watch `AbortedStaleListing` (retry only if stale; escalate on persistent recurrence, §4.1) vs `Failure` (real fault). |
+| `deltasharp.delta.vacuum.cdc_scan.commits` | Histogram `{commit}` | commits read by the in-window cdc scan (cost grows with `delta.logRetentionDuration` depth) — [#641](https://github.com/khaines/deltasharp/issues/641) item 2. |
+| `deltasharp.delta.vacuum.cdc_scan.duration` | Histogram **seconds** (OTel base unit) | cdc-scan wall-clock. **Alert on this**, not the span tag. |
+| `deltasharp.delta.vacuum.cdc_scan.skipped` | Counter `{scan}` | the scan was **elided** because the log proved CDF inactive across the full in-window range ([#809](https://github.com/khaines/deltasharp/issues/809)); the commits/duration histograms are **not** recorded on a skip, so this aggregate is exactly the skip count. |
+| `deltasharp.delta.vacuum.cdc_scan.scanned` | Counter `{scan}` (+ `reason` label) | the scan **ran** (the skip did not fire); the label carries why. |
+| `deltasharp.vacuum.cdc_scan.commits` / `.duration_ms` | span tags | per-run cdc-scan cost on the vacuum span. **Note: `.duration_ms` is milliseconds**, unlike the seconds metric above. |
+| `deltasharp.vacuum.cdc_scan.completed` | span tag | whether the scan **ran to completion** vs was aborted/threw mid-read (this is *not* the skip signal — that is the `.skipped` counter). |
+| `deltasharp.vacuum.decision` — `referenced_change_data` label | metric label value | how many `_change_data/` files were protected by the in-window scan (a **decision-label value**, not a standalone counter). |
+| `VacuumAbortedStaleListing` log line (EventId 4108) | log | structured `ListedVersion` + `ResolvedVersion` fields for §4.1 self-diagnosis (and the verbatim retry-vs-escalate guidance). |
 
 ---
 
