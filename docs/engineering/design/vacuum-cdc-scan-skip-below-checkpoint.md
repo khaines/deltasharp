@@ -1,6 +1,11 @@
 # VACUUM cdc-scan skip: prove CDF-off below the checkpoint (widen the #809 envelope)
 
-> **Status:** Draft
+> **Status:** Draft — **UNSOUND (round-1 RFL).** The opus-5 council + Gemini red-team unanimously found the
+> feature-absence witness deletes live `_change_data/` files (the reliability seat executed a repro):
+> feature-absent ≠ CDF-never for legacy (`minWriterVersion < 7`, CDF by property alone) and
+> legacy→v7-downgrade tables — no forgery needed — and there is no monotonicity enforcement nor a real seal
+> backstop. **Withdraw the feature witness**; instead extend the #712 observer coverage (keep #809's
+> universally-valid property proof) or use a listing-derived proof. Full analysis in PR #827's review.
 > **Issue:** [#817](https://github.com/khaines/deltasharp/issues/817) — perf(vacuum): extend #712 observer
 > coverage below the checkpoint to widen the #809 cdc-scan-skip benefit envelope
 > **Author:** design-doc skill (orchestrated)
