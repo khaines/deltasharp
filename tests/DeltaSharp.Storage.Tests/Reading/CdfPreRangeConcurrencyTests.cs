@@ -118,6 +118,131 @@ public sealed class CdfPreRangeConcurrencyTests : IDisposable
         return (probe, error);
     }
 
+    // #821: drives the CDF read over a probe whose reported backend Kind is `kind`; when `explicitBound` is null
+    // the DeltaLog derives its fan-out bound from the backend kind (the behaviour under test), otherwise the
+    // explicit override is used.
+    private async Task<(CdfPreRangeConcurrencyProbeBackend Probe, Exception? Error)> RunKindAsync(
+        int floor, StorageBackendKind kind, int? explicitBound, Action<CdfPreRangeConcurrencyProbeBackend>? configure = null)
+    {
+        var inner = new LocalFileSystemBackend(_root);
+        var probe = new CdfPreRangeConcurrencyProbeBackend(inner) { KindOverride = kind };
+        configure?.Invoke(probe);
+        DeltaLog log = explicitBound is { } bound
+            ? new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: bound)
+            : new DeltaLog(probe, DeltaLog.MaxLogObjectBytes); // null → derive from backend kind
+        var reader = new ChangeFeedReader(probe, inner.TableIdentity, log, new ParquetFileReader());
+
+        Exception? error = null;
+        try
+        {
+            DeltaChangeFeedInfo info = await reader.ResolveAsync(
+                DeltaChangeFeedRange.FromVersion(floor, floor), CancellationToken.None).ConfigureAwait(false);
+            await foreach (ColumnBatch _ in reader.ReadAsync(info, CancellationToken.None).ConfigureAwait(false))
+            {
+            }
+        }
+        catch (Exception ex)
+        {
+            error = ex;
+        }
+        finally
+        {
+            probe.MarkGateReturned();
+        }
+
+        return (probe, error);
+    }
+
+    [Fact]
+    public void SuggestedPreRangeScanConcurrency_MapsBackendKindToItsParallelismTolerance()
+    {
+        // #821: cloud object stores reward a high fan-out; a single-spindle PVC/local FS is thrashed below it.
+        Assert.Equal(DeltaLog.CloudPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.S3));
+        Assert.Equal(DeltaLog.CloudPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.Adls));
+        Assert.Equal(DeltaLog.CloudPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.Gcs));
+        Assert.Equal(DeltaLog.PvcPreRangeScanConcurrency, DeltaLog.SuggestedPreRangeScanConcurrency(StorageBackendKind.Pvc));
+        Assert.True(DeltaLog.CloudPreRangeScanConcurrency > DeltaLog.PvcPreRangeScanConcurrency);
+    }
+
+    [Fact]
+    public async Task DefaultBound_ScalesWithBackendKind_CloudFansOutWiderThanPvc()
+    {
+        // With NO explicit override, the default fan-out bound is derived from the backend kind. Six sub-floor
+        // reads distinguish the two: a PVC backend caps at 4 (PvcPreRangeScanConcurrency); a cloud backend's
+        // bound (32) exceeds the count so all six run concurrently. This proves the default is backend-derived,
+        // not a fixed global constant.
+        void Slow(CdfPreRangeConcurrencyProbeBackend p)
+        {
+            for (long v = 1; v <= 5; v++)
+            {
+                p.Delay(v, TimeSpan.FromMilliseconds(60));
+            }
+        }
+
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend pvc, Exception? ePvc) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.Pvc, explicitBound: null, Slow);
+        Assert.Null(ePvc);
+        Assert.Equal(DeltaLog.PvcPreRangeScanConcurrency, pvc.MaxInFlightCommits); // capped at 4
+
+        Dispose();
+        Directory.CreateDirectory(_root);
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend cloud, Exception? eCloud) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: null, Slow);
+        Assert.Null(eCloud);
+        Assert.Equal(5, cloud.MaxInFlightCommits); // min(32, 5 sub-floor) → all five concurrent, wider than PVC
+    }
+
+    [Fact]
+    public async Task ExplicitOverride_IsAuthoritative_OverTheBackendDerivedDefault()
+    {
+        // An explicit preRangeScanConcurrency wins over the (cloud=32) backend default.
+        void Slow(CdfPreRangeConcurrencyProbeBackend p)
+        {
+            for (long v = 1; v <= 5; v++)
+            {
+                p.Delay(v, TimeSpan.FromMilliseconds(60));
+            }
+        }
+
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend probe, Exception? error) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: 2, Slow);
+        Assert.Null(error);
+        Assert.Equal(2, probe.MaxInFlightCommits); // the override, not the cloud default of 32
+    }
+
+    [Fact]
+    public async Task KillSwitch_ExplicitOne_IsSequential_RegardlessOfBackendKind()
+    {
+        void Slow(CdfPreRangeConcurrencyProbeBackend p)
+        {
+            for (long v = 1; v <= 5; v++)
+            {
+                p.Delay(v, TimeSpan.FromMilliseconds(60));
+            }
+        }
+
+        await BuildAsync(floor: 6, subFloorCount: 5);
+        (CdfPreRangeConcurrencyProbeBackend probe, Exception? error) = await RunKindAsync(
+            floor: 6, kind: StorageBackendKind.S3, explicitBound: 1, Slow);
+        Assert.Null(error);
+        Assert.Equal(1, probe.MaxInFlightCommits); // 1 is the exact sequential kill-switch even on a cloud backend
+    }
+
+    [Fact]
+    public void ExplicitBound_IsValidated_ButNullDefaultDerivesWithoutThrowing()
+    {
+        using var inner = new LocalFileSystemBackend(_root);
+        var probe = new CdfPreRangeConcurrencyProbeBackend(inner);
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+            new DeltaLog(probe, DeltaLog.MaxLogObjectBytes, preRangeScanConcurrency: -1));
+        _ = new DeltaLog(probe, DeltaLog.MaxLogObjectBytes); // null default → derives from kind, never throws
+    }
+
     [Fact]
     public async Task MaxInFlight_EqualsMinOfBoundAndBelowFloorCount()
     {

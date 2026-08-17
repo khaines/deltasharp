@@ -60,7 +60,11 @@ internal sealed class CdfPreRangeConcurrencyProbeBackend : IStorageBackend
 
     public void MarkGateReturned() => _gateReturned = true;
 
-    public StorageBackendKind Kind => _inner.Kind;
+    /// <summary>#821: overrides the reported backend kind so a test can drive the backend-derived default
+    /// fan-out bound (cloud vs PVC) without a real cloud backend. Null forwards the inner backend's kind.</summary>
+    public StorageBackendKind? KindOverride { get; set; }
+
+    public StorageBackendKind Kind => KindOverride ?? _inner.Kind;
 
     public string TableIdentity => _inner.TableIdentity;
 

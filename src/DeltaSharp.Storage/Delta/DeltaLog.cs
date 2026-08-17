@@ -44,10 +44,16 @@ internal sealed class DeltaLog
     /// object fails closed rather than driving an unbounded read, mirroring the checkpoint part cap.</summary>
     internal const long MaxLogObjectBytes = 256L * 1024 * 1024;
 
-    // #808: default bounded-concurrency fan-out for the below-floor CDF pre-range identity scan. 16 balances
-    // latency hiding against object-store connection-pool pressure (issue #808 range 16–32). A bound of 1
-    // restores today's sequential read set + ascending order (the kill-switch).
-    internal const int DefaultPreRangeScanConcurrency = 16;
+    // #808/#821: the DEFAULT bounded-concurrency fan-out for the below-floor CDF pre-range identity scan scales
+    // with the storage backend's parallelism tolerance (see SuggestedPreRangeScanConcurrency). The bound only
+    // affects the read SCHEDULE — never the validated set or the surfaced error (coverage-neutrality and the
+    // deterministic min-faulting-version contract are bound-independent, proven by #808's battery). An explicit
+    // ctor override remains authoritative; a bound of 1 restores today's sequential read set + ascending order
+    // (the kill-switch). Cloud object stores hide per-GET latency behind many parallel connections and reward a
+    // high fan-out (#808 range 16–32); a single-spindle PVC / local FS is thrashed well below that.
+    internal const int CloudPreRangeScanConcurrency = 32;
+    internal const int PvcPreRangeScanConcurrency = 4;
+    internal const int DefaultPreRangeScanConcurrency = 16; // neutral fallback for an unmapped backend kind
 
     private readonly IStorageBackend _backend;
     private readonly long _maxLogObjectBytes;
@@ -136,11 +142,16 @@ internal sealed class DeltaLog
         TimeProvider? timeProvider = null,
         BoundedDecoder? checkpointDecoder = null,
         long checkpointMaxPartDecodedBytes = DeltaCheckpointReader.MaxCheckpointPartDecodedBytes,
-        int preRangeScanConcurrency = DefaultPreRangeScanConcurrency)
+        int? preRangeScanConcurrency = null)
     {
         ArgumentNullException.ThrowIfNull(backend);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(checkpointMaxPartDecodedBytes, nameof(checkpointMaxPartDecodedBytes));
-        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(preRangeScanConcurrency, nameof(preRangeScanConcurrency));
+        if (preRangeScanConcurrency is { } explicitBound)
+        {
+            // An explicit override is authoritative (1 = the sequential kill-switch); only a null default is
+            // derived from the backend below.
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(explicitBound, nameof(preRangeScanConcurrency));
+        }
         if (checkpointDecodeBudget is { } budget)
         {
             // Fail fast on a misconfigured operator budget with an explicit paramName — never as a raw
@@ -157,7 +168,7 @@ internal sealed class DeltaLog
         _timeProvider = timeProvider ?? TimeProvider.System;
         _checkpointDecoder = checkpointDecoder ?? BoundedDecode.CheckpointDecoder;
         _checkpointMaxPartDecodedBytes = checkpointMaxPartDecodedBytes;
-        _preRangeScanConcurrency = preRangeScanConcurrency;
+        _preRangeScanConcurrency = preRangeScanConcurrency ?? SuggestedPreRangeScanConcurrency(backend.Kind);
 
         // One-shot startup Warning (Round-13) for an under-provisioned door. The process-global door fields have
         // no ILogger in scope at static-field init, so the first DeltaLog construction that reaches a logger
@@ -918,6 +929,25 @@ internal sealed class DeltaLog
         // — never from a `finally`, so a propagating caller OperationCanceledException is never overwritten.
         fault.ThrowIfAny();
     }
+
+    /// <summary>
+    /// #821: the DEFAULT below-floor CDF pre-range fan-out bound for a backend, derived from its
+    /// <see cref="StorageBackendKind"/> parallelism tolerance. Cloud object stores (S3/ADLS/GCS) hide per-GET
+    /// latency behind many parallel connections and reward a high fan-out; a Kubernetes PersistentVolume /
+    /// local single-spindle POSIX FS is saturated (or thrashed) well below that, so a modest fan-out avoids
+    /// seek thrash while still hiding syscall latency. An unmapped future kind falls back to the neutral #808
+    /// middle (never unbounded). This only sets the DEFAULT read <b>schedule</b>: an explicit
+    /// <c>preRangeScanConcurrency</c> ctor override is authoritative, <c>1</c> is the exact sequential
+    /// kill-switch, and coverage-neutrality + the deterministic min-faulting-version contract are
+    /// bound-independent (proven by the #808 battery), so this can never change the validated set or the
+    /// surfaced error.
+    /// </summary>
+    internal static int SuggestedPreRangeScanConcurrency(StorageBackendKind kind) => kind switch
+    {
+        StorageBackendKind.S3 or StorageBackendKind.Adls or StorageBackendKind.Gcs => CloudPreRangeScanConcurrency,
+        StorageBackendKind.Pvc => PvcPreRangeScanConcurrency,
+        _ => DefaultPreRangeScanConcurrency,
+    };
 
     /// <summary>
     /// #808: bounded-concurrency fan-out of the below-floor pre-range disk reads. Producer-gated
