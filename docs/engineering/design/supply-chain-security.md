@@ -51,7 +51,7 @@ features and their checklists (05, 14, 18); this document does not restate them.
 | 107a | Secret scanning | GitHub-native secret scanning + push protection (primary); in-repo tripwire (testable) | Enabled; `secret-scan` CI job fails on un-allowlisted match | repo settings; [`security.yml`](../../../.github/workflows/security.yml), [`tools/security/secret-scan.py`](../../../tools/security/secret-scan.py) |
 | 107b/c | Dependency / SCA scanning | Build-time NuGet audit + `sca` gate + PR `dependency-review` | HIGH/CRITICAL fail the build **and** the `sca` gate; `dependency-review` (advisory, PR-only) fails on high | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml), [`dependency-review.yml`](../../../.github/workflows/dependency-review.yml), [`tools/security/sca-gate.py`](../../../tools/security/sca-gate.py) |
 | 107d | Suppression hygiene | Allowlists carrying scope/reason/owner/expiry, expiry-enforced | Malformed/expired waivers fail closed | [`sca-policy.json`](../../../tools/security/sca-policy.json), [`secret-scan-allowlist.json`](../../../tools/security/secret-scan-allowlist.json) |
-| 107e | Dependency pinning | Committed `packages.lock.json` per project + `--locked-mode` restore in CI + the `lockfile-guard` job | Drift, deletion, `.gitignore`-hiding, or an MSBuild-resolved `RestorePackagesWithLockFile` other than `true` fails the guard (advisory until promoted) | [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml), [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh), [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) |
+| 107e | Dependency pinning | Committed `packages.lock.json` per project + `--locked-mode` restore in CI + the `lockfile-guard` job | Lock-file drift, deletion, or `.gitignore`-hiding fails the guard (advisory until promoted); disabling pinning via build-definition changes is out of scope and left to code review | [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml), [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh), [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) |
 | 108a/d | SBOM | CycloneDX per packable project, retained artifact | `sbom` CI job generates + uploads | [`security.yml`](../../../.github/workflows/security.yml), [`.config/dotnet-tools.json`](../../../.config/dotnet-tools.json) |
 | 108b | Deterministic build evidence | Deterministic compile + double-build hash comparison | `sbom` job fails on non-deterministic output | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml) |
 | 108c | Source provenance | In-box SourceLink + repository metadata | `pack.yml` asserts SourceLink resolves to the repo | [`Directory.Build.props`](../../../Directory.Build.props), [`pack.yml`](../../../.github/workflows/pack.yml) |
@@ -332,7 +332,12 @@ every pull request **and** every push to `main` with no `paths:` filter, precise
 status on the default branch and can then be added to branch protection — the pattern used for
 `coverage` (#456) and the security scans (#461). Until promoted, a drifted, deleted, or
 `.gitignore`-hidden `packages.lock.json` fails the job but does not block merge; the
-`--locked-mode` restore in `build-test-format` remains the blocking backstop for drift. Gate
+`--locked-mode` restore in `build-test-format` remains the blocking backstop for drift. The guard
+covers lock-file **drift and deletion/existence only** — turning pinning off through the build
+definition (`RestorePackagesWithLockFile=false`) is out of scope, because MSBuild evaluates that
+property differently during `restore` than during a static probe, so any such check would give a
+false sense of security; that change is visible in the pull-request diff and is left to code
+review. Gate
 details live in [quality-gates.md](quality-gates.md#gate-4--nuget-lockfile-guard-831).
 
 The security scans were promoted with the documented step:
@@ -394,7 +399,7 @@ dotnet list DeltaSharp.sln package --vulnerable --include-transitive --format js
 python3 tools/security/sca-gate.py --selftest
 python3 tools/security/sca-gate.py --input sca-report.json
 
-# Dependency-pinning gate (lock files must be in sync, present, and enabled):
+# Dependency-pinning gate (lock files must be in sync and present):
 dotnet restore DeltaSharp.sln --force-evaluate
 tools/ci/lockfile-guard.sh --selftest
 tools/ci/lockfile-guard.sh

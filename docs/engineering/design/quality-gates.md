@@ -29,7 +29,7 @@ violation surfaces on the pull request rather than accumulating as debt:
   be able to change the correctness verdict, which `build-test-format` owns (see
   [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
 - **`lockfile-guard`** — the NuGet dependency-pinning gate: every committed `packages.lock.json`
-  must match the project/central-package files, must still exist, and must not be disabled (see
+  must match the project/central-package files and must still exist (see
   [Gate 4](#gate-4--nuget-lockfile-guard-831)).
 
 > **Which checks are merge-blocking.** A CI job blocks the merge button once it is listed in
@@ -48,7 +48,7 @@ violation surfaces on the pull request rather than accumulating as debt:
 | 1 | Analyzers & warnings-as-errors | `build-test-format` | `TreatWarningsAsErrors=true` + the .NET / trim / AOT / API analyzers | any analyzer or compiler **warning** is emitted by a build |
 | 2 | Formatting | `build-test-format` | `dotnet format --verify-no-changes` against the checked-in `.editorconfig` | a file does not match the formatting/style rules |
 | 3 | Coverage | `coverage` | `coverlet.collector` + [`tools/coverage/coverage-gate.py`](../../../tools/coverage/coverage-gate.py) | merged line coverage is below the configured floor |
-| 4 | NuGet lockfile pinning | `lockfile-guard` | `dotnet restore --force-evaluate` + [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh) + [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) | a `packages.lock.json` is out of sync, missing/untracked/ignored, or lock-file generation is switched off |
+| 4 | NuGet lockfile pinning | `lockfile-guard` | `dotnet restore --force-evaluate` + [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh) + [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) | a `packages.lock.json` is out of sync, or missing/untracked/ignored |
 
 Every gate has a **local command that reproduces the CI result exactly**, because the policy
 lives in checked-in configuration (`Directory.Build.props`, `.editorconfig`,
@@ -452,7 +452,7 @@ the JSON file remains the single enforced source of truth.
 
 ### What it enforces
 
-Every project restores with `RestorePackagesWithLockFile`, so a committed `packages.lock.json`
+Every project restores with lock-file pinning enabled, so a committed `packages.lock.json`
 pins the exact resolved dependency graph (including transitive packages) and CI restores with
 `--locked-mode`. The **`lockfile-guard`** job in
 [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml) protects that
@@ -468,28 +468,25 @@ pinning. It runs a `--force-evaluate` restore and then
    [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) is no longer
    tracked or is missing from the working tree.
 3. **manifest lag** — a tracked lock file is not listed in that manifest.
-4. **opt-out** — the **resolved** MSBuild property `RestorePackagesWithLockFile` of a project
-   that owns a lock file is not `true`.
 
-   This one is evaluated, not grepped: for each path in the manifest the guard runs
-   `dotnet msbuild <project> -getProperty:RestorePackagesWithLockFile` and fails unless the
-   value is `true`. A red-team review defeated an earlier line-literal regex three ways — a
-   `Condition=` attribute (`<RestorePackagesWithLockFile Condition="'1'=='1'">false</…>`), a
-   multi-line element value, and the property inherited from `Directory.Packages.props` (a file
-   the regex never read) — each of which silently disables pinning while leaving the tree clean.
-   MSBuild resolves imports, inheritance and conditions, so all three now fail closed, and an
-   XML-**commented-out** property correctly resolves to `true` instead of a false-positive
-   failure. The probe (`dotnet msbuild` → `project<TAB>value` lines) and the verdict (fail
-   unless every value is `true`) are separate functions so the verdict is unit-testable without
-   invoking the SDK.
-
-Checks 2–4 exist so the gate **fails closed**. Drift detection alone can be defeated by
-*deleting* the lock files (or hiding them behind `.gitignore`, or turning generation off):
-`git status` then reports a clean tree and the check goes green with the pinning gone. The
+Checks 2 and 3 exist so the gate **fails closed** on deletion. Drift detection alone can be
+defeated by *deleting* the lock files (or hiding them behind `.gitignore`): `git status` then
+reports a clean tree and the check goes green with the pinning gone. The
 manifest is the committed expectation, so adding or removing a project's lock file is a visible,
 reviewed edit in the same pull request. Ignored lock files are enumerated with
 `git ls-files --others --ignored` rather than `git status --ignored=matching`, which reports
 whole ignored directories (`obj/`) that merely *could* match.
+
+### What it deliberately does not enforce
+
+Disabling pinning through the **build definition** (`RestorePackagesWithLockFile=false` in a
+`.csproj`, `Directory.Build.props` or `Directory.Packages.props`) is **out of scope**. Detecting
+that statically is not robustly achievable in a CI guard: MSBuild evaluates properties
+differently during `restore` than during a `-getProperty` probe, so a restore-session-conditioned
+opt-out passes the probe yet still disables pinning at restore time. Rather than ship a check
+that gives a false sense of security, the guard covers only what it covers robustly and that
+risk is left to human code review — the csproj/props change is visible in the pull-request diff.
+The guard is advisory.
 
 ### Reporting and safety of the job summary
 
@@ -512,10 +509,8 @@ tools/ci/lockfile-guard.sh --selftest
 It builds throwaway git repositories under `mktemp -d` (removed by an `EXIT` trap) and asserts
 the exit code and summary content for the in-sync, modified, newly-added, worktree-deleted,
 committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag, unicode/spaced-path
-and fence-breakout cases, plus the three MSBuild opt-out bypasses (Condition attribute,
-`Directory.Packages.props` inheritance, multi-line value), the commented-out-property
-non-regression, and unit tests of the property verdict against synthetic
-`project<TAB>value` input. CI runs it **before** the real check.
+and fence-breakout cases. It needs only `git` — no SDK, no network. CI runs it **before** the
+real check.
 
 ### Job posture and promotion
 
