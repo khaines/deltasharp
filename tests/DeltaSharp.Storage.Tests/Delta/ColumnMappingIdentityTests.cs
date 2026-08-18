@@ -35,6 +35,10 @@ public sealed class ColumnMappingIdentityTests
         + "{\"delta.columnMapping.id\":" + fieldId + ",\"delta.columnMapping.physicalName\":\""
         + physicalName + "\"}}";
 
+    private static string UnmappedField(string name, string typeJson, bool nullable = true) =>
+        "{\"name\":\"" + name + "\",\"type\":" + typeJson + ",\"nullable\":"
+        + (nullable ? "true" : "false") + ",\"metadata\":{}}";
+
     private static MetadataAction Meta(string schemaJson, string mode = "id", params string[] partitionColumns) =>
         new(
             Id: "t",
@@ -134,8 +138,10 @@ public sealed class ColumnMappingIdentityTests
         Assert.True(historical.IsImmutableFrom(Identity(LiteralAndNested(1, "col-literal-ab"))));
     }
 
-    [Fact]
-    public void IsImmutableFrom_LiteralDotVsNestedSameLeafIdentity_False()
+    [Theory]
+    [InlineData("id")]
+    [InlineData("name")]
+    public void IsImmutableFrom_LiteralDotVsNestedSameLeafIdentity_False(string mode)
     {
         string literalOnly = StructSchema(MappedField("a.b", "\"long\"", 7, "col-shared", nullable: true));
         string nestedOnly = StructSchema(
@@ -146,8 +152,70 @@ public sealed class ColumnMappingIdentityTests
                 "col-struct-a",
                 nullable: true));
 
-        Assert.False(Identity(literalOnly).IsImmutableFrom(Identity(nestedOnly)));
-        Assert.False(Identity(nestedOnly).IsImmutableFrom(Identity(literalOnly)));
+        Assert.False(Identity(literalOnly, mode).IsImmutableFrom(Identity(nestedOnly, mode)));
+        Assert.False(Identity(nestedOnly, mode).IsImmutableFrom(Identity(literalOnly, mode)));
+    }
+
+    [Theory]
+    [InlineData("id")]
+    [InlineData("name")]
+    public void IsImmutableFrom_DepthTwoLiteralDotVsNestedSameLeafIdentity_False(string mode)
+    {
+        string left = StructSchema(
+            MappedField(
+                "a",
+                StructSchema(MappedField("b.c", "\"long\"", 7, "col-shared", nullable: true)),
+                6,
+                "col-struct-a",
+                nullable: true));
+        string right = StructSchema(
+            MappedField(
+                "a.b",
+                StructSchema(MappedField("c", "\"long\"", 7, "col-shared", nullable: true)),
+                8,
+                "col-struct-ab",
+                nullable: true));
+
+        Assert.False(Identity(left, mode).IsImmutableFrom(Identity(right, mode)));
+        Assert.False(Identity(right, mode).IsImmutableFrom(Identity(left, mode)));
+    }
+
+    [Theory]
+    [InlineData("id")]
+    [InlineData("name")]
+    public void IsImmutableFrom_AddsLiteralDotColumnWithFreshIdentity_True(string mode)
+    {
+        string historical = StructSchema(
+            MappedField(
+                "a",
+                StructSchema(MappedField("b", "\"long\"", 3, "col-nested-b", nullable: true)),
+                2,
+                "col-struct-a",
+                nullable: true));
+        string end = StructSchema(
+            MappedField(
+                "a",
+                StructSchema(MappedField("b", "\"long\"", 3, "col-nested-b", nullable: true)),
+                2,
+                "col-struct-a",
+                nullable: true),
+            MappedField("a.b", "\"long\"", 99, "col-fresh-literal", nullable: true));
+
+        Assert.True(Identity(end, mode).IsImmutableFrom(Identity(historical, mode)));
+    }
+
+    [Fact]
+    public void IsImmutableFrom_NoneModeDotNamedAndNestedAddDrop_True()
+    {
+        string literalOnly = StructSchema(UnmappedField("a.b", "\"long\"", nullable: true));
+        string nestedOnly = StructSchema(
+            UnmappedField(
+                "a",
+                StructSchema(UnmappedField("b", "\"long\"", nullable: true)),
+                nullable: true));
+
+        Assert.True(Identity(literalOnly, "none").IsImmutableFrom(Identity(nestedOnly, "none")));
+        Assert.True(Identity(nestedOnly, "none").IsImmutableFrom(Identity(literalOnly, "none")));
     }
 
     [Fact]
@@ -222,8 +290,10 @@ public sealed class ColumnMappingIdentityTests
         Assert.True(end.IsImmutableFrom(Identity(withExtra)));
     }
 
-    [Fact]
-    public void IsImmutableFrom_LogicalRenamePreservingIdentity_True()
+    [Theory]
+    [InlineData("id")]
+    [InlineData("name")]
+    public void IsImmutableFrom_LogicalRenamePreservingIdentity_True(string mode)
     {
         // A column-mapping RENAME keeps (id, physical name) and changes the logical name — legal; the renamed
         // column changes its key so it is not compared, and no still-present column's identity changed.
@@ -233,8 +303,41 @@ public sealed class ColumnMappingIdentityTests
             + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
             + "{\"name\":\"renamed\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
             + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
-        ColumnMappingIdentity end = Identity(renamed);
-        Assert.True(end.IsImmutableFrom(Identity(FlatSchema(1, 2))));   // "name"->"renamed", (id=2,col-B) preserved
+        ColumnMappingIdentity end = Identity(renamed, mode);
+        Assert.True(end.IsImmutableFrom(Identity(FlatSchema(1, 2), mode)));   // "name"->"renamed", (id=2,col-B)
+    }
+
+    /// <summary>
+    /// Documents the current #676 boundary: mapped structs below array elements or map values are not collected
+    /// by this gate today because mapped complex types are rejected fail-closed before CDF reads reach it.
+    /// Enabling nested column mapping must extend <c>Collect</c> to descend array element and map key/value
+    /// structs before that upstream rejection is relaxed.
+    /// </summary>
+    [Fact]
+    public void IsImmutableFrom_ArrayAndMapNestedStructIdentitiesCurrentlyUncovered_True()
+    {
+        static string Schema(long arrayLeafId, long mapLeafId) =>
+            StructSchema(
+                MappedField(
+                    "items",
+                    "{\"type\":\"array\",\"elementType\":"
+                    + StructSchema(MappedField("leaf", "\"long\"", arrayLeafId, "col-array-leaf", nullable: true))
+                    + ",\"containsNull\":true}",
+                    1,
+                    "col-items",
+                    nullable: true),
+                MappedField(
+                    "lookup",
+                    "{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":"
+                    + StructSchema(MappedField("value", "\"long\"", mapLeafId, "col-map-value", nullable: true))
+                    + ",\"valueContainsNull\":true}",
+                    2,
+                    "col-lookup",
+                    nullable: true));
+
+        ColumnMappingIdentity end = Identity(Schema(arrayLeafId: 99, mapLeafId: 100));
+
+        Assert.True(end.IsImmutableFrom(Identity(Schema(arrayLeafId: 3, mapLeafId: 4))));
     }
 
     [Fact]
