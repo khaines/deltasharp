@@ -46,17 +46,15 @@
 #
 #     tools/ci/lockfile-guard.sh --selftest
 #
-# Side effect: before rendering the diff the guard runs `git add
-# --intent-to-add` on the lock-file pathspec so a brand-new (untracked) lock
-# file shows up as an addition in `git diff` instead of an empty patch.
-# Intent-to-add stages no content, and outside GitHub Actions the guard undoes
-# exactly the markers it created (`git reset` on the paths that were untracked
-# beforehand — never a path the developer had staged), so a local run leaves the
-# developer's index as it found it.
+# NO SIDE EFFECTS: the guard never writes to the index or the working tree. A
+# brand-new (untracked) lock file is rendered with `git diff --no-index` against
+# /dev/null rather than with an `git add --intent-to-add` marker, so nothing can
+# clobber a developer's staged work (a staged `git rm --cached`, a `git add -p`
+# partial stage) and no cleanup step is needed.
 #
 set -euo pipefail
 
-# One pathspec for detection, diffing, staging and the printed remediation
+# One pathspec for detection, diffing and the printed remediation
 # command, so they can never disagree. `glob` makes `**` match across
 # directories; `top` anchors at the repository root, so the guard behaves the
 # same from a subdirectory and does not miss a root-level lock file.
@@ -94,23 +92,49 @@ sanitize_fence() {
   sed -e "s/^\\([-+ ]\\{0,1\\}\\)\\( \\{0,3\\}\\)\`\\{3,\\}/\\1\\2'''/"
 }
 
-# Neutralize GitHub workflow-command injection: the Actions runner parses lines
-# such as `::error::…`, `::add-mask::…` or `::stop-commands::…` on BOTH stdout
-# and stderr, and it tolerates leading whitespace — so a PR-controlled path (a
-# directory literally named `::error::pwned`) or manifest entry could forge the
-# annotations reviewers rely on. Every untrusted line is therefore printed
-# behind a NON-whitespace bullet, which makes it unparseable as a command.
+# Render every byte that a LINE READER or a MARKDOWN RENDERER might treat as a
+# line break as a visible escape, so untrusted bytes cannot start a new line.
+# This closes two sinks at once:
 #
-# The runner's line reader also splits on a bare CR, and neither `git ls-files`
-# nor the manifest C-quotes control bytes (`git status` does), so a path
-# containing `benign<CR>::error::…` would otherwise start a fresh line at column
-# 0 behind the bullet. CR is therefore rendered as a literal `\r`, the way git
-# quotes it itself.
+#   * GitHub workflow commands — the Actions runner scans stdout AND stderr for
+#     `::error::…`, `::add-mask::…`, `::stop-commands::…`. A PR-controlled path
+#     or manifest entry carrying `benign<CR>::error::…` would otherwise begin a
+#     fresh line at column 0.
+#   * The step-summary code fence — cmark-gfm treats a bare CR as a line ending,
+#     so lock-file CONTENT containing one could close the fence early and inject
+#     markdown.
 #
-# (Diff hunks are exempt: unified-diff output always begins with `+`, `-`, ` `,
-# `@`, `d` or `i`, so their first column is never `:`.)
+# Rather than argue about which readers honour which terminator, the whole class
+# is escaped: CR, the other C0 controls, and the Unicode line breaks NEL
+# (U+0085), LS (U+2028) and PS (U+2029). LF and TAB are left alone — LF is the
+# record separator these filters work on, and TAB breaks nothing.
+ESCAPE_ARGS=(
+  -e "s/$(printf '\r')/\\\\r/g"
+  -e "s/$(printf '\013')/\\\\v/g"
+  -e "s/$(printf '\014')/\\\\f/g"
+  -e "s/$(printf '\033')/\\\\e/g"
+  -e "s/$(printf '\302\205')/\\\\u0085/g"
+  -e "s/$(printf '\342\200\250')/\\\\u2028/g"
+  -e "s/$(printf '\342\200\251')/\\\\u2029/g"
+  -e "s/[$(printf '\001-\010\016-\037\177')]/?/g"
+)
+readonly ESCAPE_ARGS
+
+escape_untrusted() {
+  LC_ALL=C sed "${ESCAPE_ARGS[@]}"
+}
+
+# Escaped AND bulleted: a NON-whitespace marker before the text, because the
+# runner tolerates indentation, so leading spaces alone would not stop a forged
+# `::` command. (Diff hunks are exempt from the bullet: unified-diff output
+# always begins with `+`, `-`, ` `, `@`, `d` or `i`, never `:` — but it is still
+# escaped, since its CONTENT can carry line breaks.)
+bullet_untrusted() {
+  sed 's/^/  - /'
+}
+
 mark_untrusted() {
-  LC_ALL=C sed -e "s/$(printf '\r')/\\\\r/g" -e 's/^/  - /'
+  escape_untrusted | bullet_untrusted
 }
 
 # ---------------------------------------------------------------------------
@@ -146,9 +170,31 @@ tracked_lockfiles() {
 # The committed expectation: which lock files MUST exist. Comments and blank
 # lines are ignored. `sort -u`, because `comm` compares sorted UNIQUE sets: a
 # duplicated manifest line would otherwise be reported as missing/unpinned.
+# `|| true`: `grep` exits 1 on an empty (or all-comment) manifest, which under
+# `set -e` + `pipefail` would abort the guard with no output at all — a red check
+# with an empty log. run_guard reports that case explicitly instead.
 manifest_lockfiles() {
-  sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$MANIFEST_REL" |
-    grep -v '^$' | LC_ALL=C sort -u
+  { sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$MANIFEST_REL" |
+    grep -v '^$' || true; } | LC_ALL=C sort -u
+}
+
+# Lock files that exist on disk but are not tracked, including .gitignore'd ones
+# (no `--exclude-standard`), NUL-delimited.
+untracked_lockfiles_z() {
+  git ls-files -z --others -- "$LOCKFILE_PATHSPEC"
+}
+
+# The full diff of every lock file, WITHOUT touching the index: tracked files
+# through the ordinary diff, untracked (and ignored) ones through
+# `git diff --no-index` against /dev/null, which renders them as additions the
+# same way an intent-to-add marker would — but is read-only, so it can never
+# disturb a developer's staged work. `$1` is `--stat` or `--patch`.
+lockfile_diff() {
+  local mode="$1" p
+  git -c core.quotePath=false --no-pager diff "$mode" -- "$LOCKFILE_PATHSPEC" 2>/dev/null || true
+  while IFS= read -r -d '' p; do
+    git -c core.quotePath=false --no-pager diff --no-index "$mode" -- /dev/null "$p" 2>/dev/null || true
+  done < <(untracked_lockfiles_z)
 }
 
 # ---------------------------------------------------------------------------
@@ -159,7 +205,7 @@ manifest_lockfiles() {
 # code block.
 emit_block() {
   printf '%s\n' "$FENCE"
-  printf '%s\n' "$1" | sanitize_fence | mark_untrusted
+  printf '%s\n' "$1" | escape_untrusted | sanitize_fence | bullet_untrusted
   printf '%s\n' "$FENCE"
   printf '\n'
 }
@@ -214,17 +260,19 @@ emit_summary() {
   printf '_.NET SDK used by this run: `%s` (CI pins it via `global.json`)._\n\n' "$sdk"
 
   if [ -n "$drift" ]; then
-    diff_stat="$(git -c core.quotePath=false --no-pager diff --stat -- "$LOCKFILE_PATHSPEC" 2>/dev/null || true)"
+    diff_stat="$(lockfile_diff --stat)"
     if [ -n "$diff_stat" ]; then
       printf '### Diff stat\n\n'
       emit_block "$diff_stat"
     fi
 
     # Bounded: the patch is PR-controlled content. `head -c` closes the pipe
-    # early, so pipefail is disabled inside this subshell only.
+    # early, so pipefail is disabled inside this subshell only. `escape_untrusted`
+    # runs BEFORE `sanitize_fence`, so a CR (or any other line break) inside
+    # lock-file content cannot end a line and slip a fence past the sanitizer.
     diff_patch="$(
       set +o pipefail
-      git -c core.quotePath=false --no-pager diff -- "$LOCKFILE_PATHSPEC" 2>/dev/null | sanitize_fence | head -c "$DIFF_BYTE_LIMIT"
+      lockfile_diff --patch | escape_untrusted | sanitize_fence | head -c "$DIFF_BYTE_LIMIT"
     )"
     if [ -n "$diff_patch" ]; then
       printf '### Diff (truncated to %s bytes)\n\n' "$DIFF_BYTE_LIMIT"
@@ -249,7 +297,6 @@ write_summary() {
 
 run_guard() {
   local repo_root drift missing extra on_disk_missing manifest tracked p
-  local -a ia_added=()
   repo_root="$(git rev-parse --show-toplevel)"
   cd "$repo_root"
 
@@ -258,11 +305,13 @@ run_guard() {
     return 1
   fi
 
-  # Detect BEFORE touching the index, so the intent-to-add below cannot mask a
-  # real result.
   drift="$(detect_drift)"
 
   manifest="$(manifest_lockfiles)"
+  if [ -z "$manifest" ]; then
+    echo "lockfile guard FAILED: '${MANIFEST_REL}' lists no lock files. Every tracked packages.lock.json must be listed there." >&2
+    return 1
+  fi
   tracked="$(tracked_lockfiles)"
 
   missing="$(LC_ALL=C comm -23 <(printf '%s\n' "$manifest") <(printf '%s\n' "$tracked"))"
@@ -278,7 +327,7 @@ run_guard() {
     [ -f "$p" ] || on_disk_missing="${on_disk_missing}${p}"$'\n'
   done <<<"$manifest"
   if [ -n "$on_disk_missing" ]; then
-    missing="$(printf '%s\n%s' "$missing" "${on_disk_missing%$'\n'}" | grep -v '^$' | LC_ALL=C sort -u)"
+    missing="$({ printf '%s\n%s' "$missing" "${on_disk_missing%$'\n'}" | grep -v '^$' || true; } | LC_ALL=C sort -u)"
   fi
 
   if [ -z "$drift" ] && [ -z "$missing" ] && [ -z "$extra" ]; then
@@ -286,32 +335,7 @@ run_guard() {
     return 0
   fi
 
-  # Make a brand-new lock file render as an addition in `git diff` rather than
-  # an empty patch. `--force` covers a lock file hidden by .gitignore. No
-  # content is staged and this job never commits.
-  #
-  # Outside CI the markers are undone afterwards, so first record exactly which
-  # paths the guard is about to add: everything matching the pathspec that git
-  # does not track yet. A path the developer staged deliberately is TRACKED in
-  # the index and therefore never appears here — the cleanup must not unstage
-  # it, least of all the `git add` the remediation message asks for.
-  if [ -z "${GITHUB_ACTIONS:-}" ]; then
-    while IFS= read -r -d '' p; do
-      ia_added+=("$p")
-    done < <(git ls-files -z --others -- "$LOCKFILE_PATHSPEC")
-  fi
-
-  git add --intent-to-add --force -- "$LOCKFILE_PATHSPEC" >/dev/null 2>&1 || true
-
   write_summary "$drift" "$missing" "$extra"
-
-  # CI checkouts are throwaway, a developer's index is not. `:(literal)` because
-  # a path may itself look like pathspec magic (`::error::…`).
-  if [ -z "${GITHUB_ACTIONS:-}" ] && [ "${#ia_added[@]}" -gt 0 ]; then
-    for p in "${ia_added[@]}"; do
-      git reset -q -- ":(literal)${p}" >/dev/null 2>&1 || true
-    done
-  fi
 
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "::error title=NuGet lockfile guard::packages.lock.json is out of sync or missing. See the job summary for the affected files and the fix."
@@ -426,12 +450,49 @@ st_write_csproj() {
 # <dir>/stdout.txt and the step summary in <dir>/summary.md.
 st_run_guard() {
   local dir="$1" rc=0
+  shift
   (
     cd "$dir" &&
-      GITHUB_STEP_SUMMARY="$dir/summary.md" GITHUB_ACTIONS='' \
+      env GITHUB_STEP_SUMMARY="$dir/summary.md" GITHUB_ACTIONS='' "$@" \
         bash "$SELFTEST_SCRIPT" >"$dir/stdout.txt" 2>&1
   ) || rc=$?
   printf '%s' "$rc"
+}
+
+# Every byte a line reader or markdown renderer may treat as a line break is
+# turned into a real LF, so an assertion sees exactly what such a reader would.
+st_split_lines() {
+  LC_ALL=C awk \
+    -v nel="$(printf '\302\205')" \
+    -v ls="$(printf '\342\200\250')" \
+    -v ps="$(printf '\342\200\251')" \
+    '{ gsub(nel, "\n"); gsub(ls, "\n"); gsub(ps, "\n"); print }' "$1" |
+    tr '\r\013\014' '[\n*]'
+}
+
+# No forged workflow command may appear at column 0 of ANY line, in EITHER
+# stream, under EITHER line-break convention.
+st_assert_no_forged_command() {
+  local d="$1" name="$2" f
+  for f in stdout.txt summary.md; do
+    [ -f "$d/$f" ] || continue
+    if st_split_lines "$d/$f" | grep -qE '^[[:space:]]*::'; then
+      st_fail "${name}: a ::workflow-command reached column 0 of ${f}"
+      return
+    fi
+  done
+  st_pass "$name"
+}
+
+# The guard is read-only: it must never leave the index (or a file's tracked
+# state) different from how it found it.
+st_assert_index_clean() {
+  local d="$1" name="$2"
+  if [ -z "$(git -C "$d" diff-index --cached --name-only HEAD)" ]; then
+    st_pass "$name"
+  else
+    st_fail "${name}: the guard mutated the index"
+  fi
 }
 
 st_case_in_sync() {
@@ -471,14 +532,15 @@ st_case_untracked() {
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'new untracked lock file fails'
   assert_contains "$d/summary.md" 'src/New/packages.lock.json' 'new lock file is listed'
-  assert_contains "$d/summary.md" '+{"version": 1' 'new lock file renders as an addition (intent-to-add)'
+  assert_contains "$d/summary.md" '+{"version": 1' 'new lock file renders as an addition (diff --no-index)'
   # `git diff-index --cached HEAD`, not `git diff --cached`: the latter does not
-  # list intent-to-add entries, so it would pass whether or not the guard
-  # cleaned up after itself.
-  if [ -z "$(git -C "$d" diff-index --cached --name-only HEAD)" ]; then
-    st_pass 'local run leaves no intent-to-add entries in the index'
+  # list intent-to-add entries, so it would pass even if the guard had left one
+  # behind.
+  st_assert_index_clean "$d" 'rendering an untracked lock file leaves the index untouched'
+  if git -C "$d" status --porcelain -- 'src/New/packages.lock.json' | grep -q '^??'; then
+    st_pass 'the new lock file is still untracked afterwards'
   else
-    st_fail 'local run left intent-to-add entries staged'
+    st_fail 'the guard changed the tracked state of an untracked lock file'
   fi
 }
 
@@ -508,9 +570,25 @@ st_case_prestaged_survives() {
     st_fail 'staged lock-file content was discarded (reset to HEAD)'
   fi
   if git -C "$d" diff-index --cached --name-only HEAD | grep -qxF 'src/New/packages.lock.json'; then
-    st_fail "the guard's own intent-to-add marker was left behind"
+    st_fail 'the guard staged an untracked lock file'
   else
-    st_pass "the guard's own intent-to-add marker is removed"
+    st_pass 'the guard staged nothing of its own'
+  fi
+}
+
+# A developer who has STAGED A REMOVAL (`git rm --cached`) must keep it: an
+# index-writing guard would resurrect the entry from HEAD.
+st_case_staged_removal_survives() {
+  local d="$SELFTEST_ROOT/staged-removal"
+  st_make_repo "$d"
+  git -C "$d" rm -q --cached 'src/Proj/packages.lock.json'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'a staged lock-file removal still fails the guard'
+  if git -C "$d" ls-files --error-unmatch -- 'src/Proj/packages.lock.json' >/dev/null 2>&1; then
+    st_fail 'the guard resurrected a staged removal into the index'
+  else
+    st_pass 'a staged removal survives the guard run'
   fi
 }
 
@@ -522,6 +600,7 @@ st_case_deleted_worktree() {
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'lock file deleted from the working tree fails'
   assert_contains "$d/summary.md" 'src/Proj/packages.lock.json' 'deleted lock file is listed'
+  st_assert_index_clean "$d" 'a worktree deletion is not staged by the guard'
 }
 
 st_case_deleted_committed() {
@@ -550,9 +629,10 @@ st_case_gitignored() {
   assert_exit 1 "$rc" 'gitignored regenerated lock file fails'
   assert_contains "$d/summary.md" 'src/Hidden/packages.lock.json' 'lock file hidden by an ignore rule is listed'
   assert_contains "$d/summary.md" 'hidden/Proj/packages.lock.json' 'lock file inside an ignored directory is listed'
-  # Pins `--force` on the intent-to-add: without it an ignored path is not added
-  # and the reviewer gets an empty patch instead of an actionable one.
-  assert_contains "$d/summary.md" '+{"version": 1}' 'hidden lock file renders as an addition (intent-to-add --force)'
+  # Pins the `--no-index` rendering of untracked files: without it a reviewer
+  # gets an empty patch for an ignored path instead of an actionable one.
+  assert_contains "$d/summary.md" '+{"version": 1}' 'hidden lock file renders as an addition (diff --no-index)'
+  st_assert_index_clean "$d" 'an ignored lock file is not staged by the guard'
 }
 
 # A built tree carries ignored `obj/` directories. They must NOT be reported:
@@ -584,6 +664,9 @@ st_case_manifest_lag() {
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'tracked lock file missing from the manifest fails'
   assert_contains "$d/summary.md" 'src/Extra/packages.lock.json' 'unlisted lock file is named'
+  # Catches a `comm -23`/`comm -13` swap: an unlisted file is NOT a missing one.
+  assert_not_contains "$d/summary.md" '**missing**' 'an unlisted lock file is not reported as missing'
+  assert_contains "$d/summary.md" '**not listed**' 'an unlisted lock file is reported as unlisted'
 }
 
 st_case_unicode_path() {
@@ -613,7 +696,8 @@ st_case_fence_breakout() {
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'lock file containing a markdown fence fails'
   assert_contains "$d/summary.md" "'''" 'leading backtick run is neutralized in the summary'
-  fences="$(grep -c '^`\{5,\}$' "$d/summary.md" || true)"
+  # Split the summary the way a markdown renderer would, not just on LF.
+  fences="$(st_split_lines "$d/summary.md" | grep -c '^`\{5,\}$' || true)"
   if [ "$((fences % 2))" -eq 0 ] && [ "$fences" -gt 0 ]; then
     st_pass "code fences stay balanced (${fences} fence lines)"
   else
@@ -693,37 +777,42 @@ st_case_workflow_command_injection() {
   assert_contains "$d/summary.md" "$drift_path" 'hostile drift path is still reported'
   assert_contains "$d/summary.md" "$manifest_entry" 'hostile manifest entry is still reported'
   assert_contains "$d/summary.md" "$extra_path" 'hostile unlisted path is still reported'
-  # Split on CR as well as LF, because the runner's line reader does too.
-  if tr '\r' '\n' <"$d/stdout.txt" | grep -qE '^[[:space:]]*::'; then
-    st_fail 'a ::workflow-command line reached column 0 of stdout/stderr'
-  else
-    st_pass 'no reporting branch forges a ::workflow-command annotation (stdout/stderr)'
-  fi
-  if tr '\r' '\n' <"$d/summary.md" | grep -qE '^[[:space:]]*::'; then
-    st_fail 'a ::workflow-command line reached column 0 of the step summary'
-  else
-    st_pass 'no reporting branch forges a ::workflow-command annotation (summary)'
-  fi
+  st_assert_no_forged_command "$d" 'no reporting branch forges a ::workflow-command annotation'
+  st_assert_index_clean "$d" 'a lock file under a magic-pathspec path is not staged'
 }
 
-# The runner's line reader also splits on a bare CR, and neither `git ls-files`
-# nor the manifest C-quotes control bytes — so the assertions here read the
-# CR-SPLIT view, not just the LF view.
-st_case_cr_injection() {
-  local d="$SELFTEST_ROOT/cr-injection"
+# The whole line-terminator class, in a MANIFEST ENTRY and in lock-file
+# CONTENT: neither may start a line for a workflow-command reader or for the
+# markdown renderer of the step summary.
+st_case_line_terminator_injection() {
+  local d="$SELFTEST_ROOT/line-terminators"
   st_make_repo "$d"
-  printf 'src/Proj/packages.lock.json\nbenign\r::error::pwned/packages.lock.json\n' \
+  # Manifest entry (the `missing` branch): CR before a forged command.
+  printf 'src/Proj/packages.lock.json\nbenign\r`````\r::error::pwned/packages.lock.json\n' \
     >"$d/tools/ci/expected-lockfiles.txt"
-  git -C "$d" commit -qam 'manifest entry carrying a bare CR'
-  local rc
+  # Lock-file CONTENT (the diff branch): every terminator, then a fence and a
+  # forged command that must NOT end up at the start of a rendered line.
+  printf '{"v": 1}\n' >"$d/src/Proj/packages.lock.json"
+  git -C "$d" commit -qam 'hostile manifest entry'
+  printf '{"v": 2, "x": "A\r`````\n## heading\rB\302\205::error::nel\342\200\250::error::ls\342\200\251::error::ps"}\n' \
+    >"$d/src/Proj/packages.lock.json"
+  local rc fences
   rc="$(st_run_guard "$d")"
-  assert_exit 1 "$rc" 'manifest entry with a CR fails (path is missing)'
-  if tr '\r' '\n' <"$d/stdout.txt" | grep -qE '^[[:space:]]*::'; then
-    st_fail 'a CR in an untrusted line forged a ::workflow-command on stdout/stderr'
+  assert_exit 1 "$rc" 'hostile manifest entry and lock-file content fail'
+  st_assert_no_forged_command "$d" 'no line terminator can forge a ::workflow-command (either stream)'
+  assert_contains "$d/stdout.txt" 'benign\r`````\r::error::pwned/packages.lock.json' 'CR in a manifest entry renders as a literal \\r'
+  # The same entry reaches the SUMMARY through emit_block, whose escape runs
+  # before the fence sanitizer: a CR there could otherwise smuggle a fence out.
+  assert_contains "$d/summary.md" 'benign\r' 'CR in a manifest entry is escaped in the summary too'
+  assert_contains "$d/summary.md" '\u0085' 'NEL in lock-file content renders as a literal \\u0085'
+  assert_contains "$d/summary.md" '\u2028' 'LS in lock-file content renders as a literal \\u2028'
+  # A CR inside content must not end a line, so it cannot smuggle a fence out.
+  fences="$(st_split_lines "$d/summary.md" | grep -c '^`\{5,\}$' || true)"
+  if [ "$((fences % 2))" -eq 0 ] && [ "$fences" -gt 0 ]; then
+    st_pass "code fences stay balanced under CR/NEL/LS splitting (${fences} fence lines)"
   else
-    st_pass 'a CR is escaped, so it cannot start a ::workflow-command line'
+    st_fail "code fences unbalanced (${fences}) — content escaped its block"
   fi
-  assert_contains "$d/stdout.txt" 'benign\r::error::pwned/packages.lock.json' 'CR renders as a literal \r'
 }
 
 st_case_missing_manifest() {
@@ -737,6 +826,36 @@ st_case_missing_manifest() {
   assert_contains "$d/stdout.txt" 'expected manifest' 'missing manifest is explained'
 }
 
+st_case_empty_manifest() {
+  local d="$SELFTEST_ROOT/empty-manifest"
+  st_make_repo "$d"
+  printf '# every entry commented out\n\n' >"$d/tools/ci/expected-lockfiles.txt"
+  git -C "$d" commit -qam 'empty the manifest'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'an empty manifest fails closed instead of dying on set -e'
+  assert_contains "$d/stdout.txt" 'lists no lock files' 'an empty manifest is explained'
+}
+
+st_case_diff_byte_limit() {
+  local d="$SELFTEST_ROOT/diff-limit" bytes
+  st_make_repo "$d"
+  local pad
+  # `head` upstream of `tr`, so nothing receives SIGPIPE under `pipefail`.
+  pad="$(head -c 4000 /dev/zero | LC_ALL=C tr '\0' 'a')"
+  printf '{"version": 1, "pad": "%s"}\n' "$pad" >"$d/src/Proj/packages.lock.json"
+  local rc
+  rc="$(LOCKFILE_GUARD_DIFF_BYTES=512 st_run_guard "$d" LOCKFILE_GUARD_DIFF_BYTES=512)"
+  assert_exit 1 "$rc" 'a large drift diff still fails'
+  assert_contains "$d/summary.md" 'truncated to 512 bytes' 'the summary states the byte limit in force'
+  bytes="$(wc -c <"$d/summary.md")"
+  if [ "$bytes" -lt 4000 ]; then
+    st_pass "the patch block is bounded by the byte limit (summary ${bytes} bytes)"
+  else
+    st_fail "the patch block was not bounded (summary ${bytes} bytes)"
+  fi
+}
+
 run_selftest() {
   SELFTEST_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   readonly SELFTEST_SCRIPT
@@ -748,6 +867,7 @@ run_selftest() {
   st_case_modified
   st_case_untracked
   st_case_prestaged_survives
+  st_case_staged_removal_survives
   st_case_deleted_worktree
   st_case_deleted_committed
   st_case_gitignored
@@ -756,11 +876,13 @@ run_selftest() {
   st_case_manifest_duplicates
   st_case_skip_worktree
   st_case_workflow_command_injection
-  st_case_cr_injection
+  st_case_line_terminator_injection
   st_case_unicode_path
   st_case_fence_breakout
   st_case_remediation_pathspec
   st_case_missing_manifest
+  st_case_empty_manifest
+  st_case_diff_byte_limit
 
   if [ "$SELFTEST_FAILURES" -eq 0 ]; then
     echo 'lockfile guard self-test: all assertions passed.'

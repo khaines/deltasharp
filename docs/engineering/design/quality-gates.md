@@ -511,17 +511,36 @@ The guard is advisory.
 
 On failure the guard writes the affected paths, a `git diff --stat`, and a **byte-bounded**
 patch (60 000 bytes, well under GitHub's 1 MiB summary cap) to `$GITHUB_STEP_SUMMARY`, plus the
-SDK version used. Lock-file content and paths are attacker-controllable, so untrusted text is
-wrapped in a five-backtick fence and leading backtick runs are rewritten — content cannot break
-out of the code block and inject markup. On **stdout and stderr** — the streams the Actions
-runner scans for
-[workflow commands](https://docs.github.com/actions/reference/workflow-commands-for-github-actions)
-— every untrusted line is printed behind a `  - ` bullet and any bare CR is rendered as a literal
-`\r`, so a path such as `::error::pwned/` (or `benign<CR>::error::…`) cannot begin a line at
-column 0 and forge an annotation; indentation alone would not suffice, since the runner tolerates
-it. The step summary is markdown and is *not* scanned for workflow commands, but the same
-bulleting is applied there as defense-in-depth. Paths print unquoted (`core.quotePath=false`) so
-a non-ASCII path stays copy-pasteable.
+SDK version used. Lock-file content, lock-file paths and manifest entries are all
+attacker-controllable, so every untrusted sink shares one filter:
+
+* **Line breaks are escaped, as a class.** Before anything is printed, `escape_untrusted`
+  rewrites every byte a line reader or a markdown renderer might treat as a line ending into a
+  visible literal — CR (`\r`), the remaining C0 controls, NEL (`U+0085`), LINE SEPARATOR
+  (`U+2028`) and PARAGRAPH SEPARATOR (`U+2029`). Only LF (the record separator the filters
+  themselves work on) and TAB are left alone. Escaping the whole class rather than only the
+  terminators a given reader is believed to honour means untrusted bytes cannot start a new line
+  anywhere, in either stream or in the summary.
+* **The fence cannot be broken out of.** Untrusted text is wrapped in a five-backtick fence and
+  leading backtick runs are rewritten. The escape runs *before* the fence sanitizer, so a CR
+  embedded in lock-file content cannot end a line and slip a fence past it. This applies to the
+  diff patch as well as to the path lists.
+* **Annotations cannot be forged.** On **stdout and stderr** — the streams the Actions runner
+  scans for
+  [workflow commands](https://docs.github.com/actions/reference/workflow-commands-for-github-actions)
+  — every untrusted line is additionally printed behind a `  - ` bullet, so a path such as
+  `::error::pwned/` (or `benign<CR>::error::…`) cannot begin a line at column 0; indentation
+  alone would not suffice, since the runner tolerates it. The step summary is markdown and is
+  *not* scanned for workflow commands, but the same bulleting is applied there as
+  defense-in-depth.
+
+Paths print unquoted (`core.quotePath=false`) so a non-ASCII path stays copy-pasteable.
+
+The guard has **no side effects**. A lock file that is new (or hidden by `.gitignore`) is
+rendered with `git diff --no-index -- /dev/null <path>`, which produces the same addition hunk an
+intent-to-add marker would, without ever writing to the index. A developer running the guard
+locally therefore keeps their staged work — including a staged lock file, a staged
+`git rm --cached` removal, or a partial `git add -p` — exactly as it was.
 
 ### Testing the gate
 
@@ -533,12 +552,15 @@ tools/ci/lockfile-guard.sh --selftest
 ```
 
 It builds throwaway git repositories under `mktemp -d` (removed by an `EXIT` trap) and asserts
-the exit code and summary content for the in-sync, modified, newly-added, worktree-deleted,
-committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag,
-duplicated-manifest-entry, `--skip-worktree`-deletion, deliberately-pre-staged,
-unicode/spaced-path, fence-breakout and `::workflow-command`-injection (including the bare-CR
-variant) cases. It needs only `git` — no SDK, no network. CI runs it **before** the
-real check.
+the exit code, the summary content and the *cleanliness of the index* for the in-sync, modified,
+newly-added, worktree-deleted, committed-deletion, `.gitignore`-hidden, ignored-build-output,
+manifest-lag, duplicated-manifest-entry, missing-manifest, empty-manifest,
+`--skip-worktree`-deletion, deliberately-pre-staged, staged-removal, diff-byte-limit,
+unicode/spaced-path, fence-breakout, `::workflow-command`-injection and line-terminator-injection
+(CR/NEL/LS/PS in both a path and lock-file content) cases. The injection and fence cases assert
+against the stream *split the way a line reader would split it*, not merely on LF, so an escape
+dropped from any sink turns the suite red. It needs only `git` — no SDK, no network. CI runs it
+**before** the real check.
 
 ### Job posture and promotion
 

@@ -333,7 +333,9 @@ status on the default branch and can then be added to branch protection — the 
 `coverage` (#456) and the security scans (#461). Until promoted, a drifted, deleted, or
 `.gitignore`-hidden `packages.lock.json` fails the job but does not block merge; the
 `--locked-mode` restore in `build-test-format` remains the blocking backstop for drift. The guard
-covers lock-file **drift and deletion/existence only** — turning pinning off through the build
+is read-only — it renders new or `.gitignore`-hidden lock files with `git diff --no-index` rather
+than staging them — so it is safe to run over a dirty local checkout. It covers lock-file
+**drift and deletion/existence only** — turning pinning off through the build
 definition (`RestorePackagesWithLockFile=false`) is out of scope, because MSBuild evaluates that
 property differently during `restore` than during a static probe, so any such check would give a
 false sense of security; that change is visible in the pull-request diff and is left to code
