@@ -454,37 +454,37 @@ internal sealed class ParquetFileReader
         return BuildFieldIdMap(reader.Schema, reader.Metadata?.Schema);
     }
 
+    private const int MaxFooterFieldIdMapDepth = 100;
+
     internal static IReadOnlyDictionary<int, DataField> BuildFieldIdMap(
         ParquetSchema schema,
         IReadOnlyList<global::Parquet.Meta.SchemaElement>? footer)
     {
-        var byPath = new Dictionary<string, DataField>(StringComparer.Ordinal);
+        var byPath = new Dictionary<PhysicalPathKey, DataField>();
         foreach (DataField dataField in schema.DataFields)
         {
-            string path = dataField.Path.ToString();
-            if (!byPath.TryAdd(path, dataField))
+            PhysicalPathKey pathKey = PhysicalPathKey.From(dataField.Path);
+            if (!byPath.TryAdd(pathKey, dataField))
             {
                 throw DeltaStorageException.SchemaMismatch(
                     $"The Parquet file decodes multiple leaf columns at physical path "
-                    + $"'{DiagnosticText.Sanitize(path)}' — a column-mapping id-mode table must map each "
+                    + $"'{DiagnosticText.Sanitize(pathKey.ToDisplayString())}' — a column-mapping id-mode table must map each "
                     + "physical leaf path to exactly one column.");
             }
         }
 
         var byFieldId = new Dictionary<int, DataField>();
-        var fieldIdByPath = new Dictionary<string, int>(StringComparer.Ordinal);
-        int idBearingFooterLeaves = 0;
+        var fieldIdByPath = new Dictionary<PhysicalPathKey, int>();
         if (footer is not null)
         {
-            foreach ((global::Parquet.Meta.SchemaElement Element, string Path) in EnumerateFooterLeafPaths(footer))
+            foreach ((global::Parquet.Meta.SchemaElement schemaElement, PhysicalPathKey pathKey) in EnumerateFooterLeafPaths(footer))
             {
-                if (Element.FieldId is not int fieldId)
+                if (schemaElement.FieldId is not int fieldId)
                 {
                     continue;
                 }
 
-                idBearingFooterLeaves++;
-                if (!byPath.TryGetValue(Path, out DataField? dataField))
+                if (!byPath.TryGetValue(pathKey, out DataField? dataField))
                 {
                     throw DeltaStorageException.SchemaMismatch(
                         $"The Parquet file declares field_id {fieldId} on a footer leaf with no decoded "
@@ -492,19 +492,22 @@ internal sealed class ParquetFileReader
                         + "id-bearing footer leaf to exactly one decoded column.");
                 }
 
-                if (fieldIdByPath.TryGetValue(Path, out int existingFieldId) && existingFieldId != fieldId)
+                if (fieldIdByPath.TryGetValue(pathKey, out int existingFieldId))
                 {
+                    if (existingFieldId == fieldId)
+                    {
+                        throw DeltaStorageException.SchemaMismatch(
+                            $"The Parquet file declares field_id {fieldId} on duplicate footer leaf path "
+                            + $"'{DiagnosticText.Sanitize(pathKey.ToDisplayString())}' — a column-mapping "
+                            + "id-mode table must assign each id-bearing footer leaf to a distinct column.");
+                    }
+
                     throw DeltaStorageException.SchemaMismatch(
                         $"The Parquet file maps field_ids {existingFieldId} and {fieldId} to the same physical "
                         + "leaf — a column-mapping id-mode table must assign each field_id to a distinct column.");
                 }
 
-                if (!fieldIdByPath.TryAdd(Path, fieldId))
-                {
-                    throw DeltaStorageException.SchemaMismatch(
-                        $"The Parquet file declares duplicate field_id {fieldId} — a column-mapping id-mode "
-                        + "table must assign each column a unique field_id.");
-                }
+                fieldIdByPath.Add(pathKey, fieldId);
 
                 if (!byFieldId.TryAdd(fieldId, dataField))
                 {
@@ -515,16 +518,15 @@ internal sealed class ParquetFileReader
             }
         }
 
-        if (byFieldId.Count != idBearingFooterLeaves || fieldIdByPath.Count != idBearingFooterLeaves)
-        {
-            throw DeltaStorageException.SchemaMismatch(
-                "The Parquet file's id-bearing footer leaves did not map one-to-one to decoded DataFields.");
-        }
-
         return byFieldId;
     }
 
-    private static IEnumerable<(global::Parquet.Meta.SchemaElement Element, string Path)> EnumerateFooterLeafPaths(
+    // Walks Parquet.Net's flat pre-order footer schema using SchemaElement.NumChildren. The synthetic root is
+    // excluded from the physical path, while every non-empty descendant component is preserved exactly as
+    // Parquet.Net's FieldPath does — including LIST/MAP wrapper names such as list/element and key_value/key.
+    // The depth cap keeps hostile footers from amplifying a tiny pre-order schema into quadratic path material
+    // before the row-group decode-time budget is in force.
+    private static IEnumerable<(global::Parquet.Meta.SchemaElement Element, PhysicalPathKey PathKey)> EnumerateFooterLeafPaths(
         IReadOnlyList<global::Parquet.Meta.SchemaElement> footer)
     {
         var path = new List<string>();
@@ -551,8 +553,16 @@ internal sealed class ParquetFileReader
             int childCount = element.NumChildren.GetValueOrDefault();
             int pathDepthBeforeElement = path.Count;
             bool isRoot = i == 0;
-            if (!isRoot)
+            bool addedPathComponent = !isRoot && !string.IsNullOrEmpty(element.Name);
+            if (addedPathComponent)
             {
+                if (path.Count >= MaxFooterFieldIdMapDepth)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"The Parquet footer schema nesting depth exceeds the supported column-mapping id-mode "
+                        + $"limit of {MaxFooterFieldIdMapDepth}.");
+                }
+
                 path.Add(element.Name);
             }
 
@@ -560,8 +570,11 @@ internal sealed class ParquetFileReader
             {
                 if (!isRoot)
                 {
-                    yield return (element, string.Join('/', path));
-                    path.RemoveAt(path.Count - 1);
+                    yield return (element, PhysicalPathKey.From(path));
+                    if (addedPathComponent)
+                    {
+                        path.RemoveAt(path.Count - 1);
+                    }
                 }
             }
             else
@@ -572,6 +585,68 @@ internal sealed class ParquetFileReader
     }
 
     private readonly record struct FooterPathFrame(int RemainingChildren, int PathDepthBeforeElement);
+
+    internal readonly struct PhysicalPathKey : IEquatable<PhysicalPathKey>
+    {
+        private readonly string[] _segments;
+
+        private PhysicalPathKey(string[] segments)
+        {
+            _segments = segments;
+        }
+
+        public int Length => Segments.Length;
+
+        private string[] Segments => _segments ?? Array.Empty<string>();
+
+        public static PhysicalPathKey From(FieldPath path)
+        {
+            var segments = new string[path.Length];
+            for (int i = 0; i < path.Length; i++)
+            {
+                segments[i] = path[i];
+            }
+
+            return new PhysicalPathKey(segments);
+        }
+
+        public static PhysicalPathKey From(IReadOnlyList<string> path) => new(path.ToArray());
+
+        public bool Equals(PhysicalPathKey other)
+        {
+            string[] left = Segments;
+            string[] right = other.Segments;
+            if (left.Length != right.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < left.Length; i++)
+            {
+                if (!string.Equals(left[i], right[i], StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is PhysicalPathKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            foreach (string segment in Segments)
+            {
+                hash.Add(segment, StringComparer.Ordinal);
+            }
+
+            return hash.ToHashCode();
+        }
+
+        public string ToDisplayString() => string.Join('/', Segments);
+    }
 
     /// <summary>
     /// Reads only the Parquet footer and returns the file's total PHYSICAL row count (summed across row
@@ -770,7 +845,21 @@ internal sealed class ParquetFileReader
             var fieldIdByName = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (KeyValuePair<int, DataField> entry in byFieldId)
             {
-                fieldIdByName[entry.Value.Name] = entry.Key;
+                // This metadata-only leaf summary is consumed by current flat id-mode CDF validation. Nested
+                // leaves are still reported through their top-level container field by MapFooterSchemaFailClosed,
+                // so only top-level leaf DataFields may populate the flat name→field_id map.
+                if (entry.Value.Path.Length != 1)
+                {
+                    continue;
+                }
+
+                if (!fieldIdByName.TryAdd(entry.Value.Name, entry.Key))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"The Parquet file maps multiple top-level leaves named "
+                        + $"'{DiagnosticText.Sanitize(entry.Value.Name)}' to field_ids — a column-mapping "
+                        + "id-mode table must assign each top-level leaf a distinct name.");
+                }
             }
 
             var columns = new List<ParquetLeafColumn>(schema.Count);
@@ -1361,7 +1450,10 @@ internal sealed class ParquetFileReader
             idBearingFileNames = new HashSet<string>(StringComparer.Ordinal);
             foreach (DataField idBearing in byFieldId.Values)
             {
-                idBearingFileNames.Add(idBearing.Name);
+                if (idBearing.Path.Length == 1)
+                {
+                    idBearingFileNames.Add(idBearing.Name);
+                }
             }
         }
 
@@ -1409,6 +1501,12 @@ internal sealed class ParquetFileReader
             {
                 present = id is >= 0 and <= int.MaxValue
                     && byFieldId.TryGetValue((int)id, out field);
+                if (present && field!.Path.Length > 1)
+                {
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Column '{DiagnosticText.Sanitize(name)}': its column-mapping field_id resolves to a nested physical "
+                        + "leaf; reading a nested leaf as a top-level column under id mode is not supported (#571/#676).");
+                }
             }
             else if (byName.TryGetValue(name, out Field? candidate)
                 && (idBearingFileNames is null || !idBearingFileNames.Contains(name)))
