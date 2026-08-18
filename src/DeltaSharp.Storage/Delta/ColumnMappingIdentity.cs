@@ -20,10 +20,10 @@ internal readonly struct ColumnMappingIdentity
 {
     private readonly ColumnMappingMode _mode;
     private readonly ImmutableArray<string> _partitionColumns;
-    private readonly Dictionary<string, ColumnKey> _columns;
+    private readonly Dictionary<ColumnPathKey, ColumnKey> _columns;
 
     private ColumnMappingIdentity(
-        ColumnMappingMode mode, ImmutableArray<string> partitionColumns, Dictionary<string, ColumnKey> columns)
+        ColumnMappingMode mode, ImmutableArray<string> partitionColumns, Dictionary<ColumnPathKey, ColumnKey> columns)
     {
         _mode = mode;
         _partitionColumns = partitionColumns.IsDefault ? ImmutableArray<string>.Empty : partitionColumns;
@@ -47,7 +47,7 @@ internal readonly struct ColumnMappingIdentity
         // SchemaJson.FromJson; a schemaString that parses to a NON-struct DataType (e.g. a bare "long") is
         // likewise a forged/inconsistent log — fail closed rather than treat it as zero columns (which would
         // silently exempt the version from the per-column identity compare).
-        var columns = new Dictionary<string, ColumnKey>(StringComparer.Ordinal);
+        var columns = new Dictionary<ColumnPathKey, ColumnKey>();
         if (SchemaJson.FromJson(metadata.SchemaString) is not StructType schema)
         {
             throw new SchemaValidationException(
@@ -55,7 +55,7 @@ internal readonly struct ColumnMappingIdentity
                 + "schema must be a struct, so the log is inconsistent and the read fails closed.");
         }
 
-        Collect(schema, string.Empty, columns);
+        Collect(schema, ImmutableArray<string>.Empty, columns);
         return new ColumnMappingIdentity(
             ColumnMapping.ResolveMode(metadata.Configuration), metadata.PartitionColumns, columns);
     }
@@ -69,6 +69,9 @@ internal readonly struct ColumnMappingIdentity
     /// <para>A logical rename (column-mapping) keeps id + physical name but changes the logical path, so it
     /// changes the key: it is neither falsely flagged (legal) nor able to mask a reassignment of a
     /// still-present logical column (that column stays keyed and is compared).</para>
+    /// <para>A historical column whose structured path differs from an end column but has the same unescaped
+    /// dotted spelling is treated as a mismatch, because otherwise a literal-dot name could masquerade as a
+    /// nested path (or vice versa) once nested column mapping is enabled.</para>
     /// <para><b>Rename-equivalent residual (not a preventable mismap).</b> Dropping a logical column
     /// <c>victim(id=1, phys=col-A)</c> and adding a NEW logical column <c>attacker(id=1, phys=col-A)</c> that
     /// REUSES the dropped id/physical name is byte-identical, in the metadata, to a legal RENAME of
@@ -87,9 +90,15 @@ internal readonly struct ColumnMappingIdentity
             return false;
         }
 
-        foreach (KeyValuePair<string, ColumnKey> end in _columns)
+        foreach (KeyValuePair<ColumnPathKey, ColumnKey> end in _columns)
         {
-            if (historical._columns.TryGetValue(end.Key, out ColumnKey past) && past != end.Value)
+            bool hasExactPath = historical._columns.TryGetValue(end.Key, out ColumnKey past);
+            if (hasExactPath && past != end.Value)
+            {
+                return false;
+            }
+
+            if (!hasExactPath && historical.ContainsDottedPathCollision(end.Key))
             {
                 return false;
             }
@@ -98,30 +107,110 @@ internal readonly struct ColumnMappingIdentity
         return true;
     }
 
-    // Collects each logical column's (field id, physical name) keyed by its fully-qualified logical path.
-    // Recurses DIRECT struct fields only — structs nested inside array/map element types are NOT descended,
-    // matching this build's support surface (nested column mapping — incl. nested-in-array/map — is
-    // unsupported and rejected fail-closed upstream at create/commit and in the Parquet reader; tracked under
-    // #676). The dotted path key is not collision-proof against a forged literal-dot logical name (e.g. a
-    // top-level column literally named "a.b" vs a nested "a"→"b"), but that is not a reachable mismap here:
-    // an id-mode nested read already fails closed (flat/leaf-only), so no CDF read resolves through a nested
-    // path, and a legitimate table never carries such a name.
-    private static void Collect(StructType schema, string prefix, Dictionary<string, ColumnKey> into)
+    private bool ContainsDottedPathCollision(ColumnPathKey key)
+    {
+        foreach (ColumnPathKey historical in _columns.Keys)
+        {
+            if (!historical.Equals(key) && historical.HasSameDottedPathAs(key))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Collects each logical column's (field id, physical name) keyed by a structured, segment-preserving
+    // logical path. That makes a literal top-level name such as "a.b" (one segment) distinct from nested
+    // a→b (two segments), which is the collision-proof safety precondition nested column mapping (#676)
+    // consumes before CDF compares identities across retained versions.
+    //
+    // Recurses DIRECT StructField.DataType structs only. It intentionally does NOT descend through array
+    // element or map key/value types, even when those types contain structs: Delta column mapping assigns ids
+    // and physical names to StructFields at every depth, while array element/map key/value nodes are not
+    // StructFields and carry no Delta column-mapping identity to compare here.
+    private static void Collect(
+        StructType schema, ImmutableArray<string> prefix, Dictionary<ColumnPathKey, ColumnKey> into)
     {
         foreach (StructField field in schema)
         {
-            string path = prefix.Length == 0 ? field.Name : prefix + "." + field.Name;
+            ImmutableArray<string> path = prefix.Add(field.Name);
             long? id = ColumnMapping.TryGetId(field, out long value) ? value : null;
             string? physicalName =
                 field.Metadata.TryGetString(ColumnMapping.PhysicalNameKey, out string? physical) && physical.Length > 0
                     ? physical
                     : null;
-            into[path] = new ColumnKey(id, physicalName);
+            into[new ColumnPathKey(path)] = new ColumnKey(id, physicalName);
             if (field.DataType is StructType nested)
             {
                 Collect(nested, path, into);
             }
         }
+    }
+
+    // A collision-proof logical column path. ImmutableArray<T> does not provide sequence value equality, so
+    // this key compares and hashes the ordered path segments explicitly.
+    private readonly struct ColumnPathKey : IEquatable<ColumnPathKey>
+    {
+        private readonly ImmutableArray<string> _segments;
+
+        internal ColumnPathKey(ImmutableArray<string> segments)
+        {
+            _segments = segments.IsDefault ? ImmutableArray<string>.Empty : segments;
+        }
+
+        public bool Equals(ColumnPathKey other)
+        {
+            if (Length != other.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < Length; i++)
+            {
+                if (!string.Equals(_segments[i], other._segments[i], StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is ColumnPathKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            unchecked
+            {
+                uint hash = 2166136261;
+                hash = AddHash(hash, Length);
+                if (_segments.IsDefault)
+                {
+                    return (int)hash;
+                }
+
+                foreach (string segment in _segments)
+                {
+                    hash = AddHash(hash, segment.Length);
+                    foreach (char c in segment)
+                    {
+                        hash = AddHash(hash, c);
+                    }
+                }
+
+                return (int)hash;
+            }
+        }
+
+        internal bool HasSameDottedPathAs(ColumnPathKey other) =>
+            string.Equals(ToDottedPath(), other.ToDottedPath(), StringComparison.Ordinal);
+
+        private int Length => _segments.IsDefault ? 0 : _segments.Length;
+
+        private string ToDottedPath() => _segments.IsDefaultOrEmpty ? string.Empty : string.Join(".", _segments);
+
+        private static uint AddHash(uint hash, int value) => (hash ^ (uint)value) * 16777619;
     }
 
     // A single column's column-mapping identity: its field id and physical name (either may be absent under

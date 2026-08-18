@@ -25,6 +25,16 @@ public sealed class ColumnMappingIdentityTests
         + "{\"name\":\"name\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
         + "{\"delta.columnMapping.id\":" + nameFieldId + ",\"delta.columnMapping.physicalName\":\"" + namePhysical + "\"}}]}";
 
+    private static string StructSchema(params string[] fields) =>
+        "{\"type\":\"struct\",\"fields\":[" + string.Join(",", fields) + "]}";
+
+    private static string MappedField(
+        string name, string typeJson, long fieldId, string physicalName, bool nullable = true) =>
+        "{\"name\":\"" + name + "\",\"type\":" + typeJson + ",\"nullable\":"
+        + (nullable ? "true" : "false") + ",\"metadata\":"
+        + "{\"delta.columnMapping.id\":" + fieldId + ",\"delta.columnMapping.physicalName\":\""
+        + physicalName + "\"}}";
+
     private static MetadataAction Meta(string schemaJson, string mode = "id", params string[] partitionColumns) =>
         new(
             Id: "t",
@@ -102,6 +112,81 @@ public sealed class ColumnMappingIdentityTests
         ColumnMappingIdentity end = Identity(Nested(99));
         Assert.False(end.IsImmutableFrom(Identity(Nested(3))));   // caught only if the recursion descends
         Assert.True(end.IsImmutableFrom(Identity(Nested(99))));   // identical nested identity — no false positive
+    }
+
+    [Fact]
+    public void IsImmutableFrom_LiteralDotAndNestedPathKeysDoNotCollide()
+    {
+        static string LiteralAndNested(long literalId, string literalPhysicalName) =>
+            StructSchema(
+                MappedField("a.b", "\"long\"", literalId, literalPhysicalName, nullable: true),
+                MappedField(
+                    "a",
+                    StructSchema(MappedField("b", "\"long\"", 3, "col-nested-b", nullable: true)),
+                    2,
+                    "col-struct-a",
+                    nullable: true));
+
+        ColumnMappingIdentity end = Identity(LiteralAndNested(99, "col-literal-z"));
+        ColumnMappingIdentity historical = Identity(LiteralAndNested(1, "col-literal-ab"));
+
+        Assert.False(end.IsImmutableFrom(historical));
+        Assert.True(historical.IsImmutableFrom(Identity(LiteralAndNested(1, "col-literal-ab"))));
+    }
+
+    [Fact]
+    public void IsImmutableFrom_LiteralDotVsNestedSameLeafIdentity_False()
+    {
+        string literalOnly = StructSchema(MappedField("a.b", "\"long\"", 7, "col-shared", nullable: true));
+        string nestedOnly = StructSchema(
+            MappedField(
+                "a",
+                StructSchema(MappedField("b", "\"long\"", 7, "col-shared", nullable: true)),
+                6,
+                "col-struct-a",
+                nullable: true));
+
+        Assert.False(Identity(literalOnly).IsImmutableFrom(Identity(nestedOnly)));
+        Assert.False(Identity(nestedOnly).IsImmutableFrom(Identity(literalOnly)));
+    }
+
+    [Fact]
+    public void IsImmutableFrom_FlatLiteralDotSchemaParity_Unchanged()
+    {
+        string flat = StructSchema(
+            MappedField("a.b", "\"long\"", 1, "col-literal-ab", nullable: false),
+            MappedField("c", "\"string\"", 2, "col-c", nullable: true));
+        string changedPhysicalName = StructSchema(
+            MappedField("a.b", "\"long\"", 1, "col-literal-z", nullable: false),
+            MappedField("c", "\"string\"", 2, "col-c", nullable: true));
+
+        Assert.True(Identity(flat).IsImmutableFrom(Identity(flat)));
+        Assert.False(Identity(changedPhysicalName).IsImmutableFrom(Identity(flat)));
+    }
+
+    [Fact]
+    public void IsImmutableFrom_NestedStructPathSegmentsRoundTrip()
+    {
+        static string Nested(long leafId, string leafPhysicalName) =>
+            StructSchema(
+                MappedField(
+                    "a",
+                    StructSchema(
+                        MappedField(
+                            "b",
+                            StructSchema(MappedField("c", "\"long\"", leafId, leafPhysicalName, nullable: true)),
+                            2,
+                            "col-struct-b",
+                            nullable: true)),
+                    1,
+                    "col-struct-a",
+                    nullable: true));
+
+        ColumnMappingIdentity end = Identity(Nested(3, "col-leaf-c"));
+
+        Assert.True(end.IsImmutableFrom(Identity(Nested(3, "col-leaf-c"))));
+        Assert.False(end.IsImmutableFrom(Identity(Nested(99, "col-leaf-c"))));
+        Assert.False(end.IsImmutableFrom(Identity(Nested(3, "col-leaf-z"))));
     }
 
     [Fact]
