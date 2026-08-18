@@ -1,0 +1,117 @@
+name: NuGet lockfile guard
+
+# Fails a pull request early, with an actionable message, when a committed
+# `packages.lock.json` is out of sync with the project/central-package files.
+#
+# Why this exists (issue #831): Dependabot's NuGet updater regenerates the lock
+# file of a MULTI-TARGETED project (e.g. tests/DeltaSharp.Core.Tests and
+# tests/DeltaSharp.Abstractions.Tests, both `net8.0;net10.0`) for a SINGLE target
+# framework, silently dropping the other TFM section. The CI `--locked-mode`
+# restore then fails deep in the build with a raw NU1004, which is easy to
+# misread. This guard runs a `--force-evaluate` restore and diffs the lock files,
+# so drift is caught quickly and the fix is spelled out.
+#
+# Security posture: this is an ordinary `pull_request` job. It uses the default
+# READ-ONLY `GITHUB_TOKEN`, never pushes, and holds no write permission — so
+# running `dotnet restore` on PR-authored inputs carries no more privilege than
+# the existing build/test jobs in ci.yml. It deliberately does NOT auto-commit a
+# fix (an earlier `pull_request_target` autofix design was rejected in review for
+# running PR-controlled MSBuild under a write token); remediation is a one-line
+# command the author runs locally.
+#
+# No `paths:` filter: this job is intended to be a required check, so it must
+# always report a status (a `--force-evaluate` restore on an unchanged tree is a
+# no-op and passes quickly).
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lockfile-guard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lockfile-guard:
+    name: lockfile-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Install the net8.0 runtime plus the exact SDK pinned by global.json, so the
+      # lock content this guard regenerates matches what ci.yml and local developers
+      # produce (a mismatched SDK band could regenerate different lock content and
+      # cause a spurious pass/fail). Mirrors ci.yml.
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # Regenerate every committed lock file from the current project + central
+      # package files. On an in-sync tree this rewrites nothing.
+      - name: Regenerate lock files (force-evaluate)
+        run: dotnet restore DeltaSharp.sln --force-evaluate
+
+      # Fail if regeneration changed any lock file. `git status --porcelain` sees
+      # BOTH modified-tracked and newly-created-untracked lock files, so a dropped
+      # TFM section (modification) and a brand-new lock file (addition) are both
+      # caught — a plain `git diff` would miss the untracked case.
+      - name: Verify lock files are in sync
+        run: |
+          set -euo pipefail
+          drift="$(git status --porcelain -- ':(glob)**/packages.lock.json')"
+          if [ -z "$drift" ]; then
+            echo "All packages.lock.json files are in sync with the project files."
+            exit 0
+          fi
+
+          changed="$(printf '%s\n' "$drift" | sed 's/^...//')"
+
+          {
+            echo "## NuGet lockfile guard failed"
+            echo ""
+            echo "The following \`packages.lock.json\` file(s) are out of sync with the project files:"
+            echo ""
+            echo '```'
+            printf '%s\n' "$changed"
+            echo '```'
+            echo ""
+            echo "This commonly happens when Dependabot bumps a package on a multi-targeted"
+            echo "project and regenerates the lock file for only one target framework"
+            echo "(dropping the other TFM section) — see issue #831."
+            echo ""
+            echo "**To fix, run locally and commit the result:**"
+            echo ""
+            echo '```bash'
+            echo "dotnet restore DeltaSharp.sln --force-evaluate"
+            echo "git add '**/packages.lock.json'"
+            echo "git commit -s -m 'deps: regenerate NuGet lock files'"
+            echo '```'
+            echo ""
+            echo "### Diff"
+            echo ""
+            echo '```diff'
+            git --no-pager diff -- ':(glob)**/packages.lock.json'
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "::error title=NuGet lockfile drift::packages.lock.json is out of sync. Run 'dotnet restore DeltaSharp.sln --force-evaluate' and commit the updated lock files. See the job summary for the affected files and diff."
+          printf 'Out-of-sync lock file(s):\n%s\n' "$changed"
+          exit 1
