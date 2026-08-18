@@ -563,7 +563,11 @@ public sealed class ParquetSchemaMappingTests
         // asked for. Only the first is "unsupported", so the cause clause is conditional — and without this
         // test, inverting that condition would make a legal decimal(10,2) tell an operator on a real read
         // path that its own well-formed column is unsupported, with the whole suite green.
-        byte[] file = await ParquetTestHelpers.WriteDecimalColumnAsync("d");
+        // A scale of 3 (deliberately NOT the scale 2 used by the out-of-range theory above): pinning a
+        // mappable fixture whose scale differs from every other decimal fixture is what makes the rendered
+        // scale a real, file-derived value — a `scale {const}` regression cannot satisfy both this render
+        // ("scale 3") and the out-of-range render ("scale 2") at once.
+        byte[] file = await ParquetTestHelpers.WriteDecimalColumnAsync("d", precision: 10, scale: 3);
         var readSchema = new StructType(new[]
         {
             new StructField("d", DataTypes.StringType, nullable: true),
@@ -573,8 +577,10 @@ public sealed class ParquetSchemaMappingTests
             () => ParquetTestHelpers.ReadAllAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
 
-        // Names the footer's real shape — both numbers, so neither can be rendered as a constant …
-        Assert.Contains("Parquet DECIMAL(precision 10, scale 2) column", error.Message, StringComparison.Ordinal);
+        // Names the footer's real shape — precision AND scale are file-derived (precision is pinned to
+        // varying values by the out-of-range theory; scale 3 here differs from the scale 2 there), so
+        // neither number can be rendered as a constant with the suite still green.
+        Assert.Contains("Parquet DECIMAL(precision 10, scale 3) column", error.Message, StringComparison.Ordinal);
 
         // … and does NOT slander it as unsupported: the column maps fine, the REQUEST is what disagrees.
         Assert.DoesNotContain("unsupported:", error.Message, StringComparison.Ordinal);
