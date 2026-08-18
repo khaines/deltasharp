@@ -77,7 +77,7 @@ dotnet test --filter "Name=Select_ProjectsColumns"
 
 ## Quality gates
 
-Every pull request must pass three automated gates across two CI jobs (see
+Every pull request must pass four automated gates across three CI jobs (see
 [docs/engineering/design/quality-gates.md](docs/engineering/design/quality-gates.md) for the
 full policy):
 
@@ -87,6 +87,9 @@ full policy):
   measurement-only so coverage instrumentation can never change the correctness verdict. It is a
   **required check** on `main` (added to branch protection after it first ran there, #456), so a
   coverage breach **blocks merge**.
+- **`lockfile-guard`** runs in parallel and enforces gate 4 (NuGet lock files stay in sync and
+  keep existing). It is **advisory** until it is promoted to a required check the same way
+  `coverage` was.
 
 Each gate has a local command that reproduces the CI result:
 
@@ -102,6 +105,13 @@ Each gate has a local command that reproduces the CI result:
    dotnet test -c Release --collect:"XPlat Code Coverage" \
      --settings coverlet.runsettings --results-directory TestResults
    python3 tools/coverage/coverage-gate.py --results-dir TestResults
+   ```
+
+4. **NuGet lockfile pinning** — regenerate the lock files and commit any change:
+
+   ```bash
+   dotnet restore DeltaSharp.sln --force-evaluate
+   tools/ci/lockfile-guard.sh
    ```
 
 ## Tests

@@ -90,14 +90,16 @@ jobs:
 
       # Regression-test the guard's own exit-code and reporting contract (drift,
       # deletion, .gitignore-hiding, manifest drift, path quoting, summary
-      # sanitization) against throwaway git repositories BEFORE trusting it on
-      # the real tree — mirroring the coverage-gate self-test in ci.yml. A broken
-      # guard fails the build loudly here instead of failing open.
+      # sanitization, workflow-command injection) against throwaway git
+      # repositories BEFORE trusting it on the real tree — mirroring the
+      # coverage-gate self-test in ci.yml. A broken guard fails the build loudly
+      # here instead of failing open.
       - name: Lockfile guard self-test
         run: tools/ci/lockfile-guard.sh --selftest
 
-      # Fail if regeneration changed any lock file, if a lock file listed in
-      # tools/ci/expected-lockfiles.txt disappeared, or if a project disabled
-      # lock-file generation. All logic (and its tests) live in the script.
+      # Fail if regeneration changed any lock file, or if the set of tracked
+      # lock files no longer matches tools/ci/expected-lockfiles.txt (deleted,
+      # .gitignore-hidden, or newly added without updating the manifest). All
+      # logic (and its tests) live in the script.
       - name: Verify lock files are in sync
         run: tools/ci/lockfile-guard.sh

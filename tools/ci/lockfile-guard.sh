@@ -49,7 +49,9 @@
 # Side effect: before rendering the diff the guard runs `git add
 # --intent-to-add` on the lock-file pathspec so a brand-new (untracked) lock
 # file shows up as an addition in `git diff` instead of an empty patch.
-# Intent-to-add stages no content and is undone with `git reset`.
+# Intent-to-add stages no content, and outside GitHub Actions the markers are
+# undone (`git reset`) before the guard returns, so a local run leaves the
+# developer's index as it found it.
 #
 set -euo pipefail
 
@@ -91,6 +93,18 @@ sanitize_fence() {
   sed -e "s/^\\([-+ ]\\{0,1\\}\\)\\( \\{0,3\\}\\)\`\\{3,\\}/\\1\\2'''/"
 }
 
+# Neutralize GitHub workflow-command injection: the Actions runner parses lines
+# such as `::error::…`, `::add-mask::…` or `::stop-commands::…` on BOTH stdout
+# and stderr, and it tolerates leading whitespace — so a PR-controlled path (a
+# directory literally named `::error::pwned`) or manifest entry could forge the
+# annotations reviewers rely on. Every untrusted line is therefore printed
+# behind a NON-whitespace bullet, which makes it unparseable as a command.
+# (Diff hunks are exempt: unified-diff output always begins with `+`, `-`, ` `,
+# `@`, `d` or `i`, so their first column is never `:`.)
+mark_untrusted() {
+  sed 's/^/  - /'
+}
+
 # ---------------------------------------------------------------------------
 # Checks
 # ---------------------------------------------------------------------------
@@ -122,10 +136,11 @@ tracked_lockfiles() {
 }
 
 # The committed expectation: which lock files MUST exist. Comments and blank
-# lines are ignored.
+# lines are ignored. `sort -u`, because `comm` compares sorted UNIQUE sets: a
+# duplicated manifest line would otherwise be reported as missing/unpinned.
 manifest_lockfiles() {
   sed -e 's/#.*//' -e 's/[[:space:]]*$//' "$MANIFEST_REL" |
-    grep -v '^$' | LC_ALL=C sort
+    grep -v '^$' | LC_ALL=C sort -u
 }
 
 # ---------------------------------------------------------------------------
@@ -135,7 +150,7 @@ manifest_lockfiles() {
 # Render a bullet-free block of untrusted lines inside a fenced code block.
 emit_block() {
   printf '%s\n' "$FENCE"
-  printf '%s\n' "$1" | sanitize_fence
+  printf '%s\n' "$1" | sanitize_fence | mark_untrusted
   printf '%s\n' "$FENCE"
   printf '\n'
 }
@@ -244,7 +259,9 @@ run_guard() {
   extra="$(LC_ALL=C comm -13 <(printf '%s\n' "$manifest") <(printf '%s\n' "$tracked"))"
 
   # A tracked-but-deleted file still appears in `git ls-files`, so also assert
-  # presence on disk.
+  # presence on disk. Deliberate redundancy over detect_drift: it stays true
+  # even if git is told to ignore the working tree (`--skip-worktree`,
+  # `--assume-unchanged`), where `git status` reports nothing.
   on_disk_missing=''
   while IFS= read -r p; do
     [ -n "$p" ] || continue
@@ -266,13 +283,28 @@ run_guard() {
 
   write_summary "$drift" "$missing" "$extra"
 
+  # CI checkouts are throwaway, a developer's index is not: undo the
+  # intent-to-add markers after the diff has been rendered.
+  if [ -z "${GITHUB_ACTIONS:-}" ]; then
+    git reset -q -- "$LOCKFILE_PATHSPEC" >/dev/null 2>&1 || true
+  fi
+
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
     echo "::error title=NuGet lockfile guard::packages.lock.json is out of sync or missing. See the job summary for the affected files and the fix."
   fi
 
-  [ -z "$drift" ] || printf 'Out-of-sync lock file(s):\n%s\n' "$(printf '%s\n' "$drift" | sed 's/^...//')" >&2
-  [ -z "$missing" ] || printf 'Missing (unpinned) lock file(s):\n%s\n' "$missing" >&2
-  [ -z "$extra" ] || printf 'Tracked lock file(s) absent from %s:\n%s\n' "$MANIFEST_REL" "$extra" >&2
+  if [ -n "$drift" ]; then
+    printf 'Out-of-sync lock file(s):\n' >&2
+    printf '%s\n' "$drift" | sed 's/^...//' | mark_untrusted >&2
+  fi
+  if [ -n "$missing" ]; then
+    printf 'Missing (unpinned) lock file(s):\n' >&2
+    printf '%s\n' "$missing" | mark_untrusted >&2
+  fi
+  if [ -n "$extra" ]; then
+    printf 'Tracked lock file(s) absent from %s:\n' "$MANIFEST_REL" >&2
+    printf '%s\n' "$extra" | mark_untrusted >&2
+  fi
   echo "lockfile guard FAILED. Run '${RESTORE_CMD}' and commit the result." >&2
   return 1
 }
@@ -416,6 +448,11 @@ st_case_untracked() {
   assert_exit 1 "$rc" 'new untracked lock file fails'
   assert_contains "$d/summary.md" 'src/New/packages.lock.json' 'new lock file is listed'
   assert_contains "$d/summary.md" '+{"version": 1' 'new lock file renders as an addition (intent-to-add)'
+  if [ -z "$(git -C "$d" diff --cached --name-only)" ]; then
+    st_pass 'local run leaves no intent-to-add entries in the index'
+  else
+    st_fail 'local run left intent-to-add entries staged'
+  fi
 }
 
 st_case_deleted_worktree() {
@@ -454,6 +491,9 @@ st_case_gitignored() {
   assert_exit 1 "$rc" 'gitignored regenerated lock file fails'
   assert_contains "$d/summary.md" 'src/Hidden/packages.lock.json' 'lock file hidden by an ignore rule is listed'
   assert_contains "$d/summary.md" 'hidden/Proj/packages.lock.json' 'lock file inside an ignored directory is listed'
+  # Pins `--force` on the intent-to-add: without it an ignored path is not added
+  # and the reviewer gets an empty patch instead of an actionable one.
+  assert_contains "$d/summary.md" '+{"version": 1}' 'hidden lock file renders as an addition (intent-to-add --force)'
 }
 
 # A built tree carries ignored `obj/` directories. They must NOT be reported:
@@ -531,6 +571,57 @@ st_case_remediation_pathspec() {
   assert_contains "$d/summary.md" '.NET SDK used by this run' 'summary carries the SDK breadcrumb'
 }
 
+# A duplicated (or unsorted) manifest line must not be reported as missing:
+# `comm` compares sorted UNIQUE sets, so manifest_lockfiles uses `sort -u`.
+st_case_manifest_duplicates() {
+  local d="$SELFTEST_ROOT/manifest-duplicates"
+  st_make_repo "$d" "src/Second/packages.lock.json"
+  printf 'src/Second/packages.lock.json\nsrc/Proj/packages.lock.json\nsrc/Proj/packages.lock.json\n' \
+    >"$d/tools/ci/expected-lockfiles.txt"
+  git -C "$d" commit -qam 'duplicated, unsorted manifest'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 0 "$rc" 'duplicated/unsorted manifest entries do not false-fail'
+  assert_contains "$d/stdout.txt" 'lockfile guard OK' 'duplicated manifest still reports OK'
+}
+
+# `--skip-worktree` tells git to ignore the working-tree copy, so `git status`
+# stays clean after the file is deleted. The on-disk presence loop is the check
+# that still catches it.
+st_case_skip_worktree() {
+  local d="$SELFTEST_ROOT/skip-worktree"
+  st_make_repo "$d"
+  git -C "$d" update-index --skip-worktree 'src/Proj/packages.lock.json'
+  rm "$d/src/Proj/packages.lock.json"
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'skip-worktree deletion still fails (on-disk presence check)'
+  assert_contains "$d/summary.md" '**missing**' 'skip-worktree deletion reports a missing lock file'
+}
+
+# A PR-controlled path must never reach column 0 of stdout/stderr in GitHub's
+# `::workflow-command` syntax, or a pull request could forge annotations.
+st_case_workflow_command_injection() {
+  local d="$SELFTEST_ROOT/command-injection"
+  local evil='::error::pwned/packages.lock.json'
+  st_make_repo "$d" "$evil"
+  printf '{"version": 1, "dependencies": {}}\n' >"$d/$evil"
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'lock file under a ::workflow-command path fails on drift'
+  assert_contains "$d/summary.md" '::error::pwned/packages.lock.json' 'injection path is still reported'
+  if grep -qE '^[[:space:]]*::' "$d/stdout.txt"; then
+    st_fail 'a ::workflow-command line reached column 0 of stdout/stderr'
+  else
+    st_pass 'untrusted path cannot forge a ::workflow-command annotation (stdout/stderr)'
+  fi
+  if grep -qE '^[[:space:]]*::' "$d/summary.md"; then
+    st_fail 'a ::workflow-command line reached column 0 of the step summary'
+  else
+    st_pass 'untrusted path cannot forge a ::workflow-command annotation (summary)'
+  fi
+}
+
 st_case_missing_manifest() {
   local d="$SELFTEST_ROOT/no-manifest"
   st_make_repo "$d"
@@ -557,6 +648,9 @@ run_selftest() {
   st_case_gitignored
   st_case_ignored_build_dirs
   st_case_manifest_lag
+  st_case_manifest_duplicates
+  st_case_skip_worktree
+  st_case_workflow_command_injection
   st_case_unicode_path
   st_case_fence_breakout
   st_case_remediation_pathspec

@@ -452,9 +452,13 @@ the JSON file remains the single enforced source of truth.
 
 ### What it enforces
 
-Every project restores with lock-file pinning enabled, so a committed `packages.lock.json`
-pins the exact resolved dependency graph (including transitive packages) and CI restores with
-`--locked-mode`. The **`lockfile-guard`** job in
+The projects that consume third-party packages restore with lock-file pinning enabled — the
+test projects (via [`tests/Directory.Build.props`](../../../tests/Directory.Build.props)) plus
+the package-consuming production libraries `DeltaSharp.Engine` and `DeltaSharp.Storage`. Their
+committed `packages.lock.json` pins the exact resolved dependency graph (including transitive
+packages) and CI restores with `--locked-mode`. `DeltaSharp.Abstractions`, `DeltaSharp.Core`,
+`DeltaSharp.Executor` and the samples have no third-party `PackageReference` and therefore ship
+no lock file (see [repository layout](repository-layout.md)). The **`lockfile-guard`** job in
 [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml) protects that
 pinning. It runs a `--force-evaluate` restore and then
 [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh), which fails when:
@@ -486,6 +490,13 @@ differently during `restore` than during a `-getProperty` probe, so a restore-se
 opt-out passes the probe yet still disables pinning at restore time. Rather than ship a check
 that gives a false sense of security, the guard covers only what it covers robustly and that
 risk is left to human code review — the csproj/props change is visible in the pull-request diff.
+
+The **omission** case is equally out of scope: the manifest is a *set-equality* check against
+the lock files that exist today, so a project that gains its **first** `PackageReference`
+without enabling `RestorePackagesWithLockFile` never produces a lock file, is never listed in
+the manifest, and is therefore invisible to the guard. It ships unpinned dependencies. That,
+too, rests on code review of the `.csproj` change.
+
 The guard is advisory.
 
 ### Reporting and safety of the job summary
@@ -494,8 +505,11 @@ On failure the guard writes the affected paths, a `git diff --stat`, and a **byt
 patch (60 000 bytes, well under GitHub's 1 MiB summary cap) to `$GITHUB_STEP_SUMMARY`, plus the
 SDK version used. Lock-file content and paths are attacker-controllable, so untrusted text is
 wrapped in a five-backtick fence and leading backtick runs are rewritten — content cannot break
-out of the code block and inject markup. Paths print unquoted (`core.quotePath=false`) so a
-non-ASCII path stays copy-pasteable.
+out of the code block and inject markup. Untrusted lines are additionally printed behind a
+`  - ` bullet, so a path such as `::error::pwned/` cannot reach column 0 and forge a GitHub
+[workflow command](https://docs.github.com/actions/reference/workflow-commands-for-github-actions)
+(the runner parses those on stdout *and* stderr, and tolerates indentation). Paths print
+unquoted (`core.quotePath=false`) so a non-ASCII path stays copy-pasteable.
 
 ### Testing the gate
 
@@ -508,8 +522,9 @@ tools/ci/lockfile-guard.sh --selftest
 
 It builds throwaway git repositories under `mktemp -d` (removed by an `EXIT` trap) and asserts
 the exit code and summary content for the in-sync, modified, newly-added, worktree-deleted,
-committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag, unicode/spaced-path
-and fence-breakout cases. It needs only `git` — no SDK, no network. CI runs it **before** the
+committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag,
+duplicated-manifest-entry, `--skip-worktree`-deletion, unicode/spaced-path, fence-breakout and
+`::workflow-command`-injection cases. It needs only `git` — no SDK, no network. CI runs it **before** the
 real check.
 
 ### Job posture and promotion
