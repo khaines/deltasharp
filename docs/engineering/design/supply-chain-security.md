@@ -51,6 +51,7 @@ features and their checklists (05, 14, 18); this document does not restate them.
 | 107a | Secret scanning | GitHub-native secret scanning + push protection (primary); in-repo tripwire (testable) | Enabled; `secret-scan` CI job fails on un-allowlisted match | repo settings; [`security.yml`](../../../.github/workflows/security.yml), [`tools/security/secret-scan.py`](../../../tools/security/secret-scan.py) |
 | 107b/c | Dependency / SCA scanning | Build-time NuGet audit + `sca` gate + PR `dependency-review` | HIGH/CRITICAL fail the build **and** the `sca` gate; `dependency-review` (advisory, PR-only) fails on high | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml), [`dependency-review.yml`](../../../.github/workflows/dependency-review.yml), [`tools/security/sca-gate.py`](../../../tools/security/sca-gate.py) |
 | 107d | Suppression hygiene | Allowlists carrying scope/reason/owner/expiry, expiry-enforced | Malformed/expired waivers fail closed | [`sca-policy.json`](../../../tools/security/sca-policy.json), [`secret-scan-allowlist.json`](../../../tools/security/secret-scan-allowlist.json) |
+| 107e | Dependency pinning | Committed `packages.lock.json` per project + `--locked-mode` restore in CI + the `lockfile-guard` job | Drift, deletion, `.gitignore`-hiding, or `RestorePackagesWithLockFile=false` fails the guard (advisory until promoted) | [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml), [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh), [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) |
 | 108a/d | SBOM | CycloneDX per packable project, retained artifact | `sbom` CI job generates + uploads | [`security.yml`](../../../.github/workflows/security.yml), [`.config/dotnet-tools.json`](../../../.config/dotnet-tools.json) |
 | 108b | Deterministic build evidence | Deterministic compile + double-build hash comparison | `sbom` job fails on non-deterministic output | [`Directory.Build.props`](../../../Directory.Build.props), [`security.yml`](../../../.github/workflows/security.yml) |
 | 108c | Source provenance | In-box SourceLink + repository metadata | `pack.yml` asserts SourceLink resolves to the repo | [`Directory.Build.props`](../../../Directory.Build.props), [`pack.yml`](../../../.github/workflows/pack.yml) |
@@ -325,6 +326,15 @@ is **advisory and PR-only**. It needs a base↔head range to diff, so it never r
 fails on a high-severity introduced dependency, but it does not gate `main` via branch
 protection.
 
+`lockfile-guard` (in [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml),
+control 107e, #831) is **advisory today and slated for the same post-merge promotion**: it runs on
+every pull request **and** every push to `main` with no `paths:` filter, precisely so it reports a
+status on the default branch and can then be added to branch protection — the pattern used for
+`coverage` (#456) and the security scans (#461). Until promoted, a drifted, deleted, or
+`.gitignore`-hidden `packages.lock.json` fails the job but does not block merge; the
+`--locked-mode` restore in `build-test-format` remains the blocking backstop for drift. Gate
+details live in [quality-gates.md](quality-gates.md#gate-4--nuget-lockfile-guard-831).
+
 The security scans were promoted with the documented step:
 
 ```bash
@@ -384,6 +394,11 @@ dotnet list DeltaSharp.sln package --vulnerable --include-transitive --format js
 python3 tools/security/sca-gate.py --selftest
 python3 tools/security/sca-gate.py --input sca-report.json
 
+# Dependency-pinning gate (lock files must be in sync, present, and enabled):
+dotnet restore DeltaSharp.sln --force-evaluate
+tools/ci/lockfile-guard.sh --selftest
+tools/ci/lockfile-guard.sh
+
 # Secret scan (un-allowlisted match fails; the safe fixture is reported, masked):
 python3 tools/security/secret-scan.py --selftest
 python3 tools/security/secret-scan.py
@@ -416,5 +431,6 @@ sha256sum repro/a/DeltaSharp.Core.dll repro/b/DeltaSharp.Core.dll   # the two ha
   [`.github/CODEOWNERS`](../../../.github/CODEOWNERS)
 - [`.github/workflows/security.yml`](../../../.github/workflows/security.yml),
   [`.github/workflows/dependency-review.yml`](../../../.github/workflows/dependency-review.yml),
+  [`.github/workflows/nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml),
   [`.github/workflows/pack.yml`](../../../.github/workflows/pack.yml),
   [`.github/workflows/dco.yml`](../../../.github/workflows/dco.yml)

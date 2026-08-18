@@ -19,9 +19,19 @@ name: NuGet lockfile guard
 # running PR-controlled MSBuild under a write token); remediation is a one-line
 # command the author runs locally.
 #
-# No `paths:` filter: this job is intended to be a required check, so it must
-# always report a status (a `--force-evaluate` restore on an unchanged tree is a
-# no-op and passes quickly).
+# The detection/reporting logic lives in `tools/ci/lockfile-guard.sh` (with a
+# `--selftest` suite CI runs first, mirroring the coverage gate), so it is
+# testable and locally reproducible. It also FAILS CLOSED: deleting a lock file,
+# hiding one behind .gitignore, or setting `RestorePackagesWithLockFile=false`
+# fails the guard instead of leaving `git status` clean and the check green — see
+# `tools/ci/expected-lockfiles.txt`.
+#
+# No `paths:` filter: this job must always report a status so it can be promoted
+# to a required check once it has run on `main` (a status check can only be made
+# required after it has executed on the default branch; #456 precedent). Until
+# that promotion it is advisory — see
+# docs/engineering/design/quality-gates.md. A `--force-evaluate` restore on an
+# unchanged tree is a no-op and passes quickly.
 on:
   push:
     branches: [main]
@@ -69,49 +79,16 @@ jobs:
       - name: Regenerate lock files (force-evaluate)
         run: dotnet restore DeltaSharp.sln --force-evaluate
 
-      # Fail if regeneration changed any lock file. `git status --porcelain` sees
-      # BOTH modified-tracked and newly-created-untracked lock files, so a dropped
-      # TFM section (modification) and a brand-new lock file (addition) are both
-      # caught — a plain `git diff` would miss the untracked case.
+      # Regression-test the guard's own exit-code and reporting contract (drift,
+      # deletion, .gitignore-hiding, lock-file opt-out, path quoting, summary
+      # sanitization) against throwaway git repositories BEFORE trusting it on
+      # the real tree — mirroring the coverage-gate self-test in ci.yml. A broken
+      # guard fails the build loudly here instead of failing open.
+      - name: Lockfile guard self-test
+        run: tools/ci/lockfile-guard.sh --selftest
+
+      # Fail if regeneration changed any lock file, if a lock file listed in
+      # tools/ci/expected-lockfiles.txt disappeared, or if a project disabled
+      # lock-file generation. All logic (and its tests) live in the script.
       - name: Verify lock files are in sync
-        run: |
-          set -euo pipefail
-          drift="$(git status --porcelain -- ':(glob)**/packages.lock.json')"
-          if [ -z "$drift" ]; then
-            echo "All packages.lock.json files are in sync with the project files."
-            exit 0
-          fi
-
-          changed="$(printf '%s\n' "$drift" | sed 's/^...//')"
-
-          {
-            echo "## NuGet lockfile guard failed"
-            echo ""
-            echo "The following \`packages.lock.json\` file(s) are out of sync with the project files:"
-            echo ""
-            echo '```'
-            printf '%s\n' "$changed"
-            echo '```'
-            echo ""
-            echo "This commonly happens when Dependabot bumps a package on a multi-targeted"
-            echo "project and regenerates the lock file for only one target framework"
-            echo "(dropping the other TFM section) — see issue #831."
-            echo ""
-            echo "**To fix, run locally and commit the result:**"
-            echo ""
-            echo '```bash'
-            echo "dotnet restore DeltaSharp.sln --force-evaluate"
-            echo "git add '**/packages.lock.json'"
-            echo "git commit -s -m 'deps: regenerate NuGet lock files'"
-            echo '```'
-            echo ""
-            echo "### Diff"
-            echo ""
-            echo '```diff'
-            git --no-pager diff -- ':(glob)**/packages.lock.json'
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          echo "::error title=NuGet lockfile drift::packages.lock.json is out of sync. Run 'dotnet restore DeltaSharp.sln --force-evaluate' and commit the updated lock files. See the job summary for the affected files and diff."
-          printf 'Out-of-sync lock file(s):\n%s\n' "$changed"
-          exit 1
+        run: tools/ci/lockfile-guard.sh
