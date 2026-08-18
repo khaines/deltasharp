@@ -472,7 +472,10 @@ st_case_untracked() {
   assert_exit 1 "$rc" 'new untracked lock file fails'
   assert_contains "$d/summary.md" 'src/New/packages.lock.json' 'new lock file is listed'
   assert_contains "$d/summary.md" '+{"version": 1' 'new lock file renders as an addition (intent-to-add)'
-  if [ -z "$(git -C "$d" diff --cached --name-only)" ]; then
+  # `git diff-index --cached HEAD`, not `git diff --cached`: the latter does not
+  # list intent-to-add entries, so it would pass whether or not the guard
+  # cleaned up after itself.
+  if [ -z "$(git -C "$d" diff-index --cached --name-only HEAD)" ]; then
     st_pass 'local run leaves no intent-to-add entries in the index'
   else
     st_fail 'local run left intent-to-add entries staged'
@@ -494,7 +497,7 @@ st_case_prestaged_survives() {
   local rc
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'guard still fails with a deliberately staged lock file'
-  if git -C "$d" diff --cached --name-only | grep -qxF 'src/Proj/packages.lock.json'; then
+  if git -C "$d" diff-index --cached --name-only HEAD | grep -qxF 'src/Proj/packages.lock.json'; then
     st_pass 'a deliberately staged lock file is still staged afterwards'
   else
     st_fail 'the guard unstaged a deliberately staged lock file'
@@ -504,7 +507,7 @@ st_case_prestaged_survives() {
   else
     st_fail 'staged lock-file content was discarded (reset to HEAD)'
   fi
-  if git -C "$d" diff --cached --name-only | grep -qxF 'src/New/packages.lock.json'; then
+  if git -C "$d" diff-index --cached --name-only HEAD | grep -qxF 'src/New/packages.lock.json'; then
     st_fail "the guard's own intent-to-add marker was left behind"
   else
     st_pass "the guard's own intent-to-add marker is removed"
@@ -657,24 +660,49 @@ st_case_skip_worktree() {
 
 # A PR-controlled path must never reach column 0 of stdout/stderr in GitHub's
 # `::workflow-command` syntax, or a pull request could forge annotations.
+# Drives ALL THREE reporting branches (drift, missing, extra): each prints
+# untrusted text through its own `mark_untrusted` call, so a fixture that only
+# produces drift would let a regression in the other two go unnoticed.
 st_case_workflow_command_injection() {
   local d="$SELFTEST_ROOT/command-injection"
-  local evil='::error::pwned/packages.lock.json'
-  st_make_repo "$d" "$evil"
-  printf '{"version": 1, "dependencies": {}}\n' >"$d/$evil"
+  local drift_path='::error::pwned/packages.lock.json'
+  local extra_path='::warning::extra/packages.lock.json'
+  local manifest_entry='::stop-commands::deadbeef/packages.lock.json'
+  st_make_repo "$d" "$drift_path"
+
+  # drift: a tracked lock file under a hostile path changed after the restore.
+  printf '{"version": 1, "dependencies": {}}\n' >"$d/$drift_path"
+
+  # extra: a tracked lock file under a hostile path that the manifest omits.
+  mkdir -p "$d/$(dirname "$extra_path")"
+  st_write_csproj "$d/$(dirname "$extra_path")/Extra.csproj"
+  printf '{"version": 1}\n' >"$d/$extra_path"
+  # The `./` prefix matters: `git add -- '::warning::extra/…'` is parsed as
+  # MAGIC pathspec, not as a path.
+  git -C "$d" add -- "./$(dirname "$extra_path")"
+  git -C "$d" commit -qm 'unlisted lock file under a hostile path'
+
+  # missing: a hostile manifest entry that is not tracked.
+  printf '%s\n' "$manifest_entry" >>"$d/tools/ci/expected-lockfiles.txt"
+  git -C "$d" add -- tools/ci/expected-lockfiles.txt
+  git -C "$d" commit -qm 'hostile manifest entry'
+
   local rc
   rc="$(st_run_guard "$d")"
-  assert_exit 1 "$rc" 'lock file under a ::workflow-command path fails on drift'
-  assert_contains "$d/summary.md" '::error::pwned/packages.lock.json' 'injection path is still reported'
-  if grep -qE '^[[:space:]]*::' "$d/stdout.txt"; then
+  assert_exit 1 "$rc" 'lock files under ::workflow-command paths fail'
+  assert_contains "$d/summary.md" "$drift_path" 'hostile drift path is still reported'
+  assert_contains "$d/summary.md" "$manifest_entry" 'hostile manifest entry is still reported'
+  assert_contains "$d/summary.md" "$extra_path" 'hostile unlisted path is still reported'
+  # Split on CR as well as LF, because the runner's line reader does too.
+  if tr '\r' '\n' <"$d/stdout.txt" | grep -qE '^[[:space:]]*::'; then
     st_fail 'a ::workflow-command line reached column 0 of stdout/stderr'
   else
-    st_pass 'untrusted path cannot forge a ::workflow-command annotation (stdout/stderr)'
+    st_pass 'no reporting branch forges a ::workflow-command annotation (stdout/stderr)'
   fi
-  if grep -qE '^[[:space:]]*::' "$d/summary.md"; then
+  if tr '\r' '\n' <"$d/summary.md" | grep -qE '^[[:space:]]*::'; then
     st_fail 'a ::workflow-command line reached column 0 of the step summary'
   else
-    st_pass 'untrusted path cannot forge a ::workflow-command annotation (summary)'
+    st_pass 'no reporting branch forges a ::workflow-command annotation (summary)'
   fi
 }
 
