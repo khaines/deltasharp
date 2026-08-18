@@ -241,12 +241,18 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
-    /// <summary>Writes a single-column Parquet file holding a well-formed <c>DECIMAL(10, 2)</c> column named
-    /// <paramref name="columnName"/> — the carrier <see cref="ForgeDecimalPrecisionAsync"/> re-annotates into
-    /// an out-of-range decimal.</summary>
-    public static async Task<byte[]> WriteDecimalColumnAsync(string columnName)
+    /// <summary>Writes a single-column Parquet file holding a well-formed
+    /// <c>DECIMAL(<paramref name="precision"/>, <paramref name="scale"/>)</c> column named
+    /// <paramref name="columnName"/>. At the default <c>DECIMAL(10, 2)</c> it is the carrier
+    /// <see cref="ForgeDecimalPrecisionAsync"/> re-annotates into an out-of-range decimal; the explicit
+    /// precision overload authors an IN-range decimal AT the cap, pinning that the fail-closed range check
+    /// rejects only what is genuinely unrepresentable.</summary>
+    public static async Task<byte[]> WriteDecimalColumnAsync(
+        string columnName,
+        int precision = 10,
+        int scale = 2)
     {
-        var field = new global::Parquet.Schema.DecimalDataField(columnName, precision: 10, scale: 2);
+        var field = new global::Parquet.Schema.DecimalDataField(columnName, precision, scale);
         var schema = new global::Parquet.Schema.ParquetSchema(field);
         using var stream = new MemoryStream();
         await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))

@@ -297,9 +297,7 @@ internal static class ParquetTypeMapping
                 // instead routes it through the SAME unmappable-type rejection as any other unsupported
                 // physical type — a typed, fail-closed DeltaStorageException. This is what makes
                 // TryToDataType TOTAL: it must answer for EVERY footer field, never throw.
-                if (decimalField.Precision is < DecimalType.MinPrecision or > DecimalType.MaxPrecision
-                    || decimalField.Scale < 0
-                    || decimalField.Scale > decimalField.Precision)
+                if (!IsRepresentableDecimal(decimalField))
                 {
                     type = null;
                     return false;
@@ -385,19 +383,53 @@ internal static class ParquetTypeMapping
     /// <summary>
     /// The ANNOTATION-AWARE form of <see cref="DescribePhysicalClrType(Type)"/>, for a message that describes
     /// a whole footer <see cref="DataField"/> rather than a bare CLR type. A TIME column's CLR type is a raw
-    /// <see cref="int"/>/<see cref="long"/>, so describing it by CLR type alone produced the
-    /// self-contradictory "physical type 'Int64' does not match the requested engine type 'bigint'" — the
-    /// operator could not see that the file column is a TIME. Name the TIME annotation instead; everything
-    /// else keeps the CLR-shape rendering.
-    /// <para>Message-hygiene safe (#653): a fixed vocabulary, never file-derived text.</para>
+    /// <see cref="int"/>/<see cref="long"/> and a DECIMAL column's is a bare <see cref="decimal"/>, so
+    /// describing either by CLR type alone produced a self-contradictory message — "physical type 'Int64'
+    /// does not match the requested engine type 'bigint'", or "physical type 'Decimal' … cannot be read as
+    /// 'decimal(10,2)'" — from which an operator could not see that the file column is a TIME, or WHICH
+    /// decimal shape the file actually declares. Name the annotation instead; everything else keeps the
+    /// CLR-shape rendering.
+    /// <para>Message-hygiene safe (#653): a fixed vocabulary plus, for DECIMAL, the footer's own two small
+    /// integers — never file-derived, attacker-authored TEXT.</para>
     /// </summary>
     internal static string DescribePhysical(DataField field)
     {
         ArgumentNullException.ThrowIfNull(field);
-        return IsTimeColumn(field)
-            ? $"Parquet TIME column ({DescribeTimeEncoding(field)})"
-            : DescribePhysicalClrType(field.ClrType);
+        if (IsTimeColumn(field))
+        {
+            return $"Parquet TIME column ({DescribeTimeEncoding(field)})";
+        }
+
+        if (field is DecimalDataField decimalField)
+        {
+            // Name the footer's declared precision/scale, and — when they are the very reason the column was
+            // rejected — the supported range, so the message is ACTIONABLE. The cause clause is conditional
+            // because this method also renders MAPPABLE decimals: the CLR-shape gate in
+            // ParquetFileReader.ValidateFileField describes an in-range decimal column that was requested as
+            // some other engine type, and claiming "unsupported" there would be a lie.
+            string cause = IsRepresentableDecimal(decimalField)
+                ? string.Empty
+                : $" (unsupported: precision must be in [{DecimalType.MinPrecision}, "
+                    + $"{DecimalType.MaxPrecision}] and scale in [0, precision])";
+            return $"Parquet DECIMAL(precision {decimalField.Precision}, scale {decimalField.Scale}) "
+                + $"column{cause}";
+        }
+
+        return DescribePhysicalClrType(field.ClrType);
     }
+
+    /// <summary>
+    /// Returns whether a footer DECIMAL annotation is within the range DeltaSharp's <see cref="DecimalType"/>
+    /// can represent. A Parquet footer may legally declare more than DeltaSharp's Spark-parity cap of 38
+    /// (Arrow's <c>decimal256</c> emits up to 76) and a hostile footer can declare anything at all, so this is
+    /// the single source of truth shared by the fail-closed check in <see cref="TryToDataType"/> and the
+    /// message rendered by <see cref="DescribePhysical(DataField)"/> — the two must never disagree about
+    /// whether a column is representable.
+    /// </summary>
+    private static bool IsRepresentableDecimal(DecimalDataField field) =>
+        field.Precision is >= DecimalType.MinPrecision and <= DecimalType.MaxPrecision
+        && field.Scale >= 0
+        && field.Scale <= field.Precision;
 
     /// <summary>
     /// Returns whether <paramref name="field"/> is a Parquet <b>TIME</b> (time-of-day) column under ANY of the

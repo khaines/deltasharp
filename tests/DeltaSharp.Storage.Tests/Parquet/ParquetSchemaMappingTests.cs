@@ -412,7 +412,8 @@ public sealed class ParquetSchemaMappingTests
     }
 
     [Theory]
-    [InlineData(40)]  // Just past DeltaSharp's Spark-parity cap of 38.
+    [InlineData(39)]  // One past DeltaSharp's Spark-parity cap of 38 — pins the cap's exact boundary.
+    [InlineData(40)]  // Just past the cap.
     [InlineData(76)]  // What Arrow's decimal256 emits.
     public async Task OutOfRangeDecimalPrecision_FailsClosed_AtBothDoors_NotWithARawValidationError(
         int precision)
@@ -438,7 +439,15 @@ public sealed class ParquetSchemaMappingTests
                 Assert.Equal(precision, footerField.Precision);
 
                 Assert.False(ParquetTypeMapping.TryToDataType(footerField, out _));
-                Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.ToDataSchema(reader.Schema));
+                var schemaDoorError = Assert.Throws<DeltaStorageException>(
+                    () => ParquetTypeMapping.ToDataSchema(reader.Schema));
+
+                // Pin the DECIMAL branch of DescribePhysical. A DecimalDataField's CLR type is a bare
+                // `decimal`, so without that branch the rejection read "file physical type 'Decimal' …
+                // cannot be read as 'decimal(10,2)'" — self-contradictory and unactionable, the very defect
+                // this PR fixed for TIME. The message must name the footer's OWN precision.
+                Assert.Contains(
+                    $"DECIMAL(precision {precision}", schemaDoorError.Message, StringComparison.Ordinal);
             }
         }
 
@@ -453,6 +462,58 @@ public sealed class ParquetSchemaMappingTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => ReadAsDeltaScanAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains($"DECIMAL(precision {precision}", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(28, true)]   // The largest precision the phased System.Decimal read path can materialize.
+    [InlineData(29, false)]  // Past System.Decimal's 28 digits, but still MAPPABLE.
+    [InlineData(38, false)]  // EXACTLY at DeltaSharp's Spark-parity cap — the boundary the check must ACCEPT.
+    public async Task InRangeDecimalPrecision_AtTheCap_StaysMappable(int precision, bool readableEndToEnd)
+    {
+        // The twin of the out-of-range theory, and the half of the boundary that fail-closed changes tend to
+        // break: a range check is only correct if it rejects what is unrepresentable AND still accepts
+        // everything that is. Without this, tightening the check by one (rejecting precision 38) would
+        // silently fail-close a perfectly legal Spark-parity decimal with the whole suite green.
+        const int Scale = 2;
+        byte[] file = await ParquetTestHelpers.WriteDecimalColumnAsync("d", precision, Scale);
+
+        using (var probe = new MemoryStream(file, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(probe, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                var footerField = Assert.IsType<DecimalDataField>(Assert.Single(reader.Schema.DataFields));
+                Assert.Equal(precision, footerField.Precision);
+
+                Assert.True(ParquetTypeMapping.TryToDataType(footerField, out DataType? mapped));
+                Assert.Equal(DataTypes.CreateDecimalType(precision, Scale), mapped);
+            }
+        }
+
+        var readSchema = new StructType(new[]
+        {
+            new StructField("d", DataTypes.CreateDecimalType(precision, Scale), nullable: true),
+        });
+
+        if (readableEndToEnd)
+        {
+            // …and it must actually READ, not merely map: the read door calls TryToDataType for every column
+            // of every file, so a too-tight range check would fail the read as well as the schema mapping.
+            IReadOnlyList<ColumnBatch> batches = await ParquetTestHelpers.ReadAllAsync(file, readSchema);
+            Assert.Equal(1, batches.Sum(batch => batch.RowCount));
+            return;
+        }
+
+        // Above 28 digits the read stops for an INDEPENDENT, pre-existing reason: DeltaSharp materializes
+        // decimals into System.Decimal, whose 28-digit ceiling is a phased limitation (design §2.9) of the
+        // REQUESTED engine type, not of footer mappability. Pinning which error it is keeps the two apart —
+        // if the fail-closed range check ever swallowed these it would report the unmappable-footer
+        // SchemaMismatch instead, and this assertion would catch the confusion.
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(file, readSchema));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("System.Decimal limit", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
