@@ -93,12 +93,12 @@ internal sealed class CheckpointFixture
         };
         if (readerFeatures is not null)
         {
-            protocol["readerFeatures"] = readerFeatures.ToList();
+            protocol["readerFeatures"] = ToStringList(readerFeatures);
         }
 
         if (writerFeatures is not null)
         {
-            protocol["writerFeatures"] = writerFeatures.ToList();
+            protocol["writerFeatures"] = ToStringList(writerFeatures);
         }
 
         return Row("protocol", protocol);
@@ -119,10 +119,10 @@ internal sealed class CheckpointFixture
             ["format"] = new Dictionary<string, object?>
             {
                 ["provider"] = provider,
-                ["options"] = new Dictionary<string, string?>(),
+                ["options"] = ToNullableMap(null),
             },
             ["schemaString"] = schemaString,
-            ["partitionColumns"] = (partitionColumns ?? []).ToList(),
+            ["partitionColumns"] = ToStringList(partitionColumns ?? []),
             ["configuration"] = ToMap(configuration),
         };
         if (name is not null)
@@ -315,14 +315,20 @@ internal sealed class CheckpointFixture
             {
                 ["add"] = new Dictionary<string, object?>
                 {
-                    ["partitionValues"] = new Dictionary<string, string?> { ["k1"] = "v1" },
+                    ["partitionValues"] = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>
+                    {
+                        [Memory("k1")] = Memory("v1"),
+                    },
                 },
             },
             new Dictionary<string, object?>
             {
                 ["add"] = new Dictionary<string, object?>
                 {
-                    ["partitionValues"] = new Dictionary<string, string?> { ["k2"] = "v2" },
+                    ["partitionValues"] = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>
+                    {
+                        [Memory("k2")] = Memory("v2"),
+                    },
                 },
             },
         };
@@ -338,6 +344,43 @@ internal sealed class CheckpointFixture
         long actual = await ParquetTestHelpers.RowGroupNumRowsAsync(bytes, 0);
         return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(
             bytes, 0, overDeclareRows ? actual + 1 : actual - 1);
+    }
+
+    /// <summary>Authors a minimal valid checkpoint add action with a null <c>partitionValues</c> map value
+    /// through the low-level writer. Parquet.Net 6.1's high-level untyped serializer requires
+    /// <see cref="ReadOnlyMemory{T}"/> string map values and materializes null nullable-memory values as empty
+    /// strings, so this keeps the checkpoint reader's real null-value coverage independent of that serializer
+    /// conversion seam.</summary>
+    internal static async Task<byte[]> AddWithNullPartitionValueAsync()
+    {
+        var schema = new ParquetSchema(new StructField("add",
+            new DataField<string?>("path"),
+            new MapField("partitionValues",
+                new DataField<string>("key", nullable: false),
+                new DataField<string?>("value")),
+            new DataField<long?>("size")));
+        DataField[] leaves = schema.GetDataFields(); // [path, key, value, size]
+
+        var path = new ReadOnlyMemory<char>?[] { Memory("part-null.parquet") };
+        var keys = new ReadOnlyMemory<char>?[] { Memory("year"), Memory("month") };
+        var values = new ReadOnlyMemory<char>?[] { Memory("2026"), null };
+        var size = new long?[] { 100L };
+
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                leaves[0], new ReadOnlyMemory<ReadOnlyMemory<char>?>(path), null, null, CancellationToken.None);
+            await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                leaves[1], new ReadOnlyMemory<ReadOnlyMemory<char>?>(keys), new[] { 0, 1 }, null, CancellationToken.None);
+            await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                leaves[2], new ReadOnlyMemory<ReadOnlyMemory<char>?>(values), new[] { 0, 1 }, null, CancellationToken.None);
+            await rowGroup.WriteAsync<long>(
+                leaves[3], new ReadOnlyMemory<long?>(size), null, null, CancellationToken.None);
+        }
+
+        return stream.ToArray();
     }
 
     /// <summary>Authors a MINIMAL classic checkpoint whose ONLY column is the <c>add.partitionValues</c> MAP
@@ -361,7 +404,7 @@ internal sealed class CheckpointFixture
             {
                 ["add"] = new Dictionary<string, object?>
                 {
-                    ["partitionValues"] = new Dictionary<string, int?> { ["k1"] = 7 },
+                    ["partitionValues"] = new Dictionary<ReadOnlyMemory<char>, int?> { [Memory("k1")] = 7 },
                 },
             },
         };
@@ -476,14 +519,14 @@ internal sealed class CheckpointFixture
             {
                 ["metaData"] = new Dictionary<string, object?>
                 {
-                    ["partitionColumns"] = new List<string?> { "c1" },
+                    ["partitionColumns"] = new List<ReadOnlyMemory<char>?> { Memory("c1") },
                 },
             },
             new Dictionary<string, object?>
             {
                 ["metaData"] = new Dictionary<string, object?>
                 {
-                    ["partitionColumns"] = new List<string?> { "c2" },
+                    ["partitionColumns"] = new List<ReadOnlyMemory<char>?> { Memory("c2") },
                 },
             },
         };
@@ -499,27 +542,32 @@ internal sealed class CheckpointFixture
         return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, 0, actual + 1);
     }
 
-    private static Dictionary<string, string?> ToNullableMap((string Key, string? Value)[]? entries)
+    private static Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?> ToNullableMap((string Key, string? Value)[]? entries)
     {
-        var map = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var map = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>();
         foreach ((string key, string? value) in entries ?? [])
         {
-            map[key] = value;
+            map[Memory(key)] = value is null ? null : Memory(value);
         }
 
         return map;
     }
 
-    private static Dictionary<string, string?> ToMap((string Key, string Value)[]? entries)
+    private static Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?> ToMap((string Key, string Value)[]? entries)
     {
-        var map = new Dictionary<string, string?>(StringComparer.Ordinal);
+        var map = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>();
         foreach ((string key, string value) in entries ?? [])
         {
-            map[key] = value;
+            map[Memory(key)] = Memory(value);
         }
 
         return map;
     }
+
+    private static List<ReadOnlyMemory<char>?> ToStringList(IEnumerable<string> values) =>
+        values.Select(value => (ReadOnlyMemory<char>?)Memory(value)).ToList();
+
+    private static ReadOnlyMemory<char> Memory(string value) => value.AsMemory();
 
     /// <summary>The standard Delta classic-checkpoint Parquet schema (all v1-baseline action columns), plus
     /// the nested <c>deletionVector</c> struct on <c>add</c>/<c>remove</c> when a DV-bearing action was added

@@ -26,22 +26,24 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
-    /// <summary>Writes a single-column Parquet file whose one column is a physical <see cref="TimeSpan"/>
-    /// named <paramref name="columnName"/>. TimeSpan has NO DeltaSharp type mapping, so reading this file's
+    /// <summary>Writes a single-column Parquet file whose one column is a physical unsigned <see cref="byte"/>
+    /// named <paramref name="columnName"/>. Unsigned byte has NO DeltaSharp type mapping, so reading this file's
     /// footer (<c>ParquetFileReader.ReadDataSchemaAsync</c> → <c>ParquetTypeMapping.ToDataType</c>) fails
     /// closed with <c>UnsupportedFeature</c> — used to prove that fail-closed message never echoes the
-    /// file-derived column name (#653). Authored with Parquet.Net's serializer directly because DeltaSharp's
+    /// file-derived column name (#653). Authored with Parquet.Net's low-level writer because DeltaSharp's
     /// writer, by construction, cannot emit an unmapped physical type.</summary>
-    public static async Task<byte[]> WriteUnmappedTimeSpanColumnAsync(string columnName)
+    public static async Task<byte[]> WriteUnmappedByteColumnAsync(string columnName)
     {
-        var schema = new global::Parquet.Schema.ParquetSchema(
-            new global::Parquet.Schema.DataField<TimeSpan>(columnName));
-        var rows = new List<IDictionary<string, object?>>
-        {
-            new Dictionary<string, object?> { [columnName] = TimeSpan.FromSeconds(1) },
-        };
+        var field = new global::Parquet.Schema.DataField<byte>(columnName);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
         using var stream = new MemoryStream();
-        await global::Parquet.Serialization.ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<byte>(
+                field, new ReadOnlyMemory<byte>(new byte[] { 1 }), null, null, CancellationToken.None);
+        }
+
         return stream.ToArray();
     }
 

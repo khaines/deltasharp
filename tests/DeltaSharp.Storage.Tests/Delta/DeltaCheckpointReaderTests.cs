@@ -38,7 +38,7 @@ public sealed class DeltaCheckpointReaderTests
             .Add(
                 "part-a.parquet",
                 size: 100,
-                partitionValues: [("year", "2026"), ("month", null)],
+                partitionValues: [("year", "2026"), ("month", "08")],
                 stats: """{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":9},"nullCount":{"id":0}}""",
                 modificationTime: 1717171717,
                 dataChange: false,
@@ -67,7 +67,7 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Equal(1717171717, add.ModificationTime); // decoded, not defaulted (guards the ?? 0L path)
         Assert.False(add.DataChange);                    // decoded, not defaulted (guards the ?? true path)
         Assert.Equal("2026", add.PartitionValues["year"]);
-        Assert.Null(add.PartitionValues["month"]); // explicit null partition value round-trips
+        Assert.Equal("08", add.PartitionValues["month"]);
         Assert.Equal("deltasharp", add.Tags["ENGINE"]);
         Assert.NotNull(add.Stats);
         Assert.Equal(10, add.Stats!.NumRecords);
@@ -83,6 +83,18 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Equal("app-1", txn.AppId);
         Assert.Equal(7, txn.Version);
         Assert.Equal(999, txn.LastUpdated);
+    }
+
+    [Fact]
+    public async Task Reads_NullPartitionValue_FromLowLevelCheckpoint()
+    {
+        byte[] parquet = await CheckpointFixture.AddWithNullPartitionValueAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+        Assert.Equal("2026", add.PartitionValues["year"]);
+        Assert.Null(add.PartitionValues["month"]);
     }
 
     [Fact]

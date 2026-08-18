@@ -24,7 +24,7 @@
          design §2.7/§8.5).
 
          TRANSITIVE DEPENDENCIES (per src/DeltaSharp.Storage/packages.lock.json — NOT zero): Parquet.Net
-         6.0.3 pulls in FIVE packages
+         6.1.0 pulls in FIVE packages
            - Snappier                              (Snappy codec)
            - K4os.Compression.LZ4                  (LZ4 codec)
            - ZstdSharp.Port                        (Zstandard codec)
@@ -36,7 +36,7 @@
          not via Parquet.Net.) These packages enter the SBOM/SCA scope for DeltaSharp.Storage; the
          sca-policy `expectedProjects` already covers DeltaSharp.Storage, so they are scanned by the
          supply-chain gate. -->
-    <PackageVersion Include="Parquet.Net" Version="6.0.3" />
+    <PackageVersion Include="Parquet.Net" Version="6.1.0" />
     <!-- STORY-05.3 observability (#479): Microsoft.Extensions.Logging.Abstractions supplies
          ILogger<T>, the [LoggerMessage] source generator (allocation-free structured logging,
          checklist 09a), EventId, and LogLevel for DeltaSharp.Storage's commit-path telemetry.

@@ -1135,10 +1135,10 @@ public sealed class ParquetCorruptionTests
         // footer) — and ReadDataSchemaAsync surfaces this typed UnsupportedFeature UNWRAPPED through the public
         // read facade (both its catch predicates exclude DeltaStorageException, so it is never re-masked as
         // CorruptData). So the mapping-failure message must name the unsupported physical TYPE yet NEVER the
-        // column name. Author a Parquet whose one column is a physical TimeSpan (no DeltaSharp type mapping)
+        // column name. Author a Parquet whose one column is a physical unsigned byte (no DeltaSharp type mapping)
         // named a sentinel — a type DeltaSharp's own writer cannot emit — then map its footer schema.
         const string sentinel = "att4cker_footer_col_s3ntinel";
-        byte[] file = await ParquetTestHelpers.WriteUnmappedTimeSpanColumnAsync(sentinel);
+        byte[] file = await ParquetTestHelpers.WriteUnmappedByteColumnAsync(sentinel);
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => new ParquetFileReader().ReadDataSchemaAsync(new MemoryStream(file), CancellationToken.None));
@@ -1146,7 +1146,7 @@ public sealed class ParquetCorruptionTests
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.DoesNotContain(sentinel, error.Message, StringComparison.Ordinal);   // no file-derived column name
         // Pins the scrubbed ToDataType site: it names the unsupported physical CLR TYPE, never the column name.
-        Assert.Contains("physical CLR type 'TimeSpan'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("physical CLR type 'Byte'", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -294,10 +294,39 @@ internal static class ParquetTypeMapping
             : clr == typeof(long) ? DataTypes.LongType
             : clr == typeof(float) ? DataTypes.FloatType
             : clr == typeof(double) ? DataTypes.DoubleType
-            : clr == typeof(string) ? DataTypes.StringType
-            : clr == typeof(byte[]) ? DataTypes.BinaryType
+            : IsStringPhysicalClrType(clr) ? DataTypes.StringType
+            : IsBinaryPhysicalClrType(clr) ? DataTypes.BinaryType
             : null;
         return type is not null;
+    }
+
+    /// <summary>
+    /// Returns whether <paramref name="clr"/> is a Parquet.Net physical CLR shape for a UTF-8 string column.
+    /// Parquet.Net 6.1 reports footer string fields as <see cref="ReadOnlyMemory{T}"/> of <see cref="char"/>,
+    /// while earlier versions reported <see cref="string"/>; both encode the same DeltaSharp logical type.
+    /// </summary>
+    internal static bool IsStringPhysicalClrType(Type clr) =>
+        clr == typeof(string) || clr == typeof(ReadOnlyMemory<char>);
+
+    /// <summary>
+    /// Returns whether <paramref name="clr"/> is a Parquet.Net physical CLR shape for a binary column.
+    /// Parquet.Net 6.1 reports footer binary fields as <see cref="ReadOnlyMemory{T}"/> of <see cref="byte"/>,
+    /// while earlier versions reported <see cref="byte"/> arrays; both encode the same DeltaSharp logical type.
+    /// </summary>
+    internal static bool IsBinaryPhysicalClrType(Type clr) =>
+        clr == typeof(byte[]) || clr == typeof(ReadOnlyMemory<byte>);
+
+    /// <summary>
+    /// Compares Parquet.Net footer physical CLR shapes, treating the pre-6.1 and 6.1 string/binary
+    /// representations as equivalent while leaving every other type exact-match and fail-closed.
+    /// </summary>
+    internal static bool PhysicalClrTypesMatch(DataField fileField, DataField expected)
+    {
+        Type file = fileField.ClrType;
+        Type requested = expected.ClrType;
+        return file == requested
+            || (IsStringPhysicalClrType(file) && IsStringPhysicalClrType(requested))
+            || (IsBinaryPhysicalClrType(file) && IsBinaryPhysicalClrType(requested));
     }
 
     /// <summary>

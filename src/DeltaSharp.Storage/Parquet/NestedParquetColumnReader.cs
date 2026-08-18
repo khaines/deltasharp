@@ -1190,8 +1190,8 @@ internal static class NestedParquetColumnReader
             LongType => leaf.ClrType == typeof(long),
             FloatType => leaf.ClrType == typeof(float),
             DoubleType => leaf.ClrType == typeof(double),
-            StringType => leaf.ClrType == typeof(string),
-            BinaryType => leaf.ClrType == typeof(byte[]),
+            StringType => ParquetTypeMapping.IsStringPhysicalClrType(leaf.ClrType),
+            BinaryType => ParquetTypeMapping.IsBinaryPhysicalClrType(leaf.ClrType),
             DateType => leaf is DateTimeDataField { DateTimeFormat: DateTimeFormat.Date },
             TimestampType or TimestampNtzType =>
                 leaf is DateTimeDataField timestamp && timestamp.DateTimeFormat != DateTimeFormat.Date,

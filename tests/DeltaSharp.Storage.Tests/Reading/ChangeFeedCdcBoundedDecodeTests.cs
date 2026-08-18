@@ -73,7 +73,7 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
         // accept a different 951-byte mutation if the (deterministic) build or replay drifted.
         Assert.Equal(951, mutated.Length);
         Assert.Equal(
-            "710de774791564a3bfe6fd12c93fe1ba7f3aed002188bf1f84da0a424d345f33",
+            "6f873b8a2dd0b8d1141d72b59ed8326b66f563557893ed3dd72d2d4dedfc4704",
             Sha256Hex(mutated));
 
         // Read the (unmutated) cdc data schema so we can decode the mutated file through the shared reader.

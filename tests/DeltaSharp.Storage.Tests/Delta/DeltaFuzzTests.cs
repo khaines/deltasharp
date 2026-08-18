@@ -187,7 +187,7 @@ public sealed class DeltaFuzzTests
         Assert.Equal(0x00, valid[5595]);
         valid[5595] = 0xB4;
         Assert.Equal(
-            "adc4ae4b08b536affbf63283aaf9870467e4524bb028342f3f498ddfe3f13042",
+            "ca34fdac2017b8eef6d59fae3552ec877cff9bff28b68c053841997e1d7966c2",
             Sha256Hex(valid));
 
         (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(

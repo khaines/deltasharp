@@ -1398,7 +1398,7 @@ internal sealed class ParquetFileReader
             && !physicalType.Equals(requestedField.DataType)
             && TypeWidening.IsSanctionedWidening(physicalType, requestedField.DataType);
 
-        if (!promotable && fileField.ClrType != expected.ClrType)
+        if (!promotable && !ParquetTypeMapping.PhysicalClrTypesMatch(fileField, expected))
         {
             throw DeltaStorageException.SchemaMismatch(
                 $"Column '{columnLabel}': file physical type '{fileField.ClrType.Name}' does not "

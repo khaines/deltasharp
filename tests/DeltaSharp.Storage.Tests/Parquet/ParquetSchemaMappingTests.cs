@@ -63,8 +63,8 @@ public sealed class ParquetSchemaMappingTests
             Assert.Equal(typeof(long), Field("long").ClrType);
             Assert.Equal(typeof(float), Field("float").ClrType);
             Assert.Equal(typeof(double), Field("double").ClrType);
-            Assert.Equal(typeof(string), Field("string").ClrType);
-            Assert.Equal(typeof(byte[]), Field("binary").ClrType);
+            Assert.Equal(typeof(ReadOnlyMemory<char>), Field("string").ClrType);
+            Assert.Equal(typeof(ReadOnlyMemory<byte>), Field("binary").ClrType);
 
             var date = Assert.IsType<DateTimeDataField>(Field("date"));
             Assert.Equal(DateTimeFormat.Date, date.DateTimeFormat);
@@ -82,6 +82,15 @@ public sealed class ParquetSchemaMappingTests
             Assert.Equal(24, wide.Precision);
             Assert.Equal(4, wide.Scale);
         }
+    }
+
+    [Fact]
+    public void StringAndBinaryFooterClrForms_MapToDeltaTypes()
+    {
+        Assert.Equal(DataTypes.StringType, ParquetTypeMapping.ToDataType(new DataField<string>("legacy_string")));
+        Assert.Equal(DataTypes.StringType, ParquetTypeMapping.ToDataType(new DataField<ReadOnlyMemory<char>>("memory_string")));
+        Assert.Equal(DataTypes.BinaryType, ParquetTypeMapping.ToDataType(new DataField<byte[]>("legacy_binary")));
+        Assert.Equal(DataTypes.BinaryType, ParquetTypeMapping.ToDataType(new DataField<ReadOnlyMemory<byte>>("memory_binary")));
     }
 
     [Fact]
