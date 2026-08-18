@@ -440,40 +440,138 @@ internal sealed class ParquetFileReader
         }
     }
 
-    // Column-mapping id mode (#523): correlates the Parquet footer's field_ids with the file's leaf data
+    // Column-mapping id mode (#523/#829): correlates the Parquet footer's field_ids with the file's leaf data
     // fields. The footer SchemaElements (reader.Metadata.Schema) carry field_id but not the decoded values;
     // reader.Schema.DataFields carry the values but always read FieldId == -1 (Parquet.Net's high-level decode
-    // never copies the footer field_id onto DataField). Correlating the two by physical name (a DeltaSharp
-    // file is flat) yields the field_id → DataField map an id-mode reader resolves against. A duplicate
-    // field_id in a foreign footer is rejected fail-closed rather than silently taking the last writer.
+    // never copies the footer field_id onto DataField). Correlating by fully-qualified physical path (not
+    // leaf-local name) keeps nested leaves like home/city and work/city distinct. Parquet.Net's DataField.Path
+    // includes the physical LIST/MAP wrapper components (`list/element`, `key_value/key|value`), so the footer
+    // pre-order walk preserves those wrapper names to produce identical path keys. Duplicate field_ids, duplicate
+    // decoded leaf paths, missing id-bearing footer leaves, and two distinct ids aliasing one leaf all fail
+    // closed rather than silently binding a requested id to the wrong physical column.
     private static IReadOnlyDictionary<int, DataField> BuildFieldIdMap(ParquetReader reader)
     {
-        var byName = new Dictionary<string, DataField>(StringComparer.Ordinal);
-        foreach (DataField dataField in reader.Schema.DataFields)
+        return BuildFieldIdMap(reader.Schema, reader.Metadata?.Schema);
+    }
+
+    internal static IReadOnlyDictionary<int, DataField> BuildFieldIdMap(
+        ParquetSchema schema,
+        IReadOnlyList<global::Parquet.Meta.SchemaElement>? footer)
+    {
+        var byPath = new Dictionary<string, DataField>(StringComparer.Ordinal);
+        foreach (DataField dataField in schema.DataFields)
         {
-            byName[dataField.Name] = dataField;
+            string path = dataField.Path.ToString();
+            if (!byPath.TryAdd(path, dataField))
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"The Parquet file decodes multiple leaf columns at physical path "
+                    + $"'{DiagnosticText.Sanitize(path)}' — a column-mapping id-mode table must map each "
+                    + "physical leaf path to exactly one column.");
+            }
         }
 
         var byFieldId = new Dictionary<int, DataField>();
-        IReadOnlyList<global::Parquet.Meta.SchemaElement>? footer = reader.Metadata?.Schema;
+        var fieldIdByPath = new Dictionary<string, int>(StringComparer.Ordinal);
+        int idBearingFooterLeaves = 0;
         if (footer is not null)
         {
-            foreach (global::Parquet.Meta.SchemaElement element in footer)
+            foreach ((global::Parquet.Meta.SchemaElement Element, string Path) in EnumerateFooterLeafPaths(footer))
             {
-                if (element.FieldId is int fieldId && byName.TryGetValue(element.Name, out DataField? dataField))
+                if (Element.FieldId is not int fieldId)
                 {
-                    if (!byFieldId.TryAdd(fieldId, dataField!))
-                    {
-                        throw DeltaStorageException.SchemaMismatch(
-                            $"The Parquet file declares duplicate field_id {fieldId} — a column-mapping id-mode "
-                            + "table must assign each column a unique field_id.");
-                    }
+                    continue;
+                }
+
+                idBearingFooterLeaves++;
+                if (!byPath.TryGetValue(Path, out DataField? dataField))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"The Parquet file declares field_id {fieldId} on a footer leaf with no decoded "
+                        + "DataField at the same physical path — a column-mapping id-mode table must map every "
+                        + "id-bearing footer leaf to exactly one decoded column.");
+                }
+
+                if (fieldIdByPath.TryGetValue(Path, out int existingFieldId) && existingFieldId != fieldId)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"The Parquet file maps field_ids {existingFieldId} and {fieldId} to the same physical "
+                        + "leaf — a column-mapping id-mode table must assign each field_id to a distinct column.");
+                }
+
+                if (!fieldIdByPath.TryAdd(Path, fieldId))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"The Parquet file declares duplicate field_id {fieldId} — a column-mapping id-mode "
+                        + "table must assign each column a unique field_id.");
+                }
+
+                if (!byFieldId.TryAdd(fieldId, dataField))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"The Parquet file declares duplicate field_id {fieldId} — a column-mapping id-mode "
+                        + "table must assign each column a unique field_id.");
                 }
             }
         }
 
+        if (byFieldId.Count != idBearingFooterLeaves || fieldIdByPath.Count != idBearingFooterLeaves)
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                "The Parquet file's id-bearing footer leaves did not map one-to-one to decoded DataFields.");
+        }
+
         return byFieldId;
     }
+
+    private static IEnumerable<(global::Parquet.Meta.SchemaElement Element, string Path)> EnumerateFooterLeafPaths(
+        IReadOnlyList<global::Parquet.Meta.SchemaElement> footer)
+    {
+        var path = new List<string>();
+        var stack = new Stack<FooterPathFrame>();
+
+        for (int i = 0; i < footer.Count; i++)
+        {
+            while (stack.Count > 0 && stack.Peek().RemainingChildren == 0)
+            {
+                FooterPathFrame completed = stack.Pop();
+                if (path.Count > completed.PathDepthBeforeElement)
+                {
+                    path.RemoveRange(completed.PathDepthBeforeElement, path.Count - completed.PathDepthBeforeElement);
+                }
+            }
+
+            if (stack.Count > 0)
+            {
+                FooterPathFrame parent = stack.Pop();
+                stack.Push(parent with { RemainingChildren = parent.RemainingChildren - 1 });
+            }
+
+            global::Parquet.Meta.SchemaElement element = footer[i];
+            int childCount = element.NumChildren.GetValueOrDefault();
+            int pathDepthBeforeElement = path.Count;
+            bool isRoot = i == 0;
+            if (!isRoot)
+            {
+                path.Add(element.Name);
+            }
+
+            if (childCount <= 0)
+            {
+                if (!isRoot)
+                {
+                    yield return (element, string.Join('/', path));
+                    path.RemoveAt(path.Count - 1);
+                }
+            }
+            else
+            {
+                stack.Push(new FooterPathFrame(childCount, pathDepthBeforeElement));
+            }
+        }
+    }
+
+    private readonly record struct FooterPathFrame(int RemainingChildren, int PathDepthBeforeElement);
 
     /// <summary>
     /// Reads only the Parquet footer and returns the file's total PHYSICAL row count (summed across row
@@ -1275,8 +1373,9 @@ internal sealed class ParquetFileReader
 
             if (requestedField.DataType is ArrayType or MapType or StructType)
             {
-                // Nested column (#571). Not supported under id mode (BuildFieldIdMap is flat/leaf-only) — fail
-                // closed rather than resolve a nested container by an ambiguous leaf field_id.
+                // Nested column (#571/#829). BuildFieldIdMap is leaf-path-aware, but this reader still lacks
+                // nested id-mode container binding — fail closed rather than resolve a nested container through
+                // leaf ids before the full nested column-mapping contract lands.
                 if (byFieldId is not null)
                 {
                     throw DeltaStorageException.UnsupportedFeature(
