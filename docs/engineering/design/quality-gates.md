@@ -452,13 +452,21 @@ the JSON file remains the single enforced source of truth.
 
 ### What it enforces
 
-The projects that consume third-party packages restore with lock-file pinning enabled — the
-test projects (via [`tests/Directory.Build.props`](../../../tests/Directory.Build.props)) plus
-the package-consuming production libraries `DeltaSharp.Engine` and `DeltaSharp.Storage`. Their
+The projects that take a **real third-party runtime** `PackageReference` restore with lock-file
+pinning enabled — every test project (via
+[`tests/Directory.Build.props`](../../../tests/Directory.Build.props)) plus the production
+libraries `DeltaSharp.Engine` (Apache.Arrow) and `DeltaSharp.Storage` (Parquet.Net). Their
 committed `packages.lock.json` pins the exact resolved dependency graph (including transitive
-packages) and CI restores with `--locked-mode`. `DeltaSharp.Abstractions`, `DeltaSharp.Core`,
-`DeltaSharp.Executor` and the samples have no third-party `PackageReference` and therefore ship
-no lock file (see [repository layout](repository-layout.md)). The **`lockfile-guard`** job in
+packages) and CI restores with `--locked-mode`. The still-SDK-only `DeltaSharp.Abstractions`,
+`DeltaSharp.Core` and `DeltaSharp.Executor` deliberately commit none: their only package
+references are dev-time analyzers (`BannedApiAnalyzers`, plus `PublicApiAnalyzers` on the packable
+ones — all `PrivateAssets=all`, injected centrally by
+[`Directory.Build.props`](../../../Directory.Build.props)) plus the
+SDK-implicit `Microsoft.NET.ILLink.Tasks`, whose floating, SDK-tied version is precisely what a
+lock file cannot pin (#468). Those analyzer versions are pinned by *version* through Central
+Package Management ([`Directory.Packages.props`](../../../Directory.Packages.props)), not by
+content hash. The samples reference no package at all. See
+[repository layout](repository-layout.md). The **`lockfile-guard`** job in
 [`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml) protects that
 pinning. It runs a `--force-evaluate` restore and then
 [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh), which fails when:
@@ -492,9 +500,9 @@ that gives a false sense of security, the guard covers only what it covers robus
 risk is left to human code review — the csproj/props change is visible in the pull-request diff.
 
 The **omission** case is equally out of scope: the manifest is a *set-equality* check against
-the lock files that exist today, so a project that gains its **first** `PackageReference`
-without enabling `RestorePackagesWithLockFile` never produces a lock file, is never listed in
-the manifest, and is therefore invisible to the guard. It ships unpinned dependencies. That,
+the lock files that exist today, so a project that gains its **first third-party runtime
+dependency** without enabling `RestorePackagesWithLockFile` never produces a lock file, is never
+listed in the manifest, and is therefore invisible to the guard. It ships unpinned dependencies. That,
 too, rests on code review of the `.csproj` change.
 
 The guard is advisory.
@@ -505,11 +513,15 @@ On failure the guard writes the affected paths, a `git diff --stat`, and a **byt
 patch (60 000 bytes, well under GitHub's 1 MiB summary cap) to `$GITHUB_STEP_SUMMARY`, plus the
 SDK version used. Lock-file content and paths are attacker-controllable, so untrusted text is
 wrapped in a five-backtick fence and leading backtick runs are rewritten — content cannot break
-out of the code block and inject markup. Untrusted lines are additionally printed behind a
-`  - ` bullet, so a path such as `::error::pwned/` cannot reach column 0 and forge a GitHub
-[workflow command](https://docs.github.com/actions/reference/workflow-commands-for-github-actions)
-(the runner parses those on stdout *and* stderr, and tolerates indentation). Paths print
-unquoted (`core.quotePath=false`) so a non-ASCII path stays copy-pasteable.
+out of the code block and inject markup. On **stdout and stderr** — the streams the Actions
+runner scans for
+[workflow commands](https://docs.github.com/actions/reference/workflow-commands-for-github-actions)
+— every untrusted line is printed behind a `  - ` bullet and any bare CR is rendered as a literal
+`\r`, so a path such as `::error::pwned/` (or `benign<CR>::error::…`) cannot begin a line at
+column 0 and forge an annotation; indentation alone would not suffice, since the runner tolerates
+it. The step summary is markdown and is *not* scanned for workflow commands, but the same
+bulleting is applied there as defense-in-depth. Paths print unquoted (`core.quotePath=false`) so
+a non-ASCII path stays copy-pasteable.
 
 ### Testing the gate
 
@@ -523,8 +535,9 @@ tools/ci/lockfile-guard.sh --selftest
 It builds throwaway git repositories under `mktemp -d` (removed by an `EXIT` trap) and asserts
 the exit code and summary content for the in-sync, modified, newly-added, worktree-deleted,
 committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag,
-duplicated-manifest-entry, `--skip-worktree`-deletion, unicode/spaced-path, fence-breakout and
-`::workflow-command`-injection cases. It needs only `git` — no SDK, no network. CI runs it **before** the
+duplicated-manifest-entry, `--skip-worktree`-deletion, deliberately-pre-staged,
+unicode/spaced-path, fence-breakout and `::workflow-command`-injection (including the bare-CR
+variant) cases. It needs only `git` — no SDK, no network. CI runs it **before** the
 real check.
 
 ### Job posture and promotion

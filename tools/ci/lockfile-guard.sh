@@ -49,8 +49,9 @@
 # Side effect: before rendering the diff the guard runs `git add
 # --intent-to-add` on the lock-file pathspec so a brand-new (untracked) lock
 # file shows up as an addition in `git diff` instead of an empty patch.
-# Intent-to-add stages no content, and outside GitHub Actions the markers are
-# undone (`git reset`) before the guard returns, so a local run leaves the
+# Intent-to-add stages no content, and outside GitHub Actions the guard undoes
+# exactly the markers it created (`git reset` on the paths that were untracked
+# beforehand — never a path the developer had staged), so a local run leaves the
 # developer's index as it found it.
 #
 set -euo pipefail
@@ -99,10 +100,17 @@ sanitize_fence() {
 # directory literally named `::error::pwned`) or manifest entry could forge the
 # annotations reviewers rely on. Every untrusted line is therefore printed
 # behind a NON-whitespace bullet, which makes it unparseable as a command.
+#
+# The runner's line reader also splits on a bare CR, and neither `git ls-files`
+# nor the manifest C-quotes control bytes (`git status` does), so a path
+# containing `benign<CR>::error::…` would otherwise start a fresh line at column
+# 0 behind the bullet. CR is therefore rendered as a literal `\r`, the way git
+# quotes it itself.
+#
 # (Diff hunks are exempt: unified-diff output always begins with `+`, `-`, ` `,
 # `@`, `d` or `i`, so their first column is never `:`.)
 mark_untrusted() {
-  sed 's/^/  - /'
+  LC_ALL=C sed -e "s/$(printf '\r')/\\\\r/g" -e 's/^/  - /'
 }
 
 # ---------------------------------------------------------------------------
@@ -147,7 +155,8 @@ manifest_lockfiles() {
 # Reporting
 # ---------------------------------------------------------------------------
 
-# Render a bullet-free block of untrusted lines inside a fenced code block.
+# Render a bulleted, fence-sanitized block of untrusted lines inside a fenced
+# code block.
 emit_block() {
   printf '%s\n' "$FENCE"
   printf '%s\n' "$1" | sanitize_fence | mark_untrusted
@@ -240,6 +249,7 @@ write_summary() {
 
 run_guard() {
   local repo_root drift missing extra on_disk_missing manifest tracked p
+  local -a ia_added=()
   repo_root="$(git rev-parse --show-toplevel)"
   cd "$repo_root"
 
@@ -279,14 +289,28 @@ run_guard() {
   # Make a brand-new lock file render as an addition in `git diff` rather than
   # an empty patch. `--force` covers a lock file hidden by .gitignore. No
   # content is staged and this job never commits.
+  #
+  # Outside CI the markers are undone afterwards, so first record exactly which
+  # paths the guard is about to add: everything matching the pathspec that git
+  # does not track yet. A path the developer staged deliberately is TRACKED in
+  # the index and therefore never appears here — the cleanup must not unstage
+  # it, least of all the `git add` the remediation message asks for.
+  if [ -z "${GITHUB_ACTIONS:-}" ]; then
+    while IFS= read -r -d '' p; do
+      ia_added+=("$p")
+    done < <(git ls-files -z --others -- "$LOCKFILE_PATHSPEC")
+  fi
+
   git add --intent-to-add --force -- "$LOCKFILE_PATHSPEC" >/dev/null 2>&1 || true
 
   write_summary "$drift" "$missing" "$extra"
 
-  # CI checkouts are throwaway, a developer's index is not: undo the
-  # intent-to-add markers after the diff has been rendered.
-  if [ -z "${GITHUB_ACTIONS:-}" ]; then
-    git reset -q -- "$LOCKFILE_PATHSPEC" >/dev/null 2>&1 || true
+  # CI checkouts are throwaway, a developer's index is not. `:(literal)` because
+  # a path may itself look like pathspec magic (`::error::…`).
+  if [ -z "${GITHUB_ACTIONS:-}" ] && [ "${#ia_added[@]}" -gt 0 ]; then
+    for p in "${ia_added[@]}"; do
+      git reset -q -- ":(literal)${p}" >/dev/null 2>&1 || true
+    done
   fi
 
   if [ -n "${GITHUB_ACTIONS:-}" ]; then
@@ -452,6 +476,38 @@ st_case_untracked() {
     st_pass 'local run leaves no intent-to-add entries in the index'
   else
     st_fail 'local run left intent-to-add entries staged'
+  fi
+}
+
+# A developer who follows the guard's own remediation (`git add -- <pathspec>`)
+# must not have that work unstaged by the next run: the cleanup may only undo
+# the markers the guard itself created.
+st_case_prestaged_survives() {
+  local d="$SELFTEST_ROOT/prestaged"
+  local staged='{"version": 1, "dependencies": {"net10.0": {"deliberately": "staged"}}}'
+  st_make_repo "$d"
+  printf '%s\n' "$staged" >"$d/src/Proj/packages.lock.json"
+  git -C "$d" add -- 'src/Proj/packages.lock.json'
+  # A second, untracked lock file so the guard also intent-to-adds something.
+  mkdir -p "$d/src/New"
+  printf '{"version": 1, "dependencies": {}}\n' >"$d/src/New/packages.lock.json"
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'guard still fails with a deliberately staged lock file'
+  if git -C "$d" diff --cached --name-only | grep -qxF 'src/Proj/packages.lock.json'; then
+    st_pass 'a deliberately staged lock file is still staged afterwards'
+  else
+    st_fail 'the guard unstaged a deliberately staged lock file'
+  fi
+  if [ "$(git -C "$d" show ':src/Proj/packages.lock.json')" = "$staged" ]; then
+    st_pass 'staged lock-file CONTENT survives the guard run'
+  else
+    st_fail 'staged lock-file content was discarded (reset to HEAD)'
+  fi
+  if git -C "$d" diff --cached --name-only | grep -qxF 'src/New/packages.lock.json'; then
+    st_fail "the guard's own intent-to-add marker was left behind"
+  else
+    st_pass "the guard's own intent-to-add marker is removed"
   fi
 }
 
@@ -622,6 +678,26 @@ st_case_workflow_command_injection() {
   fi
 }
 
+# The runner's line reader also splits on a bare CR, and neither `git ls-files`
+# nor the manifest C-quotes control bytes — so the assertions here read the
+# CR-SPLIT view, not just the LF view.
+st_case_cr_injection() {
+  local d="$SELFTEST_ROOT/cr-injection"
+  st_make_repo "$d"
+  printf 'src/Proj/packages.lock.json\nbenign\r::error::pwned/packages.lock.json\n' \
+    >"$d/tools/ci/expected-lockfiles.txt"
+  git -C "$d" commit -qam 'manifest entry carrying a bare CR'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'manifest entry with a CR fails (path is missing)'
+  if tr '\r' '\n' <"$d/stdout.txt" | grep -qE '^[[:space:]]*::'; then
+    st_fail 'a CR in an untrusted line forged a ::workflow-command on stdout/stderr'
+  else
+    st_pass 'a CR is escaped, so it cannot start a ::workflow-command line'
+  fi
+  assert_contains "$d/stdout.txt" 'benign\r::error::pwned/packages.lock.json' 'CR renders as a literal \r'
+}
+
 st_case_missing_manifest() {
   local d="$SELFTEST_ROOT/no-manifest"
   st_make_repo "$d"
@@ -643,6 +719,7 @@ run_selftest() {
   st_case_in_sync
   st_case_modified
   st_case_untracked
+  st_case_prestaged_survives
   st_case_deleted_worktree
   st_case_deleted_committed
   st_case_gitignored
@@ -651,6 +728,7 @@ run_selftest() {
   st_case_manifest_duplicates
   st_case_skip_worktree
   st_case_workflow_command_injection
+  st_case_cr_injection
   st_case_unicode_path
   st_case_fence_breakout
   st_case_remediation_pathspec
