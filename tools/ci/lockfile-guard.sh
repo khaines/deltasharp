@@ -20,8 +20,13 @@
 #   2. removal      — a lock file listed in tools/ci/expected-lockfiles.txt is no
 #                     longer tracked, or is missing from the working tree.
 #   3. manifest lag — a tracked lock file is NOT listed in the manifest.
-#   4. opt-out      — a project or Directory.Build.props sets
-#                     `<RestorePackagesWithLockFile>false</...>`.
+#   4. opt-out      — the RESOLVED MSBuild property
+#                     `RestorePackagesWithLockFile` of a project that owns a
+#                     lock file is not `true`. It is evaluated with
+#                     `dotnet msbuild -getProperty:`, not grepped, so a
+#                     `Condition=` attribute, a multi-line value, or a value
+#                     inherited from `Directory.Packages.props` /
+#                     `Directory.Build.props` cannot slip past it.
 #
 # Checks 2-4 make the gate FAIL CLOSED. Without them a pull request could delete
 # every `packages.lock.json` (and/or .gitignore them, and/or turn lock-file
@@ -33,7 +38,7 @@
 #     dotnet restore DeltaSharp.sln --force-evaluate
 #     tools/ci/lockfile-guard.sh
 #
-# Regression-test the guard itself (no dotnet, no network required):
+# Regression-test the guard itself (no network required):
 #
 #     tools/ci/lockfile-guard.sh --selftest
 #
@@ -119,20 +124,66 @@ manifest_lockfiles() {
     grep -v '^$' | LC_ALL=C sort
 }
 
-# Projects that switch lock-file generation off. Nobody should: without it a
-# restore writes no lock file, so the drift check above has nothing to compare.
-detect_lockfile_optout() {
-  local files
-  files="$(git ls-files -z -- ':(glob,top)**/*.csproj' ':(glob,top)**/Directory.Build.props' ':(glob,top)**/Directory.Build.targets' | tr '\0' '\n')"
-  [ -n "$files" ] || return 0
-  printf '%s\n' "$files" |
-    while IFS= read -r f; do
-      [ -n "$f" ] || continue
-      [ -f "$f" ] || continue
-      if grep -Eiq '<RestorePackagesWithLockFile>[[:space:]]*false[[:space:]]*</RestorePackagesWithLockFile>' "$f"; then
-        printf '%s\n' "$f"
-      fi
+# Whether lock-file generation is still switched ON for every project that owns
+# an expected lock file.
+#
+# This asks MSBUILD for the RESOLVED value instead of grepping the XML, because
+# a text search is trivially bypassable — a red-team review defeated the earlier
+# regex three ways, each of which silently disables pinning while leaving the
+# tree clean and the guard green:
+#   * `<RestorePackagesWithLockFile Condition="'1'=='1'">false</...>` — the
+#     attribute breaks a line-literal match;
+#   * a multi-line element value;
+#   * the property inherited from `Directory.Packages.props` (or any other
+#     imported file), which a fixed file list never reads.
+# `dotnet msbuild -getProperty:` evaluates imports, inheritance and conditions,
+# so all three resolve to `false` here — and an XML-COMMENTED-OUT property
+# correctly resolves to `true` instead of a false-positive failure.
+#
+# stdin : expected lock-file paths (one per line)
+# stdout: `<project><TAB><value>` per owning project, `<value>` being the
+#         trimmed resolved property or a `<...>` sentinel.
+probe_lockfile_properties() {
+  local lockfile dir csproj value found
+
+  if ! command -v dotnet >/dev/null 2>&1; then
+    while IFS= read -r lockfile; do
+      [ -n "$lockfile" ] || continue
+      printf '%s\t%s\n' "$(dirname "$lockfile")" '<dotnet-missing>'
     done
+    return 0
+  fi
+
+  while IFS= read -r lockfile; do
+    [ -n "$lockfile" ] || continue
+    dir="$(dirname "$lockfile")"
+    found=0
+    for csproj in "$dir"/*.csproj; do
+      [ -f "$csproj" ] || continue
+      found=1
+      if ! value="$(dotnet msbuild "$csproj" -getProperty:RestorePackagesWithLockFile 2>/dev/null)"; then
+        printf '%s\t%s\n' "$csproj" '<evaluation-failed>'
+        continue
+      fi
+      # A multi-line or padded value collapses to its token here, so
+      # "\n      false\n    " is judged as `false`.
+      value="$(printf '%s' "$value" | tr -d '[:space:]')"
+      printf '%s\t%s\n' "$csproj" "${value:-<unset>}"
+    done
+    [ "$found" -eq 1 ] || printf '%s\t%s\n' "$dir" '<no-project>'
+  done
+}
+
+# Pure decision half of the check (no dotnet, no git): echo every
+# `<project><TAB><value>` line whose value is not `true`. Kept separate so
+# --selftest can unit-test the verdict against synthetic input.
+check_lockfile_property_values() {
+  local project value normalized
+  while IFS="$(printf '\t')" read -r project value; do
+    [ -n "$project" ] || continue
+    normalized="$(printf '%s' "$value" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    [ "$normalized" = 'true' ] || printf '%s\t%s\n' "$project" "${value:-<unset>}"
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -181,9 +232,14 @@ emit_summary() {
   fi
 
   if [ -n "$optout" ]; then
-    printf 'The following project file(s) set `<RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>`,\n'
-    printf 'which disables lock-file generation and therefore dependency pinning:\n\n'
+    printf 'Lock-file generation is **switched off** for the following project(s) that own a\n'
+    printf 'lock file: the resolved MSBuild property `RestorePackagesWithLockFile` (shown after\n'
+    printf 'the tab) evaluates to something other than `true`, so a restore neither writes nor\n'
+    printf 'honours their lock file and dependency pinning is gone:\n\n'
     emit_block "$optout"
+    printf 'Evaluated with `dotnet msbuild <project> -getProperty:RestorePackagesWithLockFile`,\n'
+    printf 'which resolves `Condition` attributes and values inherited from\n'
+    printf '`Directory.Build.props` / `Directory.Packages.props`.\n\n'
   fi
 
   printf '**To fix, run locally and commit the result:**\n\n'
@@ -267,7 +323,10 @@ run_guard() {
     missing="$(printf '%s\n%s' "$missing" "${on_disk_missing%$'\n'}" | grep -v '^$' | LC_ALL=C sort -u)"
   fi
 
-  optout="$(detect_lockfile_optout)"
+  # Ask MSBuild whether each owning project still generates a lock file. Only
+  # projects that own an EXPECTED lock file are probed, so a project that never
+  # had one is not dragged in.
+  optout="$(printf '%s\n' "$manifest" | probe_lockfile_properties | check_lockfile_property_values)"
 
   if [ -z "$drift" ] && [ -z "$missing" ] && [ -z "$extra" ] && [ -z "$optout" ]; then
     echo "lockfile guard OK: $(printf '%s\n' "$manifest" | grep -c '^') tracked packages.lock.json file(s) present and in sync with the project files."
@@ -288,7 +347,7 @@ run_guard() {
   [ -z "$drift" ] || printf 'Out-of-sync lock file(s):\n%s\n' "$(printf '%s\n' "$drift" | sed 's/^...//')" >&2
   [ -z "$missing" ] || printf 'Missing (unpinned) lock file(s):\n%s\n' "$missing" >&2
   [ -z "$extra" ] || printf 'Tracked lock file(s) absent from %s:\n%s\n' "$MANIFEST_REL" "$extra" >&2
-  [ -z "$optout" ] || printf 'Project file(s) disabling lock-file generation:\n%s\n' "$optout" >&2
+  [ -z "$optout" ] || printf 'Project(s) whose resolved RestorePackagesWithLockFile is not true:\n%s\n' "$optout" >&2
   echo "lockfile guard FAILED. Run '${RESTORE_CMD}' and commit the result." >&2
   return 1
 }
@@ -342,17 +401,18 @@ assert_not_contains() {
   fi
 }
 
-# A minimal repo: one project, one tracked lock file, a manifest listing it.
-# Extra lock-file paths may be passed as additional arguments.
+# A minimal repo: one project (real enough for `dotnet msbuild` to evaluate),
+# one tracked lock file, a manifest listing it. Extra lock-file paths may be
+# passed as additional arguments; each gets a sibling project.
 st_make_repo() {
   local dir="$1"
   shift
-  local p
+  local p name
   git -c init.defaultBranch=main init -q "$dir"
   git -C "$dir" config user.email 'lockfile-guard@example.invalid'
   git -C "$dir" config user.name 'Lockfile Guard Selftest'
   git -C "$dir" config commit.gpgsign false
-  mkdir -p "$dir/tools/ci" "$dir/src/Proj"
+  mkdir -p "$dir/tools/ci"
   cat >"$dir/Directory.Build.props" <<'EOF'
 <Project>
   <PropertyGroup>
@@ -360,16 +420,24 @@ st_make_repo() {
   </PropertyGroup>
 </Project>
 EOF
-  printf '<Project Sdk="Microsoft.NET.Sdk"></Project>\n' >"$dir/src/Proj/Proj.csproj"
   : >"$dir/tools/ci/expected-lockfiles.txt"
   for p in "src/Proj/packages.lock.json" "$@"; do
     mkdir -p "$dir/$(dirname "$p")"
+    name="$(basename "$(dirname "$p")")"
+    st_write_csproj "$dir/$(dirname "$p")/${name}.csproj"
     printf '{"version": 1, "dependencies": {"net8.0": {}}}\n' >"$dir/$p"
     printf '%s\n' "$p" >>"$dir/tools/ci/expected-lockfiles.txt"
   done
   LC_ALL=C sort -o "$dir/tools/ci/expected-lockfiles.txt" "$dir/tools/ci/expected-lockfiles.txt"
   git -C "$dir" add -A
   git -C "$dir" commit -qm 'fixture'
+}
+
+# A project MSBuild can evaluate. The body (if given on stdin via $2) replaces
+# the default lock-file-enabled PropertyGroup.
+st_write_csproj() {
+  local path="$1" body="${2:-  <PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup>}"
+  printf '<Project Sdk="Microsoft.NET.Sdk">\n%s\n</Project>\n' "$body" >"$path"
 }
 
 # Run the guard inside a fixture repo; echo its exit code. Output lands in
@@ -493,21 +561,128 @@ st_case_manifest_lag() {
   assert_contains "$d/summary.md" 'src/Extra/packages.lock.json' 'unlisted lock file is named'
 }
 
-st_case_optout() {
-  local d="$SELFTEST_ROOT/optout"
+# Red-team bypass (a): a `Condition` attribute defeats a line-literal regex, but
+# MSBuild resolves the property to false.
+st_case_optout_condition_attribute() {
+  local d="$SELFTEST_ROOT/optout-condition"
   st_make_repo "$d"
-  cat >"$d/src/Proj/Proj.csproj" <<'EOF'
-<Project Sdk="Microsoft.NET.Sdk">
+  st_write_csproj "$d/src/Proj/Proj.csproj" '  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RestorePackagesWithLockFile Condition="'"'"'1'"'"'=='"'"'1'"'"'">false</RestorePackagesWithLockFile>
+  </PropertyGroup>'
+  git -C "$d" commit -qam 'disable lock files via a Condition attribute'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'Condition-attribute opt-out fails (red-team bypass a)'
+  assert_contains "$d/summary.md" 'src/Proj/Proj.csproj' 'Condition-attribute opt-out names the project'
+  assert_contains "$d/summary.md" 'switched off' 'Condition-attribute opt-out is reported as disabled pinning'
+}
+
+# Red-team bypass (b): the property inherited from Directory.Packages.props is
+# never read by a fixed-file text search.
+st_case_optout_directory_packages_props() {
+  local d="$SELFTEST_ROOT/optout-central"
+  st_make_repo "$d"
+  printf '<Project>\n  <PropertyGroup>\n  </PropertyGroup>\n</Project>\n' >"$d/Directory.Build.props"
+  cat >"$d/Directory.Packages.props" <<'EOF'
+<Project>
   <PropertyGroup>
     <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>
   </PropertyGroup>
 </Project>
 EOF
-  git -C "$d" commit -qam 'disable lock files'
+  git -C "$d" add -A
+  git -C "$d" commit -qm 'disable lock files from Directory.Packages.props'
   local rc
   rc="$(st_run_guard "$d")"
-  assert_exit 1 "$rc" 'RestorePackagesWithLockFile=false fails'
-  assert_contains "$d/summary.md" 'src/Proj/Proj.csproj' 'opt-out project is named'
+  assert_exit 1 "$rc" 'Directory.Packages.props opt-out fails (red-team bypass b)'
+  assert_contains "$d/summary.md" 'src/Proj/Proj.csproj' 'inherited opt-out names the owning project'
+}
+
+# Red-team bypass (c): a multi-line element value never matches a single-line
+# regex; the resolved value still collapses to false.
+st_case_optout_multiline_value() {
+  local d="$SELFTEST_ROOT/optout-multiline"
+  st_make_repo "$d"
+  st_write_csproj "$d/src/Proj/Proj.csproj" '  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <RestorePackagesWithLockFile>
+      false
+    </RestorePackagesWithLockFile>
+  </PropertyGroup>'
+  git -C "$d" commit -qam 'disable lock files with a multi-line value'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 1 "$rc" 'multi-line opt-out fails (red-team bypass c)'
+  assert_contains "$d/summary.md" 'src/Proj/Proj.csproj' 'multi-line opt-out names the project'
+}
+
+# The inverse error the regex also made: a COMMENTED-OUT property must not fail
+# the guard.
+st_case_commented_optout_passes() {
+  local d="$SELFTEST_ROOT/optout-commented"
+  st_make_repo "$d"
+  st_write_csproj "$d/src/Proj/Proj.csproj" '  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- <RestorePackagesWithLockFile>false</RestorePackagesWithLockFile> -->
+  </PropertyGroup>'
+  git -C "$d" commit -qam 'comment out an opt-out'
+  local rc
+  rc="$(st_run_guard "$d")"
+  assert_exit 0 "$rc" 'XML-commented opt-out is not a false positive'
+}
+
+# Unit-test the pure verdict half against synthetic `project<TAB>value` input:
+# no dotnet, no git, so every value shape is cheap to cover.
+st_case_property_verdict_unit() {
+  local out
+  out="$(st_check_values "$(printf 'a/a.csproj\ttrue\nb/b.csproj\ttrue\n')")"
+  if [ -z "$out" ]; then
+    st_pass 'verdict: all-true input reports nothing'
+  else
+    st_fail "verdict: all-true input reported '${out}'"
+  fi
+
+  out="$(st_check_values "$(printf 'a/a.csproj\ttrue\nb/b.csproj\tfalse\n')")"
+  case "$out" in
+    'b/b.csproj'*false*) st_pass 'verdict: false is reported' ;;
+    *) st_fail "verdict: false not reported (got '${out}')" ;;
+  esac
+
+  out="$(st_check_values "$(printf 'a/a.csproj\t\n')")"
+  case "$out" in
+    *'<unset>'*) st_pass 'verdict: an unset property fails closed' ;;
+    *) st_fail "verdict: unset property not reported (got '${out}')" ;;
+  esac
+
+  out="$(st_check_values "$(printf 'a/a.csproj\t<evaluation-failed>\nb/b.csproj\t<no-project>\nc/c.csproj\t<dotnet-missing>\n')")"
+  if [ "$(printf '%s\n' "$out" | grep -c 'csproj')" -eq 3 ]; then
+    st_pass 'verdict: evaluation/probe sentinels all fail closed'
+  else
+    st_fail "verdict: sentinels not all reported (got '${out}')"
+  fi
+
+  out="$(st_check_values "$(printf 'a/a.csproj\tTrue\nb/b.csproj\t  true  \n')")"
+  if [ -z "$out" ]; then
+    st_pass 'verdict: casing and padding around true are accepted'
+  else
+    st_fail "verdict: 'True'/padded true rejected (got '${out}')"
+  fi
+
+  out="$(st_check_values "$(printf 'a/a.csproj\ttruthy\nb/b.csproj\t1\n')")"
+  if [ "$(printf '%s\n' "$out" | grep -c 'csproj')" -eq 2 ]; then
+    st_pass 'verdict: only the exact value true passes'
+  else
+    st_fail "verdict: near-true values accepted (got '${out}')"
+  fi
+}
+
+# Call the pure function in a FRESH bash so sourcing cannot collide with this
+# script's own readonly globals; the `BASH_SOURCE` guard keeps main() from
+# running on source.
+st_check_values() {
+  printf '%s\n' "$1" |
+    bash -c '. "$1" >/dev/null 2>&1; check_lockfile_property_values' 'lockfile-guard-selftest' "$SELFTEST_SCRIPT"
 }
 
 st_case_unicode_path() {
@@ -580,7 +755,11 @@ run_selftest() {
   st_case_gitignored
   st_case_ignored_build_dirs
   st_case_manifest_lag
-  st_case_optout
+  st_case_optout_condition_attribute
+  st_case_optout_directory_packages_props
+  st_case_optout_multiline_value
+  st_case_commented_optout_passes
+  st_case_property_verdict_unit
   st_case_unicode_path
   st_case_fence_breakout
   st_case_remediation_pathspec
@@ -613,4 +792,9 @@ main() {
   esac
 }
 
-main "$@"
+# Executed, not sourced: the self-test sources this file in a fresh bash to
+# unit-test check_lockfile_property_values in isolation, and must not trigger a
+# real run.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  main "$@"
+fi

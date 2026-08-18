@@ -22,8 +22,11 @@ name: NuGet lockfile guard
 # The detection/reporting logic lives in `tools/ci/lockfile-guard.sh` (with a
 # `--selftest` suite CI runs first, mirroring the coverage gate), so it is
 # testable and locally reproducible. It also FAILS CLOSED: deleting a lock file,
-# hiding one behind .gitignore, or setting `RestorePackagesWithLockFile=false`
-# fails the guard instead of leaving `git status` clean and the check green — see
+# hiding one behind .gitignore, or switching `RestorePackagesWithLockFile` off
+# fails the guard instead of leaving `git status` clean and the check green. The
+# last one is read from MSBuild (`dotnet msbuild -getProperty:`), not grepped, so
+# a `Condition` attribute, a multi-line value, or a value inherited from
+# `Directory.Packages.props` cannot evade it — see
 # `tools/ci/expected-lockfiles.txt`.
 #
 # No `paths:` filter: this job must always report a status so it can be promoted
@@ -80,10 +83,11 @@ jobs:
         run: dotnet restore DeltaSharp.sln --force-evaluate
 
       # Regression-test the guard's own exit-code and reporting contract (drift,
-      # deletion, .gitignore-hiding, lock-file opt-out, path quoting, summary
-      # sanitization) against throwaway git repositories BEFORE trusting it on
-      # the real tree — mirroring the coverage-gate self-test in ci.yml. A broken
-      # guard fails the build loudly here instead of failing open.
+      # deletion, .gitignore-hiding, the three MSBuild lock-file opt-out
+      # bypasses, path quoting, summary sanitization) against throwaway git
+      # repositories BEFORE trusting it on the real tree — mirroring the
+      # coverage-gate self-test in ci.yml. A broken guard fails the build loudly
+      # here instead of failing open.
       - name: Lockfile guard self-test
         run: tools/ci/lockfile-guard.sh --selftest
 

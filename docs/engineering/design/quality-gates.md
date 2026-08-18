@@ -468,8 +468,20 @@ pinning. It runs a `--force-evaluate` restore and then
    [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) is no longer
    tracked or is missing from the working tree.
 3. **manifest lag** — a tracked lock file is not listed in that manifest.
-4. **opt-out** — a `*.csproj`, `Directory.Build.props` or `Directory.Build.targets` sets
-   `<RestorePackagesWithLockFile>false</RestorePackagesWithLockFile>`.
+4. **opt-out** — the **resolved** MSBuild property `RestorePackagesWithLockFile` of a project
+   that owns a lock file is not `true`.
+
+   This one is evaluated, not grepped: for each path in the manifest the guard runs
+   `dotnet msbuild <project> -getProperty:RestorePackagesWithLockFile` and fails unless the
+   value is `true`. A red-team review defeated an earlier line-literal regex three ways — a
+   `Condition=` attribute (`<RestorePackagesWithLockFile Condition="'1'=='1'">false</…>`), a
+   multi-line element value, and the property inherited from `Directory.Packages.props` (a file
+   the regex never read) — each of which silently disables pinning while leaving the tree clean.
+   MSBuild resolves imports, inheritance and conditions, so all three now fail closed, and an
+   XML-**commented-out** property correctly resolves to `true` instead of a false-positive
+   failure. The probe (`dotnet msbuild` → `project<TAB>value` lines) and the verdict (fail
+   unless every value is `true`) are separate functions so the verdict is unit-testable without
+   invoking the SDK.
 
 Checks 2–4 exist so the gate **fails closed**. Drift detection alone can be defeated by
 *deleting* the lock files (or hiding them behind `.gitignore`, or turning generation off):
@@ -499,8 +511,11 @@ tools/ci/lockfile-guard.sh --selftest
 
 It builds throwaway git repositories under `mktemp -d` (removed by an `EXIT` trap) and asserts
 the exit code and summary content for the in-sync, modified, newly-added, worktree-deleted,
-committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag, opt-out,
-unicode/spaced-path, and fence-breakout cases. CI runs it **before** the real check.
+committed-deletion, `.gitignore`-hidden, ignored-build-output, manifest-lag, unicode/spaced-path
+and fence-breakout cases, plus the three MSBuild opt-out bypasses (Condition attribute,
+`Directory.Packages.props` inheritance, multi-line value), the commented-out-property
+non-regression, and unit tests of the property verdict against synthetic
+`project<TAB>value` input. CI runs it **before** the real check.
 
 ### Job posture and promotion
 
