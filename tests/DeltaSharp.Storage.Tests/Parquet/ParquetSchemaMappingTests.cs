@@ -286,6 +286,12 @@ public sealed class ParquetSchemaMappingTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => ReadAsDeltaScanAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+
+        // Pin the LEGACY branch of DescribeTimeEncoding, which discriminates millis from micros using the
+        // ConvertedType alone (a ConvertedType-only field has neither a TimeDataField nor a logicalType to
+        // read the unit from). Asserting only error.Kind left that branch free to always report TIME_MICROS
+        // with the whole suite green — so a forged TIME_MILLIS would have been misreported to the operator.
+        Assert.Contains($"Parquet TIME column ({convertedType})", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -301,21 +307,15 @@ public sealed class ParquetSchemaMappingTests
         Assert.Equal(1, batches.Sum(b => b.RowCount));
     }
 
-    [Theory]
-    [InlineData(NestedTimePosition.StructField)]
-    [InlineData(NestedTimePosition.ArrayElement)]
-    [InlineData(NestedTimePosition.MapValue)]
-    public async Task NestedTimeLeaf_FailsClosed_InEveryPosition(
-        NestedTimePosition position)
+    /// <summary>Builds the DeltaSharp request that asks for <paramref name="position"/>'s container with the
+    /// integral leaf a TIME column of <paramref name="precision"/> ALIASES onto — <c>int</c> for millis
+    /// (physically INT32), <c>bigint</c> for micros/nanos (INT64). That aliasing is the whole trap: a bare CLR
+    /// comparison says "match" and the raw sub-day units decode silently.</summary>
+    private static StructField RequestNestedAliasingLeaf(
+        NestedTimePosition position, TimeUnitPrecision precision)
     {
-        // #832: the nested reader validates its leaves through its OWN physical-type check, which is a
-        // separate code path from the flat read door — so a TIME leaf buried in a struct/list/map needs its
-        // own coverage. Same trap: the leaf's ClrType is a raw long, so a bare CLR comparison against a
-        // requested bigint says "match" and the sub-day units decode silently.
-        byte[] file = await ParquetTestHelpers.WriteNestedTimeColumnAsync(position);
-
-        DataType leaf = DataTypes.LongType;
-        StructField requested = position switch
+        DataType leaf = precision == TimeUnitPrecision.Millis ? DataTypes.IntegerType : DataTypes.LongType;
+        return position switch
         {
             NestedTimePosition.StructField => new StructField(
                 "s",
@@ -328,9 +328,130 @@ public sealed class ParquetSchemaMappingTests
                 DataTypes.CreateMapType(DataTypes.StringType, leaf, valueContainsNull: true),
                 nullable: true),
         };
+    }
+
+    // The nested leaf guard has SEPARATE IntegerType and LongType arms, and a TIME column lands on one or the
+    // other purely by precision: TIME_MILLIS is physically INT32, TIME_MICROS/TIME_NANOS are INT64. Sweeping
+    // only one width lets the OTHER arm's guard be deleted with the whole suite still green, so the two
+    // theories below cross every nested POSITION with every reachable PRECISION, in both ENCODINGS.
+    [Theory]
+    [InlineData(NestedTimePosition.StructField, TimeUnitPrecision.Millis)]
+    [InlineData(NestedTimePosition.StructField, TimeUnitPrecision.Micros)]
+    [InlineData(NestedTimePosition.StructField, TimeUnitPrecision.Nanos)]
+    [InlineData(NestedTimePosition.ArrayElement, TimeUnitPrecision.Millis)]
+    [InlineData(NestedTimePosition.ArrayElement, TimeUnitPrecision.Micros)]
+    [InlineData(NestedTimePosition.ArrayElement, TimeUnitPrecision.Nanos)]
+    [InlineData(NestedTimePosition.MapValue, TimeUnitPrecision.Millis)]
+    [InlineData(NestedTimePosition.MapValue, TimeUnitPrecision.Micros)]
+    [InlineData(NestedTimePosition.MapValue, TimeUnitPrecision.Nanos)]
+    public async Task NestedTimeLeaf_FailsClosed_InEveryPositionAndPrecision(
+        NestedTimePosition position, TimeUnitPrecision precision)
+    {
+        // #832: the nested reader validates its leaves through its OWN physical-type check, which is a
+        // separate code path from the flat read door — so a TIME leaf buried in a struct/list/map needs its
+        // own coverage, at BOTH physical widths. This half of the sweep covers the MODERN encoding, where the
+        // footer carries logicalType.TIME and Parquet.Net materializes a TimeDataField.
+        byte[] file = await ParquetTestHelpers.WriteNestedTimeColumnAsync(position, precision);
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
-            () => ReadAsDeltaScanAsync(file, new StructType(new[] { requested })));
+            () => ReadAsDeltaScanAsync(
+                file, new StructType(new[] { RequestNestedAliasingLeaf(position, precision) })));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    // The legacy ConvertedType vocabulary has NO TIME_NANOS member — nanos is a logicalType-only encoding — so
+    // this half of the sweep is millis x micros, which is every legacy shape that exists.
+    [Theory]
+    [InlineData(NestedTimePosition.StructField, global::Parquet.Meta.ConvertedType.TIME_MILLIS)]
+    [InlineData(NestedTimePosition.StructField, global::Parquet.Meta.ConvertedType.TIME_MICROS)]
+    [InlineData(NestedTimePosition.ArrayElement, global::Parquet.Meta.ConvertedType.TIME_MILLIS)]
+    [InlineData(NestedTimePosition.ArrayElement, global::Parquet.Meta.ConvertedType.TIME_MICROS)]
+    [InlineData(NestedTimePosition.MapValue, global::Parquet.Meta.ConvertedType.TIME_MILLIS)]
+    [InlineData(NestedTimePosition.MapValue, global::Parquet.Meta.ConvertedType.TIME_MICROS)]
+    public async Task NestedLegacyConvertedTypeOnlyTimeLeaf_FailsClosed_InEveryPositionAndPrecision(
+        NestedTimePosition position, global::Parquet.Meta.ConvertedType convertedType)
+    {
+        // #832: the nested twin of LegacyConvertedTypeOnlyTimeColumn_FailsClosed_AtBothDoors, and the ONLY
+        // thing that pins the nested guard's GENERALIZATION from `leaf is not TimeDataField` to
+        // `!IsTimeColumn(leaf)`. Reverting that generalization left the whole suite green while a nested
+        // legacy ConvertedType-only TIME leaf decoded silently as int/bigint in every position — the modern
+        // theory above cannot catch it, because Parquet.Net never builds a TimeDataField for a footer that
+        // carries no logicalType.TIME.
+        bool millis = convertedType == global::Parquet.Meta.ConvertedType.TIME_MILLIS;
+        TimeUnitPrecision precision = millis ? TimeUnitPrecision.Millis : TimeUnitPrecision.Micros;
+        byte[] plain = await ParquetTestHelpers.WriteNestedTimeColumnAsync(
+            position, precision, annotateAsTime: false);
+        string leafName = ParquetTestHelpers.NestedTimeLeafName(position);
+        byte[] file = await ParquetTestHelpers.ForgeConvertedTypeOnlyTimeAsync(plain, leafName, convertedType);
+
+        // Prove the fixture is really the legacy shape — otherwise this would just re-test the annotated path.
+        using (var probe = new MemoryStream(file, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(probe, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                DataField leaf = reader.Schema.DataFields.Single(
+                    f => f.Path.ToString().EndsWith(leafName, StringComparison.Ordinal));
+                Assert.IsNotType<TimeDataField>(leaf);
+                Assert.Equal(convertedType, leaf.SchemaElement!.ConvertedType);
+                Assert.Null(leaf.SchemaElement.LogicalType);
+                Assert.Equal(millis ? typeof(int) : typeof(long), leaf.ClrType);
+                Assert.True(ParquetTypeMapping.IsTimeColumn(leaf));
+            }
+        }
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsDeltaScanAsync(
+                file, new StructType(new[] { RequestNestedAliasingLeaf(position, precision) })));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+
+        // Pin the LEGACY branch of DescribeTimeEncoding: a ConvertedType-only field has neither a
+        // TimeDataField nor a logicalType to read the unit from, so the message's unit can only come from the
+        // ConvertedType. Without this, that branch could always report TIME_MICROS with the suite green.
+        Assert.Contains($"Parquet TIME column ({convertedType})", error.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData(40)]  // Just past DeltaSharp's Spark-parity cap of 38.
+    [InlineData(76)]  // What Arrow's decimal256 emits.
+    public async Task OutOfRangeDecimalPrecision_FailsClosed_AtBothDoors_NotWithARawValidationError(
+        int precision)
+    {
+        // #832 totality regression. The read door now calls TryToDataType for EVERY column of EVERY file, so
+        // TryToDataType must be TOTAL — it must answer for any footer a hostile or foreign file can carry and
+        // never throw. A DECIMAL whose declared precision exceeds DeltaSharp's Spark-parity cap of 38 is
+        // perfectly legal Parquet (Arrow's decimal256 goes to 76) and Parquet.Net materializes a
+        // DecimalDataField for it, but DataTypes.CreateDecimalType would then throw a RAW
+        // SchemaValidationException — a non-DeltaStorageException escaping ReadAsync on the normal read path,
+        // sailing past every `catch (DeltaStorageException)` classifier and past the fail-closed contract they
+        // implement. It must be rejected as unmappable instead, with a TYPED exception at both doors.
+        byte[] plain = await ParquetTestHelpers.WriteDecimalColumnAsync("d");
+        byte[] file = await ParquetTestHelpers.ForgeDecimalPrecisionAsync(plain, "d", precision);
+
+        using (var probe = new MemoryStream(file, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(probe, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                // The fixture must really carry the out-of-range precision, or this test proves nothing.
+                var footerField = Assert.IsType<DecimalDataField>(Assert.Single(reader.Schema.DataFields));
+                Assert.Equal(precision, footerField.Precision);
+
+                Assert.False(ParquetTypeMapping.TryToDataType(footerField, out _));
+                Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.ToDataSchema(reader.Schema));
+            }
+        }
+
+        // Read door: the requested type is irrelevant — the file column is unmappable, so the read fails
+        // closed with a TYPED DeltaStorageException. Asserting the concrete type (not just "some exception")
+        // is the whole point: before the totality fix this threw SchemaValidationException, which is NOT a
+        // DeltaStorageException and so would not satisfy this assertion.
+        var readSchema = new StructType(new[]
+        {
+            new StructField("d", DataTypes.CreateDecimalType(10, 2), nullable: true),
+        });
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsDeltaScanAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
     }
 

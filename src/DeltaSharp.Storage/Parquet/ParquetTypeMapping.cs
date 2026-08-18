@@ -257,7 +257,13 @@ internal static class ParquetTypeMapping
     /// The non-throwing form of <see cref="ToDataType"/>: reconstructs the DeltaSharp <see cref="DataType"/> a
     /// footer <see cref="DataField"/> encodes, returning <see langword="false"/> (rather than throwing) when
     /// the physical type has no supported mapping. Used by the read path's type-widening promotion to probe a
-    /// file column's <b>physical</b> type without forcing an exception for an unmappable column.
+    /// file column's <b>physical</b> type without forcing an exception for an unmappable column, and by both
+    /// read doors as the fail-closed mappability gate.
+    /// <para>This method is <b>TOTAL</b>: it must answer for EVERY footer field a hostile or foreign file can
+    /// carry, and must never throw. It runs on the hot read path, so any escaping exception would be
+    /// unclassified — bypassing the <see cref="DeltaStorageException"/> handlers that implement the
+    /// fail-closed contract. An annotation DeltaSharp cannot represent (an out-of-range DECIMAL, a TIME of any
+    /// encoding) therefore returns <see langword="false"/> rather than propagating a validation failure.</para>
     /// </summary>
     public static bool TryToDataType(DataField field, [NotNullWhen(true)] out DataType? type)
     {
@@ -281,6 +287,24 @@ internal static class ParquetTypeMapping
                         : DataTypes.TimestampNtzType;
                 return true;
             case DecimalDataField decimalField:
+                // FAIL CLOSED on an out-of-range DECIMAL annotation rather than letting DecimalType's ctor
+                // throw. DeltaSharp caps precision at 38 (Spark parity), but a Parquet footer can legally
+                // declare more — Arrow's `decimal256` emits up to 76, and a hostile footer can declare
+                // anything at all. TryToDataType is on the HOT read path (ParquetFileReader.ValidateFileField
+                // calls it for every column of every file), so a raw SchemaValidationException here would
+                // escape ReadAsync UNCLASSIFIED, sailing past every `catch (DeltaStorageException)` in the
+                // read stack and past the fail-closed contract those handlers implement. Returning false
+                // instead routes it through the SAME unmappable-type rejection as any other unsupported
+                // physical type — a typed, fail-closed DeltaStorageException. This is what makes
+                // TryToDataType TOTAL: it must answer for EVERY footer field, never throw.
+                if (decimalField.Precision is < DecimalType.MinPrecision or > DecimalType.MaxPrecision
+                    || decimalField.Scale < 0
+                    || decimalField.Scale > decimalField.Precision)
+                {
+                    type = null;
+                    return false;
+                }
+
                 type = DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
                 return true;
         }
@@ -378,13 +402,15 @@ internal static class ParquetTypeMapping
     /// <summary>
     /// Returns whether <paramref name="field"/> is a Parquet <b>TIME</b> (time-of-day) column under ANY of the
     /// encodings a footer can carry. DeltaSharp has no time-of-day logical type, so every one of them must
-    /// fail closed — and each arm below is load-bearing:
+    /// fail closed:
     /// <list type="bullet">
     /// <item><description>Parquet.Net's own <see cref="TimeDataField"/>, which it materializes when — and
     /// ONLY when — the footer carries <c>LogicalType.TIME</c>.</description></item>
     /// <item><description><c>LogicalType.TIME</c> read straight off the footer's
-    /// <c>SchemaElement</c>, so a Parquet.Net that stops specializing the field (or a TIME shape it does not
-    /// specialize) is still caught.</description></item>
+    /// <c>SchemaElement</c>. At the pinned Parquet.Net every well-formed logical TIME already specializes to
+    /// <see cref="TimeDataField"/>, so this arm is currently REDUNDANT with the first — it is forward-compat
+    /// defense, catching a future Parquet.Net that stops specializing the field, or a TIME shape it does not
+    /// specialize.</description></item>
     /// <item><description>The LEGACY <c>ConvertedType</c>-only encoding (<c>TIME_MILLIS</c>/
     /// <c>TIME_MICROS</c>, no <c>LogicalType</c> at all) that parquet-mr ≤1.10, Hive, Impala and older Spark
     /// emit — and that is trivially forgeable. Parquet.Net 6.1 surfaces THOSE as a PLAIN
@@ -392,6 +418,8 @@ internal static class ParquetTypeMapping
     /// <see cref="TimeDataField"/> test alone lets a whole class of real-world TIME columns through and reads
     /// their sub-day units as int/bigint.</description></item>
     /// </list>
+    /// <para>The first and third arms are the ones exercised at the pinned Parquet.Net version; both are
+    /// mutation-pinned by tests, at the flat and nested read doors and at the schema door.</para>
     /// <para><c>DataField.SchemaElement</c> is <see langword="null"/> on a field this process CONSTRUCTED (it
     /// is populated only for a field read back from a real footer), hence the null-conditional access.</para>
     /// </summary>

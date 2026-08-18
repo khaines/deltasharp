@@ -41,7 +41,7 @@
            - footer/constructed string & binary DataField.ClrType are now
              ReadOnlyMemory<char>/ReadOnlyMemory<byte> (were string/byte[]); and
            - TimeSpanDataField/TimeOnlyDataField were replaced by a single TimeDataField whose ClrType is a
-             RAW int (millis) / long (micros, nanos) instead of TimeSpan/DateTime. That is a FAIL-OPEN hazard:
+             RAW int (millis) / long (micros, nanos) instead of TimeSpan/TimeOnly. That is a FAIL-OPEN hazard:
              a TIME column now shape-matches a requested int/bigint, so DeltaSharp must reject TIME on its own
              annotation (ParquetTypeMapping.IsTimeColumn) rather than relying on an unmapped CLR type. -->
     <PackageVersion Include="Parquet.Net" Version="6.1.0" />

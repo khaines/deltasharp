@@ -79,17 +79,31 @@ internal static class ParquetTestHelpers
     }
 
     /// <summary>Writes a Parquet file whose single top-level column is a nested container (per
-    /// <paramref name="position"/>) holding a real Parquet <b>TIME</b> leaf of micros precision — CLR type
-    /// <see cref="long"/>. DeltaSharp has no time-of-day type, so a nested read that asks for the container
-    /// with a <c>bigint</c> leaf must FAIL CLOSED rather than decode the raw sub-day units as a bigint
-    /// (#832). Authored with Parquet.Net's low-level writer for the same reason
-    /// <see cref="WriteTimeColumnAsync"/> is: DeltaSharp's own writer cannot emit a TIME column.</summary>
-    public static async Task<byte[]> WriteNestedTimeColumnAsync(NestedTimePosition position)
+    /// <paramref name="position"/>) holding a Parquet <b>TIME</b> leaf of <paramref name="precision"/>.
+    /// DeltaSharp has no time-of-day type, so a nested read that asks for the container with the ALIASING
+    /// integral leaf (<c>int</c> for millis, <c>bigint</c> for micros/nanos) must FAIL CLOSED rather than
+    /// decode the raw sub-day units (#832). Authored with Parquet.Net's low-level writer for the same reason
+    /// <see cref="WriteTimeColumnAsync"/> is: DeltaSharp's own writer cannot emit a TIME column.
+    /// <para><paramref name="precision"/> chooses which arm of the nested leaf guard is exercised: millis is
+    /// physically an INT32 and flows through the <c>IntegerType</c> arm, micros and nanos are INT64 and flow
+    /// through <c>LongType</c>. Covering only one of them lets the other arm's guard be deleted with the whole
+    /// suite still green, so callers must sweep all three.</para>
+    /// <para>With <paramref name="annotateAsTime"/> false the leaf is written as a PLAIN integral field of the
+    /// matching width, under the same leaf NAME — the carrier
+    /// <see cref="ForgeConvertedTypeOnlyTimeAsync"/> (which matches SchemaElements by name) re-annotates into
+    /// the LEGACY ConvertedType-only nested TIME that Parquet.Net's writer cannot itself emit.</para></summary>
+    public static async Task<byte[]> WriteNestedTimeColumnAsync(
+        NestedTimePosition position,
+        global::Parquet.Schema.TimeUnitPrecision precision,
+        bool annotateAsTime = true)
     {
-        var time = new global::Parquet.Schema.TimeDataField(
-            position == NestedTimePosition.StructField ? "t"
-            : position == NestedTimePosition.ArrayElement ? "element" : "value",
-            global::Parquet.Schema.TimeUnitPrecision.Micros);
+        string leafName = NestedTimeLeafName(position);
+        bool millis = precision == global::Parquet.Schema.TimeUnitPrecision.Millis;
+        global::Parquet.Schema.DataField time = annotateAsTime
+            ? new global::Parquet.Schema.TimeDataField(leafName, precision)
+            : millis
+                ? new global::Parquet.Schema.DataField<int>(leafName)
+                : new global::Parquet.Schema.DataField<long>(leafName);
 
         global::Parquet.Schema.Field container = position switch
         {
@@ -121,16 +135,29 @@ internal static class ParquetTestHelpers
             }
 
             global::Parquet.Schema.DataField timeLeaf = leaves[^1];
-            await rowGroup.WriteAsync<long>(
-                timeLeaf,
-                new ReadOnlyMemory<long?>(new long?[] { 5L }),
-                reps,
-                null,
-                CancellationToken.None);
+            if (millis)
+            {
+                await rowGroup.WriteAsync<int>(
+                    timeLeaf, new ReadOnlyMemory<int?>(new int?[] { 5 }), reps, null, CancellationToken.None);
+            }
+            else
+            {
+                await rowGroup.WriteAsync<long>(
+                    timeLeaf, new ReadOnlyMemory<long?>(new long?[] { 5L }), reps, null, CancellationToken.None);
+            }
         }
 
         return stream.ToArray();
     }
+
+    /// <summary>The leaf name <see cref="WriteNestedTimeColumnAsync"/> gives the TIME leaf in each nested
+    /// position — the handle the footer forge matches on, and the one a test asserts against.</summary>
+    public static string NestedTimeLeafName(NestedTimePosition position) => position switch
+    {
+        NestedTimePosition.StructField => "t",
+        NestedTimePosition.ArrayElement => "element",
+        _ => "value",
+    };
 
     /// <summary>Rewrites the footer of <paramref name="bytes"/> so its <paramref name="columnName"/> leaf is
     /// annotated as a <b>LEGACY, <c>ConvertedType</c>-ONLY</b> Parquet TIME column: <c>converted_type</c> is
@@ -168,6 +195,13 @@ internal static class ParquetTestHelpers
             }
         }
 
+        return SpliceFooter(bytes, newFooter);
+    }
+
+    /// <summary>Replaces the footer of <paramref name="bytes"/> with <paramref name="newFooter"/>, rewriting
+    /// the trailing footer length and PAR1 magic so the result reopens as a valid Parquet file.</summary>
+    private static byte[] SpliceFooter(byte[] bytes, byte[] newFooter)
+    {
         int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
         int footerStart = bytes.Length - 8 - originalFooterLength;
         using var forged = new MemoryStream();
@@ -205,6 +239,65 @@ internal static class ParquetTestHelpers
         }
 
         return stream.ToArray();
+    }
+
+    /// <summary>Writes a single-column Parquet file holding a well-formed <c>DECIMAL(10, 2)</c> column named
+    /// <paramref name="columnName"/> — the carrier <see cref="ForgeDecimalPrecisionAsync"/> re-annotates into
+    /// an out-of-range decimal.</summary>
+    public static async Task<byte[]> WriteDecimalColumnAsync(string columnName)
+    {
+        var field = new global::Parquet.Schema.DecimalDataField(columnName, precision: 10, scale: 2);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<decimal>(
+                field, new ReadOnlyMemory<decimal>(new[] { 1.23m }), null, null, CancellationToken.None);
+        }
+
+        return stream.ToArray();
+    }
+
+    /// <summary>Rewrites the footer of <paramref name="bytes"/> so its <paramref name="columnName"/> DECIMAL
+    /// leaf declares <paramref name="precision"/> — used to author a precision ABOVE DeltaSharp's Spark-parity
+    /// cap of 38. A footer may legally declare more (Arrow's <c>decimal256</c> emits up to 76, and a hostile
+    /// footer can declare anything), and Parquet.Net happily materializes a <c>DecimalDataField</c> for it, so
+    /// DeltaSharp's mapping must reject it rather than let <c>DecimalType</c>'s range validation throw.
+    /// <para>Both the legacy <c>SchemaElement.Precision</c> and the <c>logicalType.DECIMAL</c> precision are
+    /// rewritten so the two annotations agree. Forged post-write for the same reason
+    /// <see cref="ForgeConvertedTypeOnlyTimeAsync"/> is: Parquet.Net's writer rebuilds every SchemaElement
+    /// from the DataField.</para>
+    /// <para>The sibling out-of-range shapes are NOT authorable and need no fixture: Parquet.Net itself
+    /// rejects <c>scale &gt; precision</c> and <c>precision &lt; 1</c>, at both footer parse and
+    /// <c>DecimalDataField</c> construction. The mapping still guards them, as defense in depth against a
+    /// future Parquet.Net that relaxes those checks.</para></summary>
+    public static async Task<byte[]> ForgeDecimalPrecisionAsync(byte[] bytes, string columnName, int precision)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                foreach (global::Parquet.Meta.SchemaElement element in metadata.Schema)
+                {
+                    if (string.Equals(element.Name, columnName, StringComparison.Ordinal))
+                    {
+                        element.Precision = precision;
+                        if (element.LogicalType?.DECIMAL is not null)
+                        {
+                            element.LogicalType.DECIMAL.Precision = precision;
+                        }
+                    }
+                }
+
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        return SpliceFooter(bytes, newFooter);
     }
 
     /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
