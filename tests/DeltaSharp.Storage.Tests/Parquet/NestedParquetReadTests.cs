@@ -88,6 +88,37 @@ public sealed class NestedParquetReadTests
         public Dictionary<string, string?>? Sm { get; set; }
     }
 
+    // BINARY leaves in all three nested positions (#832 M5b): the nested leaf physical-type check has a
+    // dedicated BinaryType arm that no nested test exercised, so nested binary could have been broken (or the
+    // arm deleted) without a single failure. Mirrors the string-leaf row shapes above.
+    private sealed class BinaryInner
+    {
+        public int A { get; set; }
+
+        public byte[]? Bin { get; set; }
+    }
+
+    private sealed class BinaryStructRow
+    {
+        public int Id { get; set; }
+
+        public BinaryInner? S { get; set; }
+    }
+
+    private sealed class BinaryListRow
+    {
+        public int Id { get; set; }
+
+        public List<byte[]?>? Blobs { get; set; }
+    }
+
+    private sealed class BinaryMapRow
+    {
+        public int Id { get; set; }
+
+        public Dictionary<string, byte[]?>? Bm { get; set; }
+    }
+
     // A file column that is array<struct> (a nested type within a nested type), for the A8 decode-path guard.
     private sealed class NestedListRow
     {
@@ -560,6 +591,146 @@ public sealed class NestedParquetReadTests
 
         Assert.Equal("1", read["a"]);
         Assert.Null(read["b"]);
+    }
+
+    [Fact]
+    public async Task Struct_BinaryField_DecodesEmptyLargeAndNull()
+    {
+        // #832 (M5b): the nested leaf physical-type check has a BinaryType arm that NO nested test reached —
+        // mutating it to `false` left the whole suite green. Cover binary in a STRUCT field, over the same
+        // payload vector the top-level LargeAndEmptyStringBinary_RoundTrip pins: an empty array (distinct from
+        // null), a >64 KB payload (crosses the variable-width single-page/buffer boundary), and a null field
+        // inside a present struct.
+        byte[] large = LargeBinary();
+        var rows = new List<BinaryStructRow>
+        {
+            new() { Id = 1, S = new BinaryInner { A = 1, Bin = new byte[] { 0x00, 0xFF, 0x10 } } },
+            new() { Id = 2, S = new BinaryInner { A = 2, Bin = Array.Empty<byte>() } },
+            new() { Id = 3, S = new BinaryInner { A = 3, Bin = large } },
+            new() { Id = 4, S = new BinaryInner { A = 4, Bin = null } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType structType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+            DataTypes.CreateStructField("Bin", DataTypes.BinaryType, nullable: true),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("S", structType, nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        ColumnVector bin = s.Child("Bin");
+
+        Assert.Equal(new byte[] { 0x00, 0xFF, 0x10 }, bin.GetBytes(0).ToArray());
+        Assert.False(bin.IsNull(1));
+        Assert.Empty(bin.GetBytes(1).ToArray());   // an empty binary is NOT a null binary
+        Assert.Equal(large, bin.GetBytes(2).ToArray());
+        Assert.True(bin.IsNull(3));                // a present struct with a null binary field
+    }
+
+    [Fact]
+    public async Task Array_OfBinary_DecodesEmptyLargeAndNullElement()
+    {
+        // Same #832 (M5b) coverage for binary as a LIST ELEMENT — the repeated-leaf position, where the
+        // variable-width payload is interleaved with repetition levels.
+        byte[] large = LargeBinary();
+        var rows = new List<BinaryListRow>
+        {
+            new()
+            {
+                Id = 1,
+                Blobs = new List<byte[]?> { new byte[] { 0x01, 0x02 }, Array.Empty<byte>(), large, null },
+            },
+            new() { Id = 2, Blobs = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Blobs", DataTypes.CreateArrayType(DataTypes.BinaryType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var blobs = Assert.IsType<ListColumnVector>(batch.Column("Blobs"));
+
+        Assert.False(blobs.IsNull(0));
+        Assert.Equal(4, blobs.ElementLength(0));
+
+        ColumnVector e0 = blobs.ElementsAt(0);
+        Assert.Equal(new byte[] { 0x01, 0x02 }, e0.GetBytes(0).ToArray());
+        Assert.False(e0.IsNull(1));
+        Assert.Empty(e0.GetBytes(1).ToArray());    // an empty element is NOT a null element
+        Assert.Equal(large, e0.GetBytes(2).ToArray());
+        Assert.True(e0.IsNull(3));                 // a null element inside a present list
+
+        Assert.True(blobs.IsNull(1));              // a null list
+    }
+
+    [Fact]
+    public async Task Map_OfStringToBinary_DecodesEmptyLargeAndNullValue()
+    {
+        // Same #832 (M5b) coverage for binary as a MAP VALUE — the third and last nested position, and the
+        // only one where the binary leaf is read positionally against a parallel (string) key stream.
+        byte[] large = LargeBinary();
+        var rows = new List<BinaryMapRow>
+        {
+            new()
+            {
+                Id = 1,
+                Bm = new Dictionary<string, byte[]?>(StringComparer.Ordinal)
+                {
+                    ["small"] = new byte[] { 0x7F },
+                    ["empty"] = Array.Empty<byte>(),
+                    ["large"] = large,
+                    ["null"] = null,
+                },
+            },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Bm",
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.BinaryType, valueContainsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var bm = Assert.IsType<MapColumnVector>(batch.Column("Bm"));
+        Assert.Equal(4, bm.EntryLength(0));
+
+        // Map entry ordering is not part of the contract, so index the entries by key.
+        ColumnVector keys = bm.KeysAt(0);
+        ColumnVector values = bm.ValuesAt(0);
+        var read = new Dictionary<string, byte[]?>(StringComparer.Ordinal);
+        for (int i = 0; i < 4; i++)
+        {
+            read[Utf8(keys, i)] = values.IsNull(i) ? null : values.GetBytes(i).ToArray();
+        }
+
+        Assert.Equal(new byte[] { 0x7F }, read["small"]);
+        Assert.Empty(read["empty"]!);              // present key, empty (NOT null) value
+        Assert.Equal(large, read["large"]);
+        Assert.Null(read["null"]);                 // present key, null value
+    }
+
+    // The >64 KB binary payload vector, byte-for-byte identical to the top-level
+    // LargeAndEmptyStringBinary_RoundTrip fixture so nested and flat binary decode are pinned to one shape.
+    private static byte[] LargeBinary()
+    {
+        var large = new byte[70_000];
+        for (int i = 0; i < large.Length; i++)
+        {
+            large[i] = (byte)(i % 251);
+        }
+
+        return large;
     }
 
     [Fact]

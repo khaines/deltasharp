@@ -1018,7 +1018,7 @@ public sealed class DeltaCheckpointReaderTests
     public async Task PlaintextFooterEncryptedCheckpoint_EncryptedColumnMetaDataOmitted_IsUnsupportedFeature()
     {
         // FAILURE-path arm: the shape a genuine encryptor writes — the encrypted column's plaintext
-        // ColumnMetaData is absent (stored encrypted), which makes Parquet.Net 6.0.3 throw inside CreateAsync
+        // ColumnMetaData is absent (stored encrypted), which makes Parquet.Net 6.1.0 throw inside CreateAsync
         // before any parsed-metadata check can run. Only the footer probe can classify it.
         // RED-on-revert: dropping the checkpoint door's ClassifyUnreadableInput call sends this straight back
         // to DeltaProtocolException/MalformedAction.

@@ -542,23 +542,44 @@ internal sealed class CheckpointFixture
         return await ParquetTestHelpers.ForgeRowGroupNumRowsAsync(bytes, 0, actual + 1);
     }
 
+    // Parquet.Net 6.1's untyped serializer requires ReadOnlyMemory<char> string map keys/values, but
+    // ReadOnlyMemory<char> is a STRUCT whose default equality compares the (object, offset, length) triple —
+    // NOT the character content. Keying the builder dictionary by it would therefore lose the content-based
+    // last-write-wins dedup these fixtures relied on before #832 (two entries spelling the same key would
+    // both survive, silently changing the authored map's cardinality). So accumulate under `string` +
+    // StringComparer.Ordinal — exactly the pre-#832 semantics — and project to ReadOnlyMemory<char> only at
+    // the final serializer boundary, once per surviving entry.
     private static Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?> ToNullableMap((string Key, string? Value)[]? entries)
     {
-        var map = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>();
+        var map = new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach ((string key, string? value) in entries ?? [])
         {
-            map[Memory(key)] = value is null ? null : Memory(value);
+            map[key] = value;
         }
 
-        return map;
+        return ToSerializerMap(map);
     }
 
     private static Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?> ToMap((string Key, string Value)[]? entries)
     {
-        var map = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>();
+        var map = new Dictionary<string, string?>(StringComparer.Ordinal);
         foreach ((string key, string value) in entries ?? [])
         {
-            map[Memory(key)] = Memory(value);
+            map[key] = value;
+        }
+
+        return ToSerializerMap(map);
+    }
+
+    /// <summary>Projects an ordinal-keyed string map onto the <see cref="ReadOnlyMemory{T}"/> shape Parquet.Net
+    /// 6.1's untyped serializer demands. Dedup already happened on the <see cref="string"/> keys, so every key
+    /// here is distinct by content and the reference-equality semantics of the memory keys cannot collide.</summary>
+    private static Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?> ToSerializerMap(Dictionary<string, string?> entries)
+    {
+        var map = new Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?>();
+        foreach ((string key, string? value) in entries)
+        {
+            map[Memory(key)] = value is null ? null : Memory(value);
         }
 
         return map;

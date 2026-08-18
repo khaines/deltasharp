@@ -32,7 +32,7 @@ internal enum DecodeExecution
 /// memory before the ceiling engages — <b>without</b> ever charging or throttling a healthy in-flight decode.
 /// </summary>
 /// <remarks>
-/// <para>Parquet.Net (6.0.3) can be driven by a single corrupted byte (a flipped terminal footer
+/// <para>Parquet.Net (6.1.0) can be driven by a single corrupted byte (a flipped terminal footer
 /// <c>STOP</c>, a corrupt data-page header) into effectively unbounded, <b>synchronous</b> CPU work that
 /// observes <b>no</b> cancellation mid-decode. A hang is not an exception, so no <c>try</c>/<c>catch</c> and
 /// no token can interrupt it, and <b>.NET cannot abort a running thread</b> — a non-terminating decode

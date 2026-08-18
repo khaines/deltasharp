@@ -15,9 +15,9 @@ namespace DeltaSharp.Storage.Parquet;
 /// <summary>
 /// Reconstructs the three single-level nested Parquet shapes (#571) — a <b>struct of scalars</b>, an
 /// <b>array of a scalar</b>, and a <b>map of scalar→scalar</b> — from the raw Dremel repetition/definition
-/// levels Parquet.Net 6.0.3 exposes (<see cref="ParquetRowGroupReader.ReadRawAsync{T}"/>), into the
+/// levels Parquet.Net 6.1.0 exposes (<see cref="ParquetRowGroupReader.ReadRawAsync{T}"/>), into the
 /// immutable nested reference vectors <see cref="StructColumnVector"/>/<see cref="ListColumnVector"/>/
-/// <see cref="MapColumnVector"/> (#570). Parquet.Net 6.0.3 offers no reconstructed nested read (no
+/// <see cref="MapColumnVector"/> (#570). Parquet.Net 6.1.0 offers no reconstructed nested read (no
 /// <c>DataColumn</c> type), so the reader assembles the container structure itself from the leaf columns'
 /// packed values + definition levels + repetition levels.
 /// </summary>
@@ -1186,8 +1186,8 @@ internal static class NestedParquetColumnReader
             BooleanType => leaf.ClrType == typeof(bool),
             ByteType => leaf.ClrType == typeof(sbyte),
             ShortType => leaf.ClrType == typeof(short),
-            IntegerType => leaf.ClrType == typeof(int),
-            LongType => leaf.ClrType == typeof(long),
+            IntegerType => leaf.ClrType == typeof(int) && leaf is not TimeDataField,
+            LongType => leaf.ClrType == typeof(long) && leaf is not TimeDataField,
             FloatType => leaf.ClrType == typeof(float),
             DoubleType => leaf.ClrType == typeof(double),
             StringType => ParquetTypeMapping.IsStringPhysicalClrType(leaf.ClrType),
@@ -1209,7 +1209,8 @@ internal static class NestedParquetColumnReader
             // ElementType through here, where `_ => false` fires and a raw `requested.SimpleString` would recurse
             // into every nested field name. DescribeType renders the bounded kind instead.
             throw DeltaStorageException.SchemaMismatch(
-                $"Parquet nested read for {context}: the file physical type '{leaf.ClrType.Name}' does not match "
+                $"Parquet nested read for {context}: the file physical type "
+                + $"'{ParquetTypeMapping.DescribePhysicalClrType(leaf.ClrType)}' does not match "
                 + $"the requested '{DiagnosticText.DescribeType(requested)}'.");
         }
     }

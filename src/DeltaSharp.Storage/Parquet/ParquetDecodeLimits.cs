@@ -61,7 +61,7 @@ internal sealed record ParquetDecodeLimits
     /// each operation gets the full budget rather than a shrinking shared remainder. Worst-case retained memory
     /// is bounded instead by the charge-at-detach stranded-residual model of the data-file
     /// <see cref="BoundedDecode"/> door (a strand of a non-terminating decode charges its real projected
-    /// footprint against the door's residual budget). Parquet.Net 6.0.3 can be driven into non-terminating,
+    /// footprint against the door's residual budget). Parquet.Net 6.1.0 can be driven into non-terminating,
     /// cancellation-ignoring work by one corrupted byte (#647/#699), so on expiry the operation fails closed
     /// with <see cref="StorageErrorKind.DecodeBudgetExceeded"/> (a resource fault distinct from
     /// <see cref="StorageErrorKind.CorruptData"/> — a wall-clock stall is not proof the bytes are corrupt)

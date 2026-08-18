@@ -35,7 +35,11 @@
          Apache.Arrow.Scalars transitive also visible in the lock file arrives via Engine's Apache.Arrow,
          not via Parquet.Net.) These packages enter the SBOM/SCA scope for DeltaSharp.Storage; the
          sca-policy `expectedProjects` already covers DeltaSharp.Storage, so they are scanned by the
-         supply-chain gate. -->
+         supply-chain gate.
+
+         MIGRATION 6.0.3 -> 6.1.0 (BREAKING within a minor, #832): footer/constructed string & binary
+         DataField.ClrType are now ReadOnlyMemory<char>/ReadOnlyMemory<byte> (was string/byte[]), and
+         Parquet.Data.DataColumn + ParquetRowGroupReader.ReadColumnAsync were removed — see #832. -->
     <PackageVersion Include="Parquet.Net" Version="6.1.0" />
     <!-- STORY-05.3 observability (#479): Microsoft.Extensions.Logging.Abstractions supplies
          ILogger<T>, the [LoggerMessage] source generator (allocation-free structured logging,

@@ -158,6 +158,36 @@ public sealed class ParquetMessageHygieneTests
         return stream.ToArray();
     }
 
+    [Fact]
+    public async Task ValidateFileField_BinaryReadAsString_NamesDistinctActionablePhysicalTypes()
+    {
+        // #832 diagnosability pin: Parquet.Net 6.1 reports BOTH a UTF-8 and a BYTE_ARRAY column as
+        // `ReadOnlyMemory`1`, so rendering Type.Name made this message self-contradictory —
+        // "file physical type 'ReadOnlyMemory`1' does not match the requested engine type 'string'
+        // (expected 'ReadOnlyMemory`1')" — i.e. it claimed a mismatch between a type and ITSELF, telling the
+        // operator nothing about what the file actually holds. DescribePhysicalClrType must render the two
+        // kinds as DISTINCT, actionable Parquet tokens. Drive the real read path with a genuine binary column
+        // requested as a string, and pin both rendered tokens verbatim.
+        var fileSchema = new StructType(new[] { new StructField("c", DataTypes.BinaryType, nullable: true) });
+        MutableColumnVector values = ColumnVectors.Create(DataTypes.BinaryType, 1);
+        values.AppendBytes(new byte[] { 0x01, 0x02, 0x03 });
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(
+            fileSchema, new[] { new ManagedColumnBatch(fileSchema, new ColumnVector[] { values }, 1) });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsync(
+                bytes,
+                new StructType(new[] { new StructField("c", DataTypes.StringType, nullable: true) })));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("file physical type 'binary (BYTE_ARRAY)'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("(expected 'string (BYTE_ARRAY/UTF8)')", error.Message, StringComparison.Ordinal);
+
+        // The opaque CLR rendering must be gone entirely — its presence is the regression itself.
+        Assert.DoesNotContain("ReadOnlyMemory", error.Message, StringComparison.Ordinal);
+        AssertFullyNeutralized(error.Message);
+    }
+
     // ---- #683 item 7: NestedParquetColumnReader.ReadAsync entry-point sanitize ----
 
     [Fact]

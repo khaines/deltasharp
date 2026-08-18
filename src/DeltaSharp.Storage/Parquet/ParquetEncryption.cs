@@ -15,7 +15,7 @@ namespace DeltaSharp.Storage.Parquet;
 /// <para><b>The format has two modes, and they surface differently.</b>
 /// <list type="bullet">
 /// <item><b>Encrypted footer</b> — the file is bracketed by the <c>PARE</c> magic instead of
-/// <c>PAR1</c>. Parquet.Net 6.0.3 rejects it at open with a message byte-for-byte identical to the one
+/// <c>PAR1</c>. Parquet.Net 6.1.0 rejects it at open with a message byte-for-byte identical to the one
 /// it emits for arbitrary garbage, so it is discriminated by the file's own magic
 /// (<see cref="IsParquetEncryptedFooterMagic"/>), never by message matching.</item>
 /// <item><b>Plaintext footer</b> — the file keeps the ordinary <c>PAR1</c> magic and a readable footer
@@ -209,7 +209,7 @@ internal static class ParquetEncryption
     /// own plaintext footer and probing the <c>FileMetaData.encryption_algorithm</c> field (Thrift field 8),
     /// which the format spec sets for <b>every</b> plaintext-footer encrypted file. Needed because a real
     /// encrypting writer omits the plaintext <c>ColumnMetaData</c> on encrypted columns, which makes
-    /// Parquet.Net 6.0.3 throw during <c>CreateAsync</c>'s row-group-reader init <b>before</b> the success-path
+    /// Parquet.Net 6.1.0 throw during <c>CreateAsync</c>'s row-group-reader init <b>before</b> the success-path
     /// <c>reader.Metadata</c> check runs — so that shape is only reachable here, on the failure path. Reflection
     /// is deliberately avoided (Storage keeps the trim/AOT analyzers clean, ADR-0014); this walks the footer as
     /// a <see cref="ReadOnlySpan{T}"/>. As a parser of <b>untrusted</b> bytes it is strictly bounded (footer
@@ -583,7 +583,7 @@ internal static class ParquetEncryption
 
     // The Parquet file magic is 4 bytes. A plaintext file is bracketed by 'PAR1'; a Parquet Modular
     // Encryption file written in ENCRYPTED-FOOTER mode is bracketed by 'PARE' (0x50 0x41 0x52 0x45) instead
-    // (Parquet format Encryption.md). Parquet.Net 6.0.3 cannot read encrypted files and rejects the 'PARE'
+    // (Parquet format Encryption.md). Parquet.Net 6.1.0 cannot read encrypted files and rejects the 'PARE'
     // head during CreateAsync (#649).
     private const int ParquetMagicLength = 4;
 

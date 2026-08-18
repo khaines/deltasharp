@@ -508,7 +508,7 @@ internal sealed class ParquetFileReader
             // so they still propagate UNWRAPPED (never double-mapped, cancellation still wins).
             //
             // Bounded-time (#647). The loop iterates the ATTACKER-CONTROLLED RowGroupCount, and each
-            // OpenRowGroupReader/RowCount touches untrusted footer metadata that Parquet.Net 6.0.3 can be driven
+            // OpenRowGroupReader/RowCount touches untrusted footer metadata that Parquet.Net 6.1.0 can be driven
             // into non-terminating, cancellation-ignoring work over. This DV-bounding door (used to bound a
             // deletion vector's decoded positions by the truth on disk) is therefore bounded under its OWN
             // per-operation wall-clock budget (stage=metadata) so a crafted footer fails closed with a DISTINCT
@@ -1045,7 +1045,7 @@ internal sealed class ParquetFileReader
         ParquetReader? reader = null;
         try
         {
-            // Bounded-time open (#699). Parquet.Net 6.0.3 can be driven by a single flipped terminal footer
+            // Bounded-time open (#699). Parquet.Net 6.1.0 can be driven by a single flipped terminal footer
             // byte into effectively UNBOUNDED work inside CreateAsync (and the forced lazy Schema
             // materialization) that IGNORES the CancellationToken. Race the open against its OWN per-operation
             // wall-clock budget via the data-file BoundedDecoder so a crafted footer fails closed with a
@@ -1105,7 +1105,7 @@ internal sealed class ParquetFileReader
             // the parsed footer metadata (file-level encryption_algorithm and/or per-column ColumnCryptoMetaData)
             // and fail closed with an actionable UnsupportedFeature rather than returning a reader whose column
             // reads would later fall through to CorruptData. The COMPLEMENTARY case — a real encrypting writer
-            // that OMITS the plaintext ColumnMetaData on encrypted columns — makes Parquet.Net 6.0.3 throw
+            // that OMITS the plaintext ColumnMetaData on encrypted columns — makes Parquet.Net 6.1.0 throw
             // (NRE) during its row-group-reader init inside CreateAsync above, before this line; that shape is
             // caught on the FAILURE path in the catch below via the footer probe. Detection is presence-only —
             // the field's existence is the diagnosis; no footer content is read or echoed (#653 hygiene). The
@@ -1154,7 +1154,7 @@ internal sealed class ParquetFileReader
             // classified below.
             //
             // Parquet Modular Encryption classification (#649). An encrypted-footer file is a perfectly VALID
-            // Parquet file that the LIBRARY (not DeltaSharp) refuses: Parquet.Net 6.0.3 rejects its 'PARE' head
+            // Parquet file that the LIBRARY (not DeltaSharp) refuses: Parquet.Net 6.1.0 rejects its 'PARE' head
             // as "not a parquet file, head: 50415245, tail: 50415245" — a message shape BYTE-FOR-BYTE identical
             // to the one it emits for arbitrary non-Parquet garbage ("head: 74686973…" for "this is not a
             // parquet file"), so ex.Message cannot separate encryption from corruption. The file's own leading
@@ -1162,7 +1162,7 @@ internal sealed class ParquetFileReader
             // is classified via the leading-magic peek. Plaintext-footer encryption (mode b) keeps the ordinary
             // PAR1 magic; when its encrypted columns retain plaintext ColumnMetaData the footer parses cleanly
             // and it is classified on the SUCCESS path above, but a real encrypting writer OMITS that plaintext
-            // metadata, so Parquet.Net 6.0.3 throws (NRE) during row-group-reader init and lands HERE. Probe the
+            // metadata, so Parquet.Net 6.1.0 throws (NRE) during row-group-reader init and lands HERE. Probe the
             // plaintext footer directly for the FileMetaData encryption_algorithm field to reclassify that shape
             // as UnsupportedFeature too (#655). Both peeks (and their messages) live in the shared
             // ParquetEncryption classifier, which the checkpoint door applies identically (#681). They read the
@@ -1398,12 +1398,13 @@ internal sealed class ParquetFileReader
             && !physicalType.Equals(requestedField.DataType)
             && TypeWidening.IsSanctionedWidening(physicalType, requestedField.DataType);
 
-        if (!promotable && !ParquetTypeMapping.PhysicalClrTypesMatch(fileField, expected))
+        if (!promotable && !ParquetTypeMapping.PhysicalClrTypesMatch(fileField.ClrType, expected.ClrType))
         {
             throw DeltaStorageException.SchemaMismatch(
-                $"Column '{columnLabel}': file physical type '{fileField.ClrType.Name}' does not "
+                $"Column '{columnLabel}': file physical type "
+                + $"'{ParquetTypeMapping.DescribePhysicalClrType(fileField.ClrType)}' does not "
                 + $"match the requested engine type '{requestedField.DataType.SimpleString}' "
-                + $"(expected '{expected.ClrType.Name}').");
+                + $"(expected '{ParquetTypeMapping.DescribePhysicalClrType(expected.ClrType)}').");
         }
 
         // A nullable file column cannot be read into a column the writer would have emitted as
@@ -1504,7 +1505,7 @@ internal sealed class ParquetFileReader
         // (keepRowGroup:null) never reaches; EnsureDecodeCeiling / ProjectedFootprints (column-chunk sizes);
         // and the per-column page/level decode. Any raw fault maps to the deterministic CorruptData contract.
         //
-        // Bounded-time decode (#647). A corrupt data-page header can drive Parquet.Net 6.0.3's SYNCHRONOUS
+        // Bounded-time decode (#647). A corrupt data-page header can drive Parquet.Net 6.1.0's SYNCHRONOUS
         // page/level decode into a non-terminating CPU loop that observes NO CancellationToken mid-page — a
         // hang is not an exception, so the catches below cannot intercept it. Race the whole decode against its
         // OWN per-operation wall-clock budget (measured from the decode's EXECUTION start, I3 — never spanning
@@ -1685,14 +1686,14 @@ internal sealed class ParquetFileReader
             //
             // #649 note — NotSupportedException stays CorruptData here (precision boundary). It is tempting to
             // reclassify a library NotSupportedException as "unsupported-but-valid feature", but Parquet.Net
-            // 6.0.3 raises the SAME NotSupportedException on genuinely CORRUPT pages — a random bit-flip that
+            // 6.1.0 raises the SAME NotSupportedException on genuinely CORRUPT pages — a random bit-flip that
             // lands on a compression-method, page-type, or logical-type code is decoded as an unknown code and
             // rejected with e.g. "Compression method 9 is not supported" / "can't read page type 8" (an
             // empirical fuzz over this reader's own written files reproduces it, and a forged out-of-range codec
             // triggers it deterministically). "The footer parsed / the file opened" does NOT imply the pages are
             // valid, so there is no runtime predicate that separates a valid-but-unimplemented encoding from a
             // corrupt page here — and a valid-but-unsupported-encoding fixture is not even constructible with
-            // Parquet.Net 6.0.3 (it neither reads nor writes such encodings). Reclassifying would therefore
+            // Parquet.Net 6.1.0 (it neither reads nor writes such encodings). Reclassifying would therefore
             // MISLABEL corruption as "unsupported", violating the fail-closed contract, so it stays CorruptData.
             // The one distinguishable unsupported-but-valid family (Parquet Modular Encryption) is caught earlier
             // by its 'PARE' magic in OpenAsync, before any page ever reaches this decode.

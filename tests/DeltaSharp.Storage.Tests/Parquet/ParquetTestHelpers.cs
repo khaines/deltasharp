@@ -47,6 +47,37 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>Writes a single-column Parquet file whose one column is a real Parquet <b>TIME</b> logical type
+    /// (<c>TimeDataField</c>) of <paramref name="precision"/>, named <paramref name="columnName"/>. DeltaSharp
+    /// has NO time-of-day type, so this file must FAIL CLOSED at footer mapping. The trap this guards: under
+    /// Parquet.Net ≥6.1 a TIME field's <c>ClrType</c> is a RAW <see cref="int"/> (millis) or <see cref="long"/>
+    /// (micros/nanos), so without an explicit <c>TimeDataField</c> arm the raw-CLR fallback would silently
+    /// misread a TIME column as IntegerType/LongType sub-day units (#832). Authored with Parquet.Net's
+    /// low-level writer because DeltaSharp's writer, by construction, cannot emit a TIME column.</summary>
+    public static async Task<byte[]> WriteTimeColumnAsync(
+        string columnName, global::Parquet.Schema.TimeUnitPrecision precision)
+    {
+        var field = new global::Parquet.Schema.TimeDataField(columnName, precision);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            if (field.ClrType == typeof(int))
+            {
+                await rowGroup.WriteAsync<int>(
+                    field, new ReadOnlyMemory<int>(new[] { 1 }), null, null, CancellationToken.None);
+            }
+            else
+            {
+                await rowGroup.WriteAsync<long>(
+                    field, new ReadOnlyMemory<long>(new[] { 1L }), null, null, CancellationToken.None);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
     /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
     /// caller-supplied repetition levels — the only way to forge a map whose value repetition stream diverges
     /// from the key's (same total entry count, different per-row distribution), which the typed
@@ -306,7 +337,7 @@ internal static class ParquetTestHelpers
     /// <summary>Rewrites the footer so the schema element for (<paramref name="rowGroup"/>,
     /// <paramref name="columnIndex"/>) — an ordinary physical INT32 column — is annotated as a logical DATE
     /// (BOTH the legacy <c>ConvertedType.DATE</c> and the modern <c>LogicalType.DATE</c>, since Parquet.Net
-    /// 6.0.3 keys on either). The physical pages are untouched, so a raw INT32 value the writer emitted (e.g.
+    /// 6.1.0 keys on either). The physical pages are untouched, so a raw INT32 value the writer emitted (e.g.
     /// <c>int.MaxValue</c> days) now decodes through Parquet.Net's INT32-DATE → <see cref="DateTime"/> path
     /// (<c>epoch.AddDays</c>), whose <see cref="ArgumentOutOfRangeException"/> for an out-of-representable-range
     /// day drives <c>ReadValueAsync</c>'s date/time-range fail-closed catch (#653: the surfaced CorruptData
@@ -345,7 +376,7 @@ internal static class ParquetTestHelpers
 
     /// <summary>Constructs a minimal Parquet Modular Encryption (encrypted-footer mode) input: the
     /// <c>PARE</c> magic (0x50 0x41 0x52 0x45) at BOTH the head and tail (per the Parquet format Encryption
-    /// spec), bracketing an opaque encrypted-footer body. Parquet.Net 6.0.3 rejects the <c>PARE</c> head at
+    /// spec), bracketing an opaque encrypted-footer body. Parquet.Net 6.1.0 rejects the <c>PARE</c> head at
     /// open with <c>IOException "not a parquet file, head: 50415245, tail: 50415245"</c> — the same path a
     /// real pyarrow-emitted encrypted table trips (the library can neither read nor WRITE encrypted files, so
     /// this hand-crafted shape is the only way to author the fixture). Enough to drive the reader's encryption
@@ -440,7 +471,7 @@ internal static class ParquetTestHelpers
     /// <c>Type</c> of the first leaf <c>SchemaElement</c>. A null leaf type re-serializes into a footer that
     /// <see cref="ParquetReader.CreateAsync(System.IO.Stream, ParquetOptions?, bool, CancellationToken)"/>
     /// still OPENS (the reader is constructed and <c>reader.Metadata</c> is populated), but whose high-level
-    /// <c>reader.Schema</c> materialization THROWS (Parquet.Net 6.0.3: "cannot decode schema for field ...").
+    /// <c>reader.Schema</c> materialization THROWS (Parquet.Net 6.1.0: "cannot decode schema for field ...").
     /// This is the ONE shape that reaches <c>DeltaCheckpointReader.OpenAsync</c>'s failure-path catch with a
     /// <b>non-null</b> reader — so it is the only fixture that exercises the "classify BEFORE dispose" ordering
     /// (#717 survivor 4). Both checkpoint failure-path encryption fixtures make <c>CreateAsync</c> itself throw
@@ -516,7 +547,7 @@ internal static class ParquetTestHelpers
     /// writer sets the file-level <c>EncryptionAlgorithm</c>, marks the encrypted column
     /// (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>) with <c>ColumnCryptoMetaData</c>, and
     /// <b>OMITS</b> that column's plaintext <c>ColumnMetaData</c> (it is stored encrypted, not in the plaintext
-    /// footer). That omission is what makes Parquet.Net 6.0.3 throw during <c>CreateAsync</c>'s row-group-reader
+    /// footer). That omission is what makes Parquet.Net 6.1.0 throw during <c>CreateAsync</c>'s row-group-reader
     /// init — so this fixture exercises the <b>failure-path</b> footer probe, not the success-path
     /// <c>reader.Metadata</c> check. Unlike <see cref="PlaintextFooterEncryptedFileAsync"/> (which keeps
     /// <c>ColumnMetaData</c> and so opens cleanly), this is the shape a genuine encryptor produces.</summary>
@@ -587,7 +618,7 @@ internal static class ParquetTestHelpers
 
     /// <summary>The ZERO-COLUMN-CHUNK variant of <see cref="EmptyEncryptionAlgorithmUnionFileAsync"/>: sets a
     /// non-null <c>EncryptionAlgorithm</c> whose known union members are BOTH null — the shape an unknown
-    /// future algorithm id takes, since Parquet.Net 6.0.3 silently drops a union member it cannot
+    /// future algorithm id takes, since Parquet.Net 6.1.0 silently drops a union member it cannot
     /// deserialize — and ALSO clears <c>RowGroups</c>, so the footer carries no column chunk at all. That
     /// combination empties the per-column <c>CryptoMetadata</c> backstop: with no columns there is nothing to
     /// mark, so "the spec mandates crypto_metadata on every encrypted column" becomes vacuously true and

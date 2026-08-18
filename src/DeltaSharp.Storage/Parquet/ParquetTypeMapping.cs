@@ -246,11 +246,11 @@ internal static class ParquetTypeMapping
         }
 
         // Message hygiene (#653): `field` is a Parquet FOOTER DataField read back from the file, so
-        // `field.Name` is attacker-authored on a foreign file and is not echoed; the bounded physical CLR
-        // type name (a Parquet.Net type vocabulary) is sufficient to diagnose the unsupported mapping.
+        // `field.Name` is attacker-authored on a foreign file and is not echoed; the bounded physical type
+        // description (a fixed Parquet vocabulary) is sufficient to diagnose the unsupported mapping.
         throw DeltaStorageException.UnsupportedFeature(
-            $"A Parquet footer column has physical CLR type '{field.ClrType.Name}', which has no "
-            + "supported DeltaSharp type mapping.");
+            $"A Parquet footer column has physical CLR type '{DescribePhysicalClrType(field.ClrType)}', which "
+            + "has no supported DeltaSharp type mapping.");
     }
 
     /// <summary>
@@ -283,6 +283,15 @@ internal static class ParquetTypeMapping
             case DecimalDataField decimalField:
                 type = DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
                 return true;
+            case TimeDataField:
+                // Parquet.Net 6.1 introduced TimeDataField for the TIME logical type; its ClrType is a raw
+                // int/long (sub-day units) depending on precision. DeltaSharp has no time-of-day logical
+                // type, so a TIME column must FAIL CLOSED here — otherwise it would fall through to the raw
+                // CLR switch below and be silently misread as IntegerType/LongType. This preserves the
+                // fail-closed contract that held under Parquet.Net 6.0.3, where TIME surfaced as an unmapped
+                // TimeSpan. Matched before the raw switch for the same reason as the annotated types above.
+                type = null;
+                return false;
         }
 
         Type clr = field.ClrType;
@@ -302,31 +311,49 @@ internal static class ParquetTypeMapping
 
     /// <summary>
     /// Returns whether <paramref name="clr"/> is a Parquet.Net physical CLR shape for a UTF-8 string column.
-    /// Parquet.Net 6.1 reports footer string fields as <see cref="ReadOnlyMemory{T}"/> of <see cref="char"/>,
-    /// while earlier versions reported <see cref="string"/>; both encode the same DeltaSharp logical type.
+    /// Parquet.Net ≥6.1 normalizes every string <see cref="DataField"/> to <see cref="ReadOnlyMemory{T}"/> of
+    /// <see cref="char"/>; the <see cref="string"/> arm is a defensive shim for a downgraded/pinned older
+    /// Parquet.Net and is unreachable at the version this project pins. Both encode the same logical type.
     /// </summary>
     internal static bool IsStringPhysicalClrType(Type clr) =>
         clr == typeof(string) || clr == typeof(ReadOnlyMemory<char>);
 
     /// <summary>
     /// Returns whether <paramref name="clr"/> is a Parquet.Net physical CLR shape for a binary column.
-    /// Parquet.Net 6.1 reports footer binary fields as <see cref="ReadOnlyMemory{T}"/> of <see cref="byte"/>,
-    /// while earlier versions reported <see cref="byte"/> arrays; both encode the same DeltaSharp logical type.
+    /// Parquet.Net ≥6.1 normalizes every binary <see cref="DataField"/> to <see cref="ReadOnlyMemory{T}"/> of
+    /// <see cref="byte"/>; the <see cref="byte"/>-array arm is a defensive shim for a downgraded/pinned older
+    /// Parquet.Net and is unreachable at the version this project pins. Both encode the same logical type.
     /// </summary>
     internal static bool IsBinaryPhysicalClrType(Type clr) =>
         clr == typeof(byte[]) || clr == typeof(ReadOnlyMemory<byte>);
 
     /// <summary>
     /// Compares Parquet.Net footer physical CLR shapes, treating the pre-6.1 and 6.1 string/binary
-    /// representations as equivalent while leaving every other type exact-match and fail-closed.
+    /// representations as equivalent while leaving every other type exact-match and fail-closed. Takes the
+    /// two CLR types rather than the owning <see cref="DataField"/>s so a caller that only has a leaf's
+    /// physical type (the nested reader) can reuse the same equivalence.
     /// </summary>
-    internal static bool PhysicalClrTypesMatch(DataField fileField, DataField expected)
+    internal static bool PhysicalClrTypesMatch(Type file, Type requested) =>
+        file == requested
+        || (IsStringPhysicalClrType(file) && IsStringPhysicalClrType(requested))
+        || (IsBinaryPhysicalClrType(file) && IsBinaryPhysicalClrType(requested));
+
+    /// <summary>
+    /// Renders a Parquet.Net physical CLR type as an ACTIONABLE, bounded diagnostic token for an error
+    /// message. <see cref="Type.Name"/> alone regressed to the opaque, self-contradictory
+    /// <c>ReadOnlyMemory`1</c> under Parquet.Net 6.1 (which reports BOTH string and binary columns as a
+    /// <see cref="ReadOnlyMemory{T}"/>), so a reader could not tell a UTF-8 column from a BYTE_ARRAY one — or
+    /// from the type it actually asked for. Collapse both string shapes and both binary shapes onto the
+    /// PARQUET vocabulary instead, and fall back to the type name for everything else.
+    /// <para>Message-hygiene safe (#653): the output is drawn from a fixed vocabulary or from a Parquet.Net
+    /// type name — never from file-derived, attacker-authored text — and is inherently short.</para>
+    /// </summary>
+    internal static string DescribePhysicalClrType(Type clr)
     {
-        Type file = fileField.ClrType;
-        Type requested = expected.ClrType;
-        return file == requested
-            || (IsStringPhysicalClrType(file) && IsStringPhysicalClrType(requested))
-            || (IsBinaryPhysicalClrType(file) && IsBinaryPhysicalClrType(requested));
+        ArgumentNullException.ThrowIfNull(clr);
+        return IsStringPhysicalClrType(clr) ? "string (BYTE_ARRAY/UTF8)"
+            : IsBinaryPhysicalClrType(clr) ? "binary (BYTE_ARRAY)"
+            : clr.Name;
     }
 
     /// <summary>
