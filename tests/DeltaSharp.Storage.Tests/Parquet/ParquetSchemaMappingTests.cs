@@ -429,6 +429,12 @@ public sealed class ParquetSchemaMappingTests
         byte[] plain = await ParquetTestHelpers.WriteDecimalColumnAsync("d");
         byte[] file = await ParquetTestHelpers.ForgeDecimalPrecisionAsync(plain, "d", precision);
 
+        // The forge rewrites only the precision, so the carrier's scale of 2 survives into the footer — which
+        // is what makes the scale in the rendered message a real, file-derived value worth pinning.
+        string expectedRender =
+            $"Parquet DECIMAL(precision {precision}, scale 2) column "
+            + "(unsupported: precision must be in [1, 38] and scale in [0, precision])";
+
         using (var probe = new MemoryStream(file, writable: false))
         {
             ParquetReader reader = await ParquetReader.CreateAsync(probe, null, false, CancellationToken.None);
@@ -445,9 +451,11 @@ public sealed class ParquetSchemaMappingTests
                 // Pin the DECIMAL branch of DescribePhysical. A DecimalDataField's CLR type is a bare
                 // `decimal`, so without that branch the rejection read "file physical type 'Decimal' …
                 // cannot be read as 'decimal(10,2)'" — self-contradictory and unactionable, the very defect
-                // this PR fixed for TIME. The message must name the footer's OWN precision.
-                Assert.Contains(
-                    $"DECIMAL(precision {precision}", schemaDoorError.Message, StringComparison.Ordinal);
+                // this PR fixed for TIME. Pin the WHOLE rendering, not just the precision: a prefix-only
+                // assertion left the scale renderable as a constant and the "(unsupported: …)" guidance —
+                // the half of the message that tells an operator WHY the column was refused — deletable,
+                // with the suite green.
+                Assert.Contains(expectedRender, schemaDoorError.Message, StringComparison.Ordinal);
             }
         }
 
@@ -462,7 +470,7 @@ public sealed class ParquetSchemaMappingTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => ReadAsDeltaScanAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
-        Assert.Contains($"DECIMAL(precision {precision}", error.Message, StringComparison.Ordinal);
+        Assert.Contains(expectedRender, error.Message, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -544,6 +552,32 @@ public sealed class ParquetSchemaMappingTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => ParquetTestHelpers.ReadAllAsync(file, readSchema));
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    [Fact]
+    public async Task MappableDecimalReadAsString_NamesTheDecimalShape_WithoutClaimingItUnsupported()
+    {
+        // The POSITIVE half of the DescribePhysical DECIMAL rendering. DescribePhysical is reached from two
+        // places with opposite meanings: the unmappable-footer rejection (an out-of-range precision) and the
+        // CLR-shape gate, which describes a perfectly MAPPABLE column that simply is not the type the reader
+        // asked for. Only the first is "unsupported", so the cause clause is conditional — and without this
+        // test, inverting that condition would make a legal decimal(10,2) tell an operator on a real read
+        // path that its own well-formed column is unsupported, with the whole suite green.
+        byte[] file = await ParquetTestHelpers.WriteDecimalColumnAsync("d");
+        var readSchema = new StructType(new[]
+        {
+            new StructField("d", DataTypes.StringType, nullable: true),
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ParquetTestHelpers.ReadAllAsync(file, readSchema));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+
+        // Names the footer's real shape — both numbers, so neither can be rendered as a constant …
+        Assert.Contains("Parquet DECIMAL(precision 10, scale 2) column", error.Message, StringComparison.Ordinal);
+
+        // … and does NOT slander it as unsupported: the column maps fine, the REQUEST is what disagrees.
+        Assert.DoesNotContain("unsupported:", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
