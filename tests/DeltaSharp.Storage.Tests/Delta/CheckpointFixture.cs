@@ -549,6 +549,11 @@ internal sealed class CheckpointFixture
     // both survive, silently changing the authored map's cardinality). So accumulate under `string` +
     // StringComparer.Ordinal — exactly the pre-#832 semantics — and project to ReadOnlyMemory<char> only at
     // the final serializer boundary, once per surviving entry.
+    //
+    // Beyond guarding today's fixtures, this is forward protection: the moment a fixture feeds a duplicate
+    // key, a ReadOnlyMemory-keyed builder would double-count it. `Fixture_DuplicateMapKeys_CollapseByOrdinalContent`
+    // in DeltaCheckpointReaderTests feeds exactly that and asserts the AUTHORED map cardinality straight off
+    // the footer, so the ordinal accumulation cannot silently be dropped.
     private static Dictionary<ReadOnlyMemory<char>, ReadOnlyMemory<char>?> ToNullableMap((string Key, string? Value)[]? entries)
     {
         var map = new Dictionary<string, string?>(StringComparer.Ordinal);

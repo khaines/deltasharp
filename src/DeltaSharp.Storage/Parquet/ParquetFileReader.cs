@@ -1393,16 +1393,32 @@ internal sealed class ParquetFileReader
         // accepted (the values are widened on read) ONLY when the caller opened the promotion gate. This is
         // lossless and matches what the writer recorded in `delta.typeChanges`. Nullability is still checked
         // below against the physical column.
+        bool mappable = ParquetTypeMapping.TryToDataType(fileField, out DataType? physicalType);
         bool promotable = allowTypeWideningPromotion
-            && ParquetTypeMapping.TryToDataType(fileField, out DataType? physicalType)
-            && !physicalType.Equals(requestedField.DataType)
+            && mappable
+            && !physicalType!.Equals(requestedField.DataType)
             && TypeWidening.IsSanctionedWidening(physicalType, requestedField.DataType);
+
+        // FAIL CLOSED on a footer column whose physical type has NO DeltaSharp mapping, BEFORE the CLR-shape
+        // gate below. The shape gate compares raw CLR types, so an ANNOTATED column whose annotation carries
+        // the real logical type — a Parquet TIME, whose ClrType is a bare int (millis) or long (micros/nanos)
+        // — sails straight through it and is silently decoded as int/bigint sub-day units. That is a SILENT
+        // data corruption on a foreign or forged file, and it is exactly what the schema door
+        // (ToDataType/ToDataSchema) already rejects; routing the read door through the same mapping keeps the
+        // two doors from disagreeing. A genuine int/long column still maps and proceeds unchanged.
+        if (!mappable)
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Column '{columnLabel}': file physical type "
+                + $"'{ParquetTypeMapping.DescribePhysical(fileField)}' has no supported DeltaSharp type "
+                + $"mapping and cannot be read as '{requestedField.DataType.SimpleString}'.");
+        }
 
         if (!promotable && !ParquetTypeMapping.PhysicalClrTypesMatch(fileField.ClrType, expected.ClrType))
         {
             throw DeltaStorageException.SchemaMismatch(
                 $"Column '{columnLabel}': file physical type "
-                + $"'{ParquetTypeMapping.DescribePhysicalClrType(fileField.ClrType)}' does not "
+                + $"'{ParquetTypeMapping.DescribePhysical(fileField)}' does not "
                 + $"match the requested engine type '{requestedField.DataType.SimpleString}' "
                 + $"(expected '{ParquetTypeMapping.DescribePhysicalClrType(expected.ClrType)}').");
         }

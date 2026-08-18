@@ -1146,7 +1146,7 @@ public sealed class ParquetCorruptionTests
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.DoesNotContain(sentinel, error.Message, StringComparison.Ordinal);   // no file-derived column name
         // Pins the scrubbed ToDataType site: it names the unsupported physical CLR TYPE, never the column name.
-        Assert.Contains("physical CLR type 'Byte'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("physical type 'Byte'", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -1186,8 +1186,8 @@ internal static class NestedParquetColumnReader
             BooleanType => leaf.ClrType == typeof(bool),
             ByteType => leaf.ClrType == typeof(sbyte),
             ShortType => leaf.ClrType == typeof(short),
-            IntegerType => leaf.ClrType == typeof(int) && leaf is not TimeDataField,
-            LongType => leaf.ClrType == typeof(long) && leaf is not TimeDataField,
+            IntegerType => leaf.ClrType == typeof(int) && !ParquetTypeMapping.IsTimeColumn(leaf),
+            LongType => leaf.ClrType == typeof(long) && !ParquetTypeMapping.IsTimeColumn(leaf),
             FloatType => leaf.ClrType == typeof(float),
             DoubleType => leaf.ClrType == typeof(double),
             StringType => ParquetTypeMapping.IsStringPhysicalClrType(leaf.ClrType),
@@ -1210,7 +1210,7 @@ internal static class NestedParquetColumnReader
             // into every nested field name. DescribeType renders the bounded kind instead.
             throw DeltaStorageException.SchemaMismatch(
                 $"Parquet nested read for {context}: the file physical type "
-                + $"'{ParquetTypeMapping.DescribePhysicalClrType(leaf.ClrType)}' does not match "
+                + $"'{ParquetTypeMapping.DescribePhysical(leaf)}' does not match "
                 + $"the requested '{DiagnosticText.DescribeType(requested)}'.");
         }
     }

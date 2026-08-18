@@ -203,6 +203,137 @@ public sealed class ParquetSchemaMappingTests
         Assert.False(ParquetTypeMapping.TryToDataType(new TimeDataField("t", precision), out _));
     }
 
+    /// <summary>Reads under the MOST PERMISSIVE flag combination DeltaSharp's own scan path (DeltaReadSource)
+    /// uses — null-filling missing columns and allowing type-widening promotion — so a fail-closed assertion
+    /// below proves the guard holds where a real table read would land, not just under a stricter test
+    /// configuration that might be doing the rejecting for it.</summary>
+    private static async Task ReadAsDeltaScanAsync(byte[] file, StructType readSchema)
+    {
+        using var stream = new MemoryStream(file, writable: false);
+        await foreach (ColumnBatch _ in new ParquetFileReader().ReadAsync(
+            stream, readSchema, null, nullFillMissingColumns: true, allowTypeWideningPromotion: true,
+            CancellationToken.None))
+        {
+        }
+    }
+
+    [Theory]
+    [InlineData(TimeUnitPrecision.Millis, false)]  // TIME_MILLIS — physical INT32, requested as int.
+    [InlineData(TimeUnitPrecision.Micros, true)]   // TIME_MICROS — physical INT64, requested as bigint.
+    [InlineData(TimeUnitPrecision.Nanos, true)]    // TIME_NANOS  — physical INT64, requested as bigint.
+    public async Task TimeColumn_FailsClosed_AtTheREADDoor_AtEveryPrecision(
+        TimeUnitPrecision precision, bool requestBigint)
+    {
+        // #832 read-door regression, DISTINCT from the schema-door test above. ValidateFileField gates a
+        // footer column by CLR SHAPE (PhysicalClrTypesMatch), and a TIME column's ClrType is a bare int
+        // (millis) or long (micros/nanos) — so shape-matching it against a requested int/bigint returns TRUE,
+        // `promotable` is false, and the column DECODES: raw sub-day units delivered as int/bigint values with
+        // no error at all. The schema door (ToDataSchema) never runs on this path, because a Delta read takes
+        // its schema from the table metadata, not from the file footer. So the read door needs its OWN
+        // fail-closed check — routing the footer field back through TryToDataType — and this test drives it.
+        byte[] file = await ParquetTestHelpers.WriteTimeColumnAsync("t", precision);
+        var readSchema = new StructType(new[]
+        {
+            new StructField("t", requestBigint ? DataTypes.LongType : DataTypes.IntegerType, nullable: true),
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsDeltaScanAsync(file, readSchema));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    [Theory]
+    [InlineData(global::Parquet.Meta.ConvertedType.TIME_MILLIS, false)]
+    [InlineData(global::Parquet.Meta.ConvertedType.TIME_MICROS, true)]
+    public async Task LegacyConvertedTypeOnlyTimeColumn_FailsClosed_AtBothDoors(
+        global::Parquet.Meta.ConvertedType convertedType, bool requestBigint)
+    {
+        // #832, the DEEPEST hole: Parquet.Net 6.1 materializes a TimeDataField ONLY when the footer carries
+        // `logicalType.TIME`. A LEGACY column annotated with `converted_type = TIME_MILLIS/TIME_MICROS` and NO
+        // logicalType — what parquet-mr ≤1.10, Hive, Impala and older Spark all emit, and what anyone can
+        // forge — comes back as a PLAIN DataField with a raw int/long ClrType. So a guard keyed on
+        // `field is TimeDataField` misses it entirely and BOTH doors map it to int/bigint. The fix keys on the
+        // footer's own annotations (ParquetTypeMapping.IsTimeColumn), which is what this test pins.
+        byte[] plain = await ParquetTestHelpers.WriteRawIntegralColumnAsync(
+            "t", millis: convertedType == global::Parquet.Meta.ConvertedType.TIME_MILLIS);
+        byte[] file = await ParquetTestHelpers.ForgeConvertedTypeOnlyTimeAsync(plain, "t", convertedType);
+
+        // First prove the fixture really is the legacy shape — otherwise this test could pass by testing the
+        // ordinary TimeDataField path all over again.
+        using (var probe = new MemoryStream(file, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(probe, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                DataField footerField = Assert.Single(reader.Schema.DataFields);
+                Assert.IsNotType<TimeDataField>(footerField);
+                Assert.Equal(convertedType, footerField.SchemaElement!.ConvertedType);
+                Assert.Null(footerField.SchemaElement.LogicalType);
+                Assert.Equal(requestBigint ? typeof(long) : typeof(int), footerField.ClrType);
+
+                // Schema door.
+                Assert.True(ParquetTypeMapping.IsTimeColumn(footerField));
+                Assert.False(ParquetTypeMapping.TryToDataType(footerField, out _));
+                Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.ToDataSchema(reader.Schema));
+            }
+        }
+
+        // Read door, under the permissive Delta scan flags.
+        var readSchema = new StructType(new[]
+        {
+            new StructField("t", requestBigint ? DataTypes.LongType : DataTypes.IntegerType, nullable: true),
+        });
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsDeltaScanAsync(file, readSchema));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    [Fact]
+    public async Task PlainIntegralColumn_WithoutTimeAnnotation_StillReads()
+    {
+        // The counterweight to the two tests above: the read door's new "unmappable ⇒ reject" check must NOT
+        // start rejecting ordinary columns. Read back the exact un-forged carrier file the legacy-TIME fixture
+        // is built from — a plain INT64 with no annotation at all — and require it to decode normally.
+        byte[] file = await ParquetTestHelpers.WriteRawIntegralColumnAsync("t", millis: false);
+        var readSchema = new StructType(new[] { new StructField("t", DataTypes.LongType, nullable: true) });
+
+        List<ColumnBatch> batches = await ParquetTestHelpers.ReadAllAsync(file, readSchema);
+        Assert.Equal(1, batches.Sum(b => b.RowCount));
+    }
+
+    [Theory]
+    [InlineData(NestedTimePosition.StructField)]
+    [InlineData(NestedTimePosition.ArrayElement)]
+    [InlineData(NestedTimePosition.MapValue)]
+    public async Task NestedTimeLeaf_FailsClosed_InEveryPosition(
+        NestedTimePosition position)
+    {
+        // #832: the nested reader validates its leaves through its OWN physical-type check, which is a
+        // separate code path from the flat read door — so a TIME leaf buried in a struct/list/map needs its
+        // own coverage. Same trap: the leaf's ClrType is a raw long, so a bare CLR comparison against a
+        // requested bigint says "match" and the sub-day units decode silently.
+        byte[] file = await ParquetTestHelpers.WriteNestedTimeColumnAsync(position);
+
+        DataType leaf = DataTypes.LongType;
+        StructField requested = position switch
+        {
+            NestedTimePosition.StructField => new StructField(
+                "s",
+                new StructType(new[] { new StructField("t", leaf, nullable: true) }),
+                nullable: true),
+            NestedTimePosition.ArrayElement => new StructField(
+                "arr", DataTypes.CreateArrayType(leaf, containsNull: true), nullable: true),
+            _ => new StructField(
+                "m",
+                DataTypes.CreateMapType(DataTypes.StringType, leaf, valueContainsNull: true),
+                nullable: true),
+        };
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsDeltaScanAsync(file, new StructType(new[] { requested })));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
     [Fact]
     public async Task ReadWithNarrowingPhysicalType_ThrowsSchemaMismatch()
     {

@@ -78,6 +78,135 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
+    /// <summary>Writes a Parquet file whose single top-level column is a nested container (per
+    /// <paramref name="position"/>) holding a real Parquet <b>TIME</b> leaf of micros precision — CLR type
+    /// <see cref="long"/>. DeltaSharp has no time-of-day type, so a nested read that asks for the container
+    /// with a <c>bigint</c> leaf must FAIL CLOSED rather than decode the raw sub-day units as a bigint
+    /// (#832). Authored with Parquet.Net's low-level writer for the same reason
+    /// <see cref="WriteTimeColumnAsync"/> is: DeltaSharp's own writer cannot emit a TIME column.</summary>
+    public static async Task<byte[]> WriteNestedTimeColumnAsync(NestedTimePosition position)
+    {
+        var time = new global::Parquet.Schema.TimeDataField(
+            position == NestedTimePosition.StructField ? "t"
+            : position == NestedTimePosition.ArrayElement ? "element" : "value",
+            global::Parquet.Schema.TimeUnitPrecision.Micros);
+
+        global::Parquet.Schema.Field container = position switch
+        {
+            NestedTimePosition.StructField => new global::Parquet.Schema.StructField("s", time),
+            NestedTimePosition.ArrayElement => new global::Parquet.Schema.ListField("arr", time),
+            _ => new global::Parquet.Schema.MapField(
+                "m", new global::Parquet.Schema.DataField<string>("key", nullable: false), time),
+        };
+
+        var schema = new global::Parquet.Schema.ParquetSchema(container);
+        global::Parquet.Schema.DataField[] leaves = schema.GetDataFields();
+
+        // A repeated leaf needs an explicit repetition stream; a struct leaf has max repetition 0 and takes
+        // none. One row, one present value, is enough — the guard rejects on the SCHEMA, before any decode.
+        int[]? reps = position == NestedTimePosition.StructField ? null : new[] { 0 };
+
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            if (position == NestedTimePosition.MapValue)
+            {
+                await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                    leaves[0],
+                    new ReadOnlyMemory<ReadOnlyMemory<char>?>(new ReadOnlyMemory<char>?[] { "k".AsMemory() }),
+                    reps,
+                    null,
+                    CancellationToken.None);
+            }
+
+            global::Parquet.Schema.DataField timeLeaf = leaves[^1];
+            await rowGroup.WriteAsync<long>(
+                timeLeaf,
+                new ReadOnlyMemory<long?>(new long?[] { 5L }),
+                reps,
+                null,
+                CancellationToken.None);
+        }
+
+        return stream.ToArray();
+    }
+
+    /// <summary>Rewrites the footer of <paramref name="bytes"/> so its <paramref name="columnName"/> leaf is
+    /// annotated as a <b>LEGACY, <c>ConvertedType</c>-ONLY</b> Parquet TIME column: <c>converted_type</c> is
+    /// set to <paramref name="convertedType"/> and <c>logicalType</c> is CLEARED. This is the shape
+    /// parquet-mr ≤1.10, Hive, Impala and older Spark emit (they all predate the <c>logicalType</c> union),
+    /// and it is trivially forgeable on a foreign file.
+    /// <para>It CANNOT be produced by Parquet.Net's writer — the writer rebuilds every <c>SchemaElement</c>
+    /// from the <c>DataField</c>'s CLR/annotation shape and always stamps a <c>logicalType</c> for TIME (and
+    /// discards any <c>SchemaElement</c> mutation made on a constructed field, whose <c>SchemaElement</c> is
+    /// null before a footer round-trip). So author it the same way the other forged-footer fixtures here do:
+    /// reopen, mutate the parsed <c>FileMetaData</c>, and re-serialize with Parquet.Net's own Thrift writer.
+    /// The result reopens cleanly, and Parquet.Net 6.1 materializes it as a PLAIN <c>DataField</c> with a raw
+    /// <c>int</c>/<c>long</c> ClrType — i.e. <c>field is TimeDataField</c> is FALSE — which is exactly why
+    /// the fail-closed guard cannot key on <c>TimeDataField</c> alone.</para></summary>
+    public static async Task<byte[]> ForgeConvertedTypeOnlyTimeAsync(
+        byte[] bytes, string columnName, global::Parquet.Meta.ConvertedType convertedType)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                foreach (global::Parquet.Meta.SchemaElement element in metadata.Schema)
+                {
+                    if (string.Equals(element.Name, columnName, StringComparison.Ordinal))
+                    {
+                        element.ConvertedType = convertedType;
+                        element.LogicalType = null;
+                    }
+                }
+
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>Writes a single-column Parquet file whose one column is a plain physical <see cref="int"/>
+    /// (<paramref name="millis"/>) or <see cref="long"/> named <paramref name="columnName"/> — the carrier
+    /// this file's <see cref="ForgeConvertedTypeOnlyTimeAsync"/> re-annotates into a legacy TIME column.
+    /// Written unannotated so the forge is the ONLY thing that makes it a TIME.</summary>
+    public static async Task<byte[]> WriteRawIntegralColumnAsync(string columnName, bool millis)
+    {
+        global::Parquet.Schema.DataField field = millis
+            ? new global::Parquet.Schema.DataField<int>(columnName)
+            : new global::Parquet.Schema.DataField<long>(columnName);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            if (millis)
+            {
+                await rowGroup.WriteAsync<int>(
+                    field, new ReadOnlyMemory<int>(new[] { 1 }), null, null, CancellationToken.None);
+            }
+            else
+            {
+                await rowGroup.WriteAsync<long>(
+                    field, new ReadOnlyMemory<long>(new[] { 1L }), null, null, CancellationToken.None);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
     /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
     /// caller-supplied repetition levels — the only way to forge a map whose value repetition stream diverges
     /// from the key's (same total entry count, different per-row distribution), which the typed
@@ -1078,4 +1207,21 @@ internal static class ParquetTestHelpers
         write.Invoke(metadata, new[] { protocolWriter });
         return footerStream.ToArray();
     }
+}
+
+/// <summary>The nested position a forged Parquet <b>TIME</b> leaf occupies, for
+/// <see cref="ParquetTestHelpers.WriteNestedTimeColumnAsync"/>. Each one flows through a DIFFERENT arm of the
+/// nested reader's leaf validation, so all three must be covered independently. Public (unlike the internal
+/// helper class that consumes it) only because an xUnit <c>[Theory]</c> parameter cannot be less accessible
+/// than the public test method that takes it.</summary>
+public enum NestedTimePosition
+{
+    /// <summary>A TIME field inside a struct.</summary>
+    StructField,
+
+    /// <summary>A TIME element inside a list.</summary>
+    ArrayElement,
+
+    /// <summary>A TIME value inside a string-keyed map.</summary>
+    MapValue,
 }

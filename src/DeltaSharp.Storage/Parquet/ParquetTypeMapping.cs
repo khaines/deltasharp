@@ -249,7 +249,7 @@ internal static class ParquetTypeMapping
         // `field.Name` is attacker-authored on a foreign file and is not echoed; the bounded physical type
         // description (a fixed Parquet vocabulary) is sufficient to diagnose the unsupported mapping.
         throw DeltaStorageException.UnsupportedFeature(
-            $"A Parquet footer column has physical CLR type '{DescribePhysicalClrType(field.ClrType)}', which "
+            $"A Parquet footer column has physical type '{DescribePhysical(field)}', which "
             + "has no supported DeltaSharp type mapping.");
     }
 
@@ -283,15 +283,17 @@ internal static class ParquetTypeMapping
             case DecimalDataField decimalField:
                 type = DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
                 return true;
-            case TimeDataField:
-                // Parquet.Net 6.1 introduced TimeDataField for the TIME logical type; its ClrType is a raw
-                // int/long (sub-day units) depending on precision. DeltaSharp has no time-of-day logical
-                // type, so a TIME column must FAIL CLOSED here — otherwise it would fall through to the raw
-                // CLR switch below and be silently misread as IntegerType/LongType. This preserves the
-                // fail-closed contract that held under Parquet.Net 6.0.3, where TIME surfaced as an unmapped
-                // TimeSpan. Matched before the raw switch for the same reason as the annotated types above.
-                type = null;
-                return false;
+        }
+
+        // TIME must FAIL CLOSED, across EVERY footer encoding of it (see IsTimeColumn). Checked AFTER the
+        // annotated subtypes (a TIME column is neither DATE/TIMESTAMP nor DECIMAL) and BEFORE the raw CLR
+        // switch below — which would otherwise reinterpret the sub-day units as IntegerType/LongType, a
+        // SILENT data corruption rather than an error. This preserves the fail-closed contract that held
+        // under Parquet.Net 6.0.3, where TIME surfaced as an unmapped TimeSpan.
+        if (IsTimeColumn(field))
+        {
+            type = null;
+            return false;
         }
 
         Type clr = field.ClrType;
@@ -354,6 +356,80 @@ internal static class ParquetTypeMapping
         return IsStringPhysicalClrType(clr) ? "string (BYTE_ARRAY/UTF8)"
             : IsBinaryPhysicalClrType(clr) ? "binary (BYTE_ARRAY)"
             : clr.Name;
+    }
+
+    /// <summary>
+    /// The ANNOTATION-AWARE form of <see cref="DescribePhysicalClrType(Type)"/>, for a message that describes
+    /// a whole footer <see cref="DataField"/> rather than a bare CLR type. A TIME column's CLR type is a raw
+    /// <see cref="int"/>/<see cref="long"/>, so describing it by CLR type alone produced the
+    /// self-contradictory "physical type 'Int64' does not match the requested engine type 'bigint'" — the
+    /// operator could not see that the file column is a TIME. Name the TIME annotation instead; everything
+    /// else keeps the CLR-shape rendering.
+    /// <para>Message-hygiene safe (#653): a fixed vocabulary, never file-derived text.</para>
+    /// </summary>
+    internal static string DescribePhysical(DataField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return IsTimeColumn(field)
+            ? $"Parquet TIME column ({DescribeTimeEncoding(field)})"
+            : DescribePhysicalClrType(field.ClrType);
+    }
+
+    /// <summary>
+    /// Returns whether <paramref name="field"/> is a Parquet <b>TIME</b> (time-of-day) column under ANY of the
+    /// encodings a footer can carry. DeltaSharp has no time-of-day logical type, so every one of them must
+    /// fail closed — and each arm below is load-bearing:
+    /// <list type="bullet">
+    /// <item><description>Parquet.Net's own <see cref="TimeDataField"/>, which it materializes when — and
+    /// ONLY when — the footer carries <c>LogicalType.TIME</c>.</description></item>
+    /// <item><description><c>LogicalType.TIME</c> read straight off the footer's
+    /// <c>SchemaElement</c>, so a Parquet.Net that stops specializing the field (or a TIME shape it does not
+    /// specialize) is still caught.</description></item>
+    /// <item><description>The LEGACY <c>ConvertedType</c>-only encoding (<c>TIME_MILLIS</c>/
+    /// <c>TIME_MICROS</c>, no <c>LogicalType</c> at all) that parquet-mr ≤1.10, Hive, Impala and older Spark
+    /// emit — and that is trivially forgeable. Parquet.Net 6.1 surfaces THOSE as a PLAIN
+    /// <see cref="DataField"/> whose <c>ClrType</c> is a raw <see cref="int"/>/<see cref="long"/>, so a
+    /// <see cref="TimeDataField"/> test alone lets a whole class of real-world TIME columns through and reads
+    /// their sub-day units as int/bigint.</description></item>
+    /// </list>
+    /// <para><c>DataField.SchemaElement</c> is <see langword="null"/> on a field this process CONSTRUCTED (it
+    /// is populated only for a field read back from a real footer), hence the null-conditional access.</para>
+    /// </summary>
+    internal static bool IsTimeColumn(DataField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return field is TimeDataField
+            || field.SchemaElement?.LogicalType?.TIME is not null
+            || field.SchemaElement?.ConvertedType is global::Parquet.Meta.ConvertedType.TIME_MILLIS
+                or global::Parquet.Meta.ConvertedType.TIME_MICROS;
+    }
+
+    /// <summary>Names the TIME unit a footer field encodes, drawn from whichever annotation carries it. The
+    /// legacy <c>ConvertedType</c> vocabulary has no NANOS member, so a ConvertedType-only column is always
+    /// millis or micros.</summary>
+    private static string DescribeTimeEncoding(DataField field)
+    {
+        if (field is TimeDataField time)
+        {
+            return time.Precision switch
+            {
+                TimeUnitPrecision.Millis => "TIME_MILLIS",
+                TimeUnitPrecision.Micros => "TIME_MICROS",
+                _ => "TIME_NANOS",
+            };
+        }
+
+        global::Parquet.Meta.TimeType? logical = field.SchemaElement?.LogicalType?.TIME;
+        if (logical is not null)
+        {
+            return logical.Unit?.MILLIS is not null ? "TIME_MILLIS"
+                : logical.Unit?.MICROS is not null ? "TIME_MICROS"
+                : "TIME_NANOS";
+        }
+
+        return field.SchemaElement?.ConvertedType == global::Parquet.Meta.ConvertedType.TIME_MILLIS
+            ? "TIME_MILLIS"
+            : "TIME_MICROS";
     }
 
     /// <summary>

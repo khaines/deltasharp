@@ -188,6 +188,35 @@ public sealed class ParquetMessageHygieneTests
         AssertFullyNeutralized(error.Message);
     }
 
+    [Theory]
+    [InlineData(global::Parquet.Schema.TimeUnitPrecision.Millis, "TIME_MILLIS", "int")]
+    [InlineData(global::Parquet.Schema.TimeUnitPrecision.Micros, "TIME_MICROS", "bigint")]
+    [InlineData(global::Parquet.Schema.TimeUnitPrecision.Nanos, "TIME_NANOS", "bigint")]
+    public async Task ValidateFileField_TimeColumn_NamesTheAnnotation_NotASelfContradictoryClrName(
+        global::Parquet.Schema.TimeUnitPrecision precision, string annotation, string requestedTypeName)
+    {
+        // #832 diagnosability pin, TIME edition. A TIME column's ClrType is a bare Int32/Int64, so describing
+        // the rejection by CLR type produced the self-contradictory "file physical type 'Int64' … cannot be
+        // read as 'bigint'" — the operator sees the file type and the requested type as the SAME thing and has
+        // no way to learn the column is a time-of-day. The message must name the TIME ANNOTATION instead, so
+        // the fix ("this column has no DeltaSharp equivalent; cast it upstream") is legible from the message
+        // alone. Pinned here so the rendering cannot silently degrade back to a CLR name.
+        byte[] file = await ParquetTestHelpers.WriteTimeColumnAsync("t", precision);
+        DataType requested = requestedTypeName == "int" ? DataTypes.IntegerType : DataTypes.LongType;
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadAsync(file, new StructType(new[] { new StructField("t", requested, nullable: true) })));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains($"Parquet TIME column ({annotation})", error.Message, StringComparison.Ordinal);
+        Assert.Contains($"cannot be read as '{requestedTypeName}'", error.Message, StringComparison.Ordinal);
+
+        // The bare CLR names are exactly the self-contradictory rendering this replaced.
+        Assert.DoesNotContain("Int32", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("Int64", error.Message, StringComparison.Ordinal);
+        AssertFullyNeutralized(error.Message);
+    }
+
     // ---- #683 item 7: NestedParquetColumnReader.ReadAsync entry-point sanitize ----
 
     [Fact]
