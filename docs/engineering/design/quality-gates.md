@@ -557,10 +557,20 @@ newly-added, worktree-deleted, committed-deletion, `.gitignore`-hidden, ignored-
 manifest-lag, duplicated-manifest-entry, missing-manifest, empty-manifest,
 `--skip-worktree`-deletion, deliberately-pre-staged, staged-removal, diff-byte-limit,
 unicode/spaced-path, fence-breakout, `::workflow-command`-injection and line-terminator-injection
-(CR/NEL/LS/PS in both a path and lock-file content) cases. The injection and fence cases assert
-against the stream *split the way a line reader would split it*, not merely on LF, so an escape
-dropped from any sink turns the suite red. It needs only `git` — no SDK, no network. CI runs it
-**before** the real check.
+(CR/VT/FF/ESC/C0/DEL/NEL/LS/PS in both a manifest entry and lock-file content) cases.
+
+The escaping is pinned **per sink and per rule**. The injection and fence cases assert against
+the streams *split the way a line reader would split them*, not merely on LF, and they check
+every class individually — each of CR, VT, FF, ESC, NEL, LS, PS and the C0/DEL catch-all is
+asserted both by its escaped form (`\r`, `\v`, `\f`, `\e`, `\u0085`, `\u2028`, `\u2029`, `?`)
+and by the absence of the raw byte from stdout *and* the step summary. Dropping a single sed rule
+from `escape_untrusted`, or dropping the filter from any one sink, therefore turns the suite red.
+The fence oracle is structural rather than a parity count: it walks the rendered lines toggling on
+the guard's own five-backtick delimiter and fails if the walk ends inside a fence *or* if a
+payload sentinel ever reaches column 0 outside one — so an **even** number of smuggled fences is
+caught too.
+
+The suite needs only `git` — no SDK, no network — and CI runs it **before** the real check.
 
 ### Job posture and promotion
 

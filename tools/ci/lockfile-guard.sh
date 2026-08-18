@@ -484,6 +484,59 @@ st_assert_no_forged_command() {
   st_pass "$name"
 }
 
+# Raw control bytes must reach NEITHER sink: `escape_untrusted` carries one sed
+# rule per class, so every class is asserted individually — dropping any single
+# rule (CR, VT, FF, ESC, or the C0/DEL catch-all) turns this red.
+st_assert_no_raw_control() {
+  local d="$1" name="$2" f byte label leaked=''
+  for f in stdout.txt summary.md; do
+    [ -f "$d/$f" ] || continue
+    while IFS='|' read -r byte label; do
+      [ -n "$byte" ] || continue
+      if LC_ALL=C grep -qF -- "$(printf '%b' "$byte")" "$d/$f"; then
+        leaked="${leaked} ${label}(${f})"
+      fi
+    done <<'BYTES'
+\r|CR
+\013|VT
+\014|FF
+\033|ESC
+\001|SOH
+\177|DEL
+BYTES
+  done
+  if [ -z "$leaked" ]; then
+    st_pass "$name"
+  else
+    st_fail "${name}: raw control bytes survived:${leaked}"
+  fi
+}
+
+# STRUCTURAL fence oracle. Everything the guard prints from untrusted input
+# lives strictly INSIDE a five-backtick block, so walking the rendered lines the
+# way a markdown reader would — toggling on each line that is exactly the
+# guard's own delimiter — must end balanced AND must never see a payload
+# sentinel at column 0 while outside a fence. A parity count would not do: an
+# EVEN number of smuggled fences also breaks out. Only the exact 5-backtick
+# delimiter toggles, so the ```bash remediation block does not confuse the walk.
+st_assert_fence_structure() {
+  local d="$1" file="$2" name="$3" sentinels="$4" verdict
+  verdict="$(st_split_lines "$d/$file" |
+    LC_ALL=C awk -v fence="$FENCE" -v sentinels="$sentinels" '
+      $0 == fence { inside = !inside; fences++; next }
+      !inside && $0 ~ ("^(" sentinels ")") { leak = leak " | " $0 }
+      END {
+        if (fences == 0) { print "no fenced block was emitted at all"; exit }
+        if (inside) { print "the rendering ends INSIDE a code fence"; exit }
+        if (leak != "") print "untrusted content reached column 0 outside a fence:" leak
+      }')"
+  if [ -z "$verdict" ]; then
+    st_pass "$name"
+  else
+    st_fail "${name}: ${verdict} (${file})"
+  fi
+}
+
 # The guard is read-only: it must never leave the index (or a file's tracked
 # state) different from how it found it.
 st_assert_index_clean() {
@@ -533,9 +586,21 @@ st_case_untracked() {
   assert_exit 1 "$rc" 'new untracked lock file fails'
   assert_contains "$d/summary.md" 'src/New/packages.lock.json' 'new lock file is listed'
   assert_contains "$d/summary.md" '+{"version": 1' 'new lock file renders as an addition (diff --no-index)'
+  # The `--no-index` render must honour the mode it is given: the stat section
+  # is a stat, not a second copy of the patch.
+  local stat_block
+  stat_block="$(awk '/^### Diff stat/ { in_stat = 1; next } /^### / { in_stat = 0 } in_stat' "$d/summary.md")"
+  case "$stat_block" in
+    *'1 file changed'*) st_pass 'the untracked file contributes a diff STAT line' ;;
+    *) st_fail "the untracked file produced no diff stat: ${stat_block}" ;;
+  esac
+  case "$stat_block" in
+    *'@@'*) st_fail 'the diff-stat section contains patch hunks (mode was ignored)' ;;
+    *) st_pass 'the diff-stat section carries no patch hunk' ;;
+  esac
   # `git diff-index --cached HEAD`, not `git diff --cached`: the latter does not
-  # list intent-to-add entries, so it would pass even if the guard had left one
-  # behind.
+  # list intent-to-add entries, so this would pass even if a future change
+  # reintroduced an index write and left a marker behind.
   st_assert_index_clean "$d" 'rendering an untracked lock file leaves the index untouched'
   if git -C "$d" status --porcelain -- 'src/New/packages.lock.json' | grep -q '^??'; then
     st_pass 'the new lock file is still untracked afterwards'
@@ -545,15 +610,16 @@ st_case_untracked() {
 }
 
 # A developer who follows the guard's own remediation (`git add -- <pathspec>`)
-# must not have that work unstaged by the next run: the cleanup may only undo
-# the markers the guard itself created.
+# must not have that work disturbed by the next run. The guard never writes the
+# index or the working tree, so there is nothing to undo — this pins that.
 st_case_prestaged_survives() {
   local d="$SELFTEST_ROOT/prestaged"
   local staged='{"version": 1, "dependencies": {"net10.0": {"deliberately": "staged"}}}'
   st_make_repo "$d"
   printf '%s\n' "$staged" >"$d/src/Proj/packages.lock.json"
   git -C "$d" add -- 'src/Proj/packages.lock.json'
-  # A second, untracked lock file so the guard also intent-to-adds something.
+  # A second, untracked lock file: the guard renders it with `git diff
+  # --no-index`, so it must end up staging nothing of its own.
   mkdir -p "$d/src/New"
   printf '{"version": 1, "dependencies": {}}\n' >"$d/src/New/packages.lock.json"
   local rc
@@ -687,22 +753,18 @@ st_case_unicode_path() {
 st_case_fence_breakout() {
   local d="$SELFTEST_ROOT/fence-breakout"
   st_make_repo "$d"
-  printf '```\n## injected heading\n{"version": 1}\n' >"$d/src/Proj/packages.lock.json"
+  printf '```\n## INJHEADING\n{"version": 1}\n' >"$d/src/Proj/packages.lock.json"
   git -C "$d" commit -qam 'lock file whose content contains a markdown fence'
   # After this edit the ``` line is UNCHANGED, so it reaches the summary as diff
   # context (" ```"), while the five-backtick line arrives as an addition.
-  printf '```\n## injected heading\n{"version": 2}\n`````\n' >"$d/src/Proj/packages.lock.json"
-  local rc fences
+  printf '```\n## INJHEADING\n{"version": 2}\n`````\n' >"$d/src/Proj/packages.lock.json"
+  local rc
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'lock file containing a markdown fence fails'
   assert_contains "$d/summary.md" "'''" 'leading backtick run is neutralized in the summary'
-  # Split the summary the way a markdown renderer would, not just on LF.
-  fences="$(st_split_lines "$d/summary.md" | grep -c '^`\{5,\}$' || true)"
-  if [ "$((fences % 2))" -eq 0 ] && [ "$fences" -gt 0 ]; then
-    st_pass "code fences stay balanced (${fences} fence lines)"
-  else
-    st_fail "code fences unbalanced (${fences} fence lines) — content escaped its block"
-  fi
+  st_assert_fence_structure "$d" summary.md \
+    'a markdown fence in lock-file content cannot escape its block' \
+    '::error::|#*[[:space:]]*INJHEADING'
 }
 
 st_case_remediation_pathspec() {
@@ -787,32 +849,48 @@ st_case_workflow_command_injection() {
 st_case_line_terminator_injection() {
   local d="$SELFTEST_ROOT/line-terminators"
   st_make_repo "$d"
-  # Manifest entry (the `missing` branch): CR before a forged command.
-  printf 'src/Proj/packages.lock.json\nbenign\r`````\r::error::pwned/packages.lock.json\n' \
+  # Manifest entry (the `missing` branch, rendered through emit_block and
+  # printed to stderr): TWO terminator + five-backtick runs, so an EVEN number
+  # of fences is smuggled in — a parity count would not notice — plus one
+  # forged `::error::` behind each escape class.
+  # shellcheck disable=SC2016 # backticks are payload data, not a substitution
+  printf 'src/Proj/packages.lock.json\nbenign\r`````\rINJHEADING::error::cr\013`````\014::error::ff\033::error::esc\001::error::soh\177::error::del/packages.lock.json\n' \
     >"$d/tools/ci/expected-lockfiles.txt"
-  # Lock-file CONTENT (the diff branch): every terminator, then a fence and a
-  # forged command that must NOT end up at the start of a rendered line.
+  # Lock-file CONTENT (the diff-patch sink): the same classes, each immediately
+  # before a forged command, plus fence runs behind a terminator.
   printf '{"v": 1}\n' >"$d/src/Proj/packages.lock.json"
   git -C "$d" commit -qam 'hostile manifest entry'
-  printf '{"v": 2, "x": "A\r`````\n## heading\rB\302\205::error::nel\342\200\250::error::ls\342\200\251::error::ps"}\n' \
+  # shellcheck disable=SC2016 # backticks are payload data, not a substitution
+  printf '{"v": 2, "x": "A\r`````\n## INJHEADING\rB\302\205::error::nel\342\200\250::error::ls\342\200\251::error::ps\013::error::vt\014::error::ff\033::error::esc\001::error::soh\177::error::del\r`````\rINJHEADING::error::tail"}\n' \
     >"$d/src/Proj/packages.lock.json"
-  local rc fences
+  local rc
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'hostile manifest entry and lock-file content fail'
   st_assert_no_forged_command "$d" 'no line terminator can forge a ::workflow-command (either stream)'
-  assert_contains "$d/stdout.txt" 'benign\r`````\r::error::pwned/packages.lock.json' 'CR in a manifest entry renders as a literal \\r'
-  # The same entry reaches the SUMMARY through emit_block, whose escape runs
-  # before the fence sanitizer: a CR there could otherwise smuggle a fence out.
-  assert_contains "$d/summary.md" 'benign\r' 'CR in a manifest entry is escaped in the summary too'
-  assert_contains "$d/summary.md" '\u0085' 'NEL in lock-file content renders as a literal \\u0085'
-  assert_contains "$d/summary.md" '\u2028' 'LS in lock-file content renders as a literal \\u2028'
-  # A CR inside content must not end a line, so it cannot smuggle a fence out.
-  fences="$(st_split_lines "$d/summary.md" | grep -c '^`\{5,\}$' || true)"
-  if [ "$((fences % 2))" -eq 0 ] && [ "$fences" -gt 0 ]; then
-    st_pass "code fences stay balanced under CR/NEL/LS splitting (${fences} fence lines)"
-  else
-    st_fail "code fences unbalanced (${fences}) — content escaped its block"
-  fi
+  # Per-class, per-sink: the escaped form must be present and the raw byte gone.
+  # stdout carries the manifest entry, the summary carries both it and the diff.
+  assert_contains "$d/stdout.txt" 'benign\r`````\r' 'CR in a manifest entry renders as a literal \\r (stdout)'
+  assert_contains "$d/stdout.txt" '\v`````\f::error::ff' 'VT and FF in a manifest entry render as \\v and \\f (stdout)'
+  assert_contains "$d/stdout.txt" '\e::error::esc' 'ESC in a manifest entry renders as \\e (stdout)'
+  assert_contains "$d/stdout.txt" '?::error::soh' 'SOH in a manifest entry is caught by the C0 rule (stdout)'
+  assert_contains "$d/stdout.txt" '?::error::del' 'DEL in a manifest entry is caught by the C0 rule (stdout)'
+  # The manifest entry also reaches the SUMMARY through emit_block, whose escape
+  # runs before the fence sanitizer: a terminator there could otherwise smuggle
+  # a fence out of the block.
+  assert_contains "$d/summary.md" 'benign\r`````\r' 'CR in a manifest entry is escaped in the summary too'
+  assert_contains "$d/summary.md" '\u0085::error::nel' 'NEL in lock-file content renders as a literal \\u0085'
+  assert_contains "$d/summary.md" '\u2028::error::ls' 'LS in lock-file content renders as a literal \\u2028'
+  assert_contains "$d/summary.md" '\u2029::error::ps' 'PS in lock-file content renders as a literal \\u2029'
+  assert_contains "$d/summary.md" '\v::error::vt' 'VT in lock-file content renders as a literal \\v'
+  assert_contains "$d/summary.md" '\f::error::ff' 'FF in lock-file content renders as a literal \\f'
+  assert_contains "$d/summary.md" '\e::error::esc' 'ESC in lock-file content renders as a literal \\e'
+  assert_contains "$d/summary.md" '?::error::soh' 'SOH in lock-file content is caught by the C0 rule'
+  assert_contains "$d/summary.md" '?::error::del' 'DEL in lock-file content is caught by the C0 rule'
+  st_assert_no_raw_control "$d" 'no raw control byte survives into either sink'
+  st_assert_fence_structure "$d" summary.md \
+    'neither an odd nor an even fence smuggle breaks the summary block' \
+    '::error::|#*[[:space:]]*INJHEADING'
+  st_assert_index_clean "$d" 'a hostile manifest entry does not make the guard write the index'
 }
 
 st_case_missing_manifest() {
