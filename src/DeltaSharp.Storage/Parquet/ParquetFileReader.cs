@@ -463,6 +463,16 @@ internal sealed class ParquetFileReader
         var byPath = new Dictionary<PhysicalPathKey, DataField>();
         foreach (DataField dataField in schema.DataFields)
         {
+            // S-2: bound the decoded-side path materialization by the same depth cap as the footer walk,
+            // BEFORE allocating the key, so a hostile deeply-nested decoded schema can't amplify allocation
+            // outside the row-group decode-time budget.
+            if (dataField.Path.Length > MaxFooterFieldIdMapDepth)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"The Parquet file decodes a leaf column whose physical path depth exceeds the supported "
+                    + $"column-mapping id-mode limit of {MaxFooterFieldIdMapDepth}.");
+            }
+
             PhysicalPathKey pathKey = PhysicalPathKey.From(dataField.Path);
             if (!byPath.TryAdd(pathKey, dataField))
             {
@@ -475,10 +485,20 @@ internal sealed class ParquetFileReader
 
         var byFieldId = new Dictionary<int, DataField>();
         var fieldIdByPath = new Dictionary<PhysicalPathKey, int>();
+        // S-1: the footer walk (EnumerateFooterLeafPaths) and Parquet.Net's decode must agree exactly.
+        // EnumerateFooterLeafPaths already fails closed on an orphaned/truncated footer tree; here we hold a
+        // LIVE completeness cross-check — every footer leaf must correspond to a decoded leaf and the leaf sets
+        // must match one-to-one — so a footer↔decode divergence (e.g. a re-parented orphan whose synthesized
+        // path collides with a real top-level leaf) can never bind a field_id to the wrong physical column.
+        var footerLeafPaths = new HashSet<PhysicalPathKey>();
+        int footerLeafCount = 0;
         if (footer is not null)
         {
             foreach ((global::Parquet.Meta.SchemaElement schemaElement, PhysicalPathKey pathKey) in EnumerateFooterLeafPaths(footer))
             {
+                footerLeafCount++;
+                footerLeafPaths.Add(pathKey);
+
                 if (schemaElement.FieldId is not int fieldId)
                 {
                     continue;
@@ -516,6 +536,29 @@ internal sealed class ParquetFileReader
                         + "table must assign each column a unique field_id.");
                 }
             }
+
+            // S-1: enforce footer-walk ↔ decoder agreement as a checked invariant. The footer leaf set must
+            // equal the decoded leaf set one-to-one; otherwise the two walks diverged (e.g. a NumChildren
+            // under-count that Parquet.Net drops but the footer walk would otherwise re-parent) and a field_id
+            // could bind to the wrong physical column. Fail closed.
+            if (footerLeafCount != byPath.Count || footerLeafPaths.Count != byPath.Count)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    "The Parquet footer schema leaves do not correspond one-to-one with the decoded leaf "
+                    + "columns — a column-mapping id-mode table requires the footer schema tree and the "
+                    + "decoded schema to agree exactly.");
+            }
+
+            foreach (PhysicalPathKey decodedPath in byPath.Keys)
+            {
+                if (!footerLeafPaths.Contains(decodedPath))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        "The Parquet file decodes a leaf column with no corresponding footer schema leaf — a "
+                        + "column-mapping id-mode table requires the footer schema tree and the decoded schema "
+                        + "to agree exactly.");
+                }
+            }
         }
 
         return byFieldId;
@@ -541,6 +584,19 @@ internal sealed class ParquetFileReader
                 {
                     path.RemoveRange(completed.PathDepthBeforeElement, path.Count - completed.PathDepthBeforeElement);
                 }
+            }
+
+            // S-1: after the synthetic root (i == 0) pushes its frame, every later element MUST have an open
+            // parent frame. An empty stack here means the footer declared an element AFTER the root's children
+            // were exhausted (a NumChildren under-count) — Parquet.Net drops such orphans, so binding them
+            // would re-parent the orphan to the root and let its field_id collide with a real top-level leaf.
+            // Fail closed rather than shadow the decoder.
+            if (i > 0 && stack.Count == 0)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    "The Parquet footer schema declares an element after the root's children are exhausted "
+                    + "(a NumChildren under-count) — a column-mapping id-mode table requires a well-formed "
+                    + "footer schema tree.");
             }
 
             if (stack.Count > 0)
@@ -580,6 +636,19 @@ internal sealed class ParquetFileReader
             else
             {
                 stack.Push(new FooterPathFrame(childCount, pathDepthBeforeElement));
+            }
+        }
+
+        // S-1: exact-consumption invariant. A frame still carrying unconsumed children after the last footer
+        // element means the footer OVER-declared NumChildren (a truncated schema tree). Fail closed. Frames
+        // with all children consumed (RemainingChildren == 0) are simply unpopped tails and are fine.
+        while (stack.Count > 0)
+        {
+            if (stack.Pop().RemainingChildren != 0)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    "The Parquet footer schema tree is truncated (a NumChildren over-count) — a column-mapping "
+                    + "id-mode table requires a well-formed footer schema tree.");
             }
         }
     }
@@ -1501,7 +1570,7 @@ internal sealed class ParquetFileReader
             {
                 present = id is >= 0 and <= int.MaxValue
                     && byFieldId.TryGetValue((int)id, out field);
-                if (present && field!.Path.Length > 1)
+                if (present && (field!.Path.Length > 1 || field.IsArray))
                 {
                     throw DeltaStorageException.UnsupportedFeature(
                         $"Column '{DiagnosticText.Sanitize(name)}': its column-mapping field_id resolves to a nested physical "

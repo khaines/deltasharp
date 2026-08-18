@@ -233,6 +233,102 @@ public sealed class BuildFieldIdMapNestedTests
         Assert.Contains("nesting depth exceeds", error.Message, StringComparison.Ordinal);
     }
 
+    // S-1 (#829): a footer that UNDER-declares NumChildren makes Parquet.Net drop the trailing element, but
+    // the footer walk would otherwise re-parent that orphan to the root at a length-1 path — where its
+    // field_id could bind to a real top-level decoded leaf (silent cross-column mis-attribution). The walk
+    // must reject the orphan fail-closed. The decoded schema here matches what Parquet.Net actually decodes
+    // (top-level `t`, and `g/x`); the footer carries the extra orphaned `t` with field_id 77.
+    [Fact]
+    public void OrphanFooterElementAfterRootChildrenExhausted_FailsClosed()
+    {
+        var schema = new ParquetSchema(
+            new DataField<string>("t"),
+            new global::Parquet.Schema.StructField("g", new DataField<string>("x") { FieldId = 9 }));
+        var footer = new[]
+        {
+            new global::Parquet.Meta.SchemaElement { Name = "root", NumChildren = 2 },
+            new global::Parquet.Meta.SchemaElement { Name = "t" },
+            new global::Parquet.Meta.SchemaElement { Name = "g", NumChildren = 1 },
+            new global::Parquet.Meta.SchemaElement { Name = "x", FieldId = 9 },
+            new global::Parquet.Meta.SchemaElement { Name = "t", FieldId = 77 },
+        };
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.BuildFieldIdMap(schema, footer));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("after the root's children are exhausted", error.Message, StringComparison.Ordinal);
+    }
+
+    // S-1 (#829): a footer that OVER-declares NumChildren (a truncated schema tree) must fail closed at the
+    // exact-consumption check rather than silently under-yielding leaves.
+    [Fact]
+    public void TruncatedFooterOverDeclaredNumChildren_FailsClosed()
+    {
+        var schema = new ParquetSchema(new DataField<string>("leaf"));
+        var footer = new[]
+        {
+            new global::Parquet.Meta.SchemaElement { Name = "root", NumChildren = 3 },
+            new global::Parquet.Meta.SchemaElement { Name = "leaf", FieldId = 1 },
+        };
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.BuildFieldIdMap(schema, footer));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("truncated", error.Message, StringComparison.Ordinal);
+    }
+
+    // S-1 (#829): the live completeness cross-check — a footer with MORE leaves than the decoded schema (the
+    // footer↔decoder disagree, e.g. a leaf Parquet.Net could not decode) fails closed one-to-one.
+    [Fact]
+    public void FooterLeafCountExceedsDecodedLeaves_FailsClosed()
+    {
+        var schema = new ParquetSchema(new DataField<string>("a"));
+        var footer = new[]
+        {
+            new global::Parquet.Meta.SchemaElement { Name = "root", NumChildren = 2 },
+            new global::Parquet.Meta.SchemaElement { Name = "a", FieldId = 1 },
+            new global::Parquet.Meta.SchemaElement { Name = "b" },
+        };
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetFileReader.BuildFieldIdMap(schema, footer));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("do not correspond one-to-one", error.Message, StringComparison.Ordinal);
+    }
+
+    // S-1 (#829): a well-formed footer at EXACTLY the depth cap (100 physical path components) is accepted —
+    // guards the depth-cap boundary against an off-by-one that would tighten it to 99.
+    [Fact]
+    public void FooterPathAtDepthLimit_IsAccepted()
+    {
+        var footer = new List<global::Parquet.Meta.SchemaElement>
+        {
+            new() { Name = "root", NumChildren = 1 },
+        };
+        for (int i = 0; i < 99; i++)
+        {
+            footer.Add(new global::Parquet.Meta.SchemaElement { Name = "g" + i, NumChildren = 1 });
+        }
+
+        footer.Add(new global::Parquet.Meta.SchemaElement { Name = "leaf", FieldId = 1 });
+
+        // Decoded schema: a single leaf whose physical path is g0/g1/.../g98/leaf (100 components).
+        global::Parquet.Schema.Field leaf = new DataField<string>("leaf") { FieldId = 1 };
+        for (int i = 98; i >= 0; i--)
+        {
+            leaf = new global::Parquet.Schema.StructField("g" + i, leaf);
+        }
+
+        var schema = new ParquetSchema(leaf);
+
+        IReadOnlyDictionary<int, DataField> map = ParquetFileReader.BuildFieldIdMap(schema, footer);
+
+        Assert.True(map.ContainsKey(1));
+    }
+
     [Fact]
     public async Task FlatSchema_FieldIdMappingPreservesExistingNameParity()
     {
