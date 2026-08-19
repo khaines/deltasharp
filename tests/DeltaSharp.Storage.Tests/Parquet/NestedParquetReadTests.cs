@@ -1439,8 +1439,8 @@ public sealed class NestedParquetReadTests
     [Fact]
     public async Task Nested_UnderIdMode_FailsClosed_UnsupportedFeature()
     {
-        // A2: a nested column under column-mapping id mode is not supported (BuildFieldIdMap is flat/leaf-only).
-        // Without the guard, the nested column would silently resolve BY NAME under id mode — a wrong read.
+        // A2: nested column container binding under column-mapping id mode is not supported yet. The reader
+        // fails closed before any nested id-mode resolution until an end-to-end container contract lands.
         byte[] bytes = await WriteAsync(new List<ListRow> { new() { Id = 1, Arr = new List<int?> { 1, 2 } } });
         var requested = new StructType(new[]
         {
