@@ -1,6 +1,6 @@
 # Nested Parquet write (§2.9) — single-level `struct` / `array` / `map` of scalars
 
-> **Status:** Draft (v4 — 6.1.0-viable; council rounds 2-3 findings folded in; all seats 4/5→PASS pending)
+> **Status:** Draft (v5 — 6.1.0-viable; council rounds 2-4 findings folded in; **unanimous 5/5 + red-team NO-MISS**)
 > **Issue:** [#828](https://github.com/khaines/deltasharp/issues/828) — feat(storage): nested Parquet write (§2.9)
 > **Author:** design (spike-informed; 6.1.0 + RFL-round-2 revision)
 > **Reviewers:** delta-storage-format-engineer, dotnet-vectorized-columnar-compute-engineer, dotnet-framework-runtime-engineer, reliability-test-chaos-engineer, cloud-native-security-sme
@@ -214,15 +214,21 @@ decoder uses, not its own belief (N4-c):
 - **A4:** map any raw Parquet.Net writer fault escaping `WriteAllPartsAsync` (e.g. the library's own
   cross-leaf row-count `InvalidOperationException`) to the typed `CorruptData` contract (§2.8's wrapping scope
   extends to the write call, not only `ColumnVector` interactions).
-- **Provenance (N4-c/A2):** the guard reads `field.MaxDefinitionLevel`/`MaxRepetitionLevel` off the
-  **schema-attached** instance (they read 0 until the field is attached to a `ParquetSchema`; the ctor and
+- **Provenance (N4-c/A2/Security-note-1):** the guard reads `field.MaxDefinitionLevel`/`MaxRepetitionLevel` off
+  the **schema-attached** instance (they read 0 until the field is attached to a `ParquetSchema`; the ctor and
   `GetDataFields()` propagate them), and asserts `maxDef ≥ 1` for every nested leaf (always true in-scope) so a
-  detached-field mis-derivation cannot silently degrade the bounds.
+  detached-field mis-derivation cannot silently degrade the bounds. Likewise `containerMaxDef` /
+  `emptyContainerDef` are derived normatively as `field.MaxDefinitionLevel − (field.IsNullable ? 1 : 0)` off the
+  same schema-attached instance (= 2 / 1 for every in-scope repeated leaf) — never hand-computed, so a low
+  mis-derivation cannot silently re-open the empty-list phantom the run-legality clause exists to reject.
 
 ### 2.4 `CreateField` + recursive `ToDataSchema` + its consumers (Security F1/N1/N2/N3, Architect A3)
 `CreateField` builds the nested `Field` recursively (reusing scalar leaf builders → #730/decimal/temporal
 inherited), rejecting a nested child fail-closed (→#585) and a **zero-field struct** fail-closed
-(`UnsupportedFeature`; Parquet.Net throws a raw `ArgumentException` otherwise — NEW-5).
+(`UnsupportedFeature`). **Wrap raw Parquet.Net `Field`-construction faults too** (Security note 4): `MapField`'s
+ctor throws a raw `ArgumentException("map's key cannot be nullable")` and a zero-field `StructField` throws
+`ArgumentException` (NEW-5) — `CreateField` maps both to the typed `UnsupportedFeature`/`CorruptData` contract so
+no raw library exception escapes (A4's wrapping scope extends to `Field` construction, not only the write call).
 
 **`ToDataSchema` must become recursive** (over `ParquetSchema.Fields`, the inverse of `CreateField`) — today it
 flattens `DataFields` by leaf name, so a nested write fails `#497`'s `ValidateStagedWriteSchema` and two
@@ -367,7 +373,8 @@ residual named. **Matrix (Quality H1 — complete):**
   accepts (the recursive-`ToDataSchema` regression cell for the duplicate-leaf-name hazard).
 - **Level-guard fault injection (§2.3c — Quality Q-1 / Security):** `NestedLevelGuardTests`, one negative cell
   per §2.3c clause each asserting `CorruptData` **before `CreateAsync`** — `def.Length != rep.Length`;
-  `def[i] > maxDef` **and** a **negative** `def[i]`/`rep[i]` (the `∈ [0,·]` lower bound); values **over-** and
+  `def[i] > maxDef` and `rep[i] > maxRep` (`rep==2` where `maxRep==1`) **and** a **negative** `def[i]`/`rep[i]`
+  (the `∈ [0,·]` lower bound); values **over-** and
   **under-**supply (the over-supply case is caught by **no** other oracle — levels are correct and the file
   round-trips — so the guard is its only detector; a shredder sizing from `Elements.Length` on a mutable vector
   produces exactly this, B-5); `count(rep==0) != row count`; `rep[0] != 0`; the `rep==null` struct lane
@@ -403,7 +410,7 @@ stamping is **not** exercised (§2.5).
 ### 3.3 Write-door & footer shape (#497 / #713)
 `ReadDataSchemaAsync` on each emitted file returns the **declared logical shape** (recursive `ToDataSchema`);
 `ValidateStagedWriteSchema` accepts a nested write (the recursive nullability/metadata-insensitive comparator,
-§2.4); the post-write footer `NumRows == WriteResult.RowCount` reconciliation holds on **every** write path
+§2.4); the post-write footer `NumRows == Σ batch.LogicalRowCount` reconciliation holds on **every** write path
 (§2.4b). Footer structure per shape; map key `REQUIRED`; per-leaf `#730` repetition. A **foreign nested cdc
 footer** asserts (i) no footer-derived name reaches the CDF-EE-08 message (N1, via `DescribeType`) **and**
 (ii) the EE-08 accept/reject **acceptance set is invariant** before/after this PR (the `ToDataLeafSchema`
