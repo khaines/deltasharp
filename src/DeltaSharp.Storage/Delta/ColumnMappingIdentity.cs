@@ -20,10 +20,12 @@ internal readonly struct ColumnMappingIdentity
 {
     private readonly ColumnMappingMode _mode;
     private readonly ImmutableArray<string> _partitionColumns;
-    private readonly Dictionary<string, ColumnKey> _columns;
+    private readonly Dictionary<ColumnPathKey, ColumnKey> _columns;
 
     private ColumnMappingIdentity(
-        ColumnMappingMode mode, ImmutableArray<string> partitionColumns, Dictionary<string, ColumnKey> columns)
+        ColumnMappingMode mode,
+        ImmutableArray<string> partitionColumns,
+        Dictionary<ColumnPathKey, ColumnKey> columns)
     {
         _mode = mode;
         _partitionColumns = partitionColumns.IsDefault ? ImmutableArray<string>.Empty : partitionColumns;
@@ -32,9 +34,10 @@ internal readonly struct ColumnMappingIdentity
 
     /// <summary>
     /// Extracts the column-mapping identity from a <paramref name="metadata"/> action, keying each column by
-    /// its fully-qualified logical path (recursing into structs). CDF output is by logical schema, so keying
-    /// by logical path is correct: two versions "agree" on a column when the same logical column maps to the
-    /// same physical identity.
+    /// its structured logical path (an ordered segment sequence, recursing into direct structs). CDF output is
+    /// by logical schema, so keying by logical path is correct: two versions "agree" on a column when the same
+    /// logical column maps to the same physical identity. Structured segments make a literal top-level
+    /// <c>"a.b"</c> distinct from nested <c>a</c>→<c>b</c>, closing the old dotted-key collapse.
     /// </summary>
     /// <exception cref="SchemaValidationException">The <c>schemaString</c> is unparseable OR parses to a
     /// non-<see cref="StructType"/> top-level type (a Delta table schema is ALWAYS a struct, so either is a
@@ -47,7 +50,7 @@ internal readonly struct ColumnMappingIdentity
         // SchemaJson.FromJson; a schemaString that parses to a NON-struct DataType (e.g. a bare "long") is
         // likewise a forged/inconsistent log — fail closed rather than treat it as zero columns (which would
         // silently exempt the version from the per-column identity compare).
-        var columns = new Dictionary<string, ColumnKey>(StringComparer.Ordinal);
+        var columns = new Dictionary<ColumnPathKey, ColumnKey>();
         if (SchemaJson.FromJson(metadata.SchemaString) is not StructType schema)
         {
             throw new SchemaValidationException(
@@ -55,7 +58,7 @@ internal readonly struct ColumnMappingIdentity
                 + "schema must be a struct, so the log is inconsistent and the read fails closed.");
         }
 
-        Collect(schema, string.Empty, columns);
+        Collect(schema, ImmutableArray<string>.Empty, columns);
         return new ColumnMappingIdentity(
             ColumnMapping.ResolveMode(metadata.Configuration), metadata.PartitionColumns, columns);
     }
@@ -63,12 +66,15 @@ internal readonly struct ColumnMappingIdentity
     /// <summary>
     /// True if <paramref name="historical"/> is a legal (immutability-preserving) predecessor of THIS (end)
     /// identity: identical mode, identical partition-column set, and — for every column present in BOTH — an
-    /// identical (field id, physical name). A column present on only one side is permitted, because
-    /// legitimate schema evolution ADDS (or DROPS) columns; only a COMMON column whose identity changed is a
-    /// violation.
+    /// identical (field id, physical name). A column present on only one side is permitted, because legitimate
+    /// schema evolution ADDS (or DROPS) columns; only a COMMON column whose identity changed is a violation.
     /// <para>A logical rename (column-mapping) keeps id + physical name but changes the logical path, so it
     /// changes the key: it is neither falsely flagged (legal) nor able to mask a reassignment of a
     /// still-present logical column (that column stays keyed and is compared).</para>
+    /// <para>Alternate structured paths with the same dotted spelling (literal-dot vs nested) are unreachable
+    /// for mapped tables today because mapped complex columns are rejected upstream by
+    /// <c>ColumnMapping.EnsureLeaf</c> and <c>ColumnMappingProjection.ResolvePhysicalNames</c>. #676 must
+    /// preserve or extend that coverage before nested column mapping is enabled.</para>
     /// <para><b>Rename-equivalent residual (not a preventable mismap).</b> Dropping a logical column
     /// <c>victim(id=1, phys=col-A)</c> and adding a NEW logical column <c>attacker(id=1, phys=col-A)</c> that
     /// REUSES the dropped id/physical name is byte-identical, in the metadata, to a legal RENAME of
@@ -87,9 +93,10 @@ internal readonly struct ColumnMappingIdentity
             return false;
         }
 
-        foreach (KeyValuePair<string, ColumnKey> end in _columns)
+        foreach (KeyValuePair<ColumnPathKey, ColumnKey> end in _columns)
         {
-            if (historical._columns.TryGetValue(end.Key, out ColumnKey past) && past != end.Value)
+            bool hasExactPath = historical._columns.TryGetValue(end.Key, out ColumnKey past);
+            if (hasExactPath && past != end.Value)
             {
                 return false;
             }
@@ -98,30 +105,85 @@ internal readonly struct ColumnMappingIdentity
         return true;
     }
 
-    // Collects each logical column's (field id, physical name) keyed by its fully-qualified logical path.
-    // Recurses DIRECT struct fields only — structs nested inside array/map element types are NOT descended,
-    // matching this build's support surface (nested column mapping — incl. nested-in-array/map — is
-    // unsupported and rejected fail-closed upstream at create/commit and in the Parquet reader; tracked under
-    // #676). The dotted path key is not collision-proof against a forged literal-dot logical name (e.g. a
-    // top-level column literally named "a.b" vs a nested "a"→"b"), but that is not a reachable mismap here:
-    // an id-mode nested read already fails closed (flat/leaf-only), so no CDF read resolves through a nested
-    // path, and a legitimate table never carries such a name.
-    private static void Collect(StructType schema, string prefix, Dictionary<string, ColumnKey> into)
+    // Collects each logical column's (field id, physical name) keyed by a structured, segment-preserving
+    // logical path. That makes a literal top-level name such as "a.b" (one segment) distinct from nested
+    // a→b (two segments), so CDF compares identities across retained versions without a literal-dot collision.
+    //
+    // Recurses DIRECT StructField.DataType structs only. It intentionally does NOT descend through array
+    // element or map key/value structs today. Those nested StructFields do carry Delta column-mapping identity,
+    // but mapped complex types are currently rejected fail-closed upstream by ColumnMapping.EnsureLeaf and
+    // ColumnMappingProjection.ResolvePhysicalNames before CDF reads can rely on this gate. #676 MUST extend
+    // this collection to descend array element and map key/value structs before relaxing that upstream reject.
+    private static void Collect(
+        StructType schema,
+        ImmutableArray<string> prefix,
+        Dictionary<ColumnPathKey, ColumnKey> into)
     {
         foreach (StructField field in schema)
         {
-            string path = prefix.Length == 0 ? field.Name : prefix + "." + field.Name;
+            ImmutableArray<string> path = prefix.Add(field.Name);
             long? id = ColumnMapping.TryGetId(field, out long value) ? value : null;
             string? physicalName =
                 field.Metadata.TryGetString(ColumnMapping.PhysicalNameKey, out string? physical) && physical.Length > 0
                     ? physical
                     : null;
-            into[path] = new ColumnKey(id, physicalName);
+            var pathKey = new ColumnPathKey(path);
+            var columnKey = new ColumnKey(id, physicalName);
+            into[pathKey] = columnKey;
+
             if (field.DataType is StructType nested)
             {
                 Collect(nested, path, into);
             }
         }
+    }
+
+    // A collision-proof logical column path. ImmutableArray<T> does not provide sequence value equality, so
+    // this key compares and hashes the ordered path segments explicitly.
+    private readonly struct ColumnPathKey : IEquatable<ColumnPathKey>
+    {
+        private readonly ImmutableArray<string> _segments;
+
+        internal ColumnPathKey(ImmutableArray<string> segments)
+        {
+            _segments = segments.IsDefault ? ImmutableArray<string>.Empty : segments;
+        }
+
+        public bool Equals(ColumnPathKey other)
+        {
+            if (Length != other.Length)
+            {
+                return false;
+            }
+
+            for (int i = 0; i < Length; i++)
+            {
+                if (!string.Equals(_segments[i], other._segments[i], StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+
+            return true;
+        }
+
+        public override bool Equals(object? obj) => obj is ColumnPathKey other && Equals(other);
+
+        public override int GetHashCode()
+        {
+            var hash = new HashCode();
+            hash.Add(Length);
+            for (int i = 0; i < Length; i++)
+            {
+                string segment = _segments[i];
+                hash.Add(segment.Length);
+                hash.Add(StringComparer.Ordinal.GetHashCode(segment));
+            }
+
+            return hash.ToHashCode();
+        }
+
+        private int Length => _segments.IsDefault ? 0 : _segments.Length;
     }
 
     // A single column's column-mapping identity: its field id and physical name (either may be absent under
