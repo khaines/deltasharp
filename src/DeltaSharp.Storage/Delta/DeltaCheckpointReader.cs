@@ -248,7 +248,7 @@ internal static class DeltaCheckpointReader
 
         // Bounded-time decode (#716/#699/#647). A single corrupted byte (the terminal footer STOP flipped,
         // #699; the byte at index 5595 in the #716 minimized repro; a corrupt data-page header, #647) can
-        // drive Parquet.Net 6.0.3 into effectively UNBOUNDED work — inside ParquetReader.CreateAsync at
+        // drive Parquet.Net 6.1.0 into effectively UNBOUNDED work — inside ParquetReader.CreateAsync at
         // open, or inside the synchronous column/page decode — that IGNORES the CancellationToken. A hang is
         // not an exception, so the fail-closed catch inside DecodeBufferedAsync cannot intercept it. Race the
         // WHOLE open+decode against the per-part wall-clock budget via the CHECKPOINT door so a corrupt

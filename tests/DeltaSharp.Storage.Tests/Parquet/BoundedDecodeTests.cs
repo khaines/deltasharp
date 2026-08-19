@@ -15,7 +15,7 @@ namespace DeltaSharp.Storage.Tests;
 /// <summary>
 /// Unit + integration coverage for the shared <see cref="BoundedDecode"/> wall-clock decode policy and its
 /// wiring into the data-file door (design §5.4 C-DECODE — the bounded wall-clock decode ceiling;
-/// #647/#699/#716). Parquet.Net 6.0.3 can be driven by a single corrupted byte into unbounded,
+/// #647/#699/#716). Parquet.Net 6.1.0 can be driven by a single corrupted byte into unbounded,
 /// cancellation-ignoring work; the policy converts that non-termination into a deterministic, typed
 /// fail-closed exception within a bounded time, and bounds the residual of the abandoned work.
 /// </summary>

@@ -12,7 +12,7 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// <summary>
 /// Pinned deterministic regression for #647: an adversarial <c>cdc</c> input the CDF read-door fuzz strategy
 /// produces (<c>DELTASHARP_TEST_SEED=35</c>, byte-flip strategy, iteration 14 — a 951-byte cdc file with an
-/// intact footer whose decode Parquet.Net 6.0.3 drove into a non-terminating, cancellation-ignoring CPU loop)
+/// intact footer whose decode Parquet.Net 6.1.0 drove into a non-terminating, cancellation-ignoring CPU loop)
 /// must now fail closed with a typed <see cref="DeltaStorageException"/> WITHIN the bounded-decode budget,
 /// not hang (design §5.4 C-DECODE — the bounded wall-clock decode ceiling).
 /// <para>
@@ -73,7 +73,9 @@ public sealed class ChangeFeedCdcBoundedDecodeTests : IDisposable
         // accept a different 951-byte mutation if the (deterministic) build or replay drifted.
         Assert.Equal(951, mutated.Length);
         Assert.Equal(
-            "710de774791564a3bfe6fd12c93fe1ba7f3aed002188bf1f84da0a424d345f33",
+            // Re-derived under Parquet.Net 6.1.0 (#832): the library's own footer/page bytes shifted, so the
+            // fixture's exact bytes changed while its length and structure invariants above are unchanged.
+            "6f873b8a2dd0b8d1141d72b59ed8326b66f563557893ed3dd72d2d4dedfc4704",
             Sha256Hex(mutated));
 
         // Read the (unmutated) cdc data schema so we can decode the mutated file through the shared reader.

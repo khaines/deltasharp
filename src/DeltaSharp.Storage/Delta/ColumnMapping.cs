@@ -393,7 +393,7 @@ internal static class ColumnMapping
     /// (since #708 the NAME too, not only the value), so a slash/traversal/control character in either is
     /// neutralised at write time (the value is data, not committed metaData); the
     /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>
-    /// legality imposes nothing (Parquet.Net 6.0.3 round-trips ANY column name verbatim — empirically verified),
+    /// legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim — empirically verified),
     /// so the binding constraint on a physical name is uniformly the partition-directory path, not the
     /// footer. (Note: the length bound is on the RAW name; the ENCODED-length residual for an all-non-ASCII
     /// name is tracked under #806 — see <c>MaxPathSegmentNameBytes</c>.)</para>

@@ -236,7 +236,7 @@ internal sealed class ParquetFileWriter
     {
         // #730 backstop: this method's null-rejection flag and the Parquet field's REPETITION
         // (REQUIRED/OPTIONAL, chosen by ParquetTypeMapping.CreateField from the same
-        // StructField.Nullable) are two readings of ONE decision. Parquet.Net 6.0.3 does not
+        // StructField.Nullable) are two readings of ONE decision. Parquet.Net 6.1.0 does not
         // cross-check them: writing a null-bearing (nullable) value array into a field the footer
         // declares REQUIRED — or a non-null array into an OPTIONAL field — produces a structurally
         // corrupt file with NO exception. So take the flag from the DataField that is actually

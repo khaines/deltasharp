@@ -246,18 +246,24 @@ internal static class ParquetTypeMapping
         }
 
         // Message hygiene (#653): `field` is a Parquet FOOTER DataField read back from the file, so
-        // `field.Name` is attacker-authored on a foreign file and is not echoed; the bounded physical CLR
-        // type name (a Parquet.Net type vocabulary) is sufficient to diagnose the unsupported mapping.
+        // `field.Name` is attacker-authored on a foreign file and is not echoed; the bounded physical type
+        // description (a fixed Parquet vocabulary) is sufficient to diagnose the unsupported mapping.
         throw DeltaStorageException.UnsupportedFeature(
-            $"A Parquet footer column has physical CLR type '{field.ClrType.Name}', which has no "
-            + "supported DeltaSharp type mapping.");
+            $"A Parquet footer column has physical type '{DescribePhysical(field)}', which "
+            + "has no supported DeltaSharp type mapping.");
     }
 
     /// <summary>
     /// The non-throwing form of <see cref="ToDataType"/>: reconstructs the DeltaSharp <see cref="DataType"/> a
     /// footer <see cref="DataField"/> encodes, returning <see langword="false"/> (rather than throwing) when
     /// the physical type has no supported mapping. Used by the read path's type-widening promotion to probe a
-    /// file column's <b>physical</b> type without forcing an exception for an unmappable column.
+    /// file column's <b>physical</b> type without forcing an exception for an unmappable column, and by both
+    /// read doors as the fail-closed mappability gate.
+    /// <para>This method is <b>TOTAL</b>: it must answer for EVERY footer field a hostile or foreign file can
+    /// carry, and must never throw. It runs on the hot read path, so any escaping exception would be
+    /// unclassified — bypassing the <see cref="DeltaStorageException"/> handlers that implement the
+    /// fail-closed contract. An annotation DeltaSharp cannot represent (an out-of-range DECIMAL, a TIME of any
+    /// encoding) therefore returns <see langword="false"/> rather than propagating a validation failure.</para>
     /// </summary>
     public static bool TryToDataType(DataField field, [NotNullWhen(true)] out DataType? type)
     {
@@ -281,8 +287,35 @@ internal static class ParquetTypeMapping
                         : DataTypes.TimestampNtzType;
                 return true;
             case DecimalDataField decimalField:
+                // FAIL CLOSED on an out-of-range DECIMAL annotation rather than letting DecimalType's ctor
+                // throw. DeltaSharp caps precision at 38 (Spark parity), but a Parquet footer can legally
+                // declare more — Arrow's `decimal256` emits up to 76, and a hostile footer can declare
+                // anything at all. TryToDataType is on the HOT read path (ParquetFileReader.ValidateFileField
+                // calls it for every column of every file), so a raw SchemaValidationException here would
+                // escape ReadAsync UNCLASSIFIED, sailing past every `catch (DeltaStorageException)` in the
+                // read stack and past the fail-closed contract those handlers implement. Returning false
+                // instead routes it through the SAME unmappable-type rejection as any other unsupported
+                // physical type — a typed, fail-closed DeltaStorageException. This is what makes
+                // TryToDataType TOTAL: it must answer for EVERY footer field, never throw.
+                if (!IsRepresentableDecimal(decimalField))
+                {
+                    type = null;
+                    return false;
+                }
+
                 type = DataTypes.CreateDecimalType(decimalField.Precision, decimalField.Scale);
                 return true;
+        }
+
+        // TIME must FAIL CLOSED, across EVERY footer encoding of it (see IsTimeColumn). Checked AFTER the
+        // annotated subtypes (a TIME column is neither DATE/TIMESTAMP nor DECIMAL) and BEFORE the raw CLR
+        // switch below — which would otherwise reinterpret the sub-day units as IntegerType/LongType, a
+        // SILENT data corruption rather than an error. This preserves the fail-closed contract that held
+        // under Parquet.Net 6.0.3, where TIME surfaced as an unmapped TimeSpan.
+        if (IsTimeColumn(field))
+        {
+            type = null;
+            return false;
         }
 
         Type clr = field.ClrType;
@@ -294,10 +327,169 @@ internal static class ParquetTypeMapping
             : clr == typeof(long) ? DataTypes.LongType
             : clr == typeof(float) ? DataTypes.FloatType
             : clr == typeof(double) ? DataTypes.DoubleType
-            : clr == typeof(string) ? DataTypes.StringType
-            : clr == typeof(byte[]) ? DataTypes.BinaryType
+            : IsStringPhysicalClrType(clr) ? DataTypes.StringType
+            : IsBinaryPhysicalClrType(clr) ? DataTypes.BinaryType
             : null;
         return type is not null;
+    }
+
+    /// <summary>
+    /// Returns whether <paramref name="clr"/> is a Parquet.Net physical CLR shape for a UTF-8 string column.
+    /// Parquet.Net ≥6.1 normalizes every string <see cref="DataField"/> to <see cref="ReadOnlyMemory{T}"/> of
+    /// <see cref="char"/>; the <see cref="string"/> arm is a defensive shim for a downgraded/pinned older
+    /// Parquet.Net and is unreachable at the version this project pins. Both encode the same logical type.
+    /// </summary>
+    internal static bool IsStringPhysicalClrType(Type clr) =>
+        clr == typeof(string) || clr == typeof(ReadOnlyMemory<char>);
+
+    /// <summary>
+    /// Returns whether <paramref name="clr"/> is a Parquet.Net physical CLR shape for a binary column.
+    /// Parquet.Net ≥6.1 normalizes every binary <see cref="DataField"/> to <see cref="ReadOnlyMemory{T}"/> of
+    /// <see cref="byte"/>; the <see cref="byte"/>-array arm is a defensive shim for a downgraded/pinned older
+    /// Parquet.Net and is unreachable at the version this project pins. Both encode the same logical type.
+    /// </summary>
+    internal static bool IsBinaryPhysicalClrType(Type clr) =>
+        clr == typeof(byte[]) || clr == typeof(ReadOnlyMemory<byte>);
+
+    /// <summary>
+    /// Compares Parquet.Net footer physical CLR shapes, treating the pre-6.1 and 6.1 string/binary
+    /// representations as equivalent while leaving every other type exact-match and fail-closed. Takes the
+    /// two CLR types rather than the owning <see cref="DataField"/>s so a caller that only has a leaf's
+    /// physical type (the nested reader) can reuse the same equivalence.
+    /// </summary>
+    internal static bool PhysicalClrTypesMatch(Type file, Type requested) =>
+        file == requested
+        || (IsStringPhysicalClrType(file) && IsStringPhysicalClrType(requested))
+        || (IsBinaryPhysicalClrType(file) && IsBinaryPhysicalClrType(requested));
+
+    /// <summary>
+    /// Renders a Parquet.Net physical CLR type as an ACTIONABLE, bounded diagnostic token for an error
+    /// message. <see cref="Type.Name"/> alone regressed to the opaque, self-contradictory
+    /// <c>ReadOnlyMemory`1</c> under Parquet.Net 6.1 (which reports BOTH string and binary columns as a
+    /// <see cref="ReadOnlyMemory{T}"/>), so a reader could not tell a UTF-8 column from a BYTE_ARRAY one — or
+    /// from the type it actually asked for. Collapse both string shapes and both binary shapes onto the
+    /// PARQUET vocabulary instead, and fall back to the type name for everything else.
+    /// <para>Message-hygiene safe (#653): the output is drawn from a fixed vocabulary or from a Parquet.Net
+    /// type name — never from file-derived, attacker-authored text — and is inherently short.</para>
+    /// </summary>
+    internal static string DescribePhysicalClrType(Type clr)
+    {
+        ArgumentNullException.ThrowIfNull(clr);
+        return IsStringPhysicalClrType(clr) ? "string (BYTE_ARRAY/UTF8)"
+            : IsBinaryPhysicalClrType(clr) ? "binary (BYTE_ARRAY)"
+            : clr.Name;
+    }
+
+    /// <summary>
+    /// The ANNOTATION-AWARE form of <see cref="DescribePhysicalClrType(Type)"/>, for a message that describes
+    /// a whole footer <see cref="DataField"/> rather than a bare CLR type. A TIME column's CLR type is a raw
+    /// <see cref="int"/>/<see cref="long"/> and a DECIMAL column's is a bare <see cref="decimal"/>, so
+    /// describing either by CLR type alone produced a self-contradictory message — "physical type 'Int64'
+    /// does not match the requested engine type 'bigint'", or "physical type 'Decimal' … cannot be read as
+    /// 'decimal(10,2)'" — from which an operator could not see that the file column is a TIME, or WHICH
+    /// decimal shape the file actually declares. Name the annotation instead; everything else keeps the
+    /// CLR-shape rendering.
+    /// <para>Message-hygiene safe (#653): a fixed vocabulary plus, for DECIMAL, the footer's own two small
+    /// integers — never file-derived, attacker-authored TEXT.</para>
+    /// </summary>
+    internal static string DescribePhysical(DataField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        if (IsTimeColumn(field))
+        {
+            return $"Parquet TIME column ({DescribeTimeEncoding(field)})";
+        }
+
+        if (field is DecimalDataField decimalField)
+        {
+            // Name the footer's declared precision/scale, and — when they are the very reason the column was
+            // rejected — the supported range, so the message is ACTIONABLE. The cause clause is conditional
+            // because this method also renders MAPPABLE decimals: the CLR-shape gate in
+            // ParquetFileReader.ValidateFileField describes an in-range decimal column that was requested as
+            // some other engine type, and claiming "unsupported" there would be a lie.
+            string cause = IsRepresentableDecimal(decimalField)
+                ? string.Empty
+                : $" (unsupported: precision must be in [{DecimalType.MinPrecision}, "
+                    + $"{DecimalType.MaxPrecision}] and scale in [0, precision])";
+            return $"Parquet DECIMAL(precision {decimalField.Precision}, scale {decimalField.Scale}) "
+                + $"column{cause}";
+        }
+
+        return DescribePhysicalClrType(field.ClrType);
+    }
+
+    /// <summary>
+    /// Returns whether a footer DECIMAL annotation is within the range DeltaSharp's <see cref="DecimalType"/>
+    /// can represent. A Parquet footer may legally declare more than DeltaSharp's Spark-parity cap of 38
+    /// (Arrow's <c>decimal256</c> emits up to 76) and a hostile footer can declare anything at all, so this is
+    /// the single source of truth shared by the fail-closed check in <see cref="TryToDataType"/> and the
+    /// message rendered by <see cref="DescribePhysical(DataField)"/> — the two must never disagree about
+    /// whether a column is representable.
+    /// </summary>
+    private static bool IsRepresentableDecimal(DecimalDataField field) =>
+        field.Precision is >= DecimalType.MinPrecision and <= DecimalType.MaxPrecision
+        && field.Scale >= 0
+        && field.Scale <= field.Precision;
+
+    /// <summary>
+    /// Returns whether <paramref name="field"/> is a Parquet <b>TIME</b> (time-of-day) column under ANY of the
+    /// encodings a footer can carry. DeltaSharp has no time-of-day logical type, so every one of them must
+    /// fail closed:
+    /// <list type="bullet">
+    /// <item><description>Parquet.Net's own <see cref="TimeDataField"/>, which it materializes when — and
+    /// ONLY when — the footer carries <c>LogicalType.TIME</c>.</description></item>
+    /// <item><description><c>LogicalType.TIME</c> read straight off the footer's
+    /// <c>SchemaElement</c>. At the pinned Parquet.Net every well-formed logical TIME already specializes to
+    /// <see cref="TimeDataField"/>, so this arm is currently REDUNDANT with the first — it is forward-compat
+    /// defense, catching a future Parquet.Net that stops specializing the field, or a TIME shape it does not
+    /// specialize.</description></item>
+    /// <item><description>The LEGACY <c>ConvertedType</c>-only encoding (<c>TIME_MILLIS</c>/
+    /// <c>TIME_MICROS</c>, no <c>LogicalType</c> at all) that parquet-mr ≤1.10, Hive, Impala and older Spark
+    /// emit — and that is trivially forgeable. Parquet.Net 6.1 surfaces THOSE as a PLAIN
+    /// <see cref="DataField"/> whose <c>ClrType</c> is a raw <see cref="int"/>/<see cref="long"/>, so a
+    /// <see cref="TimeDataField"/> test alone lets a whole class of real-world TIME columns through and reads
+    /// their sub-day units as int/bigint.</description></item>
+    /// </list>
+    /// <para>The first and third arms are the ones exercised at the pinned Parquet.Net version; both are
+    /// mutation-pinned by tests, at the flat and nested read doors and at the schema door.</para>
+    /// <para><c>DataField.SchemaElement</c> is <see langword="null"/> on a field this process CONSTRUCTED (it
+    /// is populated only for a field read back from a real footer), hence the null-conditional access.</para>
+    /// </summary>
+    internal static bool IsTimeColumn(DataField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return field is TimeDataField
+            || field.SchemaElement?.LogicalType?.TIME is not null
+            || field.SchemaElement?.ConvertedType is global::Parquet.Meta.ConvertedType.TIME_MILLIS
+                or global::Parquet.Meta.ConvertedType.TIME_MICROS;
+    }
+
+    /// <summary>Names the TIME unit a footer field encodes, drawn from whichever annotation carries it. The
+    /// legacy <c>ConvertedType</c> vocabulary has no NANOS member, so a ConvertedType-only column is always
+    /// millis or micros.</summary>
+    private static string DescribeTimeEncoding(DataField field)
+    {
+        if (field is TimeDataField time)
+        {
+            return time.Precision switch
+            {
+                TimeUnitPrecision.Millis => "TIME_MILLIS",
+                TimeUnitPrecision.Micros => "TIME_MICROS",
+                _ => "TIME_NANOS",
+            };
+        }
+
+        global::Parquet.Meta.TimeType? logical = field.SchemaElement?.LogicalType?.TIME;
+        if (logical is not null)
+        {
+            return logical.Unit?.MILLIS is not null ? "TIME_MILLIS"
+                : logical.Unit?.MICROS is not null ? "TIME_MICROS"
+                : "TIME_NANOS";
+        }
+
+        return field.SchemaElement?.ConvertedType == global::Parquet.Meta.ConvertedType.TIME_MILLIS
+            ? "TIME_MILLIS"
+            : "TIME_MICROS";
     }
 
     /// <summary>

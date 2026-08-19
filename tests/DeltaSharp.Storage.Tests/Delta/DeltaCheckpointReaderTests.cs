@@ -1,7 +1,10 @@
 using System.Collections.Immutable;
+using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Types;
 using Xunit;
+using StructField = DeltaSharp.Types.StructField;
 
 namespace DeltaSharp.Storage.Tests.Delta;
 
@@ -25,6 +28,63 @@ public sealed class DeltaCheckpointReaderTests
     }
 
     [Fact]
+    public async Task Fixture_DuplicateMapKeys_CollapseByOrdinalContent()
+    {
+        // #832 fixture-semantics pin. Parquet.Net 6.1's untyped serializer wants ReadOnlyMemory<char> map
+        // keys, but ReadOnlyMemory<char> equality compares the (object, offset, length) triple — NOT the
+        // characters — so keying CheckpointFixture's builder maps by it would let two entries spelling the
+        // SAME key both survive, silently changing every authored map's cardinality. CheckpointFixture
+        // therefore accumulates under string + StringComparer.Ordinal and projects to ReadOnlyMemory only at
+        // the serializer boundary. Feed genuinely duplicate keys (distinct string instances, so reference
+        // equality cannot rescue the wrong implementation) and require last-write-wins collapse.
+        string duplicateYear = new("year".ToCharArray());
+        string duplicateEngine = new("ENGINE".ToCharArray());
+
+        byte[] parquet = await new CheckpointFixture()
+            .Add(
+                "part-a.parquet",
+                size: 100,
+                partitionValues: [("year", "2025"), (duplicateYear, "2026")],
+                tags: [("ENGINE", "spark"), (duplicateEngine, "deltasharp")])
+            .ToParquetAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+
+        Assert.Equal("2026", Assert.Single(add.PartitionValues).Value);
+        Assert.Equal("2026", add.PartitionValues["year"]);
+        Assert.Equal("deltasharp", Assert.Single(add.Tags).Value);
+        Assert.Equal("deltasharp", add.Tags["ENGINE"]);
+
+        // The reader materializes both maps into ordinal dictionaries of its own, so the assertions above
+        // would ALSO pass if the fixture had authored two physical entries — the reader would just collapse
+        // them. Assert on the AUTHORED cardinality instead, straight off the Parquet footer's per-leaf value
+        // counts, which is the only place the fixture's own dedup is observable and the only assertion a
+        // mutation dropping the ordinal accumulation cannot survive. (The columnar reader cannot serve here:
+        // it rejects a map nested inside a struct.)
+        Assert.Equal(1, await MapEntryCountAsync(parquet, "add", "partitionValues"));
+        Assert.Equal(1, await MapEntryCountAsync(parquet, "add", "tags"));
+    }
+
+    /// <summary>Counts the PHYSICAL key/value pairs the file holds for <paramref name="action"/>'s
+    /// <paramref name="mapColumn"/> map, read from the row groups' column-chunk metadata for the map's key
+    /// leaf — i.e. what the fixture actually WROTE, before any reader-side dictionary collapses it.</summary>
+    private static async Task<long> MapEntryCountAsync(byte[] parquet, string action, string mapColumn)
+    {
+        using var stream = new MemoryStream(parquet, writable: false);
+        global::Parquet.ParquetReader reader =
+            await global::Parquet.ParquetReader.CreateAsync(stream, null, false, default);
+        await using (reader.ConfigureAwait(false))
+        {
+            string[] path = [action, mapColumn, "key_value", "key"];
+            return reader.Metadata!.RowGroups
+                .SelectMany(group => group.Columns)
+                .Where(column => column.MetaData!.PathInSchema.SequenceEqual(path))
+                .Sum(column => column.MetaData!.NumValues);
+        }
+    }
+
+    [Fact]
     public async Task Reads_AllActionKinds_WithNestedMapsAndLists()
     {
         byte[] parquet = await new CheckpointFixture()
@@ -38,7 +98,7 @@ public sealed class DeltaCheckpointReaderTests
             .Add(
                 "part-a.parquet",
                 size: 100,
-                partitionValues: [("year", "2026"), ("month", null)],
+                partitionValues: [("year", "2026"), ("month", "08")],
                 stats: """{"numRecords":10,"minValues":{"id":1},"maxValues":{"id":9},"nullCount":{"id":0}}""",
                 modificationTime: 1717171717,
                 dataChange: false,
@@ -67,7 +127,7 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Equal(1717171717, add.ModificationTime); // decoded, not defaulted (guards the ?? 0L path)
         Assert.False(add.DataChange);                    // decoded, not defaulted (guards the ?? true path)
         Assert.Equal("2026", add.PartitionValues["year"]);
-        Assert.Null(add.PartitionValues["month"]); // explicit null partition value round-trips
+        Assert.Equal("08", add.PartitionValues["month"]);
         Assert.Equal("deltasharp", add.Tags["ENGINE"]);
         Assert.NotNull(add.Stats);
         Assert.Equal(10, add.Stats!.NumRecords);
@@ -83,6 +143,18 @@ public sealed class DeltaCheckpointReaderTests
         Assert.Equal("app-1", txn.AppId);
         Assert.Equal(7, txn.Version);
         Assert.Equal(999, txn.LastUpdated);
+    }
+
+    [Fact]
+    public async Task Reads_NullPartitionValue_FromLowLevelCheckpoint()
+    {
+        byte[] parquet = await CheckpointFixture.AddWithNullPartitionValueAsync();
+
+        IReadOnlyList<DeltaAction> actions = await DeltaCheckpointReader.ReadAsync(new MemoryStream(parquet), default);
+
+        AddFileAction add = Assert.Single(actions.OfType<AddFileAction>());
+        Assert.Equal("2026", add.PartitionValues["year"]);
+        Assert.Null(add.PartitionValues["month"]);
     }
 
     [Fact]
@@ -1006,7 +1078,7 @@ public sealed class DeltaCheckpointReaderTests
     public async Task PlaintextFooterEncryptedCheckpoint_EncryptedColumnMetaDataOmitted_IsUnsupportedFeature()
     {
         // FAILURE-path arm: the shape a genuine encryptor writes — the encrypted column's plaintext
-        // ColumnMetaData is absent (stored encrypted), which makes Parquet.Net 6.0.3 throw inside CreateAsync
+        // ColumnMetaData is absent (stored encrypted), which makes Parquet.Net 6.1.0 throw inside CreateAsync
         // before any parsed-metadata check can run. Only the footer probe can classify it.
         // RED-on-revert: dropping the checkpoint door's ClassifyUnreadableInput call sends this straight back
         // to DeltaProtocolException/MalformedAction.

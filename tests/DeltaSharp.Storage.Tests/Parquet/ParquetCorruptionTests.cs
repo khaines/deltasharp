@@ -502,7 +502,7 @@ public sealed class ParquetCorruptionTests
     // The Parquet fail-closed boundaries map every non-cancellation, non-typed library fault to CorruptData:
     // correct for genuine corruption, but it MIS-LABELS a VALID Parquet file the LIBRARY (not DeltaSharp)
     // refuses for using an unimplemented feature. The clearest such case is Parquet Modular Encryption: an
-    // encrypted-footer file is bracketed by the 'PARE' magic (vs plaintext 'PAR1'), which Parquet.Net 6.0.3
+    // encrypted-footer file is bracketed by the 'PARE' magic (vs plaintext 'PAR1'), which Parquet.Net 6.1.0
     // rejects at open as "not a parquet file, head: 50415245, tail: 50415245" — a message shape byte-for-byte
     // IDENTICAL to the one it emits for arbitrary garbage ("head: 74686973…"). So the reader peeks the file's
     // own leading MAGIC BYTES (never ex.Message) to reclassify only a 'PARE' head as an actionable
@@ -566,7 +566,7 @@ public sealed class ParquetCorruptionTests
     // and its footer parses cleanly, carrying encryption_algorithm (and/or per-column ColumnCryptoMetaData)
     // while the column chunks are encrypted. It therefore opens SUCCESSFULLY, so it is classified on the
     // OpenAsync SUCCESS path via IsPlaintextFooterEncrypted(reader.Metadata). Fixtures are synthesized by
-    // splicing the crypto Thrift fields into a normal file's footer (Parquet.Net 6.0.3 parses them but cannot
+    // splicing the crypto Thrift fields into a normal file's footer (Parquet.Net 6.1.0 parses them but cannot
     // decrypt) — no library upgrade required (#655).
 
     [Fact]
@@ -873,7 +873,7 @@ public sealed class ParquetCorruptionTests
     // ---- #655: the REALISTIC plaintext-footer shape (encrypted column OMITS plaintext ColumnMetaData) -----
     //
     // A real encrypting writer stores an encrypted column's ColumnMetaData ENCRYPTED, so the plaintext
-    // `meta_data` (Thrift field 3) is absent. Parquet.Net 6.0.3 dereferences it unguarded during
+    // `meta_data` (Thrift field 3) is absent. Parquet.Net 6.1.0 dereferences it unguarded during
     // CreateAsync's row-group-reader init, throwing an NRE BEFORE the success-path reader.Metadata check runs.
     // These files therefore reach the OpenAsync FAILURE path and are classified by the reflection-free footer
     // probe (which reads the file-level encryption_algorithm the format spec sets on every mode-b file). Prior
@@ -1135,10 +1135,10 @@ public sealed class ParquetCorruptionTests
         // footer) — and ReadDataSchemaAsync surfaces this typed UnsupportedFeature UNWRAPPED through the public
         // read facade (both its catch predicates exclude DeltaStorageException, so it is never re-masked as
         // CorruptData). So the mapping-failure message must name the unsupported physical TYPE yet NEVER the
-        // column name. Author a Parquet whose one column is a physical TimeSpan (no DeltaSharp type mapping)
+        // column name. Author a Parquet whose one column is a physical unsigned byte (no DeltaSharp type mapping)
         // named a sentinel — a type DeltaSharp's own writer cannot emit — then map its footer schema.
         const string sentinel = "att4cker_footer_col_s3ntinel";
-        byte[] file = await ParquetTestHelpers.WriteUnmappedTimeSpanColumnAsync(sentinel);
+        byte[] file = await ParquetTestHelpers.WriteUnmappedByteColumnAsync(sentinel);
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => new ParquetFileReader().ReadDataSchemaAsync(new MemoryStream(file), CancellationToken.None));
@@ -1146,7 +1146,7 @@ public sealed class ParquetCorruptionTests
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.DoesNotContain(sentinel, error.Message, StringComparison.Ordinal);   // no file-derived column name
         // Pins the scrubbed ToDataType site: it names the unsupported physical CLR TYPE, never the column name.
-        Assert.Contains("physical CLR type 'TimeSpan'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("physical type 'Byte'", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1159,7 +1159,7 @@ public sealed class ParquetCorruptionTests
         // corrupt pages (invalid codec / page-type / logical-type codes), so it is NOT separable from
         // corruption — reclassifying it to UnsupportedFeature would MISLABEL corruption. It must stay
         // CorruptData. This also documents why the "library NotSupported on a VALID file" case is not
-        // separately triggerable with Parquet.Net 6.0.3: the library neither reads nor writes such an encoding,
+        // separately triggerable with Parquet.Net 6.1.0: the library neither reads nor writes such an encoding,
         // so no valid-but-unsupported-encoding fixture is constructible — every NotSupportedException reachable
         // in the page decode is corruption.
         var schema = new StructType(new[] { KeepField });

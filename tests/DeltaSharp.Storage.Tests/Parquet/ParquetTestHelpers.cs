@@ -26,23 +26,284 @@ internal static class ParquetTestHelpers
         return stream.ToArray();
     }
 
-    /// <summary>Writes a single-column Parquet file whose one column is a physical <see cref="TimeSpan"/>
-    /// named <paramref name="columnName"/>. TimeSpan has NO DeltaSharp type mapping, so reading this file's
+    /// <summary>Writes a single-column Parquet file whose one column is a physical unsigned <see cref="byte"/>
+    /// named <paramref name="columnName"/>. Unsigned byte has NO DeltaSharp type mapping, so reading this file's
     /// footer (<c>ParquetFileReader.ReadDataSchemaAsync</c> → <c>ParquetTypeMapping.ToDataType</c>) fails
     /// closed with <c>UnsupportedFeature</c> — used to prove that fail-closed message never echoes the
-    /// file-derived column name (#653). Authored with Parquet.Net's serializer directly because DeltaSharp's
+    /// file-derived column name (#653). Authored with Parquet.Net's low-level writer because DeltaSharp's
     /// writer, by construction, cannot emit an unmapped physical type.</summary>
-    public static async Task<byte[]> WriteUnmappedTimeSpanColumnAsync(string columnName)
+    public static async Task<byte[]> WriteUnmappedByteColumnAsync(string columnName)
     {
-        var schema = new global::Parquet.Schema.ParquetSchema(
-            new global::Parquet.Schema.DataField<TimeSpan>(columnName));
-        var rows = new List<IDictionary<string, object?>>
-        {
-            new Dictionary<string, object?> { [columnName] = TimeSpan.FromSeconds(1) },
-        };
+        var field = new global::Parquet.Schema.DataField<byte>(columnName);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
         using var stream = new MemoryStream();
-        await global::Parquet.Serialization.ParquetSerializer.SerializeUntypedAsync(rows, schema, stream);
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<byte>(
+                field, new ReadOnlyMemory<byte>(new byte[] { 1 }), null, null, CancellationToken.None);
+        }
+
         return stream.ToArray();
+    }
+
+    /// <summary>Writes a single-column Parquet file whose one column is a real Parquet <b>TIME</b> logical type
+    /// (<c>TimeDataField</c>) of <paramref name="precision"/>, named <paramref name="columnName"/>. DeltaSharp
+    /// has NO time-of-day type, so this file must FAIL CLOSED at footer mapping. The trap this guards: under
+    /// Parquet.Net ≥6.1 a TIME field's <c>ClrType</c> is a RAW <see cref="int"/> (millis) or <see cref="long"/>
+    /// (micros/nanos), so without an explicit <c>TimeDataField</c> arm the raw-CLR fallback would silently
+    /// misread a TIME column as IntegerType/LongType sub-day units (#832). Authored with Parquet.Net's
+    /// low-level writer because DeltaSharp's writer, by construction, cannot emit a TIME column.</summary>
+    public static async Task<byte[]> WriteTimeColumnAsync(
+        string columnName, global::Parquet.Schema.TimeUnitPrecision precision)
+    {
+        var field = new global::Parquet.Schema.TimeDataField(columnName, precision);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            if (field.ClrType == typeof(int))
+            {
+                await rowGroup.WriteAsync<int>(
+                    field, new ReadOnlyMemory<int>(new[] { 1 }), null, null, CancellationToken.None);
+            }
+            else
+            {
+                await rowGroup.WriteAsync<long>(
+                    field, new ReadOnlyMemory<long>(new[] { 1L }), null, null, CancellationToken.None);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
+    /// <summary>Writes a Parquet file whose single top-level column is a nested container (per
+    /// <paramref name="position"/>) holding a Parquet <b>TIME</b> leaf of <paramref name="precision"/>.
+    /// DeltaSharp has no time-of-day type, so a nested read that asks for the container with the ALIASING
+    /// integral leaf (<c>int</c> for millis, <c>bigint</c> for micros/nanos) must FAIL CLOSED rather than
+    /// decode the raw sub-day units (#832). Authored with Parquet.Net's low-level writer for the same reason
+    /// <see cref="WriteTimeColumnAsync"/> is: DeltaSharp's own writer cannot emit a TIME column.
+    /// <para><paramref name="precision"/> chooses which arm of the nested leaf guard is exercised: millis is
+    /// physically an INT32 and flows through the <c>IntegerType</c> arm, micros and nanos are INT64 and flow
+    /// through <c>LongType</c>. Covering only one of them lets the other arm's guard be deleted with the whole
+    /// suite still green, so callers must sweep all three.</para>
+    /// <para>With <paramref name="annotateAsTime"/> false the leaf is written as a PLAIN integral field of the
+    /// matching width, under the same leaf NAME — the carrier
+    /// <see cref="ForgeConvertedTypeOnlyTimeAsync"/> (which matches SchemaElements by name) re-annotates into
+    /// the LEGACY ConvertedType-only nested TIME that Parquet.Net's writer cannot itself emit.</para></summary>
+    public static async Task<byte[]> WriteNestedTimeColumnAsync(
+        NestedTimePosition position,
+        global::Parquet.Schema.TimeUnitPrecision precision,
+        bool annotateAsTime = true)
+    {
+        string leafName = NestedTimeLeafName(position);
+        bool millis = precision == global::Parquet.Schema.TimeUnitPrecision.Millis;
+        global::Parquet.Schema.DataField time = annotateAsTime
+            ? new global::Parquet.Schema.TimeDataField(leafName, precision)
+            : millis
+                ? new global::Parquet.Schema.DataField<int>(leafName)
+                : new global::Parquet.Schema.DataField<long>(leafName);
+
+        global::Parquet.Schema.Field container = position switch
+        {
+            NestedTimePosition.StructField => new global::Parquet.Schema.StructField("s", time),
+            NestedTimePosition.ArrayElement => new global::Parquet.Schema.ListField("arr", time),
+            _ => new global::Parquet.Schema.MapField(
+                "m", new global::Parquet.Schema.DataField<string>("key", nullable: false), time),
+        };
+
+        var schema = new global::Parquet.Schema.ParquetSchema(container);
+        global::Parquet.Schema.DataField[] leaves = schema.GetDataFields();
+
+        // A repeated leaf needs an explicit repetition stream; a struct leaf has max repetition 0 and takes
+        // none. One row, one present value, is enough — the guard rejects on the SCHEMA, before any decode.
+        int[]? reps = position == NestedTimePosition.StructField ? null : new[] { 0 };
+
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            if (position == NestedTimePosition.MapValue)
+            {
+                await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                    leaves[0],
+                    new ReadOnlyMemory<ReadOnlyMemory<char>?>(new ReadOnlyMemory<char>?[] { "k".AsMemory() }),
+                    reps,
+                    null,
+                    CancellationToken.None);
+            }
+
+            global::Parquet.Schema.DataField timeLeaf = leaves[^1];
+            if (millis)
+            {
+                await rowGroup.WriteAsync<int>(
+                    timeLeaf, new ReadOnlyMemory<int?>(new int?[] { 5 }), reps, null, CancellationToken.None);
+            }
+            else
+            {
+                await rowGroup.WriteAsync<long>(
+                    timeLeaf, new ReadOnlyMemory<long?>(new long?[] { 5L }), reps, null, CancellationToken.None);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
+    /// <summary>The leaf name <see cref="WriteNestedTimeColumnAsync"/> gives the TIME leaf in each nested
+    /// position — the handle the footer forge matches on, and the one a test asserts against.</summary>
+    public static string NestedTimeLeafName(NestedTimePosition position) => position switch
+    {
+        NestedTimePosition.StructField => "t",
+        NestedTimePosition.ArrayElement => "element",
+        _ => "value",
+    };
+
+    /// <summary>Rewrites the footer of <paramref name="bytes"/> so its <paramref name="columnName"/> leaf is
+    /// annotated as a <b>LEGACY, <c>ConvertedType</c>-ONLY</b> Parquet TIME column: <c>converted_type</c> is
+    /// set to <paramref name="convertedType"/> and <c>logicalType</c> is CLEARED. This is the shape
+    /// parquet-mr ≤1.10, Hive, Impala and older Spark emit (they all predate the <c>logicalType</c> union),
+    /// and it is trivially forgeable on a foreign file.
+    /// <para>It CANNOT be produced by Parquet.Net's writer — the writer rebuilds every <c>SchemaElement</c>
+    /// from the <c>DataField</c>'s CLR/annotation shape and always stamps a <c>logicalType</c> for TIME (and
+    /// discards any <c>SchemaElement</c> mutation made on a constructed field, whose <c>SchemaElement</c> is
+    /// null before a footer round-trip). So author it the same way the other forged-footer fixtures here do:
+    /// reopen, mutate the parsed <c>FileMetaData</c>, and re-serialize with Parquet.Net's own Thrift writer.
+    /// The result reopens cleanly, and Parquet.Net 6.1 materializes it as a PLAIN <c>DataField</c> with a raw
+    /// <c>int</c>/<c>long</c> ClrType — i.e. <c>field is TimeDataField</c> is FALSE — which is exactly why
+    /// the fail-closed guard cannot key on <c>TimeDataField</c> alone.</para></summary>
+    public static async Task<byte[]> ForgeConvertedTypeOnlyTimeAsync(
+        byte[] bytes, string columnName, global::Parquet.Meta.ConvertedType convertedType)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                foreach (global::Parquet.Meta.SchemaElement element in metadata.Schema)
+                {
+                    if (string.Equals(element.Name, columnName, StringComparison.Ordinal))
+                    {
+                        element.ConvertedType = convertedType;
+                        element.LogicalType = null;
+                    }
+                }
+
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        return SpliceFooter(bytes, newFooter);
+    }
+
+    /// <summary>Replaces the footer of <paramref name="bytes"/> with <paramref name="newFooter"/>, rewriting
+    /// the trailing footer length and PAR1 magic so the result reopens as a valid Parquet file.</summary>
+    private static byte[] SpliceFooter(byte[] bytes, byte[] newFooter)
+    {
+        int originalFooterLength = BitConverter.ToInt32(bytes, bytes.Length - 8);
+        int footerStart = bytes.Length - 8 - originalFooterLength;
+        using var forged = new MemoryStream();
+        forged.Write(bytes, 0, footerStart);
+        forged.Write(newFooter, 0, newFooter.Length);
+        forged.Write(BitConverter.GetBytes(newFooter.Length), 0, 4);
+        forged.Write("PAR1"u8);
+        return forged.ToArray();
+    }
+
+    /// <summary>Writes a single-column Parquet file whose one column is a plain physical <see cref="int"/>
+    /// (<paramref name="millis"/>) or <see cref="long"/> named <paramref name="columnName"/> — the carrier
+    /// this file's <see cref="ForgeConvertedTypeOnlyTimeAsync"/> re-annotates into a legacy TIME column.
+    /// Written unannotated so the forge is the ONLY thing that makes it a TIME.</summary>
+    public static async Task<byte[]> WriteRawIntegralColumnAsync(string columnName, bool millis)
+    {
+        global::Parquet.Schema.DataField field = millis
+            ? new global::Parquet.Schema.DataField<int>(columnName)
+            : new global::Parquet.Schema.DataField<long>(columnName);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            if (millis)
+            {
+                await rowGroup.WriteAsync<int>(
+                    field, new ReadOnlyMemory<int>(new[] { 1 }), null, null, CancellationToken.None);
+            }
+            else
+            {
+                await rowGroup.WriteAsync<long>(
+                    field, new ReadOnlyMemory<long>(new[] { 1L }), null, null, CancellationToken.None);
+            }
+        }
+
+        return stream.ToArray();
+    }
+
+    /// <summary>Writes a single-column Parquet file holding a well-formed
+    /// <c>DECIMAL(<paramref name="precision"/>, <paramref name="scale"/>)</c> column named
+    /// <paramref name="columnName"/>. At the default <c>DECIMAL(10, 2)</c> it is the carrier
+    /// <see cref="ForgeDecimalPrecisionAsync"/> re-annotates into an out-of-range decimal; the explicit
+    /// precision overload authors an IN-range decimal AT the cap, pinning that the fail-closed range check
+    /// rejects only what is genuinely unrepresentable.</summary>
+    public static async Task<byte[]> WriteDecimalColumnAsync(
+        string columnName,
+        int precision = 10,
+        int scale = 2)
+    {
+        var field = new global::Parquet.Schema.DecimalDataField(columnName, precision, scale);
+        var schema = new global::Parquet.Schema.ParquetSchema(field);
+        using var stream = new MemoryStream();
+        await using (ParquetWriter writer = await ParquetWriter.CreateAsync(schema, stream))
+        {
+            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+            await rowGroup.WriteAsync<decimal>(
+                field, new ReadOnlyMemory<decimal>(new[] { 1.23m }), null, null, CancellationToken.None);
+        }
+
+        return stream.ToArray();
+    }
+
+    /// <summary>Rewrites the footer of <paramref name="bytes"/> so its <paramref name="columnName"/> DECIMAL
+    /// leaf declares <paramref name="precision"/> — used to author a precision ABOVE DeltaSharp's Spark-parity
+    /// cap of 38. A footer may legally declare more (Arrow's <c>decimal256</c> emits up to 76, and a hostile
+    /// footer can declare anything), and Parquet.Net happily materializes a <c>DecimalDataField</c> for it, so
+    /// DeltaSharp's mapping must reject it rather than let <c>DecimalType</c>'s range validation throw.
+    /// <para>Both the legacy <c>SchemaElement.Precision</c> and the <c>logicalType.DECIMAL</c> precision are
+    /// rewritten so the two annotations agree. Forged post-write for the same reason
+    /// <see cref="ForgeConvertedTypeOnlyTimeAsync"/> is: Parquet.Net's writer rebuilds every SchemaElement
+    /// from the DataField.</para>
+    /// <para>The sibling out-of-range shapes are NOT authorable and need no fixture: Parquet.Net itself
+    /// rejects <c>scale &gt; precision</c> and <c>precision &lt; 1</c>, at both footer parse and
+    /// <c>DecimalDataField</c> construction. The mapping still guards them, as defense in depth against a
+    /// future Parquet.Net that relaxes those checks.</para></summary>
+    public static async Task<byte[]> ForgeDecimalPrecisionAsync(byte[] bytes, string columnName, int precision)
+    {
+        byte[] newFooter;
+        using (var stream = new MemoryStream(bytes, writable: false))
+        {
+            ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+            await using (reader.ConfigureAwait(false))
+            {
+                global::Parquet.Meta.FileMetaData metadata = reader.Metadata!;
+                foreach (global::Parquet.Meta.SchemaElement element in metadata.Schema)
+                {
+                    if (string.Equals(element.Name, columnName, StringComparison.Ordinal))
+                    {
+                        element.Precision = precision;
+                        if (element.LogicalType?.DECIMAL is not null)
+                        {
+                            element.LogicalType.DECIMAL.Precision = precision;
+                        }
+                    }
+                }
+
+                newFooter = SerializeFooter(metadata);
+            }
+        }
+
+        return SpliceFooter(bytes, newFooter);
     }
 
     /// <summary>Authors an int→int map Parquet file at the LOW level, writing the key and value leaves with
@@ -304,7 +565,7 @@ internal static class ParquetTestHelpers
     /// <summary>Rewrites the footer so the schema element for (<paramref name="rowGroup"/>,
     /// <paramref name="columnIndex"/>) — an ordinary physical INT32 column — is annotated as a logical DATE
     /// (BOTH the legacy <c>ConvertedType.DATE</c> and the modern <c>LogicalType.DATE</c>, since Parquet.Net
-    /// 6.0.3 keys on either). The physical pages are untouched, so a raw INT32 value the writer emitted (e.g.
+    /// 6.1.0 keys on either). The physical pages are untouched, so a raw INT32 value the writer emitted (e.g.
     /// <c>int.MaxValue</c> days) now decodes through Parquet.Net's INT32-DATE → <see cref="DateTime"/> path
     /// (<c>epoch.AddDays</c>), whose <see cref="ArgumentOutOfRangeException"/> for an out-of-representable-range
     /// day drives <c>ReadValueAsync</c>'s date/time-range fail-closed catch (#653: the surfaced CorruptData
@@ -343,7 +604,7 @@ internal static class ParquetTestHelpers
 
     /// <summary>Constructs a minimal Parquet Modular Encryption (encrypted-footer mode) input: the
     /// <c>PARE</c> magic (0x50 0x41 0x52 0x45) at BOTH the head and tail (per the Parquet format Encryption
-    /// spec), bracketing an opaque encrypted-footer body. Parquet.Net 6.0.3 rejects the <c>PARE</c> head at
+    /// spec), bracketing an opaque encrypted-footer body. Parquet.Net 6.1.0 rejects the <c>PARE</c> head at
     /// open with <c>IOException "not a parquet file, head: 50415245, tail: 50415245"</c> — the same path a
     /// real pyarrow-emitted encrypted table trips (the library can neither read nor WRITE encrypted files, so
     /// this hand-crafted shape is the only way to author the fixture). Enough to drive the reader's encryption
@@ -438,7 +699,7 @@ internal static class ParquetTestHelpers
     /// <c>Type</c> of the first leaf <c>SchemaElement</c>. A null leaf type re-serializes into a footer that
     /// <see cref="ParquetReader.CreateAsync(System.IO.Stream, ParquetOptions?, bool, CancellationToken)"/>
     /// still OPENS (the reader is constructed and <c>reader.Metadata</c> is populated), but whose high-level
-    /// <c>reader.Schema</c> materialization THROWS (Parquet.Net 6.0.3: "cannot decode schema for field ...").
+    /// <c>reader.Schema</c> materialization THROWS (Parquet.Net 6.1.0: "cannot decode schema for field ...").
     /// This is the ONE shape that reaches <c>DeltaCheckpointReader.OpenAsync</c>'s failure-path catch with a
     /// <b>non-null</b> reader — so it is the only fixture that exercises the "classify BEFORE dispose" ordering
     /// (#717 survivor 4). Both checkpoint failure-path encryption fixtures make <c>CreateAsync</c> itself throw
@@ -514,7 +775,7 @@ internal static class ParquetTestHelpers
     /// writer sets the file-level <c>EncryptionAlgorithm</c>, marks the encrypted column
     /// (<paramref name="rowGroup"/>, <paramref name="columnIndex"/>) with <c>ColumnCryptoMetaData</c>, and
     /// <b>OMITS</b> that column's plaintext <c>ColumnMetaData</c> (it is stored encrypted, not in the plaintext
-    /// footer). That omission is what makes Parquet.Net 6.0.3 throw during <c>CreateAsync</c>'s row-group-reader
+    /// footer). That omission is what makes Parquet.Net 6.1.0 throw during <c>CreateAsync</c>'s row-group-reader
     /// init — so this fixture exercises the <b>failure-path</b> footer probe, not the success-path
     /// <c>reader.Metadata</c> check. Unlike <see cref="PlaintextFooterEncryptedFileAsync"/> (which keeps
     /// <c>ColumnMetaData</c> and so opens cleanly), this is the shape a genuine encryptor produces.</summary>
@@ -585,7 +846,7 @@ internal static class ParquetTestHelpers
 
     /// <summary>The ZERO-COLUMN-CHUNK variant of <see cref="EmptyEncryptionAlgorithmUnionFileAsync"/>: sets a
     /// non-null <c>EncryptionAlgorithm</c> whose known union members are BOTH null — the shape an unknown
-    /// future algorithm id takes, since Parquet.Net 6.0.3 silently drops a union member it cannot
+    /// future algorithm id takes, since Parquet.Net 6.1.0 silently drops a union member it cannot
     /// deserialize — and ALSO clears <c>RowGroups</c>, so the footer carries no column chunk at all. That
     /// combination empties the per-column <c>CryptoMetadata</c> backstop: with no columns there is nothing to
     /// mark, so "the spec mandates crypto_metadata on every encrypted column" becomes vacuously true and
@@ -1045,4 +1306,21 @@ internal static class ParquetTestHelpers
         write.Invoke(metadata, new[] { protocolWriter });
         return footerStream.ToArray();
     }
+}
+
+/// <summary>The nested position a forged Parquet <b>TIME</b> leaf occupies, for
+/// <see cref="ParquetTestHelpers.WriteNestedTimeColumnAsync"/>. Each one flows through a DIFFERENT arm of the
+/// nested reader's leaf validation, so all three must be covered independently. Public (unlike the internal
+/// helper class that consumes it) only because an xUnit <c>[Theory]</c> parameter cannot be less accessible
+/// than the public test method that takes it.</summary>
+public enum NestedTimePosition
+{
+    /// <summary>A TIME field inside a struct.</summary>
+    StructField,
+
+    /// <summary>A TIME element inside a list.</summary>
+    ArrayElement,
+
+    /// <summary>A TIME value inside a string-keyed map.</summary>
+    MapValue,
 }
