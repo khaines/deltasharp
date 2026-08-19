@@ -154,13 +154,16 @@ is unperturbed).
   OrdinalIgnoreCase) is chosen because physical names are `col-<uuid>` (collision-free by construction) and
   logical-name case-insensitive collisions are already handled separately by
   `EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:886-935`).
-- **Physical addressing is segment-structured (Security-4).** The binding rule: *no component may compose or
-  parse a dotted physical path* — all addressing uses structured segment keys (`PhysicalPathKey`
-  `ParquetFileReader.cs:658-718`; `ColumnPathKey` `ColumnMappingIdentity.cs:143`). As defense-in-depth,
-  `ValidateColumnMappingSchema` additionally **rejects an embedded `'.'` in a nested `physicalName`**
-  (the existing `FindUnsafePathSegmentReason`, `ColumnMapping.cs:198-274`, rejects only the exact strings
-  `"."`/`".."`, not an embedded dot — this design tightens it for nested physical names, where no legitimate
-  `col-<uuid>` contains a dot).
+- **Physical addressing is segment-structured (Security-4).** The *actual* guarantee is the binding rule:
+  *no component may compose or parse a dotted physical path* — all addressing uses structured segment keys
+  (`PhysicalPathKey` `ParquetFileReader.cs:658-718`; `ColumnPathKey` `ColumnMappingIdentity.cs:143`). As
+  **stricter-than-protocol defense-in-depth** (Delta treats `physicalName` as opaque),
+  `ValidateColumnMappingSchema` additionally **rejects an embedded `'.'` in a nested `physicalName`** — the
+  existing `FindUnsafePathSegmentReason` (`ColumnMapping.cs:198-274`) rejects only the exact strings
+  `"."`/`".."`, not an embedded dot, and explicitly allows `a..b`; this design tightens it **for nested
+  physical names only** (no legitimate `col-<uuid>` contains a dot). The asymmetry with top-level names is
+  intentional (a top-level relaxation must not be "consistency-fixed" to loosen the nested rule); the
+  segment-structured binding — not this check — is the guarantee.
 - **Reject foreign `nested.ids` (C1 corollary, Security/Architect):** any field of a **mapped** schema that
   carries `delta.columnMapping.nested.ids` is rejected `Unsupported` at `ValidateColumnMappingSchema` — we
   cannot honor its semantics, so silently ignoring it could mis-read a Spark-authored array/map interior.
@@ -173,14 +176,15 @@ is unperturbed).
 | `ColumnMapping.AssignFreshMapping` | `ColumnMapping.cs` | replace `EnsureLeaf` with the §2.2 `StructField`-recursive assignment; single monotone `maxColumnId`; assign only struct children, never element/key/value; reject a zero-field mapped struct at the create door (mirrors the read-side reject) |
 | `ColumnMapping.EvolveNameModeMapping` | `ColumnMapping.cs` | recursive: mint for **newly-added** nested `StructField`s only; **preserve** every existing nested id/physicalName (never re-mint, counter only increases); match existing children **per-parent-path**; a parent whose *type* changes (`struct`→`array` under `overwriteSchema`) **retires** its children's identities (not re-parented) |
 | `ColumnMapping.ToPhysicalSchema` / `MapWriteSchemaToPhysical` / `ToPhysicalField` | `ColumnMapping.cs:716/749/1021` | recursive **name-only** relabel of struct children (type/nullability/order byte-identical); strip nested child metadata in name mode; keep `id` only in id mode |
-| `ColumnMapping.ValidateColumnMappingSchema` | `ColumnMapping.cs:405` | validate id/physicalName presence, positivity, **nested** `maxColumnId` ceiling, **global id uniqueness**, **per-level Ordinal physicalName uniqueness**, per-level embedded-dot/control-char rejection, and **`nested.ids` presence reject** over the nested `StructField` tree |
+| `ColumnMapping.ValidateColumnMappingSchema` | `ColumnMapping.cs:405` | validate id/physicalName presence, positivity, **nested** `maxColumnId` ceiling, **global id uniqueness**, **per-level Ordinal physicalName uniqueness**, per-level embedded-dot/control-char rejection, **`nested.ids` presence reject** over the nested `StructField` tree; **also the id-mode array/map gate door** (a mapped schema declaring an `array`/`map` column under `id` mode → `UnsupportedFeature` naming **#839**, on **both** the commit and the load path, so an id-mode `CREATE`/`ALTER` fails at commit, not only at read); **and** call the recursive `EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:886-935`) at load for mapped tables so a foreign nested case-insensitive sibling collision (`struct<city,CITY>`) fails closed at the load choke point (today it runs at the committer/evolve path but not from this load gate) |
 | `ColumnMappingProjection.ResolvePhysicalNames` | `ColumnMappingProjection.cs:41` | drop the nested reject; return the **top-level** physical name per column (interior relabelled by `BuildDataSchema`) |
 | `ColumnMappingProjection.BuildDataSchema` | `ColumnMappingProjection.cs:73` | **recursive** relabel: today renames only the top-level field, carrying `field.DataType` verbatim (`:88`) → recurse into struct children substituting each child's `physicalName`; array/map interior carried verbatim |
-| `ColumnMappingProjection.BuildFullBatch` | `ColumnMappingProjection.cs:138-162` | **typed inverse relabel** (§2.5): validate logical↔physical tree congruence, then **re-type** each nested `StructColumnVector` to a `StructType` `Equals`-identical to the logical field's `DataType` (names *and* per-child metadata), reusing child vectors (zero copy); fail closed `DeltaStorageException.SchemaMismatch` (sanitized path) **before** constructing `ManagedColumnBatch` — never a bare `ArgumentException`, never a raw nested `SimpleString` in a message |
+| `ColumnMappingProjection.BuildFullBatch` | `ColumnMappingProjection.cs:138-162` | **typed inverse relabel** (§2.5): validate **ordered per-child tree congruence** — equal child count ∧ same order ∧ per-child `DataType.Equals` (recursively, only the name substituted at the relabelled level) ∧ equal `Nullable` (a **count-only** check is forbidden: it would silently relabel reordered same-typed children, e.g. `struct<a:long,b:long>`) — then **re-type** each nested `StructColumnVector` to a `StructType` `Equals`-identical to the logical field's `DataType` (names *and* per-child metadata), reusing child vectors (zero copy); fail closed `DeltaStorageException.SchemaMismatch` (sanitized path) **before** constructing `ManagedColumnBatch` — never a bare `ArgumentException`, never a raw nested `SimpleString` in a message |
 | `StructColumnVector` (new op) | `StructColumnVector.cs` | add a zero-copy **re-type** (rewrap children under a supplied logical `StructType`); today its ctor validates children against its own physical type (`:107`) and offers no re-wrap |
-| `ParquetFileReader.ResolveFileFields` | `ParquetFileReader.cs:1535-1544` | lift the id-mode nested reject **for `struct<scalars>` only**; array/map under id mode → fail closed naming **#839**; preserve the existing top-level-scalar guard (`:1571-1578`: a scalar column whose id resolves to a `Path.Length>1`/array leaf still fails closed) |
-| `ParquetFileReader` name-mode dup guard (new) | `ParquetFileReader.cs:1505`, `NestedParquetColumnReader.cs:1081` | **name/none mode currently has no duplicate guard** (`BuildFieldIdMap` runs only in id mode, `:415`; `byName` is last-wins `:1505`; `ResolveStructField` first-wins `:1084-1091`). Add a decoded-leaf **physical-path uniqueness** check in name/none mode and make top-level `byName` **and** `ResolveStructField` duplicate-intolerant (`SchemaMismatch`, sanitized) |
-| `NestedParquetColumnReader.ReadStructAsync` / `ResolvedColumn` | `NestedParquetColumnReader.cs:252-277`, `ParquetFileReader.cs:1481` | **id-mode child binding is containment-scoped by `field_id`, NOT name-based `ResolveStructField`** (§2.5): resolve each child leaf by id within the container's subtree; carry `byFieldId` into the nested decoder (today `ForNested` carries only the container `Field`) |
+| `ParquetFileReader.ResolveFileFields` | `ParquetFileReader.cs:1535-1544` | lift the id-mode nested reject **for `struct<scalars>` only**; array/map under id mode → fail closed naming **#839** (defense-in-depth; the primary gate is `ValidateColumnMappingSchema`, above); preserve the existing top-level-scalar guard (`:1571-1578`: a scalar column whose id resolves to a `Path.Length>1`/array leaf still fails closed) |
+| `ParquetFileReader`/`NestedParquetColumnReader` duplicate guard (new) | `ParquetFileReader.cs:1505`, `NestedParquetColumnReader.cs:1081-1091` | **name/none mode currently has no duplicate guard** (`BuildFieldIdMap` runs only in id mode, `:416`; `byName` is last-wins `:1505`; `ResolveStructField` first-wins `:1084-1091`). Add a decoded-leaf **physical-path uniqueness** check in name/none mode; make top-level `byName` duplicate-intolerant **mode-independently** (it is the precondition for id-mode container binding, §2.5 step 1) and `ResolveStructField` duplicate-intolerant (`SchemaMismatch`, sanitized) |
+| `NestedParquetColumnReader.ValidateShape` map/list name guard (new) | `NestedParquetColumnReader.cs:141-155` (call site `ParquetFileReader.cs:1552`) | **Parquet.Net binds `key_value` children *positionally*** (`MapField.Assign`: first→`Key`, second→`Value`, `ThriftFooter` order) — a `map<T,T>` with a required value silently transposes key/value past the type/level guards. Add an **Ordinal canonical-name** assertion (`fileMap.Key.Name == "key"` ∧ `fileMap.Value.Name == "value"`; `fileList.Item.Name == "element"`/`"item"`) → `SchemaMismatch` (sanitized). **Mode-independent** (closes the pre-existing none-mode #571 exposure). In id mode this door validates **structure only**; child identity is the §2.5 containment+id lookup, never a name |
+| `NestedParquetColumnReader.ReadStructAsync` / `ResolvedColumn` | `NestedParquetColumnReader.cs:234-290`, `ParquetFileReader.cs:1481` | **id-mode child binding is identity-scoped + `field_id`-verified, NOT name-based `ResolveStructField`** (§2.5): select each child from the resolved container's own `Fields` and verify its id resolves to that same leaf; carry `byFieldId` into the nested decoder (today `ForNested` carries only the container `Field`); `structMaxDef` is taken from the resolved (provenance-verified) container so `BuildStructNullMask` computes cross-field presence parity against the correct threshold |
 | `ParquetTypeMapping.CreateField` | `ParquetTypeMapping.cs:119-147,161` | today **rejects all nested types** (scalar-only writer) and is where `field_id` + the `[1,int.MaxValue]` range guard are applied. Nested-leaf `field_id` stamping (= owning child `StructField`'s id) is #676 logic layered on the **#834** nested writer; a write-door assertion requires **every** mapped struct-leaf to be stamped + range-guarded (an unstamped leaf commits a permanently-unreadable file) |
 | `ColumnMapping.BuildFieldIdMap` consumption | `ParquetFileReader.cs:452-560` | already footer↔leaf path-keyed with the S-1/S-2 bijection (#829, landed). Consumed for struct-child leaves **with the §2.5 containment check layered on top** — the bijection is *intra-file* (footer↔decoder) and does **not** by itself validate footer↔log parentage |
 | `DeltaTableWriter.RenameColumnAsync` / `DropColumnAsync` | `DeltaTableWriter.cs:695/759` | today address a column by a flat `string` via `schema.TryGetField`. Nested-path rename/drop needs **segment-array** addressing (a dotted string re-introduces the `.`-in-name collision `ColumnPathKey`/#830 exists to prevent) — **in scope if tractable; else defer with a tracked issue** (§9) |
@@ -209,29 +213,58 @@ relabel** on read (re-type each `StructColumnVector` to the logical `StructType`
 `Equals`-identical, so `ManagedColumnBatch`'s `column.Type.Equals(schema[i].DataType)` check
 (`ManagedColumnBatch.cs:126`) holds; a residual mismatch fails closed as a typed `DeltaStorageException`).
 `array`/`map` columns are relabelled only at the top-level `StructField`; their interior resolves
-**structurally**: `map` key/value bind by their **canonical `key`/`value` name** within the `key_value`
-group (Parquet.Net's `PqMapField.Key`/`.Value`, `NestedParquetColumnReader.cs:148-151`), **not**
-positionally — a footer whose `key_value` children are not exactly `{key,value}` fails closed.
+**structurally**. **Parquet.Net binds `key_value` children *positionally*, NOT by name** — verified against
+the pinned 6.1.0 source: `MapField.Assign` takes the **first** child as `Key` and the **second** as `Value`
+regardless of their names (`Parquet/Schema/MapField.cs`), and `ThriftFooter` assigns children in footer
+declaration order (`Parquet/File/ThriftFooter.cs`); `PqMapField.Key`/`.Value` (`NestedParquetColumnReader.cs:146-152`)
+therefore reflect **position**, not the canonical `key`/`value` names. This is a **silent
+transposition hazard** for `map<T,T>` with a required value (both children same physical type, both
+`REQUIRED`, identical rep/def → the existing type/level/`EnsureRequiredMapKey` guards cannot separate
+them). **This design therefore ADDS an explicit canonical-name guard** in
+`NestedParquetColumnReader.ValidateShape`'s map arm: before consuming the children, assert
+`fileMap.Key.Name == "key"` **and** `fileMap.Value.Name == "value"` (`StringComparison.Ordinal`) — else fail
+closed `DeltaStorageException.SchemaMismatch` (sanitized path). The same one-line canonical-name assertion
+is applied to `fileList.Item.Name == "element"`/`"item"` for symmetry (a single-child list has no
+transposition hazard, but the name check keeps the interior contract explicit). Because the identical
+positional exposure pre-exists in `none`-mode nested read (inherited from #571), the guard is applied
+**unconditionally (mode-independent)**, which **closes** the none-mode gap in this PR as well; §3.31's
+"none-mode nested behavior-unchanged" claim therefore holds for *well-formed* files (a previously-silent
+malformed none-mode transposition now fails closed — a deliberate, desirable change for malformed input).
 **Name/none mode also runs the new physical-path uniqueness guard** (§2.3) so a duplicate top-level
 container name or duplicate leaf physical path fails closed instead of resolving by luck.
 
 **Id mode (`struct<scalars>` only).** Parquet `field_id`s live on **leaves** (Parquet.Net 6.1.0 exposes no
 public settable `field_id` on a container/group node — empirically confirmed: `Field.SchemaElement` is
 get-only, `FieldId` is declared only on `DataField`). The write door stamps each **struct-child leaf**'s
-`field_id` = that child `StructField`'s id. Read is **containment-scoped**, not a file-global lookup:
+`field_id` = that child `StructField`'s id. Read is **containment-scoped and identity-selected**, not a
+file-global lookup:
 
-1. Resolve the **container** group from the log `physicalName` (rename-stable).
-2. For each child, look up its `delta.columnMapping.id` in the path-keyed `BuildFieldIdMap` (#829) and
-   **require the resolved leaf's parent physical path to equal the container's physical path** (structured
-   `PhysicalPathKey` equality). A child id that resolves to a leaf **outside** the container (a top-level
-   leaf, a sibling container's leaf, or a leaf of a coincidentally-equal rep/def profile) **fails closed
-   `SchemaMismatch`** — the structural level guard (`ValidateLeafStructuralLevels`,
-   `NestedParquetColumnReader.cs:1104-1131`) is *insufficient* for this and MUST NOT be relied on.
+1. Resolve the **container** group from the log `physicalName` (rename-stable) via the **mode-independent**
+   duplicate-intolerant top-level `byName` (§2.3): a duplicate top-level container physical name fails
+   closed *before* binding (this dedup is a precondition of containment, not a name-mode-only guard). The
+   container must resolve to a **group** node, not an id-bearing leaf; the scalar `idBearingFileNames`
+   guard (`ParquetFileReader.cs:1516-1526`) is untouched (a container group can never be id-bearing — group
+   nodes carry no `field_id` — so it is trivially satisfied, stated here so an implementer neither routes
+   containers through it nor bypasses it loosely).
+2. For each child, select the candidate leaf from the **resolved container's own `Fields` collection**
+   (`PqStructField.Fields` — the same identity scope `ResolveStructField` uses at
+   `NestedParquetColumnReader.cs:1084-1091`), then require its `delta.columnMapping.id` in the path-keyed
+   `BuildFieldIdMap` (#829) to resolve to **that same leaf** (structured `PhysicalPathKey` equality is a
+   *cross-check* on the identity-selected leaf, not the binding itself). A child id that resolves to a leaf
+   **outside** the resolved container's own children (a top-level leaf, a sibling container's leaf, or a
+   leaf of a coincidentally-equal rep/def profile or coincidentally-equal path prefix from a different
+   footer group) **fails closed `SchemaMismatch`** — the structural level guard
+   (`ValidateLeafStructuralLevels`, `NestedParquetColumnReader.cs:1158`) is *insufficient* for this and MUST
+   NOT be relied on. `ValidateShape` in id mode validates **structure only** (container kind, non-zero field
+   count, per-leaf physical type + rep/def levels); child **identity** is established solely by this
+   containment+id lookup, never by name.
 3. Two child ids aliasing to one leaf, or the container `physicalName` group being absent, fail closed.
 4. The **container itself has no `field_id`** and is bound by its `physicalName` (its declared id is
    **structural-only, never footer-resolvable**) — this is a documented, container-scoped exception to the
    existing "declared id absent from footer ⇒ fail closed" rule (`ParquetFileReader.cs:1565-1579`); it does
-   **not** name-fall-back because the children are bound by id within the resolved subtree.
+   **not** name-fall-back for its children because they are bound by id within the resolved subtree. A
+   container whose declared id is nonetheless *found* stamped on some footer leaf fails closed (a container
+   id must never be footer-resolvable).
 
 **Id mode — array/map: OUT (`#839`).** The interior (`element`/`key`/`value`) carries no representable id
 (C1: not a `StructField`; `nested.ids` unimplemented) and the Parquet group node cannot carry one. Binding
@@ -278,7 +311,8 @@ collision; this is an internal write-door signature, not a public API break.
 | #693 `DeltaSchemaJson`→`SchemaJson` consolidation | landed | one serializer; harness == production; footer `key_value_metadata` Spark schema JSON == log |
 | #571/#584 nested Parquet decode | landed | struct/array/map-of-scalar decode into nested `ColumnVector` |
 | #585 nested-within-nested decode | **open** | scope boundary (fail-closed) |
-| #839 array/map id-mode nested | **to be filed (open before PASS)** | deferred id-mode array/map |
+| #839 array/map id-mode nested | **filed, open** | deferred id-mode array/map |
+| #840 nested rename/drop (segment-array addressing) | **filed, open** | deferred metadata-only nested rename/drop |
 
 **H6 discharge (all seats).** `ColumnMappingIdentity` carries two `#676`-addressed obligations
 (`ColumnMappingIdentity.cs:75-78` and `:112-118`: "#676 MUST extend this collection to descend array
@@ -326,10 +360,25 @@ Every fail-closed cell asserts the **exact exception type**.
    relabel that leaves physical child metadata surfaces a typed `DeltaStorageException.SchemaMismatch`, and
    no nested `SimpleString`/raw foreign name appears in any message (`ParquetMessageHygiene`-style assert).
 
+**Type-agreement on the read exit (Balanced-3/Quality-F3/Security-5)**
+4. `NameMode_NestedRead_BatchColumnType_EqualsLogicalSchemaFieldType_Exactly` — assert
+   `batch.Column(i).Type.Equals(tableSchema[i].DataType)` including per-child **metadata**. Companion:
+   `NameMode_ReorderedPhysicalStructChildren_FailsClosed_NotSilentlyRelabelled` (`struct<a:long,b:long>`
+   with children in reversed order → the ordered-congruence check rejects; a count-only check would
+   transpose them) and `NameMode_NestedRead_LogicalChildCountDiffersFromPhysical_FailsClosedAsDeltaException`
+   (proves the bare-`ArgumentException` re-type path is unreachable at the read exit).
+5. `NameMode_NestedRead_PartialRelabel_FailsClosedAsDeltaException_NotArgumentException` — a names-only
+   relabel that leaves physical child metadata surfaces a typed `DeltaStorageException.SchemaMismatch`, and
+   no nested `SimpleString`/raw foreign name appears in any message (`ParquetMessageHygiene`-style assert).
+
 **Same-typed-sibling reversed-order (mis-attribution defense, witness-disjoint)**
 6. `NameMode_StructSameTypedSiblings_FooterReversed_BindsByPhysicalName_WitnessDisjoint` (`struct<a:long,b:long>`).
 7. `IdMode_StructSameTypedSiblings_FooterReversed_BindsByFieldId_WitnessDisjoint`.
-8. `MapKeyValue_FooterEmitsValueBeforeKey_BindsByCanonicalName_OrFailsClosed_WitnessDisjoint` (name mode).
+8. `MapKeyValue_FooterEmitsNonCanonicalChildNames_FailsClosed` — a footer whose `key_value` children are
+   not exactly named `{key,value}` fails closed via the new canonical-name guard, **plus** the specific
+   `map<long,long>` with `valueContainsNull=false` **children-swapped** witness-disjoint case (both children
+   `long` + `REQUIRED` → the type/level/`EnsureRequiredMapKey` guards cannot detect the swap; only the
+   canonical-name guard does). Name **and** none mode (the exposure pre-exists none-mode via #571).
 
 **Id-mode containment (Security-1/Quality-F1 — the CRITICAL closure)**
 9. `IdMode_NestedChildId_ResolvesToTopLevelLeaf_FailsClosed`.
@@ -339,73 +388,104 @@ Every fail-closed cell asserts the **exact exception type**.
     does not cover it.
 12. `IdMode_TopLevelScalarId_ResolvesToNestedLeaf_FailsClosed` — regression pin on the surviving
     `ParquetFileReader.cs:1571-1578` guard.
-13. `IdMode_ArrayColumn_FailsClosed_NamingIssue839`, `IdMode_MapColumn_FailsClosed_NamingIssue839`.
+13. **Container-binding negative cells (Security-2/Quality-R2 — the containment *root*):**
+    `IdMode_DuplicateContainerPhysicalName_FailsClosed` (mode-independent top-level `byName` dedup);
+    `IdMode_ContainerPhysicalNameGroupAbsentFromFooter_FailsClosed`;
+    `IdMode_ContainerPhysicalNameResolvesToNonGroupLeaf_FailsClosed`;
+    `IdMode_ContainerDeclaredIdPresentOnSomeFooterLeaf_FailsClosed` (the "structural-only, never
+    footer-resolvable" exclusion the oracle preamble asserts);
+    `IdMode_ContainerGroupPresentButChildIdsAbsentFromSubtree_FailsClosed_NoNameFallback` (pins §2.5 step 4
+    — the one claim whose failure would silently revert to name matching);
+    `IdMode_StructChild_PhysicalNameAbsentFromFooterButFieldIdPresentAndContained_Succeeds` (identity is
+    the id-within-container lookup, not the name).
+14. **#839 array/map id-mode boundary — shape × door matrix** (mirrors §3.26): `{array<scalar>,
+    map<scalar,scalar>}` × `{create door, ValidateColumnMappingSchema (commit AND load),
+    ToPhysicalSchema/MapWriteSchemaToPhysical, ResolveFileFields}` each → `UnsupportedFeature` naming
+    **#839**, **no partial `maxColumnId` advance**; plus
+    `IdMode_CreateTableWithArrayColumn_FailsClosedAtCommit_NotOnlyAtRead` (an id-mode create with an
+    `array`/`map` column must fail at commit, not brick as a permanently-unreadable table — note
+    `AssignFreshMapping` takes no mode parameter, so the gate is `ValidateColumnMappingSchema`, which sits on
+    both commit and load).
 
 **Per-door fail-closed matrix**
-14. Duplicate `physicalName` among sibling struct children → `SchemaMismatch`/`Unsupported`
-    (`ValidateColumnMappingSchema` + duplicate-intolerant `ResolveStructField`).
-15. `NameMode_DuplicateTopLevelContainerName_FailsClosed` and
-    `NameMode_DuplicateLeafPhysicalPathAnywhere_FailsClosed` (the new name-mode dup guard).
-16. Duplicate `field_id` anywhere → fail closed (`BuildFieldIdMap` dup guard, #829).
-17. Missing `id` **or** `physicalName` on a nested `StructField` → fail closed (two distinct cells).
-18. `NestedStruct_ParentMapped_ChildUnmapped_FailsClosed` (partial-recursion drift).
-19. `LogSide_NestedChildId_AboveInt32Max_FailsClosed` and `FooterSide_NestedLeafFieldId_NonPositive_FailsClosed`
+15. Duplicate `physicalName` among sibling struct children → `DeltaProtocolException.Inconsistent` at
+    `ValidateColumnMappingSchema`, **and** `DeltaStorageException.SchemaMismatch` at the duplicate-intolerant
+    `ResolveStructField` (two distinct cells, each asserting its exact type).
+16. `NameMode_DuplicateTopLevelContainerName_FailsClosed` and
+    `NameMode_DuplicateLeafPhysicalPathAnywhere_FailsClosed` (the new mode-independent dup guard).
+17. `NameMode_ArrayColumn_FooterLeafPathIs_Physical_list_element` and
+    `NameMode_MapColumn_FooterLeafPathsAre_Physical_key_value_key_And_value` — pin that the written footer
+    uses canonical 3-level LIST/MAP encoding (a 2-level list writer would silently change every path key and
+    the #829 correlation rests on `DataField.Path` carrying the exact wrapper components).
+18. Duplicate `field_id` anywhere → fail closed (`BuildFieldIdMap` dup guard, #829).
+19. Missing `id` **or** `physicalName` on a nested `StructField` → fail closed (two distinct cells).
+20. `NestedStruct_ParentMapped_ChildUnmapped_FailsClosed` (partial-recursion drift).
+21. `LogSide_NestedChildId_AboveInt32Max_FailsClosed` and `FooterSide_NestedLeafFieldId_NonPositive_FailsClosed`
     (footer `field_id` is int32; the log side is where `> int.MaxValue` is representable).
-20. `NestedChildId_ExceedsMaxColumnId_FailsClosed` (nested ceiling; today the ceiling check is top-level only).
-21. `NestedChildPhysicalNameContainingDot_FailsClosed`, `NestedChildPhysicalNameContainingControlChar_FailsClosed`;
+22. `NestedChildId_ExceedsMaxColumnId_FailsClosed` (nested ceiling; today the ceiling check is top-level only).
+23. `NestedChildPhysicalNameContainingDot_FailsClosed`, `NestedChildPhysicalNameContainingControlChar_FailsClosed`;
     and the accepted dual `NestedChildPhysicalNameEqualToTopLevelPhysicalName_IsAccepted_AndDoesNotMisCorrelate`.
-22. `MappedSchemaCarryingNestedIds_FailsClosed` (the `delta.columnMapping.nested.ids` reject).
-23. `Foreign-written read path` — a footer whose nested structure disagrees with the log (extra/missing
-    child, re-parented leaf) → rejected by the containment check + #829 bijection + duplicate-intolerant
-    child resolution; no cross-column substitution.
-24. **Nested-within-nested at the *assignment/validation* door** (not only at read): the shape set
+24. `MappedSchemaCarryingNestedIds_FailsClosed` (the `delta.columnMapping.nested.ids` reject) and
+    `ForeignMappedSchema_NestedCaseInsensitiveSiblingCollision_FailsClosed` (the load-gate
+    `EnsureNoCaseInsensitiveDuplicateColumns` call), each asserting its exact exception type.
+25. `ForeignWrittenReadPath_NestedStructureDisagreesWithLog_FailsClosed` (`DeltaStorageException.SchemaMismatch`)
+    — a footer whose nested structure disagrees with the log (extra/missing child, re-parented leaf) →
+    rejected by the containment check + #829 bijection + duplicate-intolerant child resolution; no
+    cross-column substitution.
+26. **Nested-within-nested at the *assignment/validation* door** (not only at read): the shape set
     `{array<struct>, struct<struct>, map<string,struct>, array<array>, map<string,map>}` × doors
     `{AssignFreshMapping, ValidateColumnMappingSchema (raw/foreign metaData), ResolveFileFields}` each
     → `UnsupportedFeature` **naming #585**, with **no partial `maxColumnId` advance** before the reject.
     Plus a mapped **zero-field struct** create reject (mirrors `NestedParquetColumnReader.cs:115-121`).
 
 **Null/empty container round-trip (Balanced-7 — nested-write fidelity)**
-25. Null struct row, struct with all-null children, empty `array`, all-null `array` column, empty `map`,
+27. Null struct row, struct with all-null children, empty `array`, all-null `array` column, empty `map`,
     `map` with null values, zero-row nested column — round-trip identity in both write halves; a relabel
     that alters a child's nullability corrupts these and must be caught.
 
 **Evolve / identity**
-26. `Evolve_DropNestedChildThenReAddSameLogicalName_MintsFreshIdAndPhysicalName_MaxColumnIdStrictlyIncreases_OldFileDataDoesNotSurface`.
-27. `Cdf_NestedChildIdentityChangedBetweenRetainedVersions_FailsClosed` and
+28. `Evolve_DropNestedChildThenReAddSameLogicalName_MintsFreshIdAndPhysicalName_MaxColumnIdStrictlyIncreases_OldFileDataDoesNotSurface`.
+29. `Cdf_NestedChildIdentityChangedBetweenRetainedVersions_FailsClosed` and
     `Cdf_NestedChildLogicalRename_IdAndPhysicalPreserved_IsAccepted` (the H6 CDF-identity door).
 
 **Write byte-invariance**
-28. `NameMode_NestedStructWrite_NoFieldIdOnAnyFooterLeaf`; `IdMode_NestedStructWrite_EveryStructChildLeafCarriesItsOwnFieldId`.
-29. `NoneModeNested` + `NonNestedMapped` byte/behavior-unchanged, measured against a **committed golden
+30. `NameMode_NestedStructWrite_NoFieldIdOnAnyFooterLeaf`; `IdMode_NestedStructWrite_EveryStructChildLeafCarriesItsOwnFieldId`.
+31. `NoneModeNested` + `NonNestedMapped` byte/behavior-unchanged, measured against a **committed golden
     fixture or an explicit pre/post SHA-256** (not an unbaselined "byte-unchanged"). Regression-assert **no
     nested statistics keys** are emitted.
 
 **Metadata-only no-rewrite (conjunctive assertion)**
-30. Rename/drop a nested struct child (name mode) — assert **all of**: exactly one `metaData` action and
+32. Rename/drop a nested struct child (name mode) — assert **all of**: exactly one `metaData` action and
     zero `add`/`remove` in the commit ∧ SHA-256 of every data-file byte identical pre/post ∧ each `AddFile`'s
     `(path,size,modificationTime,stats,partitionValues)` identical ∧ `maxColumnId` unchanged ∧ the post-read
-    returns the same values under the new logical name. Addressing is a **segment array**. If rename defers
-    (§9), the AC map states AC-rename/drop is unmet by this PR and cites the verified-open follow-up.
+    returns the same values under the new logical name. Addressing is a **segment array**. Rename/drop is
+    deferred per §9 to **#840** (filed, open); the AC map states AC-rename/drop is unmet by this PR and cites
+    #840, and the §8 launch checklist gates on it.
 
 **Seeded property harness (house convention — Quality-F8)**
-31. Uses `tests/Shared/TestSeed.cs` (`Resolve`/`Combine(baseSeed, scope)`, `DELTASHARP_TEST_SEED`), a fixed
-    iteration count, and the `[deltasharp-seed]` reproduction line (as `ChangeFeedCdcFuzzTests.cs:80-187`).
-    Generator space: field count, sibling count, scalar type set, per-leaf **disjoint** value domains;
-    enumerated tamper-operator set; invariants asserted as a **conjunction** (round-trip identity ∧ mode-split
-    log↔footer bijection ∧ thrown type ∈ {`DeltaProtocolException`,`DeltaStorageException`}); a
-    minimization/shrink step lands a failing draw as a permanent minimized regression, not a bare seed.
+33. Uses `tests/Shared/TestSeed.cs` (`Resolve`/`Combine(baseSeed, scope)`, `DELTASHARP_TEST_SEED`), a **fixed
+    iteration count of 200** (house precedent, `ChangeFeedCdcFuzzTests.cs:103`), and the `[deltasharp-seed]`
+    reproduction line (as `ChangeFeedCdcFuzzTests.cs:80-187`). Generator space: field count, sibling count,
+    scalar type set, per-leaf **disjoint** value domains. **Enumerated tamper-operator set:** swap two
+    sibling `physicalName`s; relocate a child's `field_id` to a sibling container's leaf; delete a child's
+    `id`; set `id = maxColumnId + 1`; inject an embedded dot into a nested `physicalName`; inject
+    `nested.ids`; reverse footer sibling order; swap `key_value` children; delete the container group.
+    Invariants asserted as a **conjunction** (round-trip identity ∧ mode-split log↔footer bijection ∧ thrown
+    type ∈ {`DeltaProtocolException`,`DeltaStorageException`}); a minimization/shrink step lands a failing
+    draw as a permanent minimized regression, not a bare seed.
 
 **Integration**
-32. CDF/CDC read of an old file after a nested-struct logical rename resolves via the mapping (the #675
+34. CDF/CDC read of an old file after a nested-struct logical rename resolves via the mapping (the #675
     oracle's concrete dependency — this design unblocks it).
 
 **Sequencing.** Read/name-mode and the id-mode struct resolution are testable now with
 `ParquetSerializer`-authored fixtures (as the existing nested-read tests). The **production write-path**
-round-trip (§3.25/§3.28 write halves) is gated on **#828/#834** landing; until then those halves use
+round-trip (§3.27/§3.30 write halves) is gated on **#828/#834** landing; until then those halves use
 serializer-authored fixtures and the production-writer assertions are marked pending #828.
 
-**Acceptance-criteria mapping (#676):** AC-assignment → §3.1–3.3; AC-resolution → §3.1,3.2,3.4–3.13;
-AC-rename/drop → §3.30 (or deferred per §9); AC-fail-closed → §3.9–3.24,3.31.
+**Acceptance-criteria mapping (#676):** AC-assignment → §3.1–3.3; AC-resolution → §3.1,3.2,3.4–3.14;
+AC-rename/drop → **unmet by this PR, deferred to #840** (§3.32 specifies the eventual assertion);
+AC-fail-closed → §3.9–3.26,3.33.
 
 ---
 
@@ -418,7 +498,7 @@ AC-rename/drop → §3.30 (or deferred per §9); AC-fail-closed → §3.9–3.24
   allocation per data row.
 - **Memory:** one metadata-annotated schema copy per transform (bounded by schema size); recursion depth ≤ 2
   (single-level scope), and parse/footer depth are already capped (`SchemaJson.MaxDepth = 64`;
-  `MaxFooterFieldIdMapDepth = 100`, `ParquetFileReader.cs:456`).
+  `MaxFooterFieldIdMapDepth = 100`, `ParquetFileReader.cs:457`).
 - **Regression gate:** a 50-`StructField` nested-schema assign+resolve micro-benchmark stays within the
   schema-transform noise floor; the per-batch decode path is untouched.
 
@@ -439,11 +519,15 @@ AC-rename/drop → §3.30 (or deferred per §9); AC-fail-closed → §3.9–3.24
   resolve to a leaf **inside** its declared container's subtree (structured-path equality), closing the
   round-1 cross-column capture (a child id stamped on a top-level or sibling-container leaf). The
   intra-file #829 bijection is a substrate, **not** the footer↔log parentage guarantee.
-- **Name mode** gains a **physical-path uniqueness guard** (previously absent) so duplicate container/leaf
-  names fail closed rather than resolving by luck.
+- **Name mode** gains a **mode-independent physical-path uniqueness guard** (previously absent) so duplicate
+  container/leaf names fail closed rather than resolving by luck, and a **canonical `key`/`value`/`element`
+  name guard** in `ValidateShape` (Parquet.Net binds `key_value` children positionally, so a `map<T,T>` with
+  a required value would otherwise silently transpose key/value).
 - **Fail-closed over fallback:** id mode never name-matches a struct child whose declared id is absent from
-  the footer; the container's structural-only id never triggers name fallback (children bound by id within
-  the subtree); array/map under id mode fail closed (#839) rather than bind via an invented interior id.
+  the footer; each child is selected from the resolved container's own `Fields` and its id verified to
+  resolve to that same leaf; the container's structural-only id never triggers name fallback and fails
+  closed if found on a footer leaf; array/map under id mode fail closed (#839) rather than bind via an
+  invented interior id.
 - **Supply-chain:** no new dependencies; nested write via public 6.1.0 `WriteAllPartsAsync` (#834).
 
 ---
@@ -460,11 +544,14 @@ graph LR
 
 | STRIDE | Surface | Threat | Mitigation |
 |---|---|---|---|
-| **Tampering** | id-mode child `field_id` vs log container | forged footer stamps a child id on a foreign leaf → **cross-column mis-attribution** | **containment check** (§2.5): child leaf's parent physical path must equal the container's; else fail closed; not the intra-file #829 bijection alone |
-| **Tampering** | name-mode duplicate container/leaf name | ambiguous resolution binds by luck | new name/none-mode physical-path uniqueness guard + duplicate-intolerant `byName`/`ResolveStructField` |
+| **Tampering** | id-mode child `field_id` vs log container | forged footer stamps a child id on a foreign leaf → **cross-column mis-attribution** | **containment + identity selection** (§2.5): child selected from the resolved container's own `Fields` and its id verified to resolve to that same leaf; else fail closed; not the intra-file #829 bijection alone |
+| **Tampering** | duplicate container physical name (both modes) | container object from group B, id-resolved leaf from group A → wrong `structMaxDef` → null-mask corruption | **mode-independent** duplicate-intolerant top-level `byName` (§2.5 step 1) |
+| **Tampering** | `map<T,T>` `key_value` children | Parquet.Net binds key/value **positionally** → silent key/value transposition past type/level guards | mode-independent Ordinal canonical `key`/`value`/`element` name guard in `ValidateShape` (§2.5) |
+| **Tampering** | name-mode duplicate leaf name | ambiguous resolution binds by luck | new name/none-mode physical-path uniqueness guard + duplicate-intolerant `ResolveStructField` |
 | **Tampering** | `delta.columnMapping.nested.ids` on a mapped schema | foreign array/map interior ids silently ignored → wrong interior read | reject `Unsupported` at validation (§2.2) |
-| **Spoofing** | id-mode struct child | declared id absent from footer → silent name fallback | fail closed; container's structural-only id never name-falls-back |
-| **Confusion** | array/map id mode | invented "primary leaf" id → wire divergence + capture | **out of scope (#839)**, fail closed |
+| **Confusion** | reordered same-typed physical struct children | count-only congruence relabels transposed children | **ordered per-child congruence** (§2.3 `BuildFullBatch`) — reject on order/count/type/nullable mismatch |
+| **Spoofing** | id-mode struct child | declared id absent from footer → silent name fallback | fail closed; container's structural-only id never name-falls-back (and a container id found on a footer leaf fails closed) |
+| **Confusion** | array/map id mode | invented "primary leaf" id → wire divergence + capture | **out of scope (#839)**, fail closed at `ValidateColumnMappingSchema` (commit + load) |
 | **Info disclosure** | read-exit relabel | raw nested `SimpleString`/foreign names in `ArgumentException` | congruence check + typed `DeltaStorageException` **before** `ManagedColumnBatch`; sanitized path only |
 | **DoS** | deeply/widely nested schema | unbounded recursion | single-level scope → depth ≤ 2; parse/footer depth capped; nested-within-nested fail-closed (#585) |
 
@@ -490,38 +577,44 @@ flat-mode rename-equivalence residual (`ColumnMappingIdentity.cs:80-92`) is unch
 ## 8 · Rollout & Risk
 
 - **Rollout:** additive behind the existing `delta.columnMapping.mode` gate; existing leaf-only, `none`, and
-  non-nested tables are byte/behavior-unchanged (§3.29). id-mode array/map stays fail-closed (#839).
+  non-nested tables are byte/behavior-unchanged (§3.31). id-mode array/map stays fail-closed (#839).
 - **Kill-switch:** the change removes a fail-closed gate for the enabled nested cases; a defect → reinstate
   the gate (revert). Data written stays readable (physical names/ids self-describing).
 - **Risk register:** (a) id-mode struct-child mis-attribution → **data mis-attribution** — mitigated by the
   §2.5 containment check + §3.9–3.13 + #829 bijection; (b) `maxColumnId` non-monotonicity on evolve → id
-  reuse — single high-water counter + §3.3/§3.26; (c) name-mode ambiguous duplicate → new dup guard +
-  §3.15; (d) read-exit `ArgumentException`/name leak → typed relabel + §3.4/3.5; (e) **cross-engine id-mode
+  reuse — single high-water counter + §3.3/§3.28; (c) name-mode ambiguous duplicate → new dup guard +
+  §3.16; (d) read-exit `ArgumentException`/name leak → typed relabel + §3.4/3.5; (e) **cross-engine id-mode
   interop** — DeltaSharp id-mode struct files lack a container-group `field_id`, and Spark id-mode array/map
   are fail-closed inbound: documented caveat, **not** silent (§2.5 matrix); (f) nested-within-nested / array
-  id-mode accidentally allowed → §3.13/§3.24 boundary tests naming #839/#585.
+  id-mode accidentally allowed → §3.14/§3.26 boundary tests naming #839/#585.
 - **Launch checklist:** unit + integration (§3) green on both TFMs; `dotnet format`; determinism ban; DCO;
-  RFL PASS; #675 unblocked; **#839 and the nested-within-nested #585 follow-ups verified open** before PASS.
+  RFL PASS; #675 unblocked; **#839, #840, and the nested-within-nested #585 follow-ups verified open** before PASS.
 
 ---
 
 ## 9 · Open Questions & Decisions
 
-1. **Rename/drop of nested struct fields (name mode).** Include *drop* (remove a child's mapping entry) and
-   *rename* if segment-array path-addressing is tractable; otherwise defer *rename* with a tracked issue.
-   Addressing MUST be a **segment array**, never a dotted string (§2.7). §3.30 gates whichever lands; the AC
-   map records any deferral against a verified-open issue.
+1. **Rename/drop of nested struct fields (name mode) — RESOLVED: deferred to #840 (filed, open).**
+   Metadata-only nested rename/drop requires **segment-array** addressing (never a dotted string, §2.7),
+   which `DeltaTableWriter.RenameColumnAsync`/`DropColumnAsync` (flat-string today) do not yet have. §3.32
+   specifies the eventual conjunctive no-rewrite assertion; AC-rename/drop is unmet by this PR.
 2. **`element`/`key`/`value` ids — RESOLVED (C1).** No id/physicalName (no `SchemaJson` slot; `nested.ids`
    unimplemented). Only `StructField`s are assigned.
-3. **Array/map id mode — RESOLVED: out of scope (#839).** No representable interior id and no container
-   group id; binding via an invented "primary leaf" id was rejected by the council (wire divergence +
-   capture). Fail closed under id mode; full support in name mode. **File #839 before PASS.**
-4. **Id-mode struct container binding — RESOLVED: containment (§2.5).** Container by `physicalName`; children
-   by `field_id` within the container subtree with structured-path equality; container id structural-only.
+3. **Array/map id mode — RESOLVED: out of scope (#839, filed+open).** No representable interior id and no
+   container group id; binding via an invented "primary leaf" id was rejected by the council (wire
+   divergence + capture). Fail closed under id mode (primary gate `ValidateColumnMappingSchema` on commit
+   AND load, §3.14); full support in name mode.
+4. **Id-mode struct container binding — RESOLVED: containment + identity selection (§2.5).** Container by
+   mode-independent duplicate-intolerant `physicalName`; each child selected from the resolved container's
+   own `Fields` and its `field_id` verified to resolve to that same leaf; container id structural-only.
+5. **Map key/value binding — RESOLVED: canonical-name guard (§2.5).** Parquet.Net binds `key_value` children
+   positionally; DeltaSharp adds a mode-independent Ordinal `key`/`value`/`element` name guard in
+   `ValidateShape` (§3.8). Applying it unconditionally also **closes** the pre-existing none-mode #571
+   exposure in this PR (no separate deferral).
 5. **Write-path sequencing.** Production write-path round-trip depends on **#828/#834** implementation;
    nested-leaf `field_id` stamping is #676 logic on the #834 writer (§2.3 `ParquetTypeMapping.CreateField`).
    Until then §3 write halves use serializer-authored fixtures.
-6. **Nested-within-nested — RESOLVED: out of scope (#585), fail-closed at the assignment door (§3.24).** File
+6. **Nested-within-nested — RESOLVED: out of scope (#585), fail-closed at the assignment door (§3.26).** File
    verified-open before PASS.
 
 ---
@@ -543,7 +636,7 @@ flat-mode rename-equivalence residual (`ColumnMappingIdentity.cs:80-92`) is unch
   `PhysicalPathKey` (`:658-718`).
   `src/DeltaSharp.Storage/Parquet/NestedParquetColumnReader.cs`: `ResolveStructField` (def `:1081-1101`,
   first-match-and-`break` `:1084-1091`; validate call `:124`; **decode** call `:257`), `ReadStructAsync`
-  (`:252-277`), `ValidateLeafStructuralLevels` (`:1104-1131`), map key/value (`:148-151`), zero-field-struct
+  (`:252-277`), `ValidateLeafStructuralLevels` (`:1158`), map key/value (`:146-152`), zero-field-struct
   reject (`:115-121`).
   `src/DeltaSharp.Engine/Columnar/ManagedColumnBatch.cs`: type-equality check (`:126`).
   `src/DeltaSharp.Storage/Delta/ColumnMappingIdentity.cs`: `#676` obligations (`:75-78`, `:112-118`),
