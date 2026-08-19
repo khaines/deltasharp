@@ -559,16 +559,26 @@ manifest-lag, duplicated-manifest-entry, missing-manifest, empty-manifest,
 unicode/spaced-path, fence-breakout, `::workflow-command`-injection and line-terminator-injection
 (CR/VT/FF/ESC/C0/DEL/NEL/LS/PS in both a manifest entry and lock-file content) cases.
 
-The escaping is pinned **per sink and per rule**. The injection and fence cases assert against
-the streams *split the way a line reader would split them*, not merely on LF, and they check
-every class individually — each of CR, VT, FF, ESC, NEL, LS, PS and the C0/DEL catch-all is
-asserted both by its escaped form (`\r`, `\v`, `\f`, `\e`, `\u0085`, `\u2028`, `\u2029`, `?`)
-and by the absence of the raw byte from stdout *and* the step summary. Dropping a single sed rule
-from `escape_untrusted`, or dropping the filter from any one sink, therefore turns the suite red.
-The fence oracle is structural rather than a parity count: it walks the rendered lines toggling on
-the guard's own five-backtick delimiter and fails if the walk ends inside a fence *or* if a
-payload sentinel ever reaches column 0 outside one — so an **even** number of smuggled fences is
-caught too.
+The escaping is pinned **per sink and per rule**: dropping any single sed rule from
+`escape_untrusted`, or dropping the filter from any one of its three sinks, turns the **suite**
+red (verified rule by rule, 8/8). The cases assert against the streams *split the way a line
+reader would split them*, not merely on LF, and each class carries its own oracle:
+
+* every class is asserted by its **escaped form** — `\r`, `\v`, `\f`, `\e`, `\u0085`, `\u2028`,
+  `\u2029` and `?` — in stdout *and* in the step summary;
+* the single-byte classes are additionally asserted by the **absence of the raw byte**: CR, VT and
+  FF by name, plus the whole catch-all range `\001-\010\016-\037\177` as a character class, with
+  every one of its 27 bytes present in the payload, so narrowing the range at any byte leaks one;
+* NEL, LS and PS are multi-byte UTF-8 rather than control bytes, so they are pinned by their
+  escaped-form assertions together with the "no forged workflow command" oracle.
+
+The fence oracle is structural rather than a parity count, so an **even** number of smuggled
+fences is caught too. It walks the rendered lines with a CommonMark-shaped toggle — a close may be
+indented up to three spaces, may be longer than the opener and may carry trailing spaces — and
+fails if the walk ends inside a fence *or* if a payload sentinel is rendered outside one. The
+fixture supplies the geometry that matters: an unchanged five-backtick line in a lock file reaches
+the summary as a space-prefixed diff **context** line, which really would close the guard's block
+were it not sanitized.
 
 The suite needs only `git` — no SDK, no network — and CI runs it **before** the real check.
 

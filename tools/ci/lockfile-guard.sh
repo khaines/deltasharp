@@ -268,8 +268,10 @@ emit_summary() {
 
     # Bounded: the patch is PR-controlled content. `head -c` closes the pipe
     # early, so pipefail is disabled inside this subshell only. `escape_untrusted`
-    # runs BEFORE `sanitize_fence`, so a CR (or any other line break) inside
-    # lock-file content cannot end a line and slip a fence past the sanitizer.
+    # runs BEFORE `sanitize_fence` as belt and braces, not because the order is
+    # load-bearing: the two filters commute (escaping never emits a backtick, and
+    # the sanitizer never emits a control byte), which a differential fuzz over
+    # 4 000 lines confirmed byte-for-byte.
     diff_patch="$(
       set +o pipefail
       lockfile_diff --patch | escape_untrusted | sanitize_fence | head -c "$DIFF_BYTE_LIMIT"
@@ -484,13 +486,22 @@ st_assert_no_forged_command() {
   st_pass "$name"
 }
 
-# Raw control bytes must reach NEITHER sink: `escape_untrusted` carries one sed
-# rule per class, so every class is asserted individually — dropping any single
-# rule (CR, VT, FF, ESC, or the C0/DEL catch-all) turns this red.
+# No raw control byte may reach EITHER sink. This oracle covers the single-byte
+# classes only: CR, VT and FF by name, plus the ENTIRE catch-all range
+# `\001-\010\016-\037\177` as a character class, so narrowing that range at any
+# byte — an interior one such as `\010`, or either boundary — leaks a raw byte
+# here. (ESC falls inside the range as well as having its own rule. NEL, LS and
+# PS are multi-byte UTF-8, not control bytes; they are pinned by their
+# escaped-form assertions and by st_assert_no_forged_command instead.)
 st_assert_no_raw_control() {
   local d="$1" name="$2" f byte label leaked=''
+  local c0_class
+  c0_class="[$(printf '\001-\010\016-\037\177')]"
   for f in stdout.txt summary.md; do
     [ -f "$d/$f" ] || continue
+    if LC_ALL=C grep -q -- "$c0_class" "$d/$f"; then
+      leaked="${leaked} C0-catch-all-range(${f})"
+    fi
     while IFS='|' read -r byte label; do
       [ -n "$byte" ] || continue
       if LC_ALL=C grep -qF -- "$(printf '%b' "$byte")" "$d/$f"; then
@@ -500,9 +511,6 @@ st_assert_no_raw_control() {
 \r|CR
 \013|VT
 \014|FF
-\033|ESC
-\001|SOH
-\177|DEL
 BYTES
   done
   if [ -z "$leaked" ]; then
@@ -514,21 +522,29 @@ BYTES
 
 # STRUCTURAL fence oracle. Everything the guard prints from untrusted input
 # lives strictly INSIDE a five-backtick block, so walking the rendered lines the
-# way a markdown reader would — toggling on each line that is exactly the
-# guard's own delimiter — must end balanced AND must never see a payload
-# sentinel at column 0 while outside a fence. A parity count would not do: an
-# EVEN number of smuggled fences also breaks out. Only the exact 5-backtick
-# delimiter toggles, so the ```bash remediation block does not confuse the walk.
+# way a markdown reader would must end balanced AND must never see a payload
+# sentinel outside a fence. A parity count would not do: an EVEN number of
+# smuggled fences also breaks out.
+#
+# The toggle models CommonMark's fence rules rather than an exact string match:
+# a closing fence may carry up to three leading spaces, may be LONGER than the
+# opener, and may have trailing spaces. That matters because a diff CONTEXT line
+# is space-prefixed — an unchanged ````` line inside a lock file reaches the
+# summary as ` `````` , which really does close the guard's block. An exact-match
+# toggle would be blind to exactly the geometry the sanitizer exists to stop.
+# Requiring at least as many backticks as the guard's own delimiter also keeps
+# the ```bash remediation block from confusing the walk, and an addition line
+# (`+`````` ) cannot close a fence, so it must not toggle either.
 st_assert_fence_structure() {
   local d="$1" file="$2" name="$3" sentinels="$4" verdict
   verdict="$(st_split_lines "$d/$file" |
     LC_ALL=C awk -v fence="$FENCE" -v sentinels="$sentinels" '
-      $0 == fence { inside = !inside; fences++; next }
+      $0 ~ ("^ {0,3}`{" length(fence) ",} *$") { inside = !inside; fences++; next }
       !inside && $0 ~ ("^(" sentinels ")") { leak = leak " | " $0 }
       END {
         if (fences == 0) { print "no fenced block was emitted at all"; exit }
         if (inside) { print "the rendering ends INSIDE a code fence"; exit }
-        if (leak != "") print "untrusted content reached column 0 outside a fence:" leak
+        if (leak != "") print "untrusted content was rendered OUTSIDE a fence:" leak
       }')"
   if [ -z "$verdict" ]; then
     st_pass "$name"
@@ -753,18 +769,22 @@ st_case_unicode_path() {
 st_case_fence_breakout() {
   local d="$SELFTEST_ROOT/fence-breakout"
   st_make_repo "$d"
-  printf '```\n## INJHEADING\n{"version": 1}\n' >"$d/src/Proj/packages.lock.json"
-  git -C "$d" commit -qam 'lock file whose content contains a markdown fence'
-  # After this edit the ``` line is UNCHANGED, so it reaches the summary as diff
-  # context (" ```"), while the five-backtick line arrives as an addition.
-  printf '```\n## INJHEADING\n{"version": 2}\n`````\n' >"$d/src/Proj/packages.lock.json"
+  # The five-backtick lines are UNCHANGED, so they reach the summary as diff
+  # CONTEXT — ` `````` , one leading space — which is a VALID CommonMark close of
+  # the guard's own block: exactly the geometry `sanitize_fence` exists to stop.
+  # The ``` line and the ## heading ride along as further payload.
+  # shellcheck disable=SC2016 # backticks are payload data, not a substitution
+  printf '`````\n```\n## INJHEADING\n{"version": 1}\n`````\n' >"$d/src/Proj/packages.lock.json"
+  git -C "$d" commit -qam 'lock file whose content contains markdown fences'
+  # shellcheck disable=SC2016 # backticks are payload data, not a substitution
+  printf '`````\n```\n## INJHEADING\n{"version": 2}\n`````\n' >"$d/src/Proj/packages.lock.json"
   local rc
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'lock file containing a markdown fence fails'
   assert_contains "$d/summary.md" "'''" 'leading backtick run is neutralized in the summary'
   st_assert_fence_structure "$d" summary.md \
-    'a markdown fence in lock-file content cannot escape its block' \
-    '::error::|#*[[:space:]]*INJHEADING'
+    'a context-line fence in lock-file content cannot close the summary block' \
+    '::error::|[[:space:]#+-]*INJHEADING'
 }
 
 st_case_remediation_pathspec() {
@@ -854,14 +874,15 @@ st_case_line_terminator_injection() {
   # of fences is smuggled in — a parity count would not notice — plus one
   # forged `::error::` behind each escape class.
   # shellcheck disable=SC2016 # backticks are payload data, not a substitution
-  printf 'src/Proj/packages.lock.json\nbenign\r`````\rINJHEADING::error::cr\013`````\014::error::ff\033::error::esc\001::error::soh\177::error::del/packages.lock.json\n' \
+  printf 'src/Proj/packages.lock.json\nbenign\r`````\rINJHEADING::error::cr\013`````\014::error::ff\033::error::esc\001::error::soh\177::error::del\002\010::error::c0lo\016\037::error::c0hi/packages.lock.json\n' \
     >"$d/tools/ci/expected-lockfiles.txt"
   # Lock-file CONTENT (the diff-patch sink): the same classes, each immediately
-  # before a forged command, plus fence runs behind a terminator.
+  # before a forged command, plus fence runs behind a terminator, plus EVERY
+  # byte of the catch-all range so narrowing it anywhere leaks a raw byte.
   printf '{"v": 1}\n' >"$d/src/Proj/packages.lock.json"
   git -C "$d" commit -qam 'hostile manifest entry'
   # shellcheck disable=SC2016 # backticks are payload data, not a substitution
-  printf '{"v": 2, "x": "A\r`````\n## INJHEADING\rB\302\205::error::nel\342\200\250::error::ls\342\200\251::error::ps\013::error::vt\014::error::ff\033::error::esc\001::error::soh\177::error::del\r`````\rINJHEADING::error::tail"}\n' \
+  printf '{"v": 2, "x": "A\r`````\n## INJHEADING\rB\302\205::error::nel\342\200\250::error::ls\342\200\251::error::ps\013::error::vt\014::error::ff\033::error::esc\001::error::soh\177::error::del\r`````\rINJHEADING::error::tail C0[\001\002\003\004\005\006\007\010\016\017\020\021\022\023\024\025\026\027\030\031\032\033\034\035\036\037\177]"}\n' \
     >"$d/src/Proj/packages.lock.json"
   local rc
   rc="$(st_run_guard "$d")"
@@ -886,10 +907,15 @@ st_case_line_terminator_injection() {
   assert_contains "$d/summary.md" '\e::error::esc' 'ESC in lock-file content renders as a literal \\e'
   assert_contains "$d/summary.md" '?::error::soh' 'SOH in lock-file content is caught by the C0 rule'
   assert_contains "$d/summary.md" '?::error::del' 'DEL in lock-file content is caught by the C0 rule'
+  assert_contains "$d/stdout.txt" '??::error::c0lo' 'a low C0 pair in a manifest entry is caught by the catch-all (stdout)'
+  assert_contains "$d/stdout.txt" '??::error::c0hi' 'a high C0 pair in a manifest entry is caught by the catch-all (stdout)'
+  # 27 bytes: \001-\010 and \016-\037 and \177, each rendered `?` by the
+  # catch-all except ESC (\033), which its own rule renders `\\e` first.
+  assert_contains "$d/summary.md" 'C0[?????????????????????\e?????]' 'every byte of the catch-all range is escaped in lock-file content'
   st_assert_no_raw_control "$d" 'no raw control byte survives into either sink'
   st_assert_fence_structure "$d" summary.md \
     'neither an odd nor an even fence smuggle breaks the summary block' \
-    '::error::|#*[[:space:]]*INJHEADING'
+    '::error::|[[:space:]#+-]*INJHEADING'
   st_assert_index_clean "$d" 'a hostile manifest entry does not make the guard write the index'
 }
 
