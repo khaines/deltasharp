@@ -1,6 +1,6 @@
 # Nested (struct/array/map) column mapping
 
-> **Status:** Draft — **round-3 (revised).** The round-1 opus-5 council found the id-model correct (C1) but
+> **Status:** Draft — **round-4 (final; unanimous RFL PASS pending gate).** The round-1 opus-5 council found the id-model correct (C1) but
 > the id-mode resolution model unsound (silent cross-column mis-attribution) and several doors/scenarios
 > missing. This revision **re-specifies id mode around containment**, **scopes id-mode nested support to
 > `struct<scalars>`** (array/map under **id mode** fail closed with tracked follow-up **#839**), adds the
@@ -276,7 +276,7 @@ file-global lookup:
 **Residual (id-authoritative, same as flat mode):** once the container is provenance-verified and the
 id-selected leaf is type-validated, a forged footer that permutes `field_id` stamps across **same-typed**
 siblings inside the correct container (e.g. `struct<a:long,b:long>`) transposes their *values* — this is
-the nested analogue of the accepted flat-mode id-anchor residual (`ColumnMappingIdentity.cs:80-92`): id is
+the nested analogue of the accepted flat-mode id-anchor residual (`ColumnMappingIdentity.cs:78-92`): id is
 the identity anchor, so a metadata-consistent same-typed permutation is indistinguishable from a legitimate
 file. It is out of the stated threat model and matches DeltaSharp's flat-mode posture; §6 states it.
 
@@ -503,7 +503,7 @@ serializer-authored fixtures and the production-writer assertions are marked pen
 
 **Acceptance-criteria mapping (#676):** AC-assignment → §3.1–3.3; AC-resolution → §3.1,3.2,3.4–3.14;
 AC-rename/drop → **unmet by this PR, deferred to #840** (§3.32 specifies the eventual assertion);
-AC-fail-closed → §3.9–3.26,3.33.
+AC-fail-closed → §3.8–3.26,3.33.
 
 ---
 
@@ -538,7 +538,7 @@ AC-fail-closed → §3.9–3.26,3.33.
   round-1 cross-column capture (a child id stamped on a top-level or sibling-container leaf). The
   intra-file #829 bijection is a substrate, **not** the footer↔log parentage guarantee.
 - **Name mode** gains a **mode-independent physical-path uniqueness guard** (previously absent) so duplicate
-  container/leaf names fail closed rather than resolving by luck, and a **canonical `key`/`value`/`element`
+  container/leaf names fail closed rather than resolving by luck, and a **canonical `key`/`value`
   name guard** in `ValidateShape` (Parquet.Net binds `key_value` children positionally, so a `map<T,T>` with
   a required value would otherwise silently transpose key/value).
 - **Fail-closed over fallback:** id mode never name-matches a struct child whose declared id is absent from
@@ -564,7 +564,7 @@ graph LR
 |---|---|---|---|
 | **Tampering** | id-mode child `field_id` vs log container | forged footer stamps a child id on a foreign leaf → **cross-column mis-attribution** | **containment + identity selection** (§2.5): child selected from the resolved container's own `Fields` and its id verified to resolve to that same leaf; else fail closed; not the intra-file #829 bijection alone |
 | **Tampering** | duplicate container physical name (both modes) | container object from group B, id-resolved leaf from group A → wrong `structMaxDef` → null-mask corruption | **mode-independent** duplicate-intolerant top-level `byName` (§2.5 step 1) |
-| **Tampering** | `map<T,T>` `key_value` children | Parquet.Net binds key/value **positionally** → silent key/value transposition past type/level guards | mode-independent Ordinal canonical `key`/`value`/`element` name guard in `ValidateShape` (§2.5) |
+| **Tampering** | `map<T,T>` `key_value` children | Parquet.Net binds key/value **positionally** → silent key/value transposition past type/level guards | mode-independent Ordinal canonical `key`/`value` name guard (map-only) in `ValidateShape` (§2.5) |
 | **Tampering** | name-mode duplicate leaf name | ambiguous resolution binds by luck | new name/none-mode physical-path uniqueness guard + duplicate-intolerant `ResolveStructField` |
 | **Tampering** | `delta.columnMapping.nested.ids` on a mapped schema | foreign array/map interior ids silently ignored → wrong interior read | reject `Unsupported` at validation (§2.2) |
 | **Confusion** | reordered same-typed physical struct children | count-only congruence relabels transposed children | **ordered per-child congruence** (§2.3 `BuildFullBatch`) — reject on order/count/type/nullable mismatch |
@@ -579,9 +579,13 @@ caveated outbound), not a data-integrity residual. **Two accepted id-anchor resi
 analogue of DeltaSharp's flat-mode posture at `ColumnMappingIdentity.cs:78-92`, out of the stated threat
 model): (i) within a provenance-verified container, a forged footer that permutes `field_id` stamps across
 **same-typed** siblings transposes their values (id is the identity anchor; differently-typed permutations
-*are* caught by the id-selected-leaf type validation, §2.5 step 2); (ii) an attacker who *consistently*
-rewrites both the footer group names and the leaf `field_id` stamps is metadata-indistinguishable from a
-legitimately-authored file. Neither is a *silent cross-column capture* — those are closed by containment +
+*are* caught by the id-selected-leaf type validation, §2.5 step 2 — with the one exception that
+`ValidateLeafPhysicalType` maps `timestamp` and `timestamp_ntz` to the same physical arm, so a
+`timestamp`↔`timestamp_ntz` swap is a same-typed-class residual, not a caught differently-typed case);
+(ii) an attacker who *consistently* rewrites both the footer group names and the leaf `field_id` stamps is
+metadata-indistinguishable from a legitimately-authored file (in **name** mode a log-only attacker suffices,
+since footer `field_id`s are not consulted — but the log is already the mapping authority, so this grants
+nothing beyond "attacker controls the log"). Neither is a *silent cross-column capture* — those are closed by containment +
 identity selection + the map/congruence guards. The pre-existing flat-mode rename-equivalence residual is
 unchanged.
 
@@ -662,7 +666,7 @@ unchanged.
   `ValidateColumnMappingSchema` (`:405`), `FindUnsafePathSegmentReason` (`:198-274`),
   `EnsureNoCaseInsensitiveDuplicateColumns` (`:886-935`).
   `src/DeltaSharp.Storage/Delta/ColumnMappingProjection.cs`: `ResolvePhysicalNames` (`:41`),
-  `BuildDataSchema` (`:73`, verbatim type at `:88`), `BuildFullBatch` (`:138-162`).
+  `BuildDataSchema` (`:73`, verbatim type at `:89`), `BuildFullBatch` (`:138-162`).
   `src/DeltaSharp.Storage/Parquet/ParquetFileReader.cs`: `ResolveFileFields` (nested id gate `:1535-1544`;
   surviving scalar guard `:1571-1578`; `byName` `:1505`), `BuildFieldIdMap` (`:452-560`, path-keyed #829),
   `PhysicalPathKey` (`:658-718`).
