@@ -1,288 +1,286 @@
 # Nested Parquet write (§2.9) — single-level `struct` / `array` / `map` of scalars
 
-> **Status:** Draft
-> **Issue:** [#828](https://github.com/khaines/deltasharp/issues/828) — feat(storage): nested Parquet write (§2.9) — single-level struct/array/map of scalars
-> **Author:** design (spike-informed)
+> **Status:** Draft (revised for Parquet.Net 6.1.0 — feature now viable)
+> **Issue:** [#828](https://github.com/khaines/deltasharp/issues/828) — feat(storage): nested Parquet write (§2.9)
+> **Author:** design (spike-informed; revised after the 6.1.0 upgrade)
 > **Reviewers:** delta-storage-format-engineer, dotnet-vectorized-columnar-compute-engineer, dotnet-framework-runtime-engineer, reliability-test-chaos-engineer, cloud-native-security-sme
-> **Last Updated:** 2026-08-15
-> **Related:** #571/#584 (nested Parquet **read** — the round-trip counterpart), #713 (nested footer artifact tests — consumer), #676 (nested column mapping — consumer), #829 (`BuildFieldIdMap` path-keying — id-mode read correlation), #585 (nested-**within**-nested — the deferred follow-up), #730 (reference-type nullability → footer repetition), #683/#686 (`SimpleString` bounded nested diagnosis)
+> **Last Updated:** 2026-08-19
+> **Related:** #571/#584 (nested **read** — the round-trip counterpart), #713 (footer artifact tests), #676 (nested column mapping), #829 (`BuildFieldIdMap` path-keying), #585 (nested-**within**-nested — deferred), #730 (nullability→repetition), #683/#686 (`SimpleString` bounded nested diagnosis), #497 (write-door schema validation), #570/#546 (nested vector selection)
 
 ---
 
 ## 1 · Overview
 
-DeltaSharp can **decode** nested Parquet — `array<T>`, `map<K,V>`, `struct<…>` — via
-`ParquetTypeMapping.EnsureReadSupported` and `NestedParquetColumnReader` (#571/#584). It **cannot write**
-nested Parquet at all: `ParquetTypeMapping.CreateField` throws `StorageErrorKind.UnsupportedFeature` for
-`ArrayType`/`MapType`/`StructType` (`ParquetTypeMapping.cs:119`) and `ParquetFileWriter` only ever writes
-scalar leaves. Every nested-storage feature is blocked behind this asymmetry:
+DeltaSharp can **decode** nested Parquet (`array<T>`, `map<K,V>`, `struct<…>`) via
+`ParquetTypeMapping.EnsureReadSupported` + `NestedParquetColumnReader` (#571/#584), but **cannot write** it:
+`ParquetTypeMapping.CreateField` throws `UnsupportedFeature` for `Array`/`Map`/`StructType` (~line 119) and
+`ParquetFileWriter` writes scalar leaves only. This blocks **#713** (footer-artifact fixtures) and **#676**
+(nested column mapping — no write→read round-trip).
 
-- **#713** — nested Parquet **footer artifact** tests cannot produce their fixtures.
-- **#676** — nested **column mapping** cannot be tested (no write→read round-trip).
+This design adds the **write** half, mirroring the delivered **read** surface: **single-level nesting of
+scalars** — `struct<s₁…sₙ>` (scalar `StructField`s), `array<scalar>`, `map<scalar,scalar>`.
+**Nested-within-nested** (`array<struct>`, `struct<array>`, `map<_,struct>`, `array<array>`, …) stays rejected
+**fail-closed** and defers to **#585** — a hard, tested boundary (§2.6), not a TODO.
 
-This design adds the **write** half so the two halves round-trip. Scope is deliberately the mirror image of
-the delivered **read** surface: **single-level nesting of scalars** —
+### 1.1 Viability — settled under Parquet.Net 6.1.0 (this is the material change from the prior draft)
 
-- `struct<s₁, …, sₙ>` where each `sᵢ` is a scalar `StructField`,
-- `array<scalar>`,
-- `map<scalar, scalar>`.
+The **prior draft was found non-viable against 6.0.3**: its public typed `WriteAsync` inferred definition
+levels from a two-state (present/null) array and could emit only `maxDef`/`maxDef−1`, so null-list, empty-list,
+null-element, and null-struct all collapsed and silently decoded wrong; the four-state def-level writer was
+`internal`. **6.1.0 (pinned on `main`, #837) makes `ParquetRowGroupWriter.WriteAllPartsAsync<T>` PUBLIC:**
 
-**Nested-within-nested** writes (`array<struct<…>>`, `struct<array<…>>`, `map<…, struct<…>>`, `array<array<…>>`,
-…) are **out of scope** and remain rejected **fail-closed**, deferred to **#585**. That boundary is a hard,
-tested contract, not a TODO (§2.6).
+```csharp
+ValueTask WriteAllPartsAsync<T>(DataField field, ReadOnlyMemory<T> values,
+    ReadOnlyMemory<int>? definitionValues, ReadOnlyMemory<int>? repetitionLevels, CancellationToken ct)
+```
 
-The invariant this feature must not break: **the writer produces exactly what the #571 reader decodes.** The
-correctness mechanism is a **round-trip oracle** (§3.1) against the real `NestedParquetColumnReader`, not
-hand-audited Dremel level arithmetic.
+It writes the leaf's **present values** plus **explicit definition and repetition levels** — the full Dremel
+encoding. A spike (`files/spike-nested-parquet-write.md`, 6.1.0) proved exact round-trips of the previously
+inexpressible cases (`ReadRawAsync` reads back the identical levels):
 
-### 1.1 Spike outcome (viability — settled)
+- `array<long>` rows `[1,2]`, **null-list**, **empty-list**, `[3, null-element]` → def `[3,3,0,1,3,2]`,
+  rep `[0,1,0,0,0,1]` — **round-tripped byte-exact**.
+- `struct<zip>` rows `{10}`, **null-struct**, `{null}` → def `[2,0,1]` — **round-tripped byte-exact**.
 
-A spike against Parquet.Net 6.0.3 (`files/spike-nested-parquet-write.md`) established:
-
-- The high-level API writes and reopens all three shapes (`StructField`, `ListField(name, element)`,
-  `MapField(name, key, value)`); the physical structure round-trips (`addr/city`; `tags/list/element`;
-  `m/key_value/key`, `m/key_value/value`).
-- Column writes are **per leaf** in `schema.GetDataFields()` order via the typed extensions the writer
-  already uses: value leaves `rg.WriteAsync<T>(field, ReadOnlyMemory<T?>, repetitionLevels?, customMeta?, ct)`
-  with **`T : struct`**; reference leaves (`string`/`byte[]`) the non-generic
-  `rg.WriteAsync(field, IReadOnlyCollection<T>, repetitionLevels?)`. Repetition levels are **supplied
-  explicitly**; **definition levels are inferred** by Parquet.Net from the (nullable) data array — there is
-  **no** explicit definition-level parameter on the typed write API.
-- **Nested value leaves must be written as nullable `T?[]`** — a non-null `ReadOnlyMemory<T>` into a nested
-  (optional-path) leaf throws `"Definition levels are not ready yet"`.
-- **Map keys are `REQUIRED`** — `MapField`'s constructor throws `"map's key cannot be nullable"`; the key leaf
-  is written non-nullable.
-- **field_id lands in the Thrift footer** (`reader.Metadata.Schema` → `Parquet.Meta.SchemaElement.FieldId`)
-  and only on **leaf** `DataField`s. `StructField`/`ListField`/`MapField` **have no settable `FieldId`** —
-  Parquet.Net's high-level API cannot stamp a group/container node's field_id. This shapes id-mode mapping
-  (§2.7) and is why container correlation is by **physicalName**, leaf correlation by **field_id**.
+So the writer **computes** the Dremel levels from the internal vector (§2.3) and writes them explicitly — it no
+longer depends on library inference, and the "phantom fallback" of the prior draft is gone. **Container nodes
+still carry no settable `field_id`** and `Field.IsNullable` has **no public setter** in 6.1.0 (verified) — both
+shape the design (§2.4, §2.5). The correctness contract is a **round-trip oracle against the real #571
+reader**, backstopped by an **explicit level-stream differential** (§3) — level math is now *specified*, per
+the prior council's H1, not left to inference.
 
 ---
 
 ## 2 · Logical architecture
 
-Keep the layering: this is a pure **storage-format** change under `DeltaSharp.Storage/Parquet`. It adds no
-public API and no engine/plan behavior; the internal `ColumnBatch`/`ColumnVector` contract is unchanged (the
-nested vectors already exist for read — §2.2).
+Pure storage-format change under `DeltaSharp.Storage/Parquet`; no public API, no engine/plan behavior; the
+internal `ColumnBatch`/`ColumnVector` contract is unchanged (the nested vectors already exist for read).
 
 ### 2.1 Where nested write sits
-
-Two functions own the writer's schema→Parquet mapping:
-
-- `ParquetTypeMapping.CreateField(StructField, honorReferenceNullability)` — today returns **one** scalar
-  `DataField` per top-level column and throws on nested. It must instead return the nested **`Field`**
-  (`StructField`/`ListField`/`MapField`) for the in-scope shapes.
-- `ParquetFileWriter.WriteAsync` builds `DataField[] fields` (one per column) and calls
-  `WriteColumnAsync(rowGroup, fields[c], schema[c], …)` per column. A nested column is **not** one
-  `DataField`; it is a `Field` whose **leaves** (`Field.Path`-addressed `DataField`s) are each written
-  separately with repetition levels. So the per-column write fans out to **N leaf writes**.
+- `ParquetTypeMapping.CreateField(StructField, honorReferenceNullability)` returns **one** scalar `DataField`
+  today and throws on nested. It must return the nested **`Field`** (`StructField`/`ListField`/`MapField`) for
+  the in-scope shapes. Its return type widens `DataField` → `Field` (base); `ParquetFileWriter` holds `Field[]`
+  and resolves each field's leaves in `schema.GetDataFields()` order.
+- `ParquetFileWriter.WriteAsync` builds the fields and calls a per-column writer. A nested column fans out to
+  **N leaf writes**, each `WriteAllPartsAsync<T>(leaf, values, def, rep, ct)`.
 
 ### 2.2 The internal nested representation already exists (read side)
+`StructColumnVector` (children, each `Length==parent.Length`, + struct validity), `ListColumnVector`
+(int offsets length `Length+1` over an `Elements` child + validity; null-list vs empty-list distinguished by
+`IsNull`), `MapColumnVector` (offsets over `Keys`+`Values`; keys non-null). The writer **consumes** these; its
+job is the inverse of `NestedParquetColumnReader` — shred offsets+validity into **def+rep** level streams.
 
-`DeltaSharp.Engine.Columnar` already models nested columns — the write path **consumes** them, it does not
-invent them:
+### 2.3 The shredder — `ColumnVector` → (values, def, rep), then `WriteAllPartsAsync` (NORMATIVE level table)
 
-- `StructColumnVector` — `FieldCount` children (`Child(i)`), each `Length == parent.Length`, plus the struct's
-  own validity bitmap (null struct vs struct-of-null-fields).
-- `ListColumnVector` — an `int` **offsets** buffer of length `Length + 1` over an `Elements` child, plus a
-  validity bitmap; a **null list** (`IsNull`) is distinct from an **empty list** (`ElementLength == 0`,
-  `IsNull == false`).
-- `MapColumnVector` — offsets over `Keys` + `Values` children; **keys non-null** by construction; value
-  nullability is advisory (`MapType.ValueContainsNull`).
+For each top-level column the shredder walks the single-level vector and, per **leaf**, produces the present
+values plus **explicit** def+rep arrays. Max depth ≤ 2, so the level tables are small and **specified here**
+(reader thresholds cited from `NestedParquetColumnReader`):
 
-These are exactly the structures the read side assembles, so **the writer's job is the inverse of
-`NestedParquetColumnReader`**: shred offsets + validity into Parquet **repetition + definition** levels.
+**`struct<leaf>`** (struct OPTIONAL, leaf per its nullability) — leaf `maxDef` = (struct optional:1) + (leaf
+optional:1); rep always 0:
 
-### 2.3 The core new machinery — `ColumnVector` → Parquet leaf shredding
+| row state | def | reader decode |
+|---|---|---|
+| null struct | 0 | `BuildStructNullMask`: `def < structMaxDef(1)` ⇒ null struct |
+| present struct, null field | 1 | present struct; leaf null |
+| present value | 2 (`maxDef`) | present value |
 
-For each top-level column the writer walks the (single-level) nested vector and, for **each leaf**, produces:
+A **REQUIRED** leaf (`nullable:false`) has `maxDef` = 1: null-struct ⇒ 0, present ⇒ 1; a null field is
+**impossible** and rejected pre-write (§2.4a).
 
-1. a **flattened, nullable** value array of the leaf's present values in document order, and
-2. a **repetition-level** array of equal length.
+**`array<element>`** (list OPTIONAL, element per its nullability) — leaf `maxDef` = (list optional:1) + (repeated
+list:1) + (element optional:1) = 3 when element nullable; `containerMaxDef=2`, `emptyContainerDef=1` in
+`BuildRepeatedStructure`:
 
-Definition levels are then inferred by Parquet.Net from the nullable value array (§1.1). The single-level
-shredding rules (max repetition/definition depth ≤ 2) are bounded and enumerable:
+| row state | def | rep(first) | reader decode |
+|---|---|---|---|
+| null list | 0 | 0 | `def < emptyContainerDef(1)` ⇒ null list |
+| empty list `[]` | 1 | 0 | `def == 1` ⇒ empty list |
+| null element | 2 | 0/1 | present list, null element |
+| present value | 3 | 0/1 | present value |
 
-- **`struct<sᵢ>`** (non-repeated): each leaf `sᵢ` emits one value **per row** (repetition level `0`
-  everywhere; leaf length `== rowCount`). Nulls encode two masked cases through the leaf's nullable array +
-  the struct's optionality: a **null struct** masks all its fields; a **null field** inside a present struct.
-  Both surface as a null at the leaf position; the reader reconstructs struct-null vs field-null from
-  definition levels (Parquet.Net infers them from the schema's optional nesting + the null markers). This
-  null/null ambiguity is precisely why the **round-trip oracle (§3.1) is the contract**, not the level math.
-- **`array<scalar>`**: iterate rows; for row *r* with `k = offsets[r+1] − offsets[r]` elements, emit the *k*
-  element values with repetition `0` for the first element of the row and `1` for each subsequent element;
-  a **null** or **empty** list emits a single boundary marker (repetition `0`, a null value) so the row is
-  represented — matching the reader's null-vs-empty decode. The exact boundary encoding is **pinned by the
-  oracle**, and if Parquet.Net's typed inference cannot distinguish null-list from empty-list, §2.8 R1
-  specifies the fallback.
-- **`map<scalar,scalar>`**: identical to `array` over the `key_value` repeated group, emitting **paired**
-  key/value leaves; keys are `REQUIRED` (never null), values follow `ValueContainsNull`.
+rep = 0 for the first element of a row, 1 for each subsequent element. A **REQUIRED** element drops one level
+(present ⇒ 2, empty ⇒ 1, null-list ⇒ 0); null-element impossible (rejected §2.4a).
 
-The shredding is a pure function of the vector's offsets + validity — **no** `Guid`/`DateTime.UtcNow`/`Random`
-(determinism ban), allocation-conscious (reuse per-leaf buffers across row groups where practical).
+**`map<key,value>`** — identical to `array` over the `key_value` repeated group, emitting **paired** key/value
+leaves. Keys are `REQUIRED` (`maxDef` one lower than the value); values follow `ValueContainsNull`. The
+key-leaf and value-leaf level slots for null/empty maps are emitted **in parallel** so
+`ValidateParallelDefinition` sees them agree on entry presence — the prior draft's contradiction ("keys never
+null" vs "a null/empty map still needs a key-leaf slot") is resolved: the key leaf's slot for a null/empty map
+is authored at `def < mapMaxDef` (a structural absence marker), never as a null key **value**.
 
-### 2.4 `CreateField` — emitting the nested `Field`
+The shredder is a pure function of offsets+validity — **no** `Guid`/`DateTime.UtcNow`/`Random` (determinism
+ban); it rents/reuses per-leaf `def`/`rep`/value buffers via `ArrayPool<T>` with `clearArray:true` and always
+writes exact-length slices (`AsMemory(0,count)`) so no stale/cross-tenant tail bytes reach disk (prior BL-4).
 
-`CreateField` gains recursive construction for the in-scope shapes, reusing the existing scalar leaf builders
-(so `#730` reference-nullability and decimal/temporal handling are inherited unchanged at the leaves):
+### 2.4 `CreateField` — emitting the nested `Field`, and the write-door schema round-trip (Security F1)
+`CreateField` gains recursive construction (reusing the scalar leaf builders, so `#730` reference-nullability
+and decimal/temporal handling are inherited at the leaves): `StructType`→`StructField`, `ArrayType`→`ListField`,
+`MapType`→`MapField(keyLeaf REQUIRED, valueLeaf)`; each rejects a **nested child** fail-closed (→ #585).
 
-- `StructType` → `new StructField(name, childLeaf₁, …, childLeafₙ)` where each child is built by the existing
-  scalar path; **reject** (fail closed) any child that is itself nested (→ #585).
-- `ArrayType(element)` → `new ListField(name, elementLeaf)`; reject nested `element`.
-- `MapType(key, value)` → `new MapField(name, keyLeaf /* REQUIRED */, valueLeaf)`; reject nested `key`/`value`.
-- The return type widens from `DataField` to `Field` (its base). `ParquetFileWriter` holds `Field[]` and
-  resolves each field's leaves via `Field`/`DataField.Path` in `GetDataFields()` order.
+**`ParquetTypeMapping.ToDataSchema` MUST become recursive.** It reconstructs the physical schema a staged file
+was written with — used by `#497`'s `ValidateStagedWriteSchema`. Today it iterates `ParquetSchema.DataFields`
+(**leaves**) keyed by leaf-local name, so a nested column reconstructs as its flattened leaves → count/name
+mismatch → **every nested write fails at commit**, and two array/map columns produce duplicate `element`/`key`/
+`value` leaves → `StructType` duplicate-name throw → DeltaSharp declares **its own valid file `CorruptData`**.
+Fix: iterate `ParquetSchema.Fields` and rebuild `StructType`/`ArrayType`/`MapType` from `StructField`/
+`ListField`/`MapField` — the exact inverse of the widened `CreateField`. §3.3 pins a `ReadDataSchemaAsync`→
+declared-shape assertion and a `#497` write-door round-trip AC. **Do not** exempt nested columns from
+`ValidateStagedWriteSchema` — that would fail-open the only gate comparing real bytes to the declaration.
 
-`EnsureReadSupported` already accepts these shapes; the two are brought into agreement (writer no longer a
-strict subset).
+### 2.4a Container nullability (BL-2) and the required-lane value guard (F5)
+`Field.IsNullable` has **no public setter** in 6.1.0, so `StructField`/`ListField`/`MapField` are always
+`OPTIONAL` on the wire. Consequences and rules:
+- A Delta `"nullable": false` **nested container** cannot be emitted `REQUIRED`. **Reject it fail-closed** at
+  `CreateField` (`UnsupportedFeature`, naming this limitation) rather than silently writing an `OPTIONAL`
+  container and re-introducing the `#730` footer↔log divergence. (Scalar leaves inside are still emitted with
+  their own repetition via the leaf builder; the container-level `nullable:false` is the unsupported case.)
+- The existing `#730` single-source assert in `WriteColumnAsync` (`field.IsNullable == schemaField.Nullable`)
+  is **per-leaf** in the nested path — assert each leaf's repetition against the mapped
+  `ArrayType.ContainsNull` / `MapType.ValueContainsNull` / struct-child `Nullable`, never against the top-level
+  column's nullability. State the stale default-arm comment fix (`ToParquetField`→`CreateField`).
+- **Required-lane value guard:** before `WriteAllPartsAsync`, validate that no `REQUIRED` nested leaf carries a
+  null (a `nullable:false` struct child; a map **key** over the *full* child range, since `MapColumnVector`
+  only enforces keys over the referenced range) → `CorruptData`, **before any bytes are written**.
 
-### 2.5 field_id stamping (column-mapping id mode)
-
-In id mode, DeltaSharp stamps `delta.columnMapping.id` as the Parquet `field_id`. Per the spike, only **leaf**
-`DataField`s can carry a footer field_id; group nodes cannot. Rules:
-
-- Stamp each **scalar leaf** (including a struct's scalar children) with its column-mapping id, exactly as the
-  scalar path does today (`ColumnMapping.TryGetId`).
-- **Array `element` / map `key`,`value`** carry **no** Delta column-mapping id (Delta assigns ids only to
-  `StructField`s — see #676 C1); they get **no** footer field_id, or a writer-synthesized one only if the
-  reader requires it (decided with #676; default: none).
-- **Container** nodes (`struct`/`array`/`map`) cannot be stamped → id-mode **read** correlation resolves
-  containers by **physicalName** and scalar leaves by **field_id** (this is the #676/#829 contract; see §2.7).
+### 2.5 field_id stamping (id mode)
+Stamp each **scalar leaf** (incl. struct scalar children) with `delta.columnMapping.id` via the existing
+range-guarded helper (extract `StampFieldId(DataField,StructField)` so the guard lives once, not duplicated
+across the three shape handlers — prior BL-3). **Array `element` / map `key`,`value` carry no Delta id → no
+footer field_id (a normative prohibition, not an open question — prior F9): stamping them would create
+guaranteed `field_id` collisions across two array/map columns).** **Containers** cannot be stamped (leaf-only,
+6.1.0-confirmed) → id-mode **read** correlates containers by **physicalName** (stable across logical rename in
+both mapped modes) and scalar leaves by **field_id**.
 
 ### 2.6 Fail-closed boundary — nested-within-nested → #585
+Depth > 1 (a nested type as a struct child / array element / map key/value) is rejected at `CreateField`
+(`UnsupportedFeature`, names #585), **before any bytes are written**, enforced structurally + tested (§3.4).
 
-Any nesting depth > 1 (a nested type appearing as a struct child, an array element, or a map key/value) is
-**rejected** at `CreateField` with `StorageErrorKind.UnsupportedFeature` and a diagnostic that names **#585**.
-This is enforced structurally (the recursion rejects a non-scalar child) and covered by explicit
-reject-tests (§3.4), so the scope boundary cannot silently regress into a partial/incorrect deep write.
+### 2.7 id-mode read correlation is gated on #676 (not #829) — prior H2/F2
+The **writer** stamps leaf field_ids and is independent of #829. But the **id-mode read** of a nested file is
+rejected upstream today by `ParquetFileReader` (nested-under-id-mode reject) **and** by `ColumnMapping.EnsureLeaf`
+at load/commit — both are **#676** scope. So **this PR ships name-mode / none-mode only**; the id-mode nested
+round-trip AC is `[Fact(Skip="#676")]`, and §3.4 asserts those upstream guards are **still armed** after this
+PR. The prior draft's claim that the id-mode oracle needs only #829 was wrong; #829 (`BuildFieldIdMap`
+path-keying) is a sibling correctness fix, not this feature's gate.
 
-### 2.7 id-mode read correlation (why #829 is a sibling, not a dependency of the writer)
+### 2.8 Selection-vector & diagnostic hygiene (prior F3/F4)
+- **Selection vector (F4):** `ParquetFileWriter` consumes `batch.SelectedColumn(c)`; `Select` throws for nested
+  vectors (#570, deferred to #546). A nested column in a batch carrying a `SelectionVector` must **fail closed**
+  with a typed `UnsupportedFeature` (nested write requires a materialized batch) — never a partial/misaligned
+  write (which would be cross-row corruption). §3.1 pins this.
+- **Diagnostics (F3):** the shredder wraps every nested-`ColumnVector` interaction so no
+  `ColumnVector`-originated exception (`ListColumnVector.Select`, `ArrowNestedColumnVector.GetValues`, …) escapes
+  the storage layer un-normalized — convert to `UnsupportedFeature` with `DiagnosticText.Sanitize(columnName)` +
+  the bounded `TypeName` KIND (never raw `DataType.SimpleString`, the #683/#686 hazard). An explicit typed
+  `default:` arm on the shredder's vector dispatch fails an Arrow-imported nested vector closed. §3.4 asserts no
+  emitted nested-write diagnostic contains a nested field name.
 
-The **writer** does not depend on #829. But the **round-trip oracle** for id mode reads back through the
-reader, which correlates footer field_ids to leaves via `BuildFieldIdMap`. On nested schemas the *current*
-`BuildFieldIdMap` mis-attributes by leaf-local name (#829). The id-mode round-trip tests therefore require
-#829's path-keying fix to pass; name-mode round-trips do not. The write design is complete without #829; the
-**id-mode test lane** consumes it. (Sequencing: #829 lands independently; this feature's id-mode oracle turns
-green once both are in.)
-
-### 2.8 Component boundaries & risks
-
-- **R1 — null-list vs empty-list encoding.** Central risk. Mitigation: an oracle case matrix (§3.1) drives the
-  encoding; if the typed API cannot express a distinction, drop to `ParquetRowGroupWriter`'s
-  `ReadRawAsync`/def-level-aware sibling or the raw column API for that leaf. Fallback is local to the
-  shredder; the `Field`/`CreateField` surface is unaffected.
-- **R2 — struct-null vs field-null ambiguity.** Resolved by definition-level inference + oracle; the writer
-  never needs to disambiguate, only to emit the correct null markers.
-- **R3 — AOT.** The write path is on the NativeAOT Executor image; the new code stays on the same typed
-  Parquet.Net surface already AOT-gated for scalar write (OQ-1). No reflection/dynamic codegen added; the
-  NativeAOT gate runs in CI when the write path changes.
-- **R4 — allocation.** Shredding allocates per-leaf value + repetition buffers; size them from offsets and
-  reuse across row groups. No `O(total-rows)` index materialized (matches the existing writer's M5 cursor).
+### 2.9 Component boundaries & residual risks
+- Shredder is a new `internal static class NestedColumnShredder` producing `(values,def,rep)` per leaf, **unit-
+  testable without a Parquet stream** (prior BL-5); `ParquetFileWriter` retains dispatch only. Element-granular
+  loops honor the existing cancellation stride.
+- **AOT (R3):** `WriteAllPartsAsync` is a typed method on the same Parquet.Net surface already AOT-gated for
+  scalar write — **no** `ParquetSerializer`/Linq-Expressions (the AOT-hostile path the prior draft's only viable
+  option required). The NativeAOT gate runs in CI when the write path changes.
+- **PII at rest (Security F8):** `add.stats` correctly omits nested (`StatisticsPolicy` → `OmittedNestedType`),
+  but Parquet's per-column-chunk footer statistics carry nested leaf min/max; state this asymmetry (§5) so a
+  data-classification reviewer isn't misled.
 
 ---
 
 ## 3 · Functional test scenarios & correctness oracles
 
-### 3.1 Round-trip oracle (the contract)
+### 3.1 Round-trip oracle + level-stream differential (the contract)
+For each shape × null/empty/present combination, `WriteAsync` a `ColumnBatch` built from the nested
+`ColumnVector`s, then (a) read the bytes back through the **real** `NestedParquetColumnReader` and assert the
+decoded vector **equals** the input via a **total, structural comparator** (values, offsets, **validity bit**,
+null-vs-empty — the comparator is specified and its kill-rate pinned by a mutation test that flips one bit at a
+time: validity flip, null-list↔empty-list swap, dropped element, reordered map entries, nulled struct field —
+prior H3); and (b) assert the **raw def/rep level streams** equal the normative §2.3 table (transcribed
+literals, `FooterWireKeys` doctrine). Matrix (prior Quality H1 — complete):
+- `struct<city:string, zip:long?>`: present / null-struct / null-field / mixed; **required struct**
+  (`structMaxDef==0` branch) and **required leaf**.
+- `array<string>` and `array<long>`: `[a,b]`, null-list, empty-list, `[c,null]`; **required container**
+  (different `emptyContainerDef` branch); **multi-element rows** (rep>0 continuation).
+- `map<string,long?>`: present / null-map / empty-map / value-null; **multi-entry map** (rep>0); keys always
+  non-null; parallel key/value slot agreement.
+- Nested leaf types beyond string/long: bool/int/double/DATE/TIMESTAMP(_NTZ)/DECIMAL/binary (annotations a
+  foreign reader keys on).
+- A **seeded generative** lane (random row counts incl. 0, per-row `{null,empty,N}`, null elements, leaf types,
+  row-group boundaries), printing+pinning failing seeds, matching the scalar path's `DeterministicRng` bar.
+- **Selection-vector fail-closed** (F4): a nested column in a batch with a `SelectionVector` throws
+  `UnsupportedFeature`.
 
-For each shape and each **null/empty/present** combination, `WriteAsync` a `ColumnBatch` built from the nested
-`ColumnVector`s, then read the bytes back through the **real** `NestedParquetColumnReader` and assert the
-decoded vector equals the input (values, offsets, validity, null-vs-empty). Matrix:
+### 3.2 Name-mode & (deferred) id-mode
+Name/none-mode round-trip is delivered here. Id-mode nested round-trip is `[Fact(Skip="#676")]`; a footer-level
+assertion that leaf field_ids land in `reader.Metadata.Schema` (for #713) **is** delivered.
 
-- `struct<city:string, zip:long>`: present struct; **null struct**; struct with **null field** (`zip` null);
-  mixed rows.
-- `array<string>`: `["a","b"]`, **null list**, **empty list `[]`**, `["c", null-element]`, all in one column.
-- `array<long>` (value-type element, exercises the nullable-`T?[]` leaf rule).
-- `map<string,long>`: present map, null map, empty map, value-null entry; **keys always non-null**.
+### 3.3 Write-door & footer shape (feeds #713, Security F1)
+Assert `ReadDataSchemaAsync` on each emitted file returns the **declared logical shape** (recursive
+`ToDataSchema`), and `ValidateStagedWriteSchema` accepts a nested write (the `#497` round-trip AC). Assert the
+Thrift footer structure per shape (`addr(nc=2)`→city,zip; `tags`→`list`→`element`; `m`→`key_value(REPEATED)`→
+`key(REQUIRED)`,`value`), map key `REQUIRED`, `#730` reference-nullability honored per leaf.
 
-### 3.2 Name-mode & id-mode
+### 3.4 Fail-closed rejects
+`array<struct>`, `struct<array>`, `struct<struct>`, `map<_,struct>`, `array<array>` throw before any bytes
+(→#585); a `nullable:false` **nested container** rejected (§2.4a); a `REQUIRED`-leaf null rejected pre-write
+(§2.4a); id-mode nested still rejected upstream (§2.7); no diagnostic echoes a nested field name (F3).
 
-- **Name mode**: round-trip without column mapping — physical names carry the correlation.
-- **Id mode**: stamp field_ids, round-trip through the id-mode reader; asserts leaf field_ids land in the
-  footer (`reader.Metadata.Schema`) and resolve to the correct leaves (requires #829; §2.7). Include a
-  **same-typed sibling** case (`home:struct<city>`, `work:struct<city>`) to prove no leaf-name collision.
+### 3.5 Determinism
+Two writes of the same batch are byte-identical (extend the scalar assertion); leaf iteration order is
+normative (`GetDataFields()` order); no wall-clock/random/guid.
 
-### 3.3 Footer shape (feeds #713)
-
-Assert the emitted Thrift footer structure for each shape: `struct` → `addr(num_children=2)` → `city`,`zip`;
-`array` → `tags`→`list`→`element`; `map` → `m`→`key_value(REPEATED)`→`key(REQUIRED)`,`value`. Map key
-`REQUIRED`; nullable leaves `OPTIONAL`; `#730` reference-nullability honored (a `"nullable":false` string leaf
-is `REQUIRED`).
-
-### 3.4 Fail-closed rejects (scope boundary, #585)
-
-`array<struct<…>>`, `struct<array<…>>`, `struct<struct<…>>`, `map<string, struct<…>>`, `array<array<…>>`
-each throw `UnsupportedFeature` **before any bytes are written**, with a message naming #585. A `map` with a
-**nullable key** type is rejected (or coerced REQUIRED) per Parquet's map contract.
-
-### 3.5 Determinism / purity
-
-Two writes of the same batch produce byte-identical files (already asserted for scalar write; extend to nested).
-No wall-clock/random/guid in the shredder.
-
-### 3.6 Acceptance-criteria mapping
-
+### 3.6 AC mapping
 | AC | Scenario |
 |----|----------|
-| write struct/array/map of scalars | §3.1 |
-| write→read parity vs #571 reader (name + id mode) | §3.1, §3.2 |
-| null vs empty list/map, null field/value | §3.1 |
-| nested-within-nested rejected fail-closed (→#585) | §3.4 |
+| write struct/array/map of scalars, name mode | §3.1 |
+| write→read parity vs #571 reader + level differential | §3.1 |
+| null vs empty list/map, null field/value (all Dremel states) | §3.1, §2.3 table |
+| #497 write-door round-trip (recursive ToDataSchema) | §3.3 |
+| nested-within-nested + nullable-container + required-null rejected | §3.4, §2.4a |
+| id-mode deferred to #676; upstream guards armed | §3.2, §3.4 |
 | footer artifacts for #713 | §3.3 |
-| id-mode field_ids in footer, correct correlation | §3.2 (with #829) |
+| selection-vector fail-closed; diagnostics sanitized | §3.1, §3.4 |
 | determinism | §3.5 |
 
----
-
 ## 4 · Performance
-
-Nested write is O(total leaf values); the shredder is a single pass over each vector's offsets + validity with
-pre-sized, reused buffers. Row-group sizing keeps the existing running-cursor model (no per-row index).
-Baseline vs the scalar path is measured with a BenchmarkDotNet micro-bench on `array<long>` /
-`struct<scalars>` writes; the gate is “no regression on the scalar path” (nested is net-new).
+O(total leaf values); single pass over offsets+validity with pooled, cleared, exact-sliced buffers; existing
+row-group cursor unchanged. BenchmarkDotNet micro-bench on `array<long>`/`struct<scalars>`; gate = no
+regression on the scalar path.
 
 ## 5 · Security
-
-No new external input on the **write** path (callers pass in-tree `ColumnBatch`es). The **read** side of the
-oracle exercises `NestedParquetColumnReader`, whose fail-closed decode (bounded nesting, footer sanity) is
-unchanged. Diagnostics run through `DiagnosticText.Sanitize` (no raw column names/paths leaked), matching the
-existing writer.
+No new external input on the write path (trusted in-tree `ColumnBatch`es). Dominant hazard is silent
+corruption — retired by §3.1's oracle **and** the level differential. Diagnostics sanitized (§2.8). **PII note:**
+nested columns are omitted from `add.stats` but their leaf min/max appear in the Parquet footer's column-chunk
+statistics — the value inherits the data's classification at rest (§2.9).
 
 ## 6 · Threat model
-
-Writer consumes trusted in-process batches — the surface is a **correctness** (silent-corruption) risk, not an
-injection risk. The dominant hazard is a mis-shredded file that reads back wrong (data corruption); the
-round-trip oracle against the independent reader is the mitigation. A malformed **foreign** nested file is a
-read-path concern, covered by the existing reader's fail-closed decode and by #829 on the id-mode correlation.
+Correctness/silent-corruption surface, not injection. Managed nested vectors validate offsets in-ctor; an
+Arrow-imported (`ArrowNestedColumnVector`) column is the one non-in-tree producer and is failed closed by the
+typed `default:` arm (§2.8). Foreign-file read hazards are the reader's/#829's domain.
 
 ## 7 · Observability
-
-Reuse the writer's existing diagnostics; nested rejects emit `UnsupportedFeature` with the bounded nested
-`SimpleString` KIND (`#683/#686`) plus the #585 pointer. No new counters required for M-scope.
+Reuse the writer's diagnostics; nested rejects emit `UnsupportedFeature` with the bounded nested `TypeName`
+KIND (#683/#686) + the #585/#676 pointer.
 
 ## 8 · Rollout & risk
+Additive: scalar write byte-identical (asserted); inert until a caller writes nested. Risk now concentrates in
+the shredder's level computation — retired by §3.1's level differential before merge. NativeAOT gate in CI. No
+migration.
 
-Additive: no existing file changes shape (scalar write is byte-identical; assert it). Feature is inert until a
-caller writes a nested schema. Risk concentrates in R1/R2 (§2.8), retired by §3.1 before merge. NativeAOT gate
-in CI. No migration.
-
-## 9 · Open questions & decisions
-
-1. **Q:** Does the typed `WriteAsync` inference express null-list vs empty-list, or is the raw fallback needed?
-   **Decision:** pin empirically in §3.1 first; implement the fallback only if a matrix case fails. Either way
-   the `CreateField` surface is unchanged.
-2. **Q:** Do array/map leaves need a synthesized footer field_id in id mode? **Decision:** default **no**
-   (Delta assigns none); revisit with #676 if its reader resolution requires it.
-3. **Q:** One PR or split (CreateField + shredder, then tests/#713 fixtures)? **Decision:** one feature PR;
-   #713 fixtures may follow as a thin consumer PR.
+## 9 · Decisions (prior open questions resolved)
+1. **Def-level expressibility:** resolved — 6.1.0 `WriteAllPartsAsync` writes explicit levels; the §2.3 table is
+   normative and differential-tested. No inference, no fallback.
+2. **array/map-leaf field_id:** normative **prohibition** (§2.5), tested.
+3. **PR split:** PR1 = `CreateField`+`ToDataSchema` widening + `Field[]` ripple + §2.6/§2.4a fail-closed rejects
+   (mechanical, no nested write yet, forces the nullability decision into the open); PR2 = shredder + oracle.
+   `#713` fixtures follow as a thin consumer.
 
 ## 10 · References
-
-- `src/DeltaSharp.Storage/Parquet/ParquetTypeMapping.cs` (`CreateField:70`, `EnsureReadSupported:165`, nested
-  throw `:119`)
-- `src/DeltaSharp.Storage/Parquet/ParquetFileWriter.cs` (`WriteAsync`, `WriteColumnAsync:227`)
-- `src/DeltaSharp.Storage/Parquet/NestedParquetColumnReader.cs` (the decode this writer must mirror)
-- `src/DeltaSharp.Engine/Columnar/{Struct,List,Map}ColumnVector.cs` (the nested representation shredded)
-- `src/DeltaSharp.Storage/Parquet/ParquetFileReader.cs` (`BuildFieldIdMap:449` — id-mode correlation, #829)
-- Spike: `files/spike-nested-parquet-write.md`
-- Issues: #571/#584 (read), #713 (footer tests), #676 (column mapping), #829 (path-keying), #585 (nested-in-nested), #730 (nullability→repetition)
+- `ParquetTypeMapping.cs` (`CreateField`, `ToDataSchema`, `EnsureReadSupported`), `ParquetFileWriter.cs`
+  (`WriteAsync`, `WriteColumnAsync`), `NestedParquetColumnReader.cs`, `Engine/Columnar/{Struct,List,Map}ColumnVector.cs`,
+  `ParquetFileReader.cs` (`BuildFieldIdMap` #829; nested-under-id-mode reject #676), `ColumnMapping.cs`
+  (`EnsureLeaf`), `StatisticsPolicy`.
+- Spike: `files/spike-nested-parquet-write.md` (6.1.0 `WriteAllPartsAsync` level round-trips).
+- Issues: #571/#584, #713, #676, #829, #585, #730, #497, #570/#546, #683/#686.
