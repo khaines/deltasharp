@@ -52,8 +52,10 @@ differential are test-time; the guards are the production control.
 
 ## 2 · Logical architecture
 
-Pure storage-format change; no public API, no engine/plan behavior; the `ColumnBatch`/`ColumnVector` contract
-is unchanged.
+Pure storage-format change; no public **behavioral** API and no engine/plan behavior; the internal
+`ColumnBatch`/`ColumnVector` semantics are unchanged — the only surface addition is two read-only vector
+accessors (`RawElementSpan`/`RawEntrySpan`, §2.3/§9-Decision-6), on `IsPackable=false` Engine surface with no
+external SemVer obligation.
 
 ### 2.1 Where nested write sits, and the `CreateField` widening ripple (NEW-2)
 `CreateField(StructField, honorReferenceNullability)` returns the nested **`Field`** for in-scope shapes; its
@@ -82,12 +84,19 @@ absolute is the raw `offsets` array; a per-row physical span is `offsets[base+i+
 `base = _offset`, i.e. offset arithmetic subtracts the **element base** `offsets[_offset]` while the child
 accessors are used as-is. Walk rows by `IsNull(i)` + the **raw span** (a null row may legitimately carry a
 non-zero span — `CopyValidatedOffsets` enforces only monotonicity — so `ElementLength(i)`, which returns 0 for
-a null row, and `ElementsAt(i)`, which returns an empty view, **cannot** recover it). No public member exposes
-a null row's raw span and `_offsets` is `private` on the Engine-layer vectors (`InternalsVisibleTo` reaches only
+a null row, and `ElementsAt(i)`, which returns an empty view, **cannot** recover it). **Element counts derive
+from the raw offsets** (`offsets[_offset+_length] − offsets[_offset]`), **never** from `Elements.Length`: for a
+*mutable* vector `Elements` returns the whole child (which can carry an uncommitted tail before `EndList()`),
+so `Elements.Length` over-counts and breaks the packed-values invariant (B-5). No public member exposes a null
+row's raw span and `_offsets` is `private` on the Engine-layer vectors (`InternalsVisibleTo` reaches only
 `*.Tests`, not `DeltaSharp.Storage`), so this design **adds a public** `(int Start, int Length)
-RawElementSpan(int index)` (and `RawEntrySpan` for maps), `_offset`-rebased, on `List`/`MapColumnVector`
-(softening §2's "no public API" to "no public *behavioral* API; one additive vector accessor"). Max depth ≤ 2,
-so the tables are small and **normative** (reader thresholds cited):
+RawElementSpan(int index)` (and `RawEntrySpan` for maps) on `List`/`MapColumnVector`: the **index** is
+row-rebased by `_offset`, and **`Start`** is **`Elements`-relative** (element-base-rebased,
+`offsets[_offset+index] − offsets[_offset]`) so it indexes the pre-sliced child view directly (B-2). This is
+solution-internal surface only — `DeltaSharp.Engine` is `IsPackable=false` and packable `DeltaSharp.Core` does
+not reference Engine — so it carries **no external SemVer obligation** (softening §2's "no public API" to "no
+public *behavioral* API; two additive read-only vector accessors" — §9 Decision 6). Max depth ≤ 2, so the
+tables are small and **normative** (reader thresholds cited):
 
 **`struct<leaf>`** (struct OPTIONAL; struct `maxDef`=1):
 
@@ -152,7 +161,10 @@ front-filled, defined-only (an off-by-one shifts every downstream value). **Stri
 (Balanced N-2):** the managed vectors store `String` as **UTF-8** and expose `ReadOnlySpan<byte>` (`GetBytes`),
 so the shredder **transcodes UTF-8→UTF-16** into a per-leaf, per-row-group pooled `char[]` scratch
 (`Encoding.UTF8.GetChars`) and hands `ReadOnlyMemory<char>` **views** into it (binary similarly copies into a
-pooled `byte[]`). The scratch is rented under `try/finally` and returned only **after** the awaited
+pooled `byte[]`). The scratch is **sized exactly up front and never grown mid-leaf** (an `Array.Resize`/re-rent
+partway through would strand already-handed-out `ReadOnlyMemory<char>` views in the abandoned array → silent
+garbage; the cheap upper bound is Σ present-values' UTF-8 byte length, since UTF-16 char count ≤ UTF-8 byte
+count — no decode pre-pass, B-3). It is rented under `try/finally` and returned only **after** the awaited
 `WriteAllPartsAsync` (which the `await`+`finally` already guarantees — so pooling is safe; N-3), with
 `clearArray:true` **mandatory** for the reference-bearing `ArrayPool<ReadOnlyMemory<char>>` element array (GC
 retention of foreign buffers), and no `ReadOnlyMemory` is ever handed over a buffer returned in a prior
@@ -182,15 +194,30 @@ decoder uses, not its own belief (N4-c):
   `IndexOutOfRange`); bounds + `count(def == maxDef) == values.Length` as above.
 - **Joint legality (N4-d/A2):** `rep[i] > 0 ⇒ def[i] > emptyContainerDef` — a continuation slot cannot claim
   container absence.
+- **Run legality (N4-e — the empty/null-container continuation class):** track the row-opening slot (`rep == 0`).
+  If a row's opening slot carries `def < containerMaxDef` (a **null or empty container**), the next slot **must**
+  have `rep == 0` — equivalently `rep[i] > 0 ⇒ def[opening slot of row i] ≥ containerMaxDef`. This mirrors the
+  reader's F2 `rowComplete` guard (`BuildRepeatedStructure`) pre-write. It is the **only** detector for the
+  phantom-element class (`def=[1,3,3]/rep=[0,1,0]` grows an element in an empty-list row; `def=[0,3,3]` in a
+  null-list row): both pass every other clause AND §2.4b (footer `NumRows` is level-derived and stays correct),
+  yet Spark/parquet-mr decode a fabricated element and lose the null-vs-empty distinction. The pointwise joint
+  clause above does not catch it (the continuation's own `def` is legally high); this run-level clause does.
 - **Cross-leaf, pre-write (N4-b — the decisive gap):** for a map, the key/value **rep streams must be
   identical** (`ValidateParallelRepetition`) and their **def streams equal for every null/empty/absent slot**
-  (R6 presence + R7 equality below `mapMaxDef`); for a struct, **every** child leaf must emit `def < structMaxDef`
-  at the *same* rows (cross-child null parity, `BuildStructNullMask`). A per-leaf-only guard passes a mis-paired
-  map (keys `[0,1,0]` / values `[0,0,1]`) that DeltaSharp reads as an availability error but Spark reads as
-  **silently wrong rows** — so these cross-leaf asserts are mandatory, not "correct by construction."
+  (R6 presence + R7 equality below `mapMaxDef`); for a struct, **cross-child null parity** — at every row, all
+  child leaves must **agree** on whether the struct is null (`def < structMaxDef` on all, or none). A per-leaf
+  guard passes a mis-paired map (keys `[0,1,0]` / values `[0,0,1]`) OR a struct where child A emits
+  `def < structMaxDef` at a row where sibling B emits `def == maxDef` — both silently persist, DeltaSharp reads
+  an availability error, Spark reads **wrong rows** — so these cross-leaf asserts are mandatory, not "correct by
+  construction." (`segment row count` is the writer's batch-derived segment sum, the same reference §2.4b uses —
+  never sourced from the shredder's own output, so the `count(rep==0)` check is non-circular, P3.)
 - **A4:** map any raw Parquet.Net writer fault escaping `WriteAllPartsAsync` (e.g. the library's own
   cross-leaf row-count `InvalidOperationException`) to the typed `CorruptData` contract (§2.8's wrapping scope
   extends to the write call, not only `ColumnVector` interactions).
+- **Provenance (N4-c/A2):** the guard reads `field.MaxDefinitionLevel`/`MaxRepetitionLevel` off the
+  **schema-attached** instance (they read 0 until the field is attached to a `ParquetSchema`; the ctor and
+  `GetDataFields()` propagate them), and asserts `maxDef ≥ 1` for every nested leaf (always true in-scope) so a
+  detached-field mis-derivation cannot silently degrade the bounds.
 
 ### 2.4 `CreateField` + recursive `ToDataSchema` + its consumers (Security F1/N1/N2/N3, Architect A3)
 `CreateField` builds the nested `Field` recursively (reusing scalar leaf builders → #730/decimal/temporal
@@ -241,18 +268,22 @@ attacker-controlled** one:
   range over-rejects legitimately sliced vectors, NEW-8/BL-13) → `CorruptData`, pre-write.
 - **Zero-field struct** rejected (NEW-5).
 
-### 2.4b Post-write footer row-count reconciliation — every write path (Security N4/S1)
-Reconciliation is a **per-file property of every `ParquetFileWriter` write path**, not a staging-door step:
-fold it into `ParquetFileWriter` (reconcile the footer's `NumRows` against the batch-derived row count before
-returning `WriteResult`), so it binds **all three** production sites — `DeltaWriteTarget.StageAsync`,
-**`DeltaOptimize.WriteCompactedFileAsync`** (the worst blast radius: compaction commits `add` + `remove`
-tombstones for its inputs in one transaction, so a level defect there tombstones the originals — recoverable
-only inside the time-travel/VACUUM window), and **`ChangeDataWriter`**. The reference count is
-**`LogicalRowCount`-derived by contract** (from `ParquetStatisticsCollector`/`batch.LogicalRowCount`,
-independent of the level streams and of `StatisticsPolicy`); a **missing** reference fails closed
-(`CorruptData`), never degrades to "compare against 0". Footer `NumRows` is summed by the existing hardened
-`GetRowCountAsync` (checked, bounded). Belt-and-suspenders with §2.3c: §2.3c catches per-leaf/cross-leaf level
-defects before bytes; §2.4b catches any residual footer/row divergence before the file is committed.
+### 2.4b Post-write footer row-count reconciliation — the common `WriteAsync` core (Security N4/S1/P1/P2/P4)
+Reconciliation is bound **inside `ParquetFileWriter.WriteAsync`'s core** — the single choke point where
+`totalRows = Σ batch.LogicalRowCount` already exists — **not** "before returning `WriteResult`" (which would
+miss `ChangeDataWriter`, whose `WriteAsync` returns `Task`, not `WriteResult`). Reconcile the footer's `NumRows`
+(via the existing hardened, checked `GetRowCountAsync`) against that batch-derived `totalRows` before the file
+is returned/committed; a mismatch ⇒ `CorruptData`. This binds **all three** production sites —
+`DeltaWriteTarget.StageAsync`, **`DeltaOptimize.WriteCompactedFileAsync`** (worst blast radius: `add` + `remove`
+tombstones in one transaction, and its only current row-count control is a **`Debug.Assert`** — absent in
+Release, so §2.4b *supersedes* it, P2), and **`ChangeDataWriter`**. The reference is `LogicalRowCount`-derived
+by contract (not `statistics.NumRecords ?? 0L`, which silently degrades to 0 when stats are off — a **missing
+reference fails closed**, never compares against 0). **Streaming sink (#442/#443, P4):** all three sites buffer
+to a `MemoryStream` today (seekable footer re-read is cheap); on a non-seekable/streaming sink the reconciliation
+**fails closed or re-reads the published object — never silently skips**. Belt-and-suspenders with §2.3c
+(per-leaf/cross-leaf level defects before bytes) and independent of it (footer `NumRows` is level-derived, so a
+**dropped/duplicated segment** — where every leaf's levels are locally valid against its segment but
+`footer NumRows ≠ Σ LogicalRowCount` — is caught **only** here, not by §2.3c, Q-7).
 
 ### 2.5 field_id stamping — and why this PR does NOT stamp nested leaf field_ids (Security N5)
 Scalar (non-nested) columns stamp `field_id` via the extracted `StampFieldId` helper (guard once — BL-3).
@@ -326,7 +357,8 @@ residual named. **Matrix (Quality H1 — complete):**
   `RowGroupRowLimit` forcing ≥2 row groups → decoded-equal, rep restarts at 0 at each row-group boundary
   (NEW-7); a row group whose **first** row is a null/empty list.
 - **Sliced vector (H1-e):** `offset > 0` list/map — offset rebasing (A1: accessors pre-sliced; only raw offsets
-  rebased by the element base).
+  rebased by the element base); **and** an **unsliced** vector (`_offset == 0`) with a **non-zero element base**
+  (`offsets[0] > 0`) + a dangling tail — legal per `CopyValidatedOffsets`, the cheapest A1 regression net.
 - **Zero-row / all-null column (Quality Q-3):** a zero-row nested batch; a column where **every** row is
   null-list/null-struct/null-map (`values.Length == 0`, incl. the string/binary empty owned buffer).
 - **Multi-nested-column attribution (Quality Q-4):** one file with `array<long> a`+`b`, `map<string,long> m1`+
@@ -335,13 +367,22 @@ residual named. **Matrix (Quality H1 — complete):**
   accepts (the recursive-`ToDataSchema` regression cell for the duplicate-leaf-name hazard).
 - **Level-guard fault injection (§2.3c — Quality Q-1 / Security):** `NestedLevelGuardTests`, one negative cell
   per §2.3c clause each asserting `CorruptData` **before `CreateAsync`** — `def.Length != rep.Length`;
-  `def[i] > maxDef`; `rep[i] > maxRep`; values **over-** and **under-**supply (the over-supply case is caught by
-  **no** other oracle — levels are correct and the file round-trips — so the guard is its only detector);
-  `count(rep==0) != row count`; `rep[0] != 0`; the `rep==null` struct lane `def.Length != row count`; the joint
-  `rep>0 ∧ def≤emptyContainerDef`; and the **cross-leaf** cases (map key/value rep re-partition at constant
-  rep-0 count; struct short def stream; mis-paired map def). `StagingRowCountReconciliationTests`: a crafted
-  no-`rep==0` write reaching every write path (`StageAsync`, `DeltaOptimize`, `ChangeDataWriter`) fails
-  `CorruptData` **before** the commit, never a committed `add` (§2.4b/S1).
+  `def[i] > maxDef` **and** a **negative** `def[i]`/`rep[i]` (the `∈ [0,·]` lower bound); values **over-** and
+  **under-**supply (the over-supply case is caught by **no** other oracle — levels are correct and the file
+  round-trips — so the guard is its only detector; a shredder sizing from `Elements.Length` on a mutable vector
+  produces exactly this, B-5); `count(rep==0) != row count`; `rep[0] != 0`; the `rep==null` struct lane
+  `def.Length != row count`; the **joint** `rep>0 ∧ def[i]≤emptyContainerDef`; the **run-legality** (N4-e)
+  continuation cells `def=[1,3,3]/rep=[0,1,0]` (empty-list) and `def=[0,3,3]/rep=[0,1,0]` (null-list), each
+  pinned as **not** detected by §2.4b; and the **cross-leaf** cases — map key/value rep re-partition at constant
+  rep-0 count, map R7 def-inequality, and the **struct cross-child null-parity disagreement** (child A
+  `def < structMaxDef` at a row where sibling B emits `def == maxDef` — a distinct defect from the per-leaf
+  short-def case, and the assert can otherwise ship no-op'd, Q-1).
+- **`WriteAsync`-core reconciliation (§2.4b/S1 — Q-7/Q-8):** the reconciliation test injects a **§2.3c-invisible**
+  fault — a **dropped/duplicated `CollectSegments` segment** where every leaf's levels stay locally valid
+  against its segment but `footer NumRows ≠ Σ batch.LogicalRowCount` — asserting `CorruptData` **before commit**
+  on **all three** write paths (`StageAsync`, `DeltaOptimize`, `ChangeDataWriter` — the last returns `Task`, so
+  the hook lives in the `WriteAsync` core), plus a **missing-reference** cell asserting fail-closed (never
+  compare-against-0).
 - **Selection-vector fail-closed** (F4); pathological fan-out bound (Quality N4).
 - **Seeded generative lane** with a **naive model-encoder** reference (row-by-row Dremel emitter in the test
   project) as an independent differential oracle, and **shrinking** to a minimized failing case before pinning
@@ -384,22 +425,31 @@ artifacts; selection-vector fail-closed + sanitized diagnostics; leaf-type/value
 coverage; determinism.)
 
 ## 4 · Performance
-O(total leaf values); single pass over offsets+validity with pooled/cleared/exact-sliced (value+level) buffers,
-child resolved once (no per-row accessor). Existing row-group cursor; BenchmarkDotNet on `array<long>`/
-`struct<scalars>`; gate = no scalar-path regression.
+O(total leaf values) + a per-byte UTF-8→UTF-16 **transcode** term on the string/binary lane (still strictly
+cheaper than the scalar path's per-value `Encoding.UTF8.GetString` allocation — the nested lane is zero string
+allocations). Single pass over offsets+validity with pooled/cleared/exact-sliced (value+level) buffers, child
+resolved once (no per-row accessor). Existing row-group cursor; BenchmarkDotNet on `array<long>`,
+`struct<scalars>` **and `array<string>`/`map<string,long>`** (the lanes with the new transcode cost); gate = no
+scalar-path regression — noting §2.4b now adds one bounded `GetRowCountAsync` footer scan to **every** write
+(scalar output stays byte-identical, §8, but not cost-identical, B-6).
 
 ## 5 · Security
 No new external input on the **write** path (trusted in-tree batches). Dominant hazard is silent corruption —
 retired by §3.1's oracle+differential **and** the §2.3c pre-write + §2.4b post-write production guards (level
-streams are an unvalidated wire contract). The recursive `ToDataSchema` now runs on **foreign** footers
-(CDF-EE-08) — bounded rendering + depth cap (§2.4). Diagnostics sanitized (§2.8). **PII at rest:** nested is
-omitted from `add.stats` (`OmittedNestedType`), but the Parquet footer's per-column-chunk stats carry
-**untruncated** nested leaf min/max (`add.stats` truncates strings to 32; footer stats do not) — same object as
-the data; route classification to `privacy-compliance-grc-lead`.
+streams are an unvalidated wire contract). The **only** foreign/attacker-controlled read surface is the
+CDF-EE-08 door, which uses the **leaf-flattening `ToDataLeafSchema`** (recursion is confined to the #497 write
+door, over DeltaSharp's own just-written bytes) with `DescribeType`-bounded rendering + depth cap (§2.4).
+Diagnostics sanitized (§2.8). **PII at rest:** nested is omitted from `add.stats` (`OmittedNestedType`), but the
+Parquet footer's per-column-chunk stats carry **untruncated** nested leaf min/max (`add.stats` truncates
+strings to 32; footer stats do not) — same object as the data; route classification to
+`privacy-compliance-grc-lead`. The new `RawElementSpan`/`RawEntrySpan` accessors expose the physically-retained
+bytes of *logically-null* rows — a shredder-internal structural affordance; §2.3c's
+`count(def==maxDef)==values.Length` clause is what keeps those bytes off disk (P5).
 
 ## 6 · Threat model
-Correctness/silent-corruption + a foreign-footer read surface (via recursive `ToDataSchema`), not injection.
-Managed nested vectors validate offsets in-ctor; the Arrow-imported `ArrowNestedColumnVector` is the one
+Correctness/silent-corruption, not injection; the sole foreign-footer surface (CDF-EE-08) is
+**leaf-flattened** (`ToDataLeafSchema`, not recursive `ToDataSchema`) + depth-capped + `DescribeType`-bounded
+(§2.4). Managed nested vectors validate offsets in-ctor; the Arrow-imported `ArrowNestedColumnVector` is the one
 non-in-tree producer, failed closed by the typed `default:` arm (§2.8). Reader-side guards
 (`BuildStructNullMask`/`ValidateParallelDefinition`) are now the backstop for **DeltaSharp-authored** files too
 (N7).
@@ -417,7 +467,14 @@ No migration.
 2. string/binary lane — `ReadOnlyMemory<char>`/`<byte>` (§2.3b).
 3. array/map-leaf and (this-PR) nested-struct-leaf field_id — not stamped; #829 is a prerequisite of #676 (§2.5).
 4. Mode — none-mode only; #676 owns mapped modes (§2.7).
-5. PR split — PR1 `CreateField`+recursive `ToDataSchema`+`Field[]` ripple + §2.4a/§2.6 rejects + §2.4b
+5. CDF-EE-08 door uses leaf-flattening `ToDataLeafSchema` (recursion confined to the #497 write door); the
+   shared `MapFooterSchemaFailClosed` boundary is **parameterized by the shaping function** (recursive vs
+   leaf-flattening) so the two footer-schema readers can never diverge on their fail-closed wrapping (Architect
+   round-4 merge-time condition; update that code comment).
+6. Vector accessors — `RawElementSpan`/`RawEntrySpan` are added as **public** read-only members on
+   `List`/`MapColumnVector` (Engine is `IsPackable=false`; no external SemVer obligation) rather than `internal`
+   (Engine grants IVT only to its own `.Tests`, so Storage cannot see Engine internals).
+7. PR split — PR1 `CreateField`+recursive `ToDataSchema`+`Field[]` ripple + §2.4a/§2.6 rejects + §2.4b
    reconciliation (mechanical, no nested write yet, forces the nullability + foreign-footer decisions open);
    PR2 shredder + §2.3c guards + oracle. #713 fixtures follow.
 
