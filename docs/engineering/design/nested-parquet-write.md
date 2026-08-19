@@ -1,6 +1,6 @@
 # Nested Parquet write (§2.9) — single-level `struct` / `array` / `map` of scalars
 
-> **Status:** Draft (v3 — 6.1.0-viable; council round-2 findings folded in)
+> **Status:** Draft (v4 — 6.1.0-viable; council rounds 2-3 findings folded in; all seats 4/5→PASS pending)
 > **Issue:** [#828](https://github.com/khaines/deltasharp/issues/828) — feat(storage): nested Parquet write (§2.9)
 > **Author:** design (spike-informed; 6.1.0 + RFL-round-2 revision)
 > **Reviewers:** delta-storage-format-engineer, dotnet-vectorized-columnar-compute-engineer, dotnet-framework-runtime-engineer, reliability-test-chaos-engineer, cloud-native-security-sme
@@ -72,15 +72,22 @@ keys non-null over the **referenced** range only). The shredder is the inverse o
 
 ### 2.3 The shredder — `ColumnVector` → (values, def, rep) — NORMATIVE level tables
 `internal static class NestedColumnShredder` fills **caller-owned** scratch buffers (no pooled arrays escape a
-tuple — BL-10) with, per leaf: present values + explicit def+rep. Accessor rule (NEW-6/BL-11/BL-12): resolve
-the child **once** via `Elements`/`Keys`/`Values` (never the per-row `ElementsAt`/`KeysAt`/`ValuesAt`, which
-allocate a `ColumnVector` per row and defeat §4); walk rows via `IsNull(i)` + the **raw physical span**
-(`offsets[i+1]−offsets[i]`), **not** `ElementLength(i)` — which returns 0 for a null list even when its physical
-span is non-zero, misaligning the leaf cursor (BL-11). Since `_offsets` is private, the shredder reads the span
-via the sanctioned public surface (`ElementLength` for present rows + a documented null-row raw-span rule); if
-that surface is insufficient, add an `internal` span accessor on the vectors (state which). Sliced vectors
-carry an absolute `_offset` — the shredder rebases by it (NEW-8/H1-e). Max depth ≤ 2, so the tables are small
-and **normative** (reader thresholds cited):
+tuple — BL-10) with, per leaf: present values + explicit def+rep. **Accessor rule (NEW-6/BL-11/BL-12) and
+slicing (A1 — the round-3 correction):** resolve the child **once** via `Elements`/`Keys`/`Values` (never the
+per-row `ElementsAt`/`KeysAt`/`ValuesAt`, which allocate a `ColumnVector` per row and defeat §4). These
+accessors — and `StructColumnVector.Child(ordinal)` — are **already row/element-aligned** to the vector's
+`_offset`/`_length` window (`Elements`/`Keys`/`Values` slice `[offsets[_offset], offsets[_offset+_length])`;
+`Child` slices `child.Slice(_offset,_length)`). **The shredder therefore does NOT re-rebase them.** What *is*
+absolute is the raw `offsets` array; a per-row physical span is `offsets[base+i+1] − offsets[base+i]` where
+`base = _offset`, i.e. offset arithmetic subtracts the **element base** `offsets[_offset]` while the child
+accessors are used as-is. Walk rows by `IsNull(i)` + the **raw span** (a null row may legitimately carry a
+non-zero span — `CopyValidatedOffsets` enforces only monotonicity — so `ElementLength(i)`, which returns 0 for
+a null row, and `ElementsAt(i)`, which returns an empty view, **cannot** recover it). No public member exposes
+a null row's raw span and `_offsets` is `private` on the Engine-layer vectors (`InternalsVisibleTo` reaches only
+`*.Tests`, not `DeltaSharp.Storage`), so this design **adds a public** `(int Start, int Length)
+RawElementSpan(int index)` (and `RawEntrySpan` for maps), `_offset`-rebased, on `List`/`MapColumnVector`
+(softening §2's "no public API" to "no public *behavioral* API; one additive vector accessor"). Max depth ≤ 2,
+so the tables are small and **normative** (reader thresholds cited):
 
 **`struct<leaf>`** (struct OPTIONAL; struct `maxDef`=1):
 
@@ -141,20 +148,51 @@ Mirrors the reader's `ReadScalarLeafAsync` dispatch; the shredder emits present 
 | Decimal | `decimal` |
 
 **Packed-values invariant (NEW-1):** `values.Length == count(def == leafMaxDef)` exactly — values are
-front-filled, defined-only (an off-by-one shifts every downstream value). String/binary `ReadOnlyMemory<char>`/
-`<byte>` buffers backing `values` **must outlive the `WriteAllPartsAsync` call** — so string/binary leaves use
-a per-write owned buffer (not a cleared-and-returned pool slice) whose lifetime spans the call, reconciling
-with §2.9's exact-slice/clear discipline (which applies to the value-type + level lanes).
+front-filled, defined-only (an off-by-one shifts every downstream value). **String/binary are NOT zero-copy
+(Balanced N-2):** the managed vectors store `String` as **UTF-8** and expose `ReadOnlySpan<byte>` (`GetBytes`),
+so the shredder **transcodes UTF-8→UTF-16** into a per-leaf, per-row-group pooled `char[]` scratch
+(`Encoding.UTF8.GetChars`) and hands `ReadOnlyMemory<char>` **views** into it (binary similarly copies into a
+pooled `byte[]`). The scratch is rented under `try/finally` and returned only **after** the awaited
+`WriteAllPartsAsync` (which the `await`+`finally` already guarantees — so pooling is safe; N-3), with
+`clearArray:true` **mandatory** for the reference-bearing `ArrayPool<ReadOnlyMemory<char>>` element array (GC
+retention of foreign buffers), and no `ReadOnlyMemory` is ever handed over a buffer returned in a prior
+iteration. §4's cost model reflects the transcode; note this lane is **strictly cheaper** than today's scalar
+path (`ParquetFileWriter` does one `Encoding.UTF8.GetString` `string` alloc per value) — the nested lane is
+zero string allocations. **AOT (N-6):** the shredder dispatches leaf writes via an explicit `switch (DataType)`
+calling closed `WriteAllPartsAsync<T>` instantiations — **never** `MakeGenericMethod` — so every instantiation
+is statically rooted for the NativeAOT gate. (Scalar-path string/binary residual: `ParquetFileWriter`'s scalar
+lane stays on the ct-less non-generic `WriteAsync` with a per-value `GetString`; migrating it onto this generic
+`ReadOnlyMemory<char>` lane — buying the CancellationToken + the allocation win — is a tracked follow-up, N-5.)
 
-### 2.3c Pre-write level-invariant guard (production control — Security N4)
+### 2.3c Pre-write level-invariant guard (production control — Security N4, Architect A2/A4)
 `WriteAllPartsAsync` is a raw primitive: malformed level streams are **silently persisted** (too-few values →
-fabricated zeros; `def>maxDef` → cross-row bleed; a missing rep-0 → the footer's `NumRows` silently wrong).
-Before **every** `WriteAllPartsAsync`, assert (O(levels), cheap) — violation ⇒ `CorruptData`, fail closed
-**before** `CreateAsync` where feasible (§2.9 N9):
-`def.Length == rep.Length` (or rep `null` for non-repeated); `def[i] ∈ [0,maxDef]`, `rep[i] ∈ [0,maxRep]`;
-`count(def == maxDef) == values.Length`; `count(rep == 0) == segment row count`; `rep[0] == 0`.
+fabricated zeros; `def>maxDef` → cross-row bleed; a missing rep-0 → the footer's `NumRows` silently wrong when
+*every* leaf agrees on the wrong count). The guard is **level-only** — right levels with wrong/reordered
+*values* are the oracle's job (§3.1), not this control. Before **every** `WriteAllPartsAsync`, assert (O(levels),
+span-based, LINQ-free, **unconditional** — not `Debug.Assert`) — violation ⇒ `CorruptData`, fail closed
+**before** `CreateAsync` where feasible (§2.9 N9). Bind `maxDef`/`maxRep` to **`field.MaxDefinitionLevel` /
+`field.MaxRepetitionLevel`** read off the exact `DataField` passed to `WriteAllPartsAsync` (public getters in
+6.1.0) — never the shredder's own computed value, so the guard checks against the **schema's** levels the
+decoder uses, not its own belief (N4-c):
+- **Per-leaf (repeated lane, `rep != null`):** `def.Length == rep.Length`; `def[i] ∈ [0,maxDef]`,
+  `rep[i] ∈ [0,maxRep]`; `count(def == maxDef) == values.Length`; `count(rep == 0) == segment row count`;
+  `levels.Length == 0 || rep[0] == 0`.
+- **Per-leaf (non-repeated lane, `rep == null` — struct/flat leaves):** `def.Length == segment row count`
+  (N4-a/A2 — otherwise a struct leaf has *no* slot-count invariant and a short `def` is a read-time
+  `IndexOutOfRange`); bounds + `count(def == maxDef) == values.Length` as above.
+- **Joint legality (N4-d/A2):** `rep[i] > 0 ⇒ def[i] > emptyContainerDef` — a continuation slot cannot claim
+  container absence.
+- **Cross-leaf, pre-write (N4-b — the decisive gap):** for a map, the key/value **rep streams must be
+  identical** (`ValidateParallelRepetition`) and their **def streams equal for every null/empty/absent slot**
+  (R6 presence + R7 equality below `mapMaxDef`); for a struct, **every** child leaf must emit `def < structMaxDef`
+  at the *same* rows (cross-child null parity, `BuildStructNullMask`). A per-leaf-only guard passes a mis-paired
+  map (keys `[0,1,0]` / values `[0,0,1]`) that DeltaSharp reads as an availability error but Spark reads as
+  **silently wrong rows** — so these cross-leaf asserts are mandatory, not "correct by construction."
+- **A4:** map any raw Parquet.Net writer fault escaping `WriteAllPartsAsync` (e.g. the library's own
+  cross-leaf row-count `InvalidOperationException`) to the typed `CorruptData` contract (§2.8's wrapping scope
+  extends to the write call, not only `ColumnVector` interactions).
 
-### 2.4 `CreateField` + recursive `ToDataSchema` + its consumers (Security F1/N1/N2/N3)
+### 2.4 `CreateField` + recursive `ToDataSchema` + its consumers (Security F1/N1/N2/N3, Architect A3)
 `CreateField` builds the nested `Field` recursively (reusing scalar leaf builders → #730/decimal/temporal
 inherited), rejecting a nested child fail-closed (→#585) and a **zero-field struct** fail-closed
 (`UnsupportedFeature`; Parquet.Net throws a raw `ArgumentException` otherwise — NEW-5).
@@ -162,22 +200,36 @@ inherited), rejecting a nested child fail-closed (→#585) and a **zero-field st
 **`ToDataSchema` must become recursive** (over `ParquetSchema.Fields`, the inverse of `CreateField`) — today it
 flattens `DataFields` by leaf name, so a nested write fails `#497`'s `ValidateStagedWriteSchema` and two
 array/map columns' duplicate `element`/`key`/`value` leaves make DeltaSharp declare its **own file
-`CorruptData`**. But `ToDataSchema` has **three** consumers, two on **foreign, attacker-controlled** footers:
-1. `ReadDataSchemaAsync` (write door) — the #497 use.
-2. **`ReadDataLeafColumnsAsync` → `ChangeFeedReader` CDF-EE-08 (#662)** — an id-mode cdc validator that
+`CorruptData`**. `ToDataSchema` has **two production consumers** (`DeltaSharp.Storage` is `IsPackable=false` — no
+external-caller surface): `ReadDataSchemaAsync` (the write door, reading DeltaSharp's **own** just-written
+bytes) and `ReadDataLeafColumnsAsync` → `ChangeFeedReader` CDF-EE-08 (#662) — the **only foreign,
+attacker-controlled** one:
+1. `ReadDataSchemaAsync` (write door) — the #497 use; uses the **recursive** `ToDataSchema`.
+2. **`ReadDataLeafColumnsAsync` → CDF-EE-08 (#662)** — an id-mode cdc validator that
    interpolates `fileType.SimpleString` **raw** into a user-visible message, safe today *only because
    `ToDataSchema` yields atomic leaf types*. Recursion would echo unbounded foreign nested field names
-   (#683/#686). **Route `fileType` through `DiagnosticText.DescribeType`** (bounded), and either keep
-   `ReadDataLeafColumnsAsync` on a **leaf-flattening** helper or specify container handling explicitly.
-- **Depth bound (N2):** `ToDataSchema` runs on untrusted footers; unbounded recursion → uncatchable
-  `StackOverflowException` (a pod abort `MapFooterSchemaFailClosed` cannot catch). Use an **iterative walk with a
-  hard depth cap** (mirror `DeltaWriteSchemaEligibility.MaxDepth = 64`); a footer deeper than the cap fails
-  closed `UnsupportedFeature`. State the depth>1 foreign-footer behavior normatively.
+   (#683/#686). **Decision (A3/N1/Q5):** `ReadDataLeafColumnsAsync` uses a **leaf-flattening `ToDataLeafSchema`**
+   helper (its existing behavior — one `ParquetLeafColumn` per leaf), so recursion is confined to the #497
+   write door and CDF-EE-08's accept/reject acceptance set is **unchanged**; additionally **route `fileType`
+   through `DiagnosticText.DescribeType`** (bounded) so even a defensive path cannot echo a foreign nested name.
+   §3.3 pins both an **EE-08 acceptance-set invariance AC** (a foreign nested cdc footer's accept *and*
+   mismatch-reject verdicts are identical before/after this PR) and the name-hygiene AC.
+- **Depth bound (N2):** the recursive `ToDataSchema` runs on the write door's own bytes, but keep it robust —
+  use an **iterative walk with a hard depth cap** (mirror `DeltaWriteSchemaEligibility.MaxDepth = 64`); a footer
+  deeper than the cap fails closed `UnsupportedFeature` (an uncatchable `StackOverflowException` is a pod abort
+  `MapFooterSchemaFailClosed` cannot catch). Public recursion surface in 6.1.0: `ParquetSchema.Fields`,
+  `StructField.Fields`, `ListField.Item`, `MapField.Key`/`Value` (not `Field.Children`). The 64-*type*-level cap
+  admits types `SchemaJson` (≈21 struct levels) would refuse, but `StagedDataFile.DataSchema` is only ever
+  compared (`DataColumnsMatch`), never serialized — no live path; stated so a future consumer doesn't open one.
 - **Comparator (N3):** `#497`'s `DataColumnsMatch` deliberately ignores top-level nullability + metadata, but
   `StructType.Equals`/`ArrayType.Equals` compare `Nullable`/`Metadata`/`ContainsNull` — so nested columns would
   false-reject. Specify a **recursive, nullability- and metadata-insensitive structural comparator** for nested
   types (extend the scalar leniency inward; never relax the door). ACs: nested child metadata present; child
-  declared non-nullable but footer OPTIONAL; `ValueContainsNull` mismatch.
+  declared non-nullable but footer OPTIONAL; `ValueContainsNull` mismatch. **This leniency is only safe because
+  §2.4a's required-lane value guard enforces the real null invariant pre-write** — a load-bearing compensating
+  control an editor must not remove. **Forward (#676):** column-mapping `id`/`physicalName` live in field
+  metadata, so nested child physical naming must be **re-derived** under #676, not inherited from this
+  metadata-insensitive comparator.
 
 ### 2.4a Container nullability + required-lane + zero-field (BL-2/F5/NEW-5/NEW-8)
 - `Field.IsNullable` has no public setter → containers are always OPTIONAL on the wire; a `nullable:false`
@@ -189,11 +241,18 @@ array/map columns' duplicate `element`/`key`/`value` leaves make DeltaSharp decl
   range over-rejects legitimately sliced vectors, NEW-8/BL-13) → `CorruptData`, pre-write.
 - **Zero-field struct** rejected (NEW-5).
 
-### 2.4b Post-write footer row-count reconciliation (Security N4)
-At the staging door (which already re-reads the footer for schema), compare the footer's `NumRows` against
-`WriteResult.RowCount` (derived from the batch) **before `PutIfAbsentAsync`**; a mismatch ⇒ `CorruptData`, so a
-level defect can never become a committed `add` whose `numRecords` contradicts the bytes (with knock-on DV/CDF
-accounting). Belt-and-suspenders with §2.3c.
+### 2.4b Post-write footer row-count reconciliation — every write path (Security N4/S1)
+Reconciliation is a **per-file property of every `ParquetFileWriter` write path**, not a staging-door step:
+fold it into `ParquetFileWriter` (reconcile the footer's `NumRows` against the batch-derived row count before
+returning `WriteResult`), so it binds **all three** production sites — `DeltaWriteTarget.StageAsync`,
+**`DeltaOptimize.WriteCompactedFileAsync`** (the worst blast radius: compaction commits `add` + `remove`
+tombstones for its inputs in one transaction, so a level defect there tombstones the originals — recoverable
+only inside the time-travel/VACUUM window), and **`ChangeDataWriter`**. The reference count is
+**`LogicalRowCount`-derived by contract** (from `ParquetStatisticsCollector`/`batch.LogicalRowCount`,
+independent of the level streams and of `StatisticsPolicy`); a **missing** reference fails closed
+(`CorruptData`), never degrades to "compare against 0". Footer `NumRows` is summed by the existing hardened
+`GetRowCountAsync` (checked, bounded). Belt-and-suspenders with §2.3c: §2.3c catches per-leaf/cross-leaf level
+defects before bytes; §2.4b catches any residual footer/row divergence before the file is committed.
 
 ### 2.5 field_id stamping — and why this PR does NOT stamp nested leaf field_ids (Security N5)
 Scalar (non-nested) columns stamp `field_id` via the extracted `StampFieldId` helper (guard once — BL-3).
@@ -266,11 +325,34 @@ residual named. **Matrix (Quality H1 — complete):**
 - **Structural (H1-d):** same logical rows as 1 batch vs N batches with varied `CollectSegments` splits vs
   `RowGroupRowLimit` forcing ≥2 row groups → decoded-equal, rep restarts at 0 at each row-group boundary
   (NEW-7); a row group whose **first** row is a null/empty list.
-- **Sliced vector (H1-e):** `offset > 0` list/map — offset rebasing.
+- **Sliced vector (H1-e):** `offset > 0` list/map — offset rebasing (A1: accessors pre-sliced; only raw offsets
+  rebased by the element base).
+- **Zero-row / all-null column (Quality Q-3):** a zero-row nested batch; a column where **every** row is
+  null-list/null-struct/null-map (`values.Length == 0`, incl. the string/binary empty owned buffer).
+- **Multi-nested-column attribution (Quality Q-4):** one file with `array<long> a`+`b`, `map<string,long> m1`+
+  `m2`, `struct<x:{zip}>`+`struct<y:{zip}>`, and a **scalar** column sharing a leaf name — assert per-column
+  **value attribution**, `ReadDataSchemaAsync` returns each shape distinctly, `ValidateStagedWriteSchema`
+  accepts (the recursive-`ToDataSchema` regression cell for the duplicate-leaf-name hazard).
+- **Level-guard fault injection (§2.3c — Quality Q-1 / Security):** `NestedLevelGuardTests`, one negative cell
+  per §2.3c clause each asserting `CorruptData` **before `CreateAsync`** — `def.Length != rep.Length`;
+  `def[i] > maxDef`; `rep[i] > maxRep`; values **over-** and **under-**supply (the over-supply case is caught by
+  **no** other oracle — levels are correct and the file round-trips — so the guard is its only detector);
+  `count(rep==0) != row count`; `rep[0] != 0`; the `rep==null` struct lane `def.Length != row count`; the joint
+  `rep>0 ∧ def≤emptyContainerDef`; and the **cross-leaf** cases (map key/value rep re-partition at constant
+  rep-0 count; struct short def stream; mis-paired map def). `StagingRowCountReconciliationTests`: a crafted
+  no-`rep==0` write reaching every write path (`StageAsync`, `DeltaOptimize`, `ChangeDataWriter`) fails
+  `CorruptData` **before** the commit, never a committed `add` (§2.4b/S1).
 - **Selection-vector fail-closed** (F4); pathological fan-out bound (Quality N4).
 - **Seeded generative lane** with a **naive model-encoder** reference (row-by-row Dremel emitter in the test
   project) as an independent differential oracle, and **shrinking** to a minimized failing case before pinning
   (Quality N2).
+- **Sentinel discipline (Quality Q-2):** structural cells use **non-default** present values (under-supply
+  back-fills `default(T)`, so a `0`/`false`/empty/`±0` present value can't be distinguished from a fabricated
+  one by round-trip alone); H1-c's deliberately-default values are covered by the level differential + §2.3c
+  guard, not round-trip equality.
+- **Golden-hash determinism (Quality Q-6):** the SHA-256 goldens are stable only under the pinned Parquet.Net
+  version + compression/encoding + `created_by`; regenerating a golden is a **review-gated** event on a
+  deliberate version bump (not a Dependabot rubber-stamp — cf. the 6.0.3→6.1.0 read-path break).
 
 ### 3.2 Mode & id-mode deferral
 **None-mode** round-trip is delivered here (§2.7). Id-mode + name-mode nested are `[Fact(Skip="#676")]`. A
@@ -280,9 +362,11 @@ stamping is **not** exercised (§2.5).
 ### 3.3 Write-door & footer shape (#497 / #713)
 `ReadDataSchemaAsync` on each emitted file returns the **declared logical shape** (recursive `ToDataSchema`);
 `ValidateStagedWriteSchema` accepts a nested write (the recursive nullability/metadata-insensitive comparator,
-§2.4); the post-write footer `NumRows == WriteResult.RowCount` reconciliation holds (§2.4b). Footer structure
-per shape; map key `REQUIRED`; per-leaf `#730` repetition. A **foreign nested cdc footer** asserts no
-footer-derived name reaches the CDF-EE-08 message (N1) and a **crafted deep footer** fails closed (N2).
+§2.4); the post-write footer `NumRows == WriteResult.RowCount` reconciliation holds on **every** write path
+(§2.4b). Footer structure per shape; map key `REQUIRED`; per-leaf `#730` repetition. A **foreign nested cdc
+footer** asserts (i) no footer-derived name reaches the CDF-EE-08 message (N1, via `DescribeType`) **and**
+(ii) the EE-08 accept/reject **acceptance set is invariant** before/after this PR (the `ToDataLeafSchema`
+leaf-flattening decision, §2.4); a **crafted deep footer** fails closed (N2).
 
 ### 3.4 Fail-closed rejects
 Nested-within-nested, `nullable:false` container, zero-field struct, required-lane null (§2.4a) — all before any
