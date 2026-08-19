@@ -777,7 +777,7 @@ st_case_fence_breakout() {
   # CONTEXT — space-prefixed — and each covers one degree of freedom of
   # CommonMark's closing-fence rule, which is exactly what `sanitize_fence`
   # exists to neutralize:
-  #   `````        -> `  `````` : a plain close.
+  #   `````        -> ` `````` : a plain close.
   #   <2 spaces>   -> `   `````` : three leading spaces in total, the maximum
   #                   indent a close may carry (this is what exercises the
   #                   sanitizer's own ` \{0,3\}` indent group).
