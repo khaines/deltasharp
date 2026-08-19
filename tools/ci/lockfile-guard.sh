@@ -48,7 +48,7 @@
 #
 # NO SIDE EFFECTS: the guard never writes to the index or the working tree. A
 # brand-new (untracked) lock file is rendered with `git diff --no-index` against
-# /dev/null rather than with an `git add --intent-to-add` marker, so nothing can
+# /dev/null rather than with a `git add --intent-to-add` marker, so nothing can
 # clobber a developer's staged work (a staged `git rm --cached`, a `git add -p`
 # partial stage) and no cleanup step is needed.
 #
@@ -145,9 +145,10 @@ mark_untrusted() {
 #
 # Two commands, because neither alone is both complete and precise:
 #   * `git status --porcelain -uall` sees modified, deleted and new (untracked)
-#     lock files. `-uall` matters: without it a brand-new directory is reported
-#     collapsed (`?? src/New/`) and the lock file inside it would be missed.
-#     It does NOT see .gitignore'd files.
+#     lock files. It does NOT see .gitignore'd files. `-uall` is kept
+#     defensively: a pathspec-limited status on current git already reports the
+#     lock file inside a brand-new directory individually rather than collapsing
+#     it to `?? src/New/`, but `-uall` guarantees that on older versions too.
 #   * `git ls-files --others --ignored` enumerates lock files hidden by
 #     .gitignore, so an ignore rule cannot make the guard pass. (`git status
 #     --ignored=matching` is unusable here: it reports whole ignored DIRECTORIES
@@ -526,12 +527,15 @@ BYTES
 # sentinel outside a fence. A parity count would not do: an EVEN number of
 # smuggled fences also breaks out.
 #
-# The toggle models CommonMark's fence rules rather than an exact string match:
-# a closing fence may carry up to three leading spaces, may be LONGER than the
-# opener, and may have trailing spaces. That matters because a diff CONTEXT line
-# is space-prefixed — an unchanged ````` line inside a lock file reaches the
-# summary as ` `````` , which really does close the guard's block. An exact-match
-# toggle would be blind to exactly the geometry the sanitizer exists to stop.
+# The toggle models the complete CommonMark closing-fence rule rather than an
+# exact string match. A close has exactly three degrees of freedom: it may be
+# indented by up to three spaces, its run may be LONGER than the opener, and it
+# may be followed by trailing spaces OR TABS. All three matter here, because a
+# diff CONTEXT line is space-prefixed: an unchanged ````` line inside a lock file
+# reaches the summary as ` `````` , an unchanged INDENTED one as `   ````` `, and
+# an unchanged tab-padded one as ` `````<TAB>` — each of which really does close
+# the guard's block. An exact-match toggle would be blind to exactly the
+# geometry the sanitizer exists to stop.
 # Requiring at least as many backticks as the guard's own delimiter also keeps
 # the ```bash remediation block from confusing the walk, and an addition line
 # (`+`````` ) cannot close a fence, so it must not toggle either.
@@ -539,7 +543,7 @@ st_assert_fence_structure() {
   local d="$1" file="$2" name="$3" sentinels="$4" verdict
   verdict="$(st_split_lines "$d/$file" |
     LC_ALL=C awk -v fence="$FENCE" -v sentinels="$sentinels" '
-      $0 ~ ("^ {0,3}`{" length(fence) ",} *$") { inside = !inside; fences++; next }
+      $0 ~ ("^ {0,3}`{" length(fence) ",}[ \t]*$") { inside = !inside; fences++; next }
       !inside && $0 ~ ("^(" sentinels ")") { leak = leak " | " $0 }
       END {
         if (fences == 0) { print "no fenced block was emitted at all"; exit }
@@ -770,14 +774,22 @@ st_case_fence_breakout() {
   local d="$SELFTEST_ROOT/fence-breakout"
   st_make_repo "$d"
   # The five-backtick lines are UNCHANGED, so they reach the summary as diff
-  # CONTEXT — ` `````` , one leading space — which is a VALID CommonMark close of
-  # the guard's own block: exactly the geometry `sanitize_fence` exists to stop.
+  # CONTEXT — space-prefixed — and each covers one degree of freedom of
+  # CommonMark's closing-fence rule, which is exactly what `sanitize_fence`
+  # exists to neutralize:
+  #   `````        -> `  `````` : a plain close.
+  #   <2 spaces>   -> `   `````` : three leading spaces in total, the maximum
+  #                   indent a close may carry (this is what exercises the
+  #                   sanitizer's own ` \{0,3\}` indent group).
+  #   <trailing \t> -> ` `````<TAB>`: a close may be followed by spaces OR tabs.
   # The ``` line and the ## heading ride along as further payload.
   # shellcheck disable=SC2016 # backticks are payload data, not a substitution
-  printf '`````\n```\n## INJHEADING\n{"version": 1}\n`````\n' >"$d/src/Proj/packages.lock.json"
+  local payload='`````\n  `````\n`````\t\n{"version": %s}\n```\n## INJHEADING\n'
+  # shellcheck disable=SC2059 # $payload is the format string on purpose
+  printf "$payload" 1 >"$d/src/Proj/packages.lock.json"
   git -C "$d" commit -qam 'lock file whose content contains markdown fences'
-  # shellcheck disable=SC2016 # backticks are payload data, not a substitution
-  printf '`````\n```\n## INJHEADING\n{"version": 2}\n`````\n' >"$d/src/Proj/packages.lock.json"
+  # shellcheck disable=SC2059 # $payload is the format string on purpose
+  printf "$payload" 2 >"$d/src/Proj/packages.lock.json"
   local rc
   rc="$(st_run_guard "$d")"
   assert_exit 1 "$rc" 'lock file containing a markdown fence fails'
