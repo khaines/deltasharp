@@ -899,9 +899,9 @@ internal sealed class ChangeFeedReader
                     // to echo an unbounded foreign nested field name here. `expectedField.DataType` is NOT
                     // leaf-shaped either: it is copied verbatim out of the foreign
                     // schemaString by BuildDataSchema, which does not flatten — so it must go through the
-                    // bounded renderer. (Unreachable with a struct TODAY, because id mode implies
-                    // ResolvePhysicalNames already rejected a nested top-level column; routed anyway so the
-                    // two branches cannot drift if that upstream guard is ever relaxed.)
+                    // bounded renderer. (#676: nested column mapping is now supported, so ResolvePhysicalNames
+                    // no longer rejects a nested column; this branch is therefore genuinely reachable via a
+                    // foreign/nested id-mode footer and remains fail-closed with a bounded message.)
                     throw NewCdcSchemaMismatch(
                         version,
                         $"the data column with column-mapping id {id} has leaf type "
@@ -968,10 +968,10 @@ internal sealed class ChangeFeedReader
 
             if (!expectedField.DataType.Equals(fileType))
             {
-                // See the id-branch note above. This branch is the REACHABLE one: under column-mapping mode
-                // NONE, ResolvePhysicalNames does not run its nested-column rejection, so a foreign
-                // schemaString may declare a STRUCT data column here. A StructType can never equal a leaf, so
-                // the guard fires unconditionally and `expectedField.DataType.SimpleString` would render every
+                // See the id-branch note above. Under column-mapping mode NONE — and, since #676, name/id mode
+                // too — ResolvePhysicalNames does not reject a nested column, so a foreign schemaString may
+                // declare a STRUCT data column here. A StructType can never equal a leaf, so the guard fires
+                // unconditionally and `expectedField.DataType.SimpleString` would render every
                 // nested field name verbatim and recursively — a >100,000-character, control-character-bearing
                 // message from a single crafted commit.
                 throw NewCdcSchemaMismatch(

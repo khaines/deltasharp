@@ -129,8 +129,10 @@ internal sealed record DeleteResult(
 /// <para><b>Scope.</b> Column mapping is resolved on the WRITE path for <c>name</c> mode (#529): the
 /// physically-named data is read and relabeled to the LOGICAL schema so the predicate sees logical column
 /// names/values, while the emitted deletion vector stays POSITIONAL over the PHYSICAL data file (column
-/// mapping never changes a row's physical position). <c>id</c> mode stays fail-closed (#523) and a nested
-/// (struct/array/map) top-level mapped column fails closed rather than risk a wrong delete. On-disk
+/// mapping never changes a row's physical position). <c>id</c> mode stays fail-closed (#523). Nested
+/// (struct/array/map) mapped columns are supported for read/DELETE via the shared column-mapping projection
+/// (#676); a CDF-active DELETE that would rewrite a nested-column data file is gated separately by
+/// <c>ChangeDataWriter.EnsureWritableDataSchema</c>. On-disk
 /// (<c>'u'</c>) deletion vectors are written; the bin-packing/inlining policy for tiny DVs is a follow-up.
 /// Predicate/partition pushdown to prune scanned files is a follow-up — every active file is scanned.</para>
 /// </summary>
@@ -304,8 +306,9 @@ internal sealed class DeltaDelete
         // mapped modes the emitted deletion vector stays POSITIONAL over the PHYSICAL data file (column
         // mapping never changes a row's physical position — the DV row-index semantics are unaffected), and
         // partition values are const/null-filled by PHYSICAL name. `none` mode is unchanged (physical name ==
-        // logical name). A nested (struct/array/map) top-level column under column mapping is rejected
-        // fail-closed in ColumnMappingProjection.ResolvePhysicalNames rather than risk a wrong delete.
+        // logical name). Nested (struct/array/map) mapped columns are supported for read/DELETE via the shared
+        // column-mapping projection (#676) — no longer rejected here; a CDF-active DELETE that would rewrite a
+        // nested-column data file is gated by ChangeDataWriter.EnsureWritableDataSchema instead.
         ColumnMappingMode mappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         bool resolveByFieldId = mappingMode == ColumnMappingMode.Id;
 

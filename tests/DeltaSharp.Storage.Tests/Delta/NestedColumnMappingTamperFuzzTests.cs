@@ -42,6 +42,26 @@ public sealed class NestedColumnMappingTamperFuzzTests
         Assert.Contains("id mode", ex.Message, StringComparison.Ordinal);
     }
 
+    // §3.14 clarification (Architect A): ToPhysicalSchema / MapWriteSchemaToPhysical are a PURE name-only
+    // relabel (design §2.3 "Balanced-4") and do NOT themselves gate id-mode array/map — they pass the container
+    // through (keeping its id). The #839 gate is ValidateColumnMappingSchema (commit AND load, asserted above),
+    // so an id-mode array/map table can never be committed OR loaded; the relabel helper is a downstream pure
+    // substitution. This test pins that actual contract so the §2.3-vs-§3.14 wording ambiguity cannot silently
+    // flip the helper into (or out of) a redundant reject.
+    [Theory]
+    [InlineData("array")]
+    [InlineData("map")]
+    public void IdMode_ToPhysicalSchema_ArrayOrMap_IsPureRelabel_DoesNotGate_839(string kind)
+    {
+        StructType schema = OneNestedContainer(kind, id: 2, physical: "col-c");
+
+        // Pure relabel: no throw, container renamed to its physical name, id preserved on the container.
+        StructType physical = ColumnMapping.ToPhysicalSchema(schema, ColumnMappingMode.Id);
+        Assert.Equal(2, physical.Count); // both the scalar 'id' and the array/map container pass through
+        Assert.True(physical.TryGetField("col-c", out StructField container));
+        Assert.True(ColumnMapping.TryGetId(container, out long id) && id == 2);
+    }
+
     [Theory]
     [InlineData("array")]
     [InlineData("map")]

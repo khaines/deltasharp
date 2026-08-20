@@ -8,8 +8,9 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// <summary>
 /// Unit tests for <see cref="ColumnMappingIdentity"/> (#671) — the value type both halves of the change-feed
 /// column-mapping identity-immutability gate compare. These exercise the comparison branches DIRECTLY (not
-/// through the CDF read door), because several are unreachable end-to-end: nested column mapping is rejected
-/// fail-closed UPSTREAM (so the recursion in <c>Collect</c> can only be exercised here), and the value-compare
+/// through the CDF read door), because several are otherwise only covered incidentally: for a NESTED mapped
+/// column the recursion in <c>Collect</c> (which descends direct struct children — #676) is most directly
+/// exercised here, and the value-compare
 /// branches (mode / partition columns / per-column field id + physical name / added-dropped-renamed columns)
 /// are otherwise only covered incidentally. Each negative asserts the exact branch that must fail closed; each
 /// positive guards against a false positive that would reject a legitimate table.
@@ -116,6 +117,36 @@ public sealed class ColumnMappingIdentityTests
         ColumnMappingIdentity end = Identity(Nested(99));
         Assert.False(end.IsImmutableFrom(Identity(Nested(3))));   // caught only if the recursion descends
         Assert.True(end.IsImmutableFrom(Identity(Nested(99))));   // identical nested identity — no false positive
+    }
+
+    // §3.29 (#676) — the CDF nested-identity door: a NESTED struct child whose identity (id + physicalName)
+    // changed between two retained versions is a forged/illegal log and fails closed; a nested child LOGICAL
+    // RENAME preserves id + physicalName (only the logical path changes) and is accepted.
+    private static string NestedChild(string innerName, long innerId, string innerPhysical) =>
+        "{\"type\":\"struct\",\"fields\":["
+        + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
+        + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
+        + "{\"name\":\"payload\",\"type\":{\"type\":\"struct\",\"fields\":["
+        + "{\"name\":\"" + innerName + "\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+        + "{\"delta.columnMapping.id\":" + innerId + ",\"delta.columnMapping.physicalName\":\"" + innerPhysical + "\"}}]},"
+        + "\"nullable\":true,\"metadata\":"
+        + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
+
+    [Fact]
+    public void Cdf_NestedChildIdentityChangedBetweenRetainedVersions_FailsClosed()
+    {
+        // Same logical path payload.inner, but its physicalName changed col-C -> col-D between versions.
+        ColumnMappingIdentity end = Identity(NestedChild("inner", 3, "col-D"));
+        Assert.False(end.IsImmutableFrom(Identity(NestedChild("inner", 3, "col-C"))));
+    }
+
+    [Fact]
+    public void Cdf_NestedChildLogicalRename_IdAndPhysicalPreserved_IsAccepted()
+    {
+        // A rename payload.inner -> payload.renamed keeps id=3 + physicalName=col-C; the logical PATH changes,
+        // so the two keys never collide and the still-present columns' identities are unchanged -> accepted.
+        ColumnMappingIdentity end = Identity(NestedChild("renamed", 3, "col-C"));
+        Assert.True(end.IsImmutableFrom(Identity(NestedChild("inner", 3, "col-C"))));
     }
 
     [Fact]

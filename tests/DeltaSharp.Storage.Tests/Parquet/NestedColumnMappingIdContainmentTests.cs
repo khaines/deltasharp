@@ -80,8 +80,8 @@ public sealed class NestedColumnMappingIdContainmentTests
         // type disagrees with the leaf the field_id resolves to fails closed as a typed SchemaMismatch (never a
         // raw mid-decode cast fault). home/v is a string leaf (id 5); request child 'v' as LONG with id 5 → the
         // id-selected string leaf is type-validated against the requested long and rejected. (The finer
-        // temporal date-vs-timestamp annotation check on the id-selected leaf is exercised by
-        // NestedParquetLeafTypeTests' ExpectScalarLeaf coverage.)
+        // temporal date-vs-timestamp annotation distinction is validated by ExpectScalarLeaf's underlying
+        // ValidateLeafPhysicalType; the mechanism that the ID-selected leaf is the one validated is pinned here.)
         byte[] bytes = await WriteTwoStringStructsAsync(homeFieldId: 5, workFieldId: 6);
 
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
