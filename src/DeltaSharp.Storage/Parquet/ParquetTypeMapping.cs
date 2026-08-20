@@ -190,7 +190,21 @@ internal static class ParquetTypeMapping
                 + "supported (deferred, #585).");
         }
 
-        return CreateScalarField(new StructField(name, type, nullable), honorReferenceNullability);
+        try
+        {
+            return CreateScalarField(new StructField(name, type, nullable), honorReferenceNullability);
+        }
+        catch (DeltaStorageException)
+        {
+            // §2.8 (Security #3): CreateScalarField identifies the offending field BY NAME, and here that name
+            // is a nested CHILD name — foreign schema text that must never reach a diagnostic, and which
+            // mis-attributes the failure to a "column" that does not exist at top level. Re-raise on the
+            // ORDINAL `context` (which already carries the sanitized top-level column label) plus the bounded
+            // leaf KIND, so the failing COLUMN is correctly attributed and no child name is echoed.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: the leaf type '{DiagnosticText.DescribeType(type)}' has no "
+                + "supported Parquet mapping.");
+        }
     }
 
     /// <summary>

@@ -157,6 +157,9 @@ internal enum DecodeDoor
 
     /// <summary>The classic-checkpoint Parquet reader.</summary>
     Checkpoint,
+
+    /// <summary>The nested-write §2.4b footer reconciliation read-back (a write verifying its own bytes).</summary>
+    Reconciliation,
 }
 
 /// <summary>
@@ -566,9 +569,12 @@ internal sealed class DeltaStorageTelemetry : IDisposable
                 new Measurement<int>(
                     BoundedDecode.CheckpointDetachedDecodeCount,
                     new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+                new Measurement<int>(
+                    BoundedDecode.ReconciliationDetachedDecodeCount,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Reconciliation))),
             },
             unit: "{strand}",
-            description: "Currently-detached (running-past-deadline, un-reclaimable) untrusted Parquet decode strands per door — the bounded residual of the wall-clock decode ceiling (.NET cannot abort a thread). Rises toward the per-door cap under a distinct-crafted-input flood; a sustained non-zero value is the DoS-pressure gauge.");
+            description: "Currently-detached (running-past-deadline, un-reclaimable) Parquet decode strands per door (data_file / checkpoint / reconciliation) — the bounded residual of the wall-clock decode ceiling (.NET cannot abort a thread). Rises toward the per-door cap under a distinct-crafted-input flood; a sustained non-zero value is the DoS-pressure gauge.");
         _decodeDetachedCancelled = _storageMeter.CreateObservableGauge(
             "deltasharp.storage.decode.detached_cancelled",
             static () => new[]
@@ -579,6 +585,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
                 new Measurement<int>(
                     BoundedDecode.CheckpointDecoder.CancelledDetachedDecodeCount,
                     new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+                new Measurement<int>(
+                    BoundedDecode.ReconciliationDecoder.CancelledDetachedDecodeCount,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Reconciliation))),
             },
             unit: "{strand}",
             description: "The CANCELLED-flavour sub-count of decode.detached per door (Round-8 #5): strands abandoned via caller-cancellation while still non-terminating (a cancellation-laundered strand still holds a thread+bytes+lease and is charged/counted). A HEALTHY cancelled decode settles in ms and releases immediately, so this gauge is ~0 in healthy operation; a sustained non-zero value is a token-ignoring/non-terminating decode masked as a cancellation.");
@@ -592,6 +601,9 @@ internal sealed class DeltaStorageTelemetry : IDisposable
                 new Measurement<int>(
                     BoundedDecode.CheckpointWedged,
                     new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Checkpoint))),
+                new Measurement<int>(
+                    BoundedDecode.ReconciliationWedged,
+                    new KeyValuePair<string, object?>(DecodeDoorKey, ToLabel(DecodeDoor.Reconciliation))),
             },
             unit: "{door}",
             description: "1 when a decode door is WEDGED (saturated — byte residual OR strand count — with no strand drain over the stall window), else 0, per door (Round-8 #1, Round-10 #10/#11). A wedged door admits no further decodes and never recovers (.NET cannot abort the stranded threads); a sustained 1 is the liveness-probe signal to recycle the pod — DecoderSaturated on a wedged door is NOT retryable-after-backoff.");
@@ -966,6 +978,7 @@ internal sealed class DeltaStorageTelemetry : IDisposable
     {
         DecodeDoor.DataFile => "data_file",
         DecodeDoor.Checkpoint => "checkpoint",
+        DecodeDoor.Reconciliation => "reconciliation",
         _ => "data_file",
     };
 

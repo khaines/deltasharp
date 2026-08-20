@@ -48,6 +48,38 @@ public sealed class NestedParquetLeafTypeTests
         Fixed("float", DataTypes.FloatType, i => i * 0.5f),
         Fixed("double", DataTypes.DoubleType, i => i * 0.25d),
 
+        // IEEE-754 boundary lane: NaN, both infinities and NEGATIVE zero all have bit patterns a
+        // "copy the payload" shredder preserves and a "normalize through a comparison" one silently loses.
+        Fixed("byte-boundaries", DataTypes.ByteType, i => new byte[] { 0, 127, 128, 255 }[i]),
+        Fixed("float-boundaries", DataTypes.FloatType,
+            i => new[] { float.NaN, float.PositiveInfinity, float.NegativeInfinity, -0.0f }[i]),
+        Fixed("double-boundaries", DataTypes.DoubleType,
+            i => new[] { double.NaN, double.PositiveInfinity, double.NegativeInfinity, -0.0d }[i]),
+
+        // DateTime.MinValue / MaxValue at both DATE and TIMESTAMP resolution: the epoch conversion the
+        // shredder applies on the way out has to be exactly inverted on the way back at the representable
+        // extremes, where an off-by-one or an overflow is otherwise invisible.
+        Fixed("date-extremes", DataTypes.DateType,
+            i => new[] { MinEpochDay, MaxEpochDay, 0, -1 }[i]),
+        Fixed("timestamp-extremes", DataTypes.TimestampType,
+            i => new[] { MinEpochMicros, MaxEpochMicros, 0L, -1L }[i]),
+        Fixed("timestamp-ntz-extremes", DataTypes.TimestampNtzType,
+            i => new[] { MinEpochMicros, MaxEpochMicros, 0L, -1L }[i]),
+
+        // Decimal boundaries: the NON-compact (Int128-backed) lane at the maximum supported precision, and
+        // scale == precision (an all-fractional decimal, the branch where the scale factor is largest).
+        new("decimal-precision-28", DataTypes.CreateDecimalType(28, 6),
+            (vector, i) => vector.AppendValue(
+                new[] { Int128.Parse("1234567890123456789012345678"), -Int128.Parse("1234567890123456789012345678"), Int128.Zero, Int128.One }[i]),
+            (vector, i) => ParquetTypeMapping.ReadDecimal(
+                vector, (DecimalType)DataTypes.CreateDecimalType(28, 6), i),
+            4),
+        new("decimal-scale-equals-precision", DataTypes.CreateDecimalType(10, 10),
+            (vector, i) => vector.AppendValue(new[] { 9_999_999_999L, -9_999_999_999L, 0L, 1L }[i]),
+            (vector, i) => ParquetTypeMapping.ReadDecimal(
+                vector, (DecimalType)DataTypes.CreateDecimalType(10, 10), i),
+            4),
+
         // DATE / TIMESTAMP / TIMESTAMP_NTZ are stored as epoch int/long and must survive the epoch
         // conversion the shredder applies on the way out and the reader applies on the way back in.
         Fixed("date", DataTypes.DateType, i => 19_000 + i),
@@ -91,6 +123,22 @@ public sealed class NestedParquetLeafTypeTests
     ];
 
     private static byte[] StringPayload(int index) => StringPayloads[index];
+
+    private const long TicksPerMicrosecond = 10L;
+
+    private static readonly long UnixEpochTicks = DateTime.UnixEpoch.Ticks;
+
+    private static readonly int MinEpochDay =
+        (int)((DateTime.MinValue.Ticks - UnixEpochTicks) / TimeSpan.TicksPerDay);
+
+    private static readonly int MaxEpochDay =
+        (int)((DateTime.MaxValue.Date.Ticks - UnixEpochTicks) / TimeSpan.TicksPerDay);
+
+    private static readonly long MinEpochMicros =
+        (DateTime.MinValue.Ticks - UnixEpochTicks) / TicksPerMicrosecond;
+
+    private static readonly long MaxEpochMicros =
+        (DateTime.MaxValue.Ticks - UnixEpochTicks) / TicksPerMicrosecond;
 
     [Theory]
     [MemberData(nameof(LeafCases))]

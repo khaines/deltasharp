@@ -30,7 +30,9 @@ internal static class NestedLevelGuard
     /// <param name="hasRepetitions">Whether a repetition stream is being passed to the writer. A non-repeated
     /// leaf must pass a genuinely ABSENT stream (<see langword="null"/>), not an empty one — Parquet.Net
     /// rejects an empty <c>Memory&lt;int&gt;?</c> as an undersized buffer.</param>
-    /// <param name="valueCount">The number of packed present values accompanying the levels.</param>
+    /// <param name="valueCount">The number of packed present values accompanying the levels, derived by the
+    /// caller from the SOURCE VECTORS (not from these levels) — the two are compared below, so passing a
+    /// level-derived count would make that clause circular and inert.</param>
     /// <param name="rowCount">The number of logical rows the row group covers.</param>
     /// <param name="label">The sanitized column label for diagnostics.</param>
     public static void Validate(
@@ -46,6 +48,20 @@ internal static class NestedLevelGuard
         int maxRep = leaf.MaxRepetitionLevel;
         bool repeated = maxRep > 0;
 
+        // §2.3c N4-c level PROVENANCE. Every in-scope nested leaf sits under an OPTIONAL container, so its
+        // max definition level is at least 1. A leaf that reports 0 is DETACHED from a ParquetSchema (levels
+        // are assigned when the schema is constructed, not by the Field constructor) — and a detached leaf
+        // silently collapses every clause below: containerMaxDef becomes 0 or -1, so `def <= emptyContainerDef`
+        // is never true and the run-legality check degenerates into a no-op. Refuse rather than validate
+        // against bounds that are not the file's.
+        if (maxDef < 1)
+        {
+            throw Corrupt(
+                label,
+                "the leaf reports max definition level 0, so it is not attached to a Parquet schema and its "
+                + "level bounds are not the ones the footer will declare");
+        }
+
         if (repeated != hasRepetitions)
         {
             throw Corrupt(
@@ -60,11 +76,8 @@ internal static class NestedLevelGuard
             throw Corrupt(label, "the definition and repetition streams have different lengths");
         }
 
-        // The container's own max definition level: the leaf's, minus the one level the leaf spends on its own
-        // OPTIONAL-ness. One below that is the level an EMPTY container occupies, and everything at or below it
-        // means "no element exists here".
-        int containerMaxDef = maxDef - (leaf.IsNullable ? 1 : 0);
-        int emptyContainerDef = containerMaxDef - 1;
+        int containerMaxDef = ContainerMaxDefinitionLevel(leaf);
+        int emptyContainerDef = EmptyContainerDefinitionLevel(leaf);
 
         int present = 0;
         int rowOpenings = 0;
@@ -144,7 +157,10 @@ internal static class NestedLevelGuard
 
         // The packed-values invariant: WriteAllPartsAsync consumes values POSITIONALLY against the slots at
         // the leaf's max definition level, so a mismatch here silently shifts every subsequent value into the
-        // wrong row.
+        // wrong row. `present` is derived HERE from the level stream; `valueCount` is derived by the caller
+        // from the source vectors' own null masks. Two independent derivations of the same quantity — an
+        // encoder that packs fewer values than its levels claim (which would otherwise publish uninitialized
+        // pooled memory) or more (a shifted lane) is caught exactly here.
         if (present != valueCount)
         {
             throw Corrupt(
@@ -152,6 +168,22 @@ internal static class NestedLevelGuard
                 $"{present} slot(s) encode a present value but {valueCount} value(s) were packed");
         }
     }
+
+    /// <summary>
+    /// The container's own max definition level for <paramref name="leaf"/>: the leaf's own level minus the
+    /// one level it spends on its OPTIONAL-ness. This is the SINGLE source of truth for the container levels
+    /// (Architect #9) — the shredder derives its level tables from it too, so the encoder and this guard can
+    /// never disagree about where the container/leaf boundary sits.
+    /// </summary>
+    internal static int ContainerMaxDefinitionLevel(DataField leaf)
+    {
+        ArgumentNullException.ThrowIfNull(leaf);
+        return leaf.MaxDefinitionLevel - (leaf.IsNullable ? 1 : 0);
+    }
+
+    /// <summary>The definition level an EMPTY repeated container occupies — one below
+    /// <see cref="ContainerMaxDefinitionLevel"/>. Everything at or below it means "no element exists here".</summary>
+    internal static int EmptyContainerDefinitionLevel(DataField leaf) => ContainerMaxDefinitionLevel(leaf) - 1;
 
     private static DeltaStorageException Corrupt(string label, string detail) =>
         DeltaStorageException.CorruptData(

@@ -120,6 +120,57 @@ internal static class NestedVectors
         return new MapColumnVector(type, keys, values, offsets, nulls);
     }
 
+    /// <summary>Builds an <c>array&lt;long&gt;</c> vector (the §3.1 duplicate-leaf-name column list).</summary>
+    public static ListColumnVector LongList(ArrayType type, IReadOnlyList<long[]?> rows)
+    {
+        MutableColumnVector elements = ColumnVectors.Create(DataTypes.LongType, 16);
+        var offsets = new int[rows.Count + 1];
+        var nulls = new bool[rows.Count];
+        int cursor = 0;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            offsets[i] = cursor;
+            long[]? row = rows[i];
+            nulls[i] = row is null;
+            if (row is not null)
+            {
+                foreach (long value in row)
+                {
+                    elements.AppendValue(value);
+                    cursor++;
+                }
+            }
+        }
+
+        offsets[rows.Count] = cursor;
+        return new ListColumnVector(type, elements, offsets, nulls);
+    }
+
+    /// <summary>Reads an <c>array&lt;long&gt;</c> vector back into the model shape.</summary>
+    public static List<long[]?> ReadLongList(ListColumnVector vector)
+    {
+        var result = new List<long[]?>(vector.Length);
+        for (int i = 0; i < vector.Length; i++)
+        {
+            if (vector.IsNull(i))
+            {
+                result.Add(null);
+                continue;
+            }
+
+            ColumnVector elements = vector.ElementsAt(i);
+            var row = new long[elements.Length];
+            for (int e = 0; e < elements.Length; e++)
+            {
+                row[e] = elements.GetValue<long>(e);
+            }
+
+            result.Add(row);
+        }
+
+        return result;
+    }
+
     /// <summary>Reads a decoded <c>struct&lt;a:int, b:string&gt;</c> back into the model shape.</summary>
     public static List<(int? A, string? B)?> ReadIntStringStruct(StructColumnVector vector)
     {

@@ -39,23 +39,26 @@ internal sealed class ParquetFileWriter
     // The §2.4b footer reconciliation's reader. Stateless and hoisted to a single static instance so the
     // self-check adds no per-write allocation. It keeps the DEFAULT decode limits — the check must fail CLOSED
     // under the same wall-clock bounds every other footer read obeys, and a write whose own footer cannot be
-    // read within the data-file budget is precisely a write that must not be published.
+    // read within its budget is precisely a write that must not be published.
     //
-    // It does NOT share the process-wide data-file door. That door admits UNTRUSTED reads; this read-back is
-    // DeltaSharp verifying bytes it just authored itself (design §5: "no new external input on the write
-    // path"). Sharing would couple the two in both directions: a flood of hostile reads saturating the door
-    // would fail otherwise-healthy WRITES with DecoderSaturated, and every write would consume an admission
-    // slot sized for untrusted decodes. The isolated door is sized identically but runs on a DEDICATED THREAD
-    // (as the checkpoint door does, and for the same reason): a footer parse over an already-materialized
-    // window is predominantly synchronous CPU work, so it must not queue behind ThreadPool work that untrusted
-    // decode strands can pin — a write must remain verifiable while the pool is under pressure.
-    private static readonly ParquetFileReader ReconciliationReader = new(
-        dataFileDecoder: BoundedDecoder.FromSizing(
-            BoundedDecode.DeriveDoorSizing(
-                BoundedDecode.ProcessMemoryBytes, BoundedDecode.DataFileMaxFootprintBytes),
-            DecodeExecution.Pool));
+    // It runs on its OWN door (BoundedDecode.ReconciliationDecoder), not the process-wide data-file one. That
+    // door admits UNTRUSTED reads; this read-back is DeltaSharp verifying bytes it just authored itself
+    // (design §5: "no new external input on the write path"). Sharing would couple the two in both directions:
+    // a flood of hostile reads saturating the door would fail otherwise-healthy WRITES with DecoderSaturated,
+    // and every write would consume an admission slot sized for untrusted decodes. See the door's own
+    // documentation for its dedicated-thread execution and footer-only sizing.
+    private static readonly ParquetFileReader ReconciliationReader =
+        new(dataFileDecoder: BoundedDecode.ReconciliationDecoder);
 
     private readonly int _rowGroupRowLimit;
+
+    /// <summary>
+    /// A TEST-ONLY seam that may perturb a row group's collected segments (and report the row count they now
+    /// describe) after <see cref="CollectSegments"/>. Null in production — the §2.4b reconciliation has no
+    /// other way to be driven from a real <see cref="WriteAsync"/>, because every in-tree code path produces
+    /// segments that trivially sum to the batch total.
+    /// </summary>
+    internal Func<List<Segment>, int, int>? RowGroupSegmentFault { get; init; }
 
     /// <summary>Creates a writer with the given row-group row cap.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="rowGroupRowLimit"/> is not positive.</exception>
@@ -158,9 +161,18 @@ internal sealed class ParquetFileWriter
             [DeltaSchemaJson.WriterMetadataKey] = WriterIdentity,
         };
 
+        // §2.9 N9: build the ParquetSchema BEFORE opening the writer. Constructing it is what ATTACHES every
+        // field and assigns the max definition/repetition levels the §2.3c guard bounds against (N4-c level
+        // provenance), and ParquetWriter.CreateAsync emits the PAR1 magic the moment it is called — so every
+        // nested reject has to be decided here, on an untouched stream.
+        var parquetSchema = new ParquetSchema(fields);
+        await ValidateNestedColumnsAsync(
+            parquetSchema, schema, fields, selectedColumns, batchRowCounts, totalRows, cancellationToken)
+            .ConfigureAwait(false);
+
         long startPosition = output.CanSeek ? output.Position : 0L;
         await using (ParquetWriter writer =
-            await ParquetWriter.CreateAsync(new ParquetSchema(fields), output, null, false, cancellationToken)
+            await ParquetWriter.CreateAsync(parquetSchema, output, null, false, cancellationToken)
                 .ConfigureAwait(false))
         {
             writer.CustomMetadata = metadata;
@@ -176,6 +188,13 @@ internal sealed class ParquetFileWriter
                 int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
                 CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
 
+                // §2.4b test seam. Production leaves this null, so `written == size` and the call is a no-op.
+                // A fault delegate may drop or duplicate a segment (and report the row count the perturbed
+                // segments now describe) to produce a file that is LOCALLY level-valid in every leaf yet whose
+                // footer NumRows no longer equals the batch-derived total — the exact class §2.3c is blind to
+                // and only the post-write reconciliation catches.
+                int written = RowGroupSegmentFault is null ? size : RowGroupSegmentFault(segments, size);
+
                 using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
                 for (int c = 0; c < columnCount; c++)
                 {
@@ -185,13 +204,13 @@ internal sealed class ParquetFileWriter
                         // the Dremel encoding, the level guard, and the required-lane checks.
                         await NestedColumnShredder.WriteColumnAsync(
                             rowGroup, fields[c], schema[c],
-                            BuildNestedSegments(selectedColumns, c, segments), size, cancellationToken)
+                            BuildNestedSegments(selectedColumns, c, segments), written, cancellationToken)
                             .ConfigureAwait(false);
                         continue;
                     }
 
                     await WriteColumnAsync(
-                        rowGroup, (DataField)fields[c], schema[c], selectedColumns, c, segments, size,
+                        rowGroup, (DataField)fields[c], schema[c], selectedColumns, c, segments, written,
                         cancellationToken).ConfigureAwait(false);
                 }
 
@@ -210,6 +229,58 @@ internal sealed class ParquetFileWriter
         // ChangeDataWriter) at once.
         await ReconcileFooterRowCountAsync(output, startPosition, totalRows, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The §2.9 N9 PRE-PASS: runs the complete nested shredding pipeline — level computation, the §2.4a
+    /// required-lane value guards, the §2.3c per-leaf <see cref="NestedLevelGuard"/> and both cross-leaf
+    /// guards — over EVERY row-group segmentation this write will produce, writing nothing. Any reject
+    /// therefore fires while <c>output</c> is still untouched, instead of after
+    /// <c>ParquetWriter.CreateAsync</c> has already published the <c>PAR1</c> magic and a footer-less prefix.
+    /// </summary>
+    private async Task ValidateNestedColumnsAsync(
+        ParquetSchema parquetSchema,
+        StructType schema,
+        Field[] fields,
+        List<ColumnVector[]> selectedColumns,
+        int[] batchRowCounts,
+        long totalRows,
+        CancellationToken cancellationToken)
+    {
+        _ = parquetSchema;
+        bool anyNested = false;
+        for (int c = 0; c < schema.Count; c++)
+        {
+            anyNested |= schema[c].DataType is StructType or ArrayType or MapType;
+        }
+
+        if (!anyNested)
+        {
+            return;
+        }
+
+        int cursorBatch = 0;
+        int cursorRow = 0;
+        long emitted = 0;
+        var segments = new List<Segment>();
+        while (emitted < totalRows)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
+            CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
+            int written = RowGroupSegmentFault is null ? size : RowGroupSegmentFault(segments, size);
+            for (int c = 0; c < schema.Count; c++)
+            {
+                if (schema[c].DataType is StructType or ArrayType or MapType)
+                {
+                    await NestedColumnShredder.ValidateColumnAsync(
+                        fields[c], schema[c], BuildNestedSegments(selectedColumns, c, segments), written,
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            emitted += size;
+        }
     }
 
     // Projects the row group's (batch, start, length) segments onto ONE column's already-selection-resolved
@@ -306,7 +377,24 @@ internal sealed class ParquetFileWriter
 
         long byteSize = output.CanSeek ? output.Position - startPosition : 0L;
         FileStatistics statistics = ParquetStatisticsCollector.Collect(schema, batches, policy);
-        return new WriteResult(byteSize, statistics.NumRecords ?? 0L, statistics);
+
+        // S11/§2.4b: the published row count is the LogicalRowCount sum — the SAME reference WriteAsync just
+        // reconciled the footer's NumRows against — never `statistics.NumRecords ?? 0L`, which is null (and
+        // would degrade to a published 0) exactly when the statistics policy disables record counting. With
+        // this, `add.numRecords` is footer-reconciled whether or not statistics are collected.
+        long rowCount = 0;
+        for (int b = 0; b < batches.Count; b++)
+        {
+            rowCount += batches[b].LogicalRowCount;
+        }
+
+        if (statistics.NumRecords is long collected && collected != rowCount)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"The collected statistics report {collected} record(s) but {rowCount} row(s) were written.");
+        }
+
+        return new WriteResult(byteSize, rowCount, statistics);
     }
 
     // Advance the (batch, row) cursor by exactly `size` logical rows, recording the contiguous
@@ -642,7 +730,7 @@ internal sealed class ParquetFileWriter
     public readonly record struct WriteResult(long ByteSize, long RowCount, FileStatistics Statistics);
 
     // A contiguous run of logical rows within a single input batch that a row group covers.
-    private readonly struct Segment
+    internal readonly struct Segment
     {
         internal Segment(int batch, int start, int length)
         {

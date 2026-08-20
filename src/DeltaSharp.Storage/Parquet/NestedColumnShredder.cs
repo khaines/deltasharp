@@ -64,7 +64,7 @@ internal static class NestedColumnShredder
     /// <exception cref="DeltaStorageException">The column's shape is out of scope
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>), a REQUIRED nested leaf holds a null, or a computed
     /// level stream violates the §2.3c pre-write invariants (<see cref="StorageErrorKind.CorruptData"/>).</exception>
-    public static async Task WriteColumnAsync(
+    public static Task WriteColumnAsync(
         ParquetRowGroupWriter rowGroup,
         Field field,
         StructField schemaField,
@@ -72,36 +72,87 @@ internal static class NestedColumnShredder
         int rowCount,
         CancellationToken cancellationToken)
     {
+        ArgumentNullException.ThrowIfNull(rowGroup);
+        return ShredAsync(rowGroup, field, schemaField, segments, rowCount, cancellationToken);
+    }
+
+    /// <summary>
+    /// Runs the ENTIRE shredding pipeline for <paramref name="schemaField"/> — level computation, the §2.4a
+    /// required-lane value guards, the §2.3c per-leaf <see cref="NestedLevelGuard"/> and both cross-leaf
+    /// guards — WITHOUT writing anything. This is the design's §2.9 N9 pre-pass: <c>ParquetWriter.CreateAsync</c>
+    /// emits the <c>PAR1</c> magic and a stream position the moment it is called, so a guard that fires after
+    /// it has already published bytes. Running the identical computation first makes every nested reject
+    /// fail closed BEFORE the first byte.
+    /// </summary>
+    public static Task ValidateColumnAsync(
+        Field field,
+        StructField schemaField,
+        IReadOnlyList<ColumnSegment> segments,
+        int rowCount,
+        CancellationToken cancellationToken) =>
+        ShredAsync(rowGroup: null, field, schemaField, segments, rowCount, cancellationToken);
+
+    private static async Task ShredAsync(
+        ParquetRowGroupWriter? rowGroup,
+        Field field,
+        StructField schemaField,
+        IReadOnlyList<ColumnSegment> segments,
+        int rowCount,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        ArgumentNullException.ThrowIfNull(schemaField);
+        ArgumentNullException.ThrowIfNull(segments);
         string label = DiagnosticText.Sanitize(schemaField.Name);
-        switch (schemaField.DataType)
+        try
         {
-            case StructType structType when field is PqStructField parquetStruct:
-                await WriteStructAsync(rowGroup, parquetStruct, structType, segments, rowCount, label, cancellationToken)
-                    .ConfigureAwait(false);
-                break;
-            case ArrayType arrayType when field is PqListField parquetList:
-                await WriteListAsync(rowGroup, parquetList, arrayType, segments, rowCount, label, cancellationToken)
-                    .ConfigureAwait(false);
-                break;
-            case MapType mapType when field is PqMapField parquetMap:
-                await WriteMapAsync(rowGroup, parquetMap, mapType, segments, rowCount, label, cancellationToken)
-                    .ConfigureAwait(false);
-                break;
-            default:
-                // F10: a typed default arm. Reached only if the Parquet field and the declared type disagree
-                // on kind — a DeltaSharp bug, not a data condition — so it fails closed on the bounded KIND
-                // rather than rendering a nested SimpleString.
-                throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet nested write for column '{label}' of kind "
-                    + $"'{DiagnosticText.DescribeType(schemaField.DataType)}': the mapped Parquet field does "
-                    + "not match the declared nested shape.");
+            switch (schemaField.DataType)
+            {
+                case StructType structType when field is PqStructField parquetStruct:
+                    await WriteStructAsync(rowGroup, parquetStruct, structType, segments, rowCount, label, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+                case ArrayType arrayType when field is PqListField parquetList:
+                    await WriteListAsync(rowGroup, parquetList, arrayType, segments, rowCount, label, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+                case MapType mapType when field is PqMapField parquetMap:
+                    await WriteMapAsync(rowGroup, parquetMap, mapType, segments, rowCount, label, cancellationToken)
+                        .ConfigureAwait(false);
+                    break;
+                default:
+                    // F10: a typed default arm. Reached only if the Parquet field and the declared type disagree
+                    // on kind — a DeltaSharp bug, not a data condition — so it fails closed on the bounded KIND
+                    // rather than rendering a nested SimpleString.
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet nested write for column '{label}' of kind "
+                        + $"'{DiagnosticText.DescribeType(schemaField.DataType)}': the mapped Parquet field does "
+                        + "not match the declared nested shape.");
+            }
+        }
+        catch (Exception ex) when (IsForeignVectorFault(ex))
+        {
+            // §2.8 (Architect): EVERY nested-ColumnVector interaction on the write path — IsNull,
+            // RawElementSpan/RawEntrySpan, GetValue<T>, GetBytes, Child(ordinal) — is covered by this single
+            // boundary, not just the child resolution. A foreign or inconsistent vector implementation
+            // therefore leaves the write door as a typed, bounded UnsupportedFeature rather than as a raw
+            // library exception carrying an unbounded message.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested write for column '{label}' of kind "
+                + $"'{DiagnosticText.DescribeType(schemaField.DataType)}': the column vector could not be "
+                + "shredded into its Parquet leaves.");
         }
     }
+
+    private static bool IsForeignVectorFault(Exception ex) =>
+        ex is NotSupportedException or InvalidOperationException or IndexOutOfRangeException
+            or ArgumentException or NullReferenceException
+        && ex is not DeltaStorageException;
 
     // ----- struct -----
 
     private static async Task WriteStructAsync(
-        ParquetRowGroupWriter rowGroup,
+        ParquetRowGroupWriter? rowGroup,
         PqStructField parquetStruct,
         StructType structType,
         IReadOnlyList<ColumnSegment> segments,
@@ -109,27 +160,59 @@ internal static class NestedColumnShredder
         string label,
         CancellationToken cancellationToken)
     {
-        int structMaxDef = parquetStruct.MaxDefinitionLevel;
-        var leaves = new DataField[structType.Count];
-        var defs = new int[structType.Count][];
+        int childCount = structType.Count;
+        var leaves = new DataField[childCount];
+        var defs = new int[childCount][];
+
+        // N4-a slot provenance (B2): the number of level slots a struct lane emits is derived HERE from the
+        // segments the row group actually covers, never from `rowCount`. Comparing a `rowCount`-derived slice
+        // length against `rowCount` is the tautology the council found; comparing this independently walked
+        // total against it is a real invariant that a dropped/duplicated segment breaks.
+        int slots = TotalSegmentRows(segments, label);
+        int structMaxDef = -1;
         try
         {
-            for (int i = 0; i < structType.Count; i++)
+            for (int i = 0; i < childCount; i++)
             {
-                leaves[i] = ExpectLeaf(parquetStruct.Fields[i], label);
-                defs[i] = ArrayPool<int>.Shared.Rent(Math.Max(rowCount, 1));
-                ComputeStructLevels(
-                    segments, i, structMaxDef, leaves[i].MaxDefinitionLevel, label,
-                    defs[i].AsSpan(0, rowCount));
+                DataField leaf = ExpectLeaf(parquetStruct.Fields[i], label);
+                leaves[i] = leaf;
+                EnsureLeafRepetition(leaf, structType[i].Nullable, label, $"field {i}");
+
+                // §2.3c N4-c / S4: the container level comes from ONE shared helper off the schema-attached
+                // leaf, so the encoder below and NestedLevelGuard can never disagree about where the
+                // container/leaf boundary sits.
+                int childContainerMaxDef = NestedLevelGuard.ContainerMaxDefinitionLevel(leaf);
+                if (i == 0)
+                {
+                    structMaxDef = childContainerMaxDef;
+                }
+                else if (childContainerMaxDef != structMaxDef)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Struct column '{label}': child leaf {i} reports container definition level "
+                        + $"{childContainerMaxDef} but child leaf 0 reports {structMaxDef}; every child of one "
+                        + "struct shares the struct's definition level.");
+                }
+
+                defs[i] = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
+                int emitted = ComputeStructLevels(
+                    segments, i, structMaxDef, leaf.MaxDefinitionLevel, label, defs[i].AsSpan(0, slots));
+                if (emitted != rowCount)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Struct column '{label}' field {i}: the shredder emitted {emitted} definition level "
+                        + $"slot(s) for {rowCount} logical row(s); an unrepeated leaf emits exactly one slot "
+                        + "per row.");
+                }
             }
 
             // §2.3c cross-leaf, PRE-write: every child must agree, at every row, on whether the struct is
             // null. A per-leaf guard passes a struct where child A emits def < structMaxDef at a row where
             // sibling B emits def == maxDef — the file persists silently, DeltaSharp reads an availability
             // error and Spark reads WRONG rows.
-            ValidateStructNullParity(defs, structType.Count, structMaxDef, rowCount, label);
+            ValidateStructNullParity(defs, childCount, structMaxDef, rowCount, label);
 
-            for (int i = 0; i < structType.Count; i++)
+            for (int i = 0; i < childCount; i++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 await WriteLeafAsync(
@@ -159,8 +242,10 @@ internal static class NestedColumnShredder
     ///   REQUIRED child — §2.4a);</description></item>
     ///   <item><description>present value → the leaf's own <c>MaxDefinitionLevel</c>.</description></item>
     /// </list>
+    /// Returns the number of slots it emitted, so the caller can check that count against the row count
+    /// INDEPENDENTLY of the buffer it was handed.
     /// </summary>
-    private static void ComputeStructLevels(
+    private static int ComputeStructLevels(
         IReadOnlyList<ColumnSegment> segments,
         int ordinal,
         int structMaxDef,
@@ -176,6 +261,13 @@ internal static class NestedColumnShredder
             for (int j = 0; j < segment.Length; j++)
             {
                 int row = segment.Start + j;
+                if (slot >= def.Length)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Struct column '{label}' field {ordinal}: the segments describe more rows than the "
+                        + "level buffer was sized for.");
+                }
+
                 if (vector.IsNull(row))
                 {
                     def[slot++] = 0;
@@ -201,12 +293,14 @@ internal static class NestedColumnShredder
                 def[slot++] = leafMaxDef;
             }
         }
+
+        return slot;
     }
 
     // ----- array (3-level LIST) -----
 
     private static async Task WriteListAsync(
-        ParquetRowGroupWriter rowGroup,
+        ParquetRowGroupWriter? rowGroup,
         PqListField parquetList,
         ArrayType arrayType,
         IReadOnlyList<ColumnSegment> segments,
@@ -215,16 +309,26 @@ internal static class NestedColumnShredder
         CancellationToken cancellationToken)
     {
         DataField leaf = ExpectLeaf(parquetList.Item, label);
-        int containerMaxDef = parquetList.MaxDefinitionLevel;
+        EnsureLeafRepetition(leaf, arrayType.ContainsNull, label, "element");
+
+        // S4/§2.3c N4-c: the container level is derived from the SCHEMA-ATTACHED leaf through the guard's own
+        // helper, so encoder and guard share one source of truth.
+        int containerMaxDef = NestedLevelGuard.ContainerMaxDefinitionLevel(leaf);
         int slots = CountListSlots(segments, label);
 
         int[] def = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         int[] rep = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         try
         {
-            ComputeListLevels(
-                segments, containerMaxDef, leaf.MaxDefinitionLevel, arrayType, label,
+            int emitted = ComputeListLevels(
+                segments, containerMaxDef, leaf.MaxDefinitionLevel, label,
                 def.AsSpan(0, slots), rep.AsSpan(0, slots));
+            if (emitted != slots)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Array column '{label}': the shredder emitted {emitted} level slot(s) but the raw offsets "
+                    + $"describe {slots}.");
+            }
             await WriteLeafAsync(
                 rowGroup, leaf, arrayType.ElementType, def.AsMemory(0, slots), rep.AsMemory(0, slots),
                 rowCount, label, new ListValueSource(segments), cancellationToken).ConfigureAwait(false);
@@ -248,11 +352,10 @@ internal static class NestedColumnShredder
     ///   makes a null element unrepresentable — §2.4a rejects it).</description></item>
     /// </list>
     /// </summary>
-    private static void ComputeListLevels(
+    private static int ComputeListLevels(
         IReadOnlyList<ColumnSegment> segments,
         int containerMaxDef,
         int leafMaxDef,
-        ArrayType arrayType,
         string label,
         Span<int> def,
         Span<int> rep)
@@ -300,13 +403,13 @@ internal static class NestedColumnShredder
             }
         }
 
-        _ = arrayType;
+        return slot;
     }
 
     // ----- map (3-level MAP) -----
 
     private static async Task WriteMapAsync(
-        ParquetRowGroupWriter rowGroup,
+        ParquetRowGroupWriter? rowGroup,
         PqMapField parquetMap,
         MapType mapType,
         IReadOnlyList<ColumnSegment> segments,
@@ -316,7 +419,20 @@ internal static class NestedColumnShredder
     {
         DataField keyLeaf = ExpectLeaf(parquetMap.Key, label);
         DataField valueLeaf = ExpectLeaf(parquetMap.Value, label);
-        int mapMaxDef = parquetMap.MaxDefinitionLevel;
+        EnsureLeafRepetition(keyLeaf, declaredNullable: false, label, "key");
+        EnsureLeafRepetition(valueLeaf, mapType.ValueContainsNull, label, "value");
+
+        // S4/§2.3c N4-c: one shared derivation, cross-checked between the two leaves of the same key_value
+        // group — a disagreement means the two leaves are not siblings in the footer the guard will bound against.
+        int mapMaxDef = NestedLevelGuard.ContainerMaxDefinitionLevel(keyLeaf);
+        int valueContainerMaxDef = NestedLevelGuard.ContainerMaxDefinitionLevel(valueLeaf);
+        if (valueContainerMaxDef != mapMaxDef)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Map column '{label}': the key leaf reports container definition level {mapMaxDef} but the "
+                + $"value leaf reports {valueContainerMaxDef}; both share one repeated key_value group.");
+        }
+
         int slots = CountMapSlots(segments, label);
 
         int[] keyDef = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
@@ -325,10 +441,16 @@ internal static class NestedColumnShredder
         int[] valueRep = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         try
         {
-            ComputeMapLevels(
+            int emitted = ComputeMapLevels(
                 segments, mapMaxDef, keyLeaf.MaxDefinitionLevel, valueLeaf.MaxDefinitionLevel, label,
                 keyDef.AsSpan(0, slots), valueDef.AsSpan(0, slots), keyRep.AsSpan(0, slots),
                 valueRep.AsSpan(0, slots));
+            if (emitted != slots)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Map column '{label}': the shredder emitted {emitted} level slot(s) but the raw offsets "
+                    + $"describe {slots}.");
+            }
 
             // §2.3c cross-leaf, PRE-write: a 3-level map nests key and value in ONE repeated key_value group,
             // so their repetition streams must be IDENTICAL and their definition streams must agree on every
@@ -369,7 +491,7 @@ internal static class NestedColumnShredder
     /// Keys are non-null over the REFERENCED range only — a null key in an unreferenced tail of a sliced
     /// vector belongs to no row and must not over-reject (NEW-8/BL-13).
     /// </summary>
-    private static void ComputeMapLevels(
+    private static int ComputeMapLevels(
         IReadOnlyList<ColumnSegment> segments,
         int mapMaxDef,
         int keyMaxDef,
@@ -434,6 +556,8 @@ internal static class NestedColumnShredder
                 }
             }
         }
+
+        return slot;
     }
 
     // ----- slot counting (raw offsets only — never Elements.Length, B-5) -----
@@ -472,7 +596,7 @@ internal static class NestedColumnShredder
         return CheckSlotBound(slots, label);
     }
 
-    private static int CheckSlotBound(long slots, string label)
+    internal static int CheckSlotBound(long slots, string label)
     {
         if (slots > MaxLeafSlotsPerRowGroup)
         {
@@ -486,21 +610,31 @@ internal static class NestedColumnShredder
 
     // ----- value sources (present cells, in slot order) -----
 
-    // The present cells of a leaf, in the SAME order the level computation emits them. Deliberately a small
-    // struct hierarchy rather than a shared structural walk: "which cells are present" is a far simpler
-    // predicate than the level tables, so re-deriving it here does not duplicate the risky logic — and the
-    // §2.3c `count(def == maxDef) == values.Length` clause cross-checks the two against each other before any
-    // byte is written.
+    // The present cells of a leaf, in the SAME order the level computation emits them, pushed at a struct
+    // VISITOR so every lane (count / copy / measure / transcode) walks the vectors exactly once with no
+    // intermediate materialization (§2.3b, B3) and no generic virtual dispatch.
+    //
+    // ForEachPresent RETURNS the number of cells it visited. That count is derived purely from the source
+    // vectors' null masks — never from the level stream — and it is what §2.3c's packed-values clause is
+    // checked against (B1). Deriving both sides of that clause from the levels made it `f(x) == f(x)`: it
+    // could never fire, and an under-filling collector would have published uninitialized pooled memory.
+    private interface IPresentVisitor
+    {
+        void Visit(ColumnVector child, int index);
+    }
+
     private interface IValueSource
     {
-        void Collect<T>(Span<T> destination, Func<ColumnVector, int, T> read, string label);
+        int ForEachPresent<TVisitor>(ref TVisitor visitor, string label)
+            where TVisitor : struct, IPresentVisitor;
     }
 
     private readonly struct StructValueSource(IReadOnlyList<ColumnSegment> segments, int ordinal) : IValueSource
     {
-        public void Collect<T>(Span<T> destination, Func<ColumnVector, int, T> read, string label)
+        public int ForEachPresent<TVisitor>(ref TVisitor visitor, string label)
+            where TVisitor : struct, IPresentVisitor
         {
-            int index = 0;
+            int count = 0;
             foreach (ColumnSegment segment in segments)
             {
                 StructColumnVector vector = ExpectStructVector(segment.Vector, label);
@@ -511,18 +645,22 @@ internal static class NestedColumnShredder
                     int row = segment.Start + j;
                     if (!vector.IsNull(row) && !child.IsNull(row))
                     {
-                        destination[index++] = read(child, row);
+                        visitor.Visit(child, row);
+                        count++;
                     }
                 }
             }
+
+            return count;
         }
     }
 
     private readonly struct ListValueSource(IReadOnlyList<ColumnSegment> segments) : IValueSource
     {
-        public void Collect<T>(Span<T> destination, Func<ColumnVector, int, T> read, string label)
+        public int ForEachPresent<TVisitor>(ref TVisitor visitor, string label)
+            where TVisitor : struct, IPresentVisitor
         {
-            int index = 0;
+            int count = 0;
             foreach (ColumnSegment segment in segments)
             {
                 ListColumnVector vector = ExpectListVector(segment.Vector, label);
@@ -540,19 +678,23 @@ internal static class NestedColumnShredder
                     {
                         if (!elements.IsNull(start + e))
                         {
-                            destination[index++] = read(elements, start + e);
+                            visitor.Visit(elements, start + e);
+                            count++;
                         }
                     }
                 }
             }
+
+            return count;
         }
     }
 
     private readonly struct MapValueSource(IReadOnlyList<ColumnSegment> segments, bool keys) : IValueSource
     {
-        public void Collect<T>(Span<T> destination, Func<ColumnVector, int, T> read, string label)
+        public int ForEachPresent<TVisitor>(ref TVisitor visitor, string label)
+            where TVisitor : struct, IPresentVisitor
         {
-            int index = 0;
+            int count = 0;
             foreach (ColumnSegment segment in segments)
             {
                 MapColumnVector vector = ExpectMapVector(segment.Vector, label);
@@ -573,18 +715,172 @@ internal static class NestedColumnShredder
                     {
                         if (!child.IsNull(start + e))
                         {
-                            destination[index++] = read(child, start + e);
+                            visitor.Visit(child, start + e);
+                            count++;
                         }
                     }
                 }
             }
+
+            return count;
         }
     }
+
+    // ----- present-cell visitors -----
+
+    /// <summary>Visits nothing: used by the §2.9 N9 pre-pass, which needs the present-cell COUNT (to feed the
+    /// §2.3c packed-values clause) but must not materialize a single value.</summary>
+    private struct CountingVisitor : IPresentVisitor
+    {
+        public readonly void Visit(ColumnVector child, int index)
+        {
+        }
+    }
+
+    /// <summary>Copies each present fixed-width cell into the caller-owned buffer, BOUNDS-CHECKING its own
+    /// writes: an over-supplying source fails closed on the typed contract instead of raising a raw
+    /// <see cref="IndexOutOfRangeException"/> (B1).</summary>
+    private struct ValueCollector<T> : IPresentVisitor
+    {
+        private readonly T[] _destination;
+        private readonly int _capacity;
+        private readonly Func<ColumnVector, int, T> _read;
+        private readonly string _label;
+        private int _count;
+
+        internal ValueCollector(T[] destination, int capacity, Func<ColumnVector, int, T> read, string label)
+        {
+            _destination = destination;
+            _capacity = capacity;
+            _read = read;
+            _label = label;
+            _count = 0;
+        }
+
+        public void Visit(ColumnVector child, int index)
+        {
+            if (_count >= _capacity)
+            {
+                throw ValueOverflow(_label, _capacity);
+            }
+
+            _destination[_count++] = _read(child, index);
+        }
+    }
+
+    /// <summary>Accumulates Σ present UTF-8 byte length under <c>checked</c>. This IS the §2.3b upper bound on
+    /// the transcoded UTF-16 scratch (a UTF-16 char count never exceeds the UTF-8 byte count), so the string
+    /// lane needs no decode pre-pass and materializes nothing.</summary>
+    private struct ByteLengthVisitor : IPresentVisitor
+    {
+        private long _total;
+
+        internal readonly long Total => _total;
+
+        public void Visit(ColumnVector child, int index) =>
+            _total = checked(_total + child.GetBytes(index).Length);
+    }
+
+    /// <summary>Transcodes UTF-8 → UTF-16 straight into the exactly-sized, NEVER-grown per-leaf scratch and
+    /// hands out views into it.</summary>
+    private struct CharTranscodeVisitor : IPresentVisitor
+    {
+        private readonly char[] _scratch;
+        private readonly int _budget;
+        private readonly ReadOnlyMemory<char>[] _destination;
+        private readonly int _capacity;
+        private readonly string _label;
+        private int _count;
+        private int _position;
+
+        internal CharTranscodeVisitor(
+            char[] scratch, int budget, ReadOnlyMemory<char>[] destination, int capacity, string label)
+        {
+            _scratch = scratch;
+            _budget = budget;
+            _destination = destination;
+            _capacity = capacity;
+            _label = label;
+            _count = 0;
+            _position = 0;
+        }
+
+        public void Visit(ColumnVector child, int index)
+        {
+            if (_count >= _capacity)
+            {
+                throw ValueOverflow(_label, _capacity);
+            }
+
+            ReadOnlySpan<byte> utf8 = child.GetBytes(index);
+            if (_position + utf8.Length > _budget)
+            {
+                throw ScratchOverflow(_label);
+            }
+
+            int written = Encoding.UTF8.GetChars(utf8, _scratch.AsSpan(_position));
+            _destination[_count++] = new ReadOnlyMemory<char>(_scratch, _position, written);
+            _position += written;
+        }
+    }
+
+    /// <summary>The binary lane's counterpart to <see cref="CharTranscodeVisitor"/> — the same ownership rules,
+    /// minus the transcode.</summary>
+    private struct ByteCopyVisitor : IPresentVisitor
+    {
+        private readonly byte[] _scratch;
+        private readonly int _budget;
+        private readonly ReadOnlyMemory<byte>[] _destination;
+        private readonly int _capacity;
+        private readonly string _label;
+        private int _count;
+        private int _position;
+
+        internal ByteCopyVisitor(
+            byte[] scratch, int budget, ReadOnlyMemory<byte>[] destination, int capacity, string label)
+        {
+            _scratch = scratch;
+            _budget = budget;
+            _destination = destination;
+            _capacity = capacity;
+            _label = label;
+            _count = 0;
+            _position = 0;
+        }
+
+        public void Visit(ColumnVector child, int index)
+        {
+            if (_count >= _capacity)
+            {
+                throw ValueOverflow(_label, _capacity);
+            }
+
+            ReadOnlySpan<byte> payload = child.GetBytes(index);
+            if (_position + payload.Length > _budget)
+            {
+                throw ScratchOverflow(_label);
+            }
+
+            payload.CopyTo(_scratch.AsSpan(_position));
+            _destination[_count++] = new ReadOnlyMemory<byte>(_scratch, _position, payload.Length);
+            _position += payload.Length;
+        }
+    }
+
+    private static DeltaStorageException ValueOverflow(string label, int capacity) =>
+        DeltaStorageException.CorruptData(
+            $"Nested column '{label}': the column vector supplied more than the {capacity} present value(s) "
+            + "its definition levels describe.");
+
+    private static DeltaStorageException ScratchOverflow(string label) =>
+        DeltaStorageException.CorruptData(
+            $"Nested column '{label}': the variable-width leaf's payloads exceed the transcode buffer measured "
+            + "for them.");
 
     // ----- leaf write dispatch (AOT-safe: closed generic instantiations, never MakeGenericMethod) -----
 
     private static Task WriteLeafAsync<TSource>(
-        ParquetRowGroupWriter rowGroup,
+        ParquetRowGroupWriter? rowGroup,
         DataField leaf,
         DataType leafType,
         ReadOnlyMemory<int> def,
@@ -596,6 +892,16 @@ internal static class NestedColumnShredder
         where TSource : struct, IValueSource
     {
         int valueCount = CountAtLevel(def.Span, leaf.MaxDefinitionLevel);
+        if (rowGroup is null)
+        {
+            // §2.9 N9 pre-pass: run the guard with an INDEPENDENTLY derived present-cell count, but touch no
+            // value and rent no value buffer.
+            var counter = default(CountingVisitor);
+            int present = source.ForEachPresent(ref counter, label);
+            RunLevelGuard(leaf, def, rep, present, rowCount, label);
+            return Task.CompletedTask;
+        }
+
         return leafType switch
         {
             BooleanType => EmitAsync<bool, TSource>(
@@ -656,10 +962,14 @@ internal static class NestedColumnShredder
         T[] values = ArrayPool<T>.Shared.Rent(Math.Max(valueCount, 1));
         try
         {
-            source.Collect(values.AsSpan(0, valueCount), read, label);
+            // Belt and braces (B1): the guard below refuses an under-filled buffer, and the buffer is cleared
+            // first so a pooled array's previous tenant's payload can never reach the writer even if it did.
+            values.AsSpan(0, valueCount).Clear();
+            var collector = new ValueCollector<T>(values, valueCount, read, label);
+            int collected = source.ForEachPresent(ref collector, label);
             await WriteAllPartsAsync<T>(
-                rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, label, cancellationToken)
-                .ConfigureAwait(false);
+                rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, collected, label,
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -684,12 +994,13 @@ internal static class NestedColumnShredder
             (vector, row) => ParquetTypeMapping.ReadDecimal(vector, decimalType, row), cancellationToken);
 
     // §2.3b string lane. The managed vectors store a String as UTF-8, so the shredder TRANSCODES UTF-8→UTF-16
-    // into a per-leaf pooled char[] and hands ReadOnlyMemory<char> VIEWS into it. The scratch is sized EXACTLY
-    // up front (Σ present values' UTF-8 byte length — a valid upper bound, since a UTF-16 char count never
-    // exceeds the UTF-8 byte count) and is NEVER grown mid-leaf: an Array.Resize/re-rent partway through would
-    // strand already-handed-out views in the abandoned array (silent garbage, B-3). Both pools are returned
-    // with clearArray:true — mandatory for the REFERENCE-bearing element array, which would otherwise retain
-    // the char[] across rents.
+    // into a per-leaf pooled char[] and hands ReadOnlyMemory<char> VIEWS into it. TWO span walks, no
+    // materialization (B3): the first sums the present payloads' UTF-8 byte lengths — a valid and exact upper
+    // bound on the char count — and the second decodes straight into the resulting scratch. The scratch is
+    // NEVER grown mid-leaf: an Array.Resize/re-rent partway through would strand already-handed-out views in
+    // the abandoned array (silent garbage). Both pools are returned with clearArray:true — mandatory for the
+    // REFERENCE-bearing element array, which would otherwise retain the char[] (and the user payload it
+    // carries) across rents.
     private static async Task EmitStringAsync<TSource>(
         ParquetRowGroupWriter rowGroup,
         DataField leaf,
@@ -702,24 +1013,17 @@ internal static class NestedColumnShredder
         CancellationToken cancellationToken)
         where TSource : struct, IValueSource
     {
-        var spans = new BytesCollector(valueCount);
-        source.Collect(spans.Destination, BytesCollector.Read, label);
-
-        char[] scratch = ArrayPool<char>.Shared.Rent(Math.Max(spans.TotalBytes, 1));
+        int budget = MeasurePayloadBytes(source, label);
+        char[] scratch = ArrayPool<char>.Shared.Rent(Math.Max(budget, 1));
         ReadOnlyMemory<char>[] values = ArrayPool<ReadOnlyMemory<char>>.Shared.Rent(Math.Max(valueCount, 1));
         try
         {
-            int position = 0;
-            for (int i = 0; i < valueCount; i++)
-            {
-                int written = Encoding.UTF8.GetChars(spans.Bytes[i], scratch.AsSpan(position));
-                values[i] = scratch.AsMemory(position, written);
-                position += written;
-            }
-
+            values.AsSpan(0, valueCount).Clear();
+            var transcoder = new CharTranscodeVisitor(scratch, budget, values, valueCount, label);
+            int collected = source.ForEachPresent(ref transcoder, label);
             await WriteAllPartsAsync<ReadOnlyMemory<char>>(
-                rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, label, cancellationToken)
-                .ConfigureAwait(false);
+                rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, collected, label,
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -741,25 +1045,17 @@ internal static class NestedColumnShredder
         CancellationToken cancellationToken)
         where TSource : struct, IValueSource
     {
-        var spans = new BytesCollector(valueCount);
-        source.Collect(spans.Destination, BytesCollector.Read, label);
-
-        byte[] scratch = ArrayPool<byte>.Shared.Rent(Math.Max(spans.TotalBytes, 1));
+        int budget = MeasurePayloadBytes(source, label);
+        byte[] scratch = ArrayPool<byte>.Shared.Rent(Math.Max(budget, 1));
         ReadOnlyMemory<byte>[] values = ArrayPool<ReadOnlyMemory<byte>>.Shared.Rent(Math.Max(valueCount, 1));
         try
         {
-            int position = 0;
-            for (int i = 0; i < valueCount; i++)
-            {
-                byte[] payload = spans.Bytes[i];
-                payload.CopyTo(scratch.AsSpan(position));
-                values[i] = scratch.AsMemory(position, payload.Length);
-                position += payload.Length;
-            }
-
+            values.AsSpan(0, valueCount).Clear();
+            var copier = new ByteCopyVisitor(scratch, budget, values, valueCount, label);
+            int collected = source.ForEachPresent(ref copier, label);
             await WriteAllPartsAsync<ReadOnlyMemory<byte>>(
-                rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, label, cancellationToken)
-                .ConfigureAwait(false);
+                rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, collected, label,
+                cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -768,34 +1064,30 @@ internal static class NestedColumnShredder
         }
     }
 
-    // Materializes the variable-width leaf's present payloads so the exactly-sized scratch above can be sized
-    // BEFORE any view is handed out (the scratch must never grow mid-leaf). GetBytes returns a span into the
-    // vector's own store, which cannot be retained across the collection, so each payload is copied once here.
-    private sealed class BytesCollector
+    // The §2.3b size pass. `checked` accumulation into a long, then an explicit ceiling: a single leaf whose
+    // payloads exceed 2 GiB cannot be transcoded into one contiguous scratch, and that is an
+    // UnsupportedFeature on the typed contract — never a raw OverflowException escaping the write door.
+    private static int MeasurePayloadBytes<TSource>(TSource source, string label)
+        where TSource : struct, IValueSource
     {
-        internal BytesCollector(int count) => Bytes = new byte[count][];
-
-        internal byte[][] Bytes { get; }
-
-        internal Span<byte[]> Destination => Bytes;
-
-        internal int TotalBytes
+        var lengths = default(ByteLengthVisitor);
+        try
         {
-            get
-            {
-                int total = 0;
-                foreach (byte[] value in Bytes)
-                {
-                    total = checked(total + value.Length);
-                }
-
-                return total;
-            }
+            _ = source.ForEachPresent(ref lengths, label);
+        }
+        catch (OverflowException)
+        {
+            throw PayloadTooLarge(label);
         }
 
-        internal static Func<ColumnVector, int, byte[]> Read { get; } =
-            static (vector, row) => vector.GetBytes(row).ToArray();
+        long total = lengths.Total;
+        return total > int.MaxValue ? throw PayloadTooLarge(label) : (int)total;
     }
+
+    private static DeltaStorageException PayloadTooLarge(string label) =>
+        DeltaStorageException.UnsupportedFeature(
+            $"Nested column '{label}': the variable-width leaf's payloads exceed the 2 GiB a single Parquet "
+            + "leaf write can stage in one buffer.");
 
     // The single write call site. Runs the §2.3c pre-write level-invariant guard against the SCHEMA-attached
     // DataField, then maps any raw Parquet.Net writer fault onto the typed contract (A4) so no library
@@ -807,13 +1099,12 @@ internal static class NestedColumnShredder
         ReadOnlyMemory<int> def,
         ReadOnlyMemory<int>? rep,
         int rowCount,
+        int collected,
         string label,
         CancellationToken cancellationToken)
         where T : struct
     {
-        NestedLevelGuard.Validate(
-            leaf, def.Span, rep.HasValue ? rep.Value.Span : ReadOnlySpan<int>.Empty, rep.HasValue,
-            values.Length, rowCount, label);
+        RunLevelGuard(leaf, def, rep, collected, rowCount, label);
         try
         {
             await rowGroup.WriteAllPartsAsync(leaf, values, def, rep, cancellationToken).ConfigureAwait(false);
@@ -828,9 +1119,27 @@ internal static class NestedColumnShredder
         }
     }
 
+    // The one place the §2.3c per-leaf guard is invoked, from BOTH the write lane and the N9 pre-pass, so the
+    // two can never diverge. `collected` is the SOURCE-derived present-cell count (B1).
+    private static void RunLevelGuard(
+        DataField leaf,
+        ReadOnlyMemory<int> def,
+        ReadOnlyMemory<int>? rep,
+        int collected,
+        int rowCount,
+        string label) =>
+        NestedLevelGuard.Validate(
+            leaf, def.Span, rep.HasValue ? rep.Value.Span : ReadOnlySpan<int>.Empty, rep.HasValue,
+            collected, rowCount, label);
+
     // ----- cross-leaf guards (§2.3c) -----
 
-    private static void ValidateStructNullParity(
+    /// <summary>
+    /// §2.3c cross-leaf struct clause: all children of an OPTIONAL struct must agree, at every row, on
+    /// whether the struct itself is null. <b>internal</b> so it can be driven directly by fault-injected
+    /// negatives — a guard with no negative test is indistinguishable from a no-op (B4).
+    /// </summary>
+    internal static void ValidateStructNullParity(
         int[]?[] defs, int childCount, int structMaxDef, int rowCount, string label)
     {
         if (structMaxDef <= 0 || childCount == 0)
@@ -853,7 +1162,13 @@ internal static class NestedColumnShredder
         }
     }
 
-    private static void ValidateMapParallelLevels(
+    /// <summary>
+    /// §2.3c cross-leaf map clause: a 3-level map nests key and value in ONE repeated <c>key_value</c> group,
+    /// so their repetition streams must be IDENTICAL and their definition streams must agree on every
+    /// null/empty/absent slot. <b>internal</b> for the same reason as
+    /// <see cref="ValidateStructNullParity"/> (B4).
+    /// </summary>
+    internal static void ValidateMapParallelLevels(
         ReadOnlySpan<int> keyDef,
         ReadOnlySpan<int> valueDef,
         ReadOnlySpan<int> keyRep,
@@ -908,6 +1223,37 @@ internal static class NestedColumnShredder
         }
 
         return count;
+    }
+
+    // The logical row count the row group's segments describe, derived from the SEGMENTS — the independent
+    // side of the struct lane's N4-a slot-count clause (B2).
+    private static int TotalSegmentRows(IReadOnlyList<ColumnSegment> segments, string label)
+    {
+        long rows = 0;
+        foreach (ColumnSegment segment in segments)
+        {
+            rows = checked(rows + segment.Length);
+        }
+
+        return CheckSlotBound(rows, label);
+    }
+
+    // #730/S2, per NESTED leaf: the mapped Parquet leaf's repetition (OPTIONAL vs REQUIRED) must equal the
+    // Delta schema's declared nullability for that leaf. A divergence is precisely the footer↔log
+    // contradiction #730 exists to remove — writing it would publish a file whose repetition contradicts the
+    // committed schemaString — so it is an UNCONDITIONAL typed reject, never a Debug.Assert that vanishes in
+    // Release.
+    private static void EnsureLeafRepetition(
+        DataField leaf, bool declaredNullable, string label, string context)
+    {
+        if (leaf.IsNullable != declaredNullable)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Nested column '{label}' {context}: the mapped Parquet leaf is "
+                + $"{(leaf.IsNullable ? "OPTIONAL" : "REQUIRED")} but the declared Delta schema says "
+                + $"{(declaredNullable ? "nullable" : "non-nullable")}; writing it would publish a footer that "
+                + "contradicts the committed schema (#730).");
+        }
     }
 
     // ----- typed vector/field accessors (§2.8 diagnostic hygiene) -----

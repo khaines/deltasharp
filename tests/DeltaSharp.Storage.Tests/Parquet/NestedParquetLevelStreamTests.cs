@@ -2,6 +2,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 using Parquet;
+using Parquet.Data;
 using Parquet.Schema;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
@@ -80,9 +81,85 @@ public sealed class NestedParquetLevelStreamTests
         Assert.Equal(new[] { 2, 0, 1, 2 }, aDef);
         Assert.Equal(new[] { 2, 0, 2, 1 }, bDef);
 
-        // A non-repeated leaf carries NO repetition stream at all — not an empty one.
+        // A non-repeated leaf carries NO repetition stream at all. Asserting the arrays are EMPTY is
+        // vacuous — the helper substitutes an empty array whenever MaxRepetitionLevel is 0, so the assertion
+        // would hold even if the writer had emitted a stream. ABSENCE is asserted separately below.
         Assert.Empty(aRep);
         Assert.Empty(bRep);
+        await AssertNoRepetitionStreamAsync(bytes, "s", "a");
+        await AssertNoRepetitionStreamAsync(bytes, "s", "b");
+    }
+
+    [Fact]
+    public async Task StructWithRequiredChild_EmitsTheNormativeRequiredStructLevelTable_AndRoundTrips()
+    {
+        // §2.3's struct REQUIRED column, otherwise entirely unpinned. A REQUIRED child's leaf maxDef equals
+        // the struct's own (1), so it has NO level of its own at which to be null — "struct present" and
+        // "value present" are the SAME level — while its OPTIONAL sibling keeps two.
+        //   {1,"x"}      -> req: def 1   opt: def 2
+        //   null struct  -> req: def 0   opt: def 0   (a REQUIRED child still drops to 0 for a null struct)
+        //   {3,null}     -> req: def 1   opt: def 1
+        var rows = new (int? A, string? B)?[] { (1, "x"), null, (3, null) };
+
+        var inner = DataTypes.CreateStructType(new[]
+        {
+            new StructField("req", DataTypes.IntegerType, nullable: false),
+            new StructField("opt", DataTypes.StringType, nullable: true),
+        });
+        var schema = DataTypes.CreateStructType(new[] { new StructField("s", inner, nullable: true) });
+        byte[] bytes = await WriteAsync(schema, NestedVectors.IntStringStruct(inner, rows));
+
+        (DataField reqField, int[] reqDef, _) = await ReadLeafAsync(bytes, "s", "req");
+        (DataField optField, int[] optDef, _) = await ReadLeafAsync(bytes, "s", "opt");
+
+        Assert.False(reqField.IsNullable);
+        Assert.Equal(1, reqField.MaxDefinitionLevel);
+        Assert.Equal(0, reqField.MaxRepetitionLevel);
+        Assert.True(optField.IsNullable);
+        Assert.Equal(2, optField.MaxDefinitionLevel);
+        Assert.Equal(0, optField.MaxRepetitionLevel);
+        Assert.Equal(new[] { 1, 0, 1 }, reqDef);
+        Assert.Equal(new[] { 2, 0, 1 }, optDef);
+
+        // …and the same file round-trips through the real read path, so the level table above is not merely
+        // self-consistent with the writer.
+        using var stream = new MemoryStream(bytes, writable: false);
+        ColumnBatch? decoded = null;
+        await foreach (ColumnBatch group in new ParquetFileReader().ReadAsync(
+            stream, schema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false,
+            CancellationToken.None))
+        {
+            decoded = group;
+        }
+
+        Assert.NotNull(decoded);
+        NestedVectors.AssertStructsEqual(
+            rows, NestedVectors.ReadIntStringStruct((StructColumnVector)decoded!.Column(0)));
+    }
+
+    // Asserts that a leaf's repetition levels are ABSENT — Parquet.Net's RawColumnData refuses to surface a
+    // repetition stream for an unrepeated column — rather than merely empty.
+    private static async Task AssertNoRepetitionStreamAsync(byte[] bytes, params string[] path)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        await using ParquetReader reader = await ParquetReader.CreateAsync(stream, null, false, default);
+        DataField field = reader.Schema.DataFields.Single(f => f.Path.ToList().SequenceEqual(path));
+        Assert.Equal(0, field.MaxRepetitionLevel);
+
+        using ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(0);
+        RawColumnData raw = await rowGroup.ReadRawColumnDataBaseAsync(field, default);
+
+        Exception? absent = null;
+        try
+        {
+            _ = raw.RepetitionLevels.Length;
+        }
+        catch (Exception ex)
+        {
+            absent = ex;
+        }
+
+        Assert.NotNull(absent);
     }
 
     [Fact]

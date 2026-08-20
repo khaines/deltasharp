@@ -334,6 +334,59 @@ public sealed class NestedParquetWriteRejectTests
                 RepeatedLeaf(), new[] { 3, 3 }, new[] { 0 }, true, 2, 1, "a"),
             "different lengths");
 
+    [Fact]
+    public void LevelGuard_RejectsANegativeDefinitionLevel() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, -1 }, new[] { 0, 1 }, true, 1, 1, "a"),
+            "outside [0, 3]");
+
+    [Fact]
+    public void LevelGuard_RejectsANegativeRepetitionLevel() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3 }, new[] { 0, -1 }, true, 2, 1, "a"),
+            "outside [0, 1]");
+
+    [Fact]
+    public void LevelGuard_RejectsAValueCountThatUNDERSuppliesTheLevels() =>
+        // The under-fill direction (B1): fewer packed values than the levels claim would leave the tail of the
+        // value buffer UNINITIALIZED — pooled memory from a previous tenant — reaching WriteAllPartsAsync.
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3, 0 }, new[] { 0, 1, 0 }, true, 1, 2, "a"),
+            "were packed");
+
+    [Fact]
+    public void LevelGuard_RejectsALeafNotAttachedToASchema() =>
+        // §2.3c N4-c level PROVENANCE (B8): a DETACHED DataField reports maxDef 0, which silently collapses
+        // the container/empty levels and turns the run-legality clause into a no-op. The guard must refuse to
+        // validate against bounds that are not the file's.
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                new DataField<int?>("element"), new[] { 0 }, new[] { 0 }, true, 0, 1, "a"),
+            "not attached to a Parquet schema");
+
+    [Fact]
+    public void SlotBound_RejectsAPathologicalNestedFanOut()
+    {
+        // Quality N4: the per-row-group leaf slot ceiling. Driving a real >268M-element vector is not
+        // feasible in a unit test, so the bound itself is exercised directly — the arm is dead otherwise.
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => NestedColumnShredder.CheckSlotBound(
+                NestedColumnShredder.MaxLeafSlotsPerRowGroup + 1L, "a"));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("Dremel level slot(s)", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void SlotBound_AcceptsTheBoundExactly() =>
+        // Non-vacuity: the ceiling is inclusive, so a leaf sitting exactly on it is legal.
+        Assert.Equal(
+            NestedColumnShredder.MaxLeafSlotsPerRowGroup,
+            NestedColumnShredder.CheckSlotBound(NestedColumnShredder.MaxLeafSlotsPerRowGroup, "a"));
+
     private static void AssertRejected(Action act, string expectedFragment)
     {
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(act);
@@ -348,6 +401,10 @@ public sealed class NestedParquetWriteRejectTests
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
             () => new ParquetFileWriter().WriteAsync(output, schema, new[] { batch }, CancellationToken.None));
 
+        // §2.9 N9 (B7): ParquetWriter.CreateAsync publishes the PAR1 magic the moment it is called, so a
+        // "fails closed BEFORE any byte" claim is only meaningful if the stream is still EMPTY. Every reject
+        // routed through this helper — schema-door AND runtime required-lane/level — is held to that bar here.
+        Assert.Equal(0, output.Length);
         return error;
     }
 }

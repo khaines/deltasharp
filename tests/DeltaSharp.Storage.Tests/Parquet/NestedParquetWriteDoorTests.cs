@@ -2,6 +2,7 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
+using Parquet.Schema;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
 
@@ -233,7 +234,68 @@ public sealed class NestedParquetWriteDoorTests
         Assert.Equal(new[] { "a", "b" }, inner.Fields.Select(f => f.Name));
         Assert.Equal(DataTypes.IntegerType, inner.Fields[0].DataType);
         Assert.Equal(DataTypes.StringType, inner.Fields[1].DataType);
-        Assert.True(ParquetTypeMapping.MaxFooterTypeDepth >= 64);
+    }
+
+    [Fact]
+    public async Task FooterSchema_AcceptsATreeExactlyAtTheDepthCap()
+    {
+        // The boundary from BELOW. `depth` is 1 for a top-level column, so a chain of
+        // (MaxFooterTypeDepth - 1) struct containers puts the leaf on exactly the cap.
+        byte[] bytes = await WriteDeepFooterAsync(ParquetTypeMapping.MaxFooterTypeDepth);
+        using var stream = new MemoryStream(bytes, writable: false);
+
+        StructType footer = await new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None);
+
+        int depth = 1;
+        DataType type = footer.Fields[0].DataType;
+        while (type is StructType nested)
+        {
+            depth++;
+            type = nested.Fields[0].DataType;
+        }
+
+        Assert.Equal(ParquetTypeMapping.MaxFooterTypeDepth, depth);
+        Assert.Equal(DataTypes.IntegerType, type);
+    }
+
+    [Fact]
+    public async Task FooterSchema_RejectsATreeOneLevelPastTheDepthCap()
+    {
+        // The boundary from ABOVE — the arm that actually guards the recursion. Asserting the CONSTANT
+        // (>= 64) proves nothing: deleting the check leaves such an assertion green. This drives a real
+        // footer through ReadDataSchemaAsync and requires the typed fail-closed reject.
+        byte[] bytes = await WriteDeepFooterAsync(ParquetTypeMapping.MaxFooterTypeDepth + 1);
+        using var stream = new MemoryStream(bytes, writable: false);
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileReader().ReadDataSchemaAsync(stream, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("deeper than the supported limit", error.Message, StringComparison.Ordinal);
+
+        // §2.8: no foreign footer field name is echoed — the bound itself is the whole diagnosis.
+        Assert.DoesNotContain("lvl", error.Message, StringComparison.Ordinal);
+    }
+
+    // Writes a ROW-LESS Parquet file whose single column is a chain of `depth` type levels (depth - 1 nested
+    // struct containers around one int leaf). A row-less file still carries a complete, parseable footer,
+    // which is all ReadDataSchemaAsync consumes.
+    private static async Task<byte[]> WriteDeepFooterAsync(int depth)
+    {
+        global::Parquet.Schema.Field field = new DataField<int?>("leaf");
+        for (int level = depth - 1; level >= 1; level--)
+        {
+            field = new global::Parquet.Schema.StructField($"lvl{level}", field);
+        }
+
+        var stream = new MemoryStream();
+        await using (await global::Parquet.ParquetWriter.CreateAsync(
+            new global::Parquet.Schema.ParquetSchema(field), stream, null, false, CancellationToken.None)
+            .ConfigureAwait(false))
+        {
+        }
+
+        return stream.ToArray();
     }
 
     private static async Task<(byte[] Bytes, long Rows)> WriteNestedAsync()
