@@ -839,7 +839,7 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            return MapFooterSchemaFailClosed(reader);
+            return MapFooterSchemaFailClosed(reader, ParquetTypeMapping.ToDataSchema);
         }
     }
 
@@ -847,17 +847,26 @@ internal sealed class ParquetFileReader
     // ReadDataSchemaAsync and ReadDataLeafColumnsAsync so the two footer-schema readers can NEVER diverge on it.
     // OpenAsync force-materialized reader.Schema inside its footer-PARSE boundary, but the SUBSEQUENT mapping of
     // untrusted footer field descriptors into DeltaSharp StructFields is a distinct decode step that was
-    // unsealed: ToDataSchema eagerly builds a StructField for EVERY footer field, so a crafted footer with an
-    // empty field name makes the StructField constructor raise a raw ArgumentException (PDX-T crafted schema).
-    // Map every library/domain fault from the mapping to the deterministic CorruptData contract with a FIXED
-    // message (no ex.Message, so no footer content echoes into the error text). ToDataSchema's legitimate typed
-    // UnsupportedFeature (an unsupported-but-VALID Parquet type) is a DeltaStorageException, EXCLUDED by both
-    // predicates below, so it still propagates UNWRAPPED (never re-masked as CorruptData).
-    private static StructType MapFooterSchemaFailClosed(ParquetReader reader)
+    // unsealed: the shaping function eagerly builds a StructField for EVERY footer field, so a crafted footer
+    // with an empty field name makes the StructField constructor raise a raw ArgumentException (PDX-T crafted
+    // schema). Map every library/domain fault from the mapping to the deterministic CorruptData contract with a
+    // FIXED message (no ex.Message, so no footer content echoes into the error text). The shaping function's
+    // legitimate typed UnsupportedFeature (an unsupported-but-VALID Parquet type, or a footer deeper than the
+    // recursive mapper's depth cap) is a DeltaStorageException, EXCLUDED by both predicates below, so it still
+    // propagates UNWRAPPED (never re-masked as CorruptData).
+    //
+    // PARAMETERIZED BY THE SHAPING FUNCTION (nested-parquet-write design, Decision 5): the #497 write door uses
+    // the RECURSIVE ParquetTypeMapping.ToDataSchema (nested footer columns map back to their logical shape,
+    // over DeltaSharp's own just-written bytes), while the foreign, attacker-controlled CDF-EE-08 door (#662)
+    // keeps the LEAF-FLATTENING ToDataLeafSchema so its accept/reject acceptance set is unchanged and every
+    // type it can render stays atomic. Both still share THIS fail-closed wrapping, so the two footer-schema
+    // readers can never diverge on it.
+    private static StructType MapFooterSchemaFailClosed(
+        ParquetReader reader, Func<ParquetSchema, StructType> shape)
     {
         try
         {
-            return ParquetTypeMapping.ToDataSchema(reader.Schema);
+            return shape(reader.Schema);
         }
         catch (Exception ex) when (IsParquetDefect(ex))
         {
@@ -883,7 +892,8 @@ internal sealed class ParquetFileReader
 
     /// <summary>
     /// Reads only the Parquet footer and returns the file's leaf data columns — each carrying its name,
-    /// DeltaSharp type (via <see cref="ParquetTypeMapping.ToDataSchema"/>), and (when the footer assigns one)
+    /// DeltaSharp type (via the LEAF-FLATTENING <see cref="ParquetTypeMapping.ToDataLeafSchema"/>), and (when
+    /// the footer assigns one)
     /// its <c>field_id</c> — decoding no data pages, in file order. This is the <b>field-id-aware sibling</b> of
     /// <see cref="ReadDataSchemaAsync"/>: the CDF explicit (cdc) read validates a foreign column-mapping
     /// <b>id</b>-mode cdc file's leaf schema by <c>field_id</c> (the Delta id-mode authority) rather than by
@@ -904,7 +914,7 @@ internal sealed class ParquetFileReader
         ParquetReader reader = await OpenAsync(input, cancellationToken).ConfigureAwait(false);
         await using (reader.ConfigureAwait(false))
         {
-            StructType schema = MapFooterSchemaFailClosed(reader);
+            StructType schema = MapFooterSchemaFailClosed(reader, ParquetTypeMapping.ToDataLeafSchema);
 
             // Correlate the footer field_ids with the leaves (BuildFieldIdMap fails closed on a duplicate
             // field_id — a typed DeltaStorageException that propagates unwrapped, mirroring the ReadAsync id
@@ -914,9 +924,10 @@ internal sealed class ParquetFileReader
             var fieldIdByName = new Dictionary<string, int>(StringComparer.Ordinal);
             foreach (KeyValuePair<int, DataField> entry in byFieldId)
             {
-                // This metadata-only leaf summary is consumed by current flat id-mode CDF validation. Nested
-                // leaves are still reported through their top-level container field by MapFooterSchemaFailClosed,
-                // so only top-level leaf DataFields may populate the flat name→field_id map.
+                // This metadata-only leaf summary is consumed by current flat id-mode CDF validation. Its
+                // schema is shaped by the LEAF-FLATTENING ToDataLeafSchema (design Decision 5), which reports
+                // every leaf — including a nested one — under its leaf-local name, so only top-level leaf
+                // DataFields may populate the flat name→field_id map.
                 if (entry.Value.Path.Length != 1)
                 {
                     continue;
@@ -1646,14 +1657,14 @@ internal sealed class ParquetFileReader
         // `requestedField.DataType.SimpleString` IS echoed raw below, and that is deliberate. The class doc on
         // DiagnosticText warns that SimpleString is unbounded FOR A NESTED TYPE, because StructType/ArrayType/
         // MapType append every nested field name verbatim and recurse. This method only ever sees a SCALAR:
-        // ParquetTypeMapping.CreateField (next line) rejects nested types outright, and a nested request is
+        // ParquetTypeMapping.CreateScalarField (next line) rejects nested types outright, and a nested request is
         // routed to NestedParquetColumnReader.ValidateShape long before it reaches here. On a scalar,
         // SimpleString is a bounded literal ("bigint", "decimal(10,2)") carrying no caller text. Do NOT copy
         // this pattern into a context that can see a nested type.
         // honorReferenceNullability: false — `expected` is the ALWAYS-NULLABLE reference shape this guard is
         // deliberately written around (see the nullability check below and issue #807). Passing true here
         // would reject every foreign/pre-#730 file that stores a log-required string/binary as OPTIONAL.
-        DataField expected = ParquetTypeMapping.CreateField(requestedField, honorReferenceNullability: false);
+        DataField expected = ParquetTypeMapping.CreateScalarField(requestedField, honorReferenceNullability: false);
 
         // Read-side promotion gate: a narrower physical type that is a sanctioned widening of the request is
         // accepted (the values are widened on read) ONLY when the caller opened the promotion gate. This is

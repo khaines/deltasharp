@@ -1557,7 +1557,7 @@ internal sealed class DeltaTableWriter
     // ignoring nullability and field metadata (see ValidateStagedWriteSchema: a footer carries physical
     // REPETITION, not Spark nullability, and no field metadata at all, so comparing either against a
     // footer-derived schema would false-reject a valid write of a foreign or pre-#730 staged file).
-    private static bool DataColumnsMatch(StructType expected, StructType actual)
+    internal static bool DataColumnsMatch(StructType expected, StructType actual)
     {
         if (expected.Count != actual.Count)
         {
@@ -1567,12 +1567,61 @@ internal sealed class DeltaTableWriter
         for (int i = 0; i < expected.Count; i++)
         {
             if (!string.Equals(expected[i].Name, actual[i].Name, StringComparison.Ordinal)
-                || !expected[i].DataType.Equals(actual[i].DataType))
+                || !TypesMatch(expected[i].DataType, actual[i].DataType))
             {
                 return false;
             }
         }
 
         return true;
+    }
+
+    // The NESTED extension of the same leniency (nested Parquet write, design §2.4/N3). StructType.Equals /
+    // ArrayType.Equals / MapType.Equals compare Nullable/Metadata/ContainsNull/ValueContainsNull, so a nested
+    // column would FALSE-REJECT at this door for exactly the reasons the top-level comparison already excuses:
+    // a footer carries physical REPETITION (every nested container is OPTIONAL on the wire — Parquet.Net
+    // exposes no IsNullable setter) and carries no Spark field metadata at all. So extend the top-level
+    // name+type leniency INWARD — recursively, ignoring nullability and metadata at every level — rather than
+    // relaxing the door itself (a name, an arity, an ordering or a leaf-type divergence still rejects).
+    //
+    // LOAD-BEARING COMPENSATING CONTROL: this leniency is only safe because the writer enforces the real null
+    // invariant BEFORE the bytes exist — ParquetTypeMapping.CreateField refuses a `nullable:false` nested
+    // container outright, and NestedColumnShredder's required-lane guard fails closed on a null in a REQUIRED
+    // nested leaf (design §2.4a). An editor must not remove either without re-tightening this comparator.
+    //
+    // FORWARD (#676): column-mapping id/physicalName live in FIELD METADATA, which this comparator ignores, so
+    // nested child physical naming must be RE-DERIVED under #676 — never inherited from this comparison.
+    private static bool TypesMatch(DataType expected, DataType actual)
+    {
+        switch (expected)
+        {
+            case StructType expectedStruct:
+                if (actual is not StructType actualStruct || expectedStruct.Count != actualStruct.Count)
+                {
+                    return false;
+                }
+
+                for (int i = 0; i < expectedStruct.Count; i++)
+                {
+                    if (!string.Equals(expectedStruct[i].Name, actualStruct[i].Name, StringComparison.Ordinal)
+                        || !TypesMatch(expectedStruct[i].DataType, actualStruct[i].DataType))
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            case ArrayType expectedArray:
+                return actual is ArrayType actualArray
+                    && TypesMatch(expectedArray.ElementType, actualArray.ElementType);
+            case MapType expectedMap:
+                return actual is MapType actualMap
+                    && TypesMatch(expectedMap.KeyType, actualMap.KeyType)
+                    && TypesMatch(expectedMap.ValueType, actualMap.ValueType);
+            default:
+                // A scalar: the atomic/decimal types carry no nullability or metadata of their own, so exact
+                // equality IS the lenient comparison (and a decimal's precision/scale still binds).
+                return expected.Equals(actual);
+        }
     }
 }

@@ -311,7 +311,12 @@ public sealed class ParquetWriterTests
         // The narrowness is a division of labour, not a gap. The positional gap is the real one,
         // and it is the LOG-side sibling call site, guarded in DeltaFooterLogSchemaParityTests
         // rather than here.
-        string[] physical = reader.Schema.DataFields.Select(x => x.Name).ToArray();
+        // TOP-LEVEL fields, not DataFields: since #841 a nested column is ONE declared column that
+        // physically fans out to N leaf DataFields, so the leaf projection would compare a struct's
+        // children against the declared column list and false-fail. Schema.Fields is the faithful
+        // counterpart of the declared top-level column list, and for a flat schema the two projections
+        // are identical — so this generalises the guard to nested footers without loosening it.
+        string[] physical = reader.Schema.Fields.Select(x => x.Name).ToArray();
         string[] redeclared = ((StructType)SchemaJson.FromJson(declared)).Select(x => x.Name).ToArray();
         string[] logical = schema.Select(x => x.Name).ToArray();
         if (!physical.SequenceEqual(redeclared, StringComparer.Ordinal))
@@ -342,7 +347,7 @@ public sealed class ParquetWriterTests
         // are derived from the artifact -- the physical Parquet field's repetition and the re-parsed
         // schemaString's Nullable -- and must agree per column; the handed schema is then checked
         // against the declaration too, so the property does not rest on caller discipline.
-        bool[] physicalNullable = reader.Schema.DataFields.Select(x => x.IsNullable).ToArray();
+        bool[] physicalNullable = reader.Schema.Fields.Select(x => x.IsNullable).ToArray();
         bool[] redeclaredNullable =
             ((StructType)SchemaJson.FromJson(declared)).Select(x => x.Nullable).ToArray();
         bool[] logicalNullable = schema.Select(x => x.Nullable).ToArray();
@@ -966,8 +971,14 @@ public sealed class ParquetWriterTests
         //   * breadth across the interior of the family is covered by the GENERATED surface, whose
         //     support is this same derived list.
         // A type that is neither pinned nor generated would be invisible; none is.
+        // NESTED types are excluded from the SCALAR corpus's completeness obligation: since #841 the
+        // writer accepts array/map/struct, but their wire shape is a Dremel level encoding rather than a
+        // scalar footer field, so it is pinned by NestedParquetWriteTests (round-trip + literal level
+        // streams) instead of by ScalarFooterGolden. The refusal-boundary assertions below pin that
+        // acceptance so this exclusion cannot quietly hide a regression in either direction.
         string[] unparameterised = accepted
             .Where(t => !t.TypeName.StartsWith("decimal", StringComparison.Ordinal))
+            .Where(t => t is not (ArrayType or MapType or StructType))
             .Select(t => t.TypeName)
             .ToArray();
         string[] missing = unparameterised
@@ -989,14 +1000,33 @@ public sealed class ParquetWriterTests
             pinnedTypeNames,
             t => t.StartsWith($"decimal({widestPrecision},", StringComparison.Ordinal));
 
-        // The refusal boundary, asserted rather than described: nested types and the null type are
-        // the only shapes the writer rejects outright, which is exactly the scope of #713 and the
-        // reason no artifact assertion for them is possible at this HEAD.
+        // The acceptance boundary, asserted rather than described. #841 MOVED it: the three SINGLE-LEVEL
+        // nested shapes are now written, so they must be accepted here; the null type and every
+        // out-of-scope nested shape must still be refused outright.
         string[] acceptedNames = accepted.Select(t => t.TypeName).ToArray();
-        Assert.DoesNotContain("array", acceptedNames, StringComparer.Ordinal);
-        Assert.DoesNotContain("map", acceptedNames, StringComparer.Ordinal);
-        Assert.DoesNotContain("struct", acceptedNames, StringComparer.Ordinal);
+        Assert.Contains("array", acceptedNames, StringComparer.Ordinal);
+        Assert.Contains("map", acceptedNames, StringComparer.Ordinal);
+        Assert.Contains("struct", acceptedNames, StringComparer.Ordinal);
         Assert.DoesNotContain("void", acceptedNames, StringComparer.Ordinal);
+
+        // The residual refusals (#585/§2.4a/§2.6): nested-within-nested, a zero-field struct, and a
+        // non-nullable nested container. Asserted through the same real-write probe the acceptance set is
+        // derived from, so the boundary is measured on both sides rather than described on one.
+        await AssertWriterRefusesAsync(
+            new StructField(
+                "probe", DataTypes.CreateArrayType(DataTypes.CreateArrayType(DataTypes.LongType)),
+                nullable: true));
+        await AssertWriterRefusesAsync(
+            new StructField("probe", DataTypes.CreateStructType(Array.Empty<StructField>()), nullable: true));
+        await AssertWriterRefusesAsync(
+            new StructField("probe", DataTypes.CreateArrayType(DataTypes.LongType), nullable: false));
+    }
+
+    private static async Task AssertWriterRefusesAsync(StructField field)
+    {
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => WriteAndReadFooterSchemaAsync(new StructType([field])));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
     }
 
     [Fact]
@@ -3138,11 +3168,13 @@ public sealed class ParquetWriterTests
                 usedNames.Add(name);
             }
 
-            fields.Add(new StructField(
-                name,
-                support[rng.Next(support.Count)],
-                nullable: rng.Next(2) == 0,
-                GenerateMetadata(rng, depth: 0)));
+            // A nested container is always emitted OPTIONAL by Parquet.Net, so the writer refuses a
+            // declared-REQUIRED one outright (#730/§2.4a) — that boundary is pinned directly by
+            // ScalarArtifactCorpus_CoversEveryTypeTheWriterAccepts. Here the generator draws from the
+            // WRITABLE surface, so nested fields are always nullable while scalars keep both lanes.
+            DataType type = support[rng.Next(support.Count)];
+            bool nullable = rng.Next(2) == 0 || type is ArrayType or MapType or StructType;
+            fields.Add(new StructField(name, type, nullable, GenerateMetadata(rng, depth: 0)));
         }
 
         return new StructType(fields);

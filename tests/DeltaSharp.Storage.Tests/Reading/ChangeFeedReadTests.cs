@@ -140,6 +140,25 @@ public sealed class ChangeFeedReadTests : IDisposable
         new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
     });
 
+    // A sentinel used as a nested STRUCT CHILD name inside a foreign cdc footer (#841 §2.8 / CDF-EE-08). Nested
+    // cdc footers became physically authorable once the nested write path landed, and EE-08's
+    // ReadDataLeafColumnsAsync is the only ATTACKER-CONTROLLED consumer of the leaf-flattening schema mapper —
+    // so a nested child name is now a file-derived token that must never reach a surfaced message.
+    private const string NestedChildSentinel = "z_att4cker_nested_child_s3ntinel";
+
+    // A foreign cdc-file schema carrying a single-level NESTED data column whose struct child is the sentinel.
+    // `id`/`name` match flat metadata schema A, so the nested column is the ONLY inconsistency.
+    private static readonly StructType CdcNestedColumnSchema = new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("name", DataTypes.StringType, nullable: true),
+        new StructField(
+            "nested",
+            DataTypes.CreateStructType(new[] { new StructField(NestedChildSentinel, DataTypes.LongType, nullable: true) }),
+            nullable: true),
+        new StructField(ChangeDataWriter.ChangeTypeColumn, DataTypes.StringType, nullable: false),
+    });
+
     public void Dispose()
     {
         try
@@ -2492,6 +2511,73 @@ public sealed class ChangeFeedReadTests : IDisposable
     }
 
     [Fact]
+    public async Task Explicit_CdcNestedDataColumn_FailsClosedWithoutEchoingTheNestedChildName()
+    {
+        // CDF-EE-08 x #841 §2.8. Before the nested write path existed a nested cdc footer was not physically
+        // authorable by this codebase; it is now, and ValidateCdcLeafSchema (via ReadDataLeafColumnsAsync /
+        // ToDataLeafSchema) is the ONLY attacker-controlled consumer of the leaf-flattening mapper. A foreign cdc
+        // file may therefore carry a STRUCT data column whose CHILD name is attacker-authored — and the flattener
+        // surfaces that child as a leaf under its own leaf-local name. The EE-08 failure must fail closed and
+        // report only the bounded absent-column COUNT: the nested child name must never be echoed.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, "nested-noecho").DeleteAsync(WhereId(id => id == 1));   // v2 cdc(A) delete
+        string cdc = Assert.Single(CdcFilePaths());
+        byte[] nested = await ParquetTestHelpers.WriteToBytesAsync(
+            CdcNestedColumnSchema, new[] { CdcNestedColumnBatch() });
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), nested);
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.DoesNotContain(NestedChildSentinel, ex.Message, StringComparison.Ordinal);   // no nested-child leak
+        Assert.DoesNotContain("nested", ex.Message, StringComparison.Ordinal);              // nor the container
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("flat", true)]
+    [InlineData("nested", false)]
+    [InlineData("surplus", false)]
+    public async Task Explicit_CdcLeafSchemaAcceptanceSet_IsInvariantAcrossNestedAndFlatFooters(
+        string body, bool accepted)
+    {
+        // Acceptance-set invariance (#841 §2.9 boundary). ToDataSchema became RECURSIVE for the #497 write door,
+        // but EE-08 stayed pinned to the leaf-flattening ToDataLeafSchema — so the set of cdc footers this
+        // validator ACCEPTS must be exactly what it was: the well-formed FLAT body, and nothing else. A nested
+        // footer must still be rejected (its flattened leaves do not reconcile with the version's metadata), and
+        // so must the surplus-column footer. The table pins BOTH arms so a future widening of the door cannot
+        // silently admit a nested cdc file.
+        await CreateCdfFlatTableAsync(Batch((1, "a"), (2, "b")));   // v0, v1 (schema A = id, name)
+        var backend = new LocalFileSystemBackend(_root);
+        await NewCdfDelete(backend, $"invariance-{body}").DeleteAsync(WhereId(id => id == 1));   // v2 cdc(A)
+        string cdc = Assert.Single(CdcFilePaths());
+
+        byte[] bytes = body switch
+        {
+            "flat" => await ParquetTestHelpers.WriteToBytesAsync(
+                CdcFlatBodySchema, new[] { CdcFlatBodyBatch((1L, "a", ChangeDataWriter.DeleteChange)) }),
+            "nested" => await ParquetTestHelpers.WriteToBytesAsync(
+                CdcNestedColumnSchema, new[] { CdcNestedColumnBatch() }),
+            _ => await ParquetTestHelpers.WriteToBytesAsync(
+                CdcSurplusColumnSchema, new[] { CdcSurplusColumnBatch() }),
+        };
+        await File.WriteAllBytesAsync(Path.Combine(_root, cdc), bytes);
+
+        if (accepted)
+        {
+            (_, List<ColumnBatch> batches) = await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2));
+            Assert.Equal(1, batches.Sum(b => b.LogicalRowCount));
+            return;
+        }
+
+        DeltaReadException ex = await Assert.ThrowsAsync<DeltaReadException>(
+            async () => await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(2, 2)));
+        Assert.Contains("CDF-EE-08", ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(NestedChildSentinel, ex.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(SurplusSentinelColumn, ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Explicit_CdcSchemaMismatch_FailsClosedWithoutEchoingCdcFilePath()
     {
         // Message hygiene (#653 site 1a): NewCdcSchemaMismatch dropped the cdc file `path` param entirely — a
@@ -3656,6 +3742,25 @@ public sealed class ChangeFeedReadTests : IDisposable
         changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
         return new ManagedColumnBatch(
             CdcSurplusColumnSchema, new ColumnVector[] { id, name, surplus, changeType }, 1);
+    }
+
+    // Builds a one-row foreign cdc body for CdcNestedColumnSchema: id/name match schema A plus a single-level
+    // NESTED struct data column whose child carries the attacker sentinel — the EE-08 nested-footer discriminator.
+    private static ColumnBatch CdcNestedColumnBatch()
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector name = ColumnVectors.Create(DataTypes.StringType, 1);
+        MutableColumnVector child = ColumnVectors.Create(DataTypes.LongType, 1);
+        MutableColumnVector changeType = ColumnVectors.Create(DataTypes.StringType, 1);
+        id.AppendValue(1L);
+        name.AppendBytes(Encoding.UTF8.GetBytes("a"));
+        child.AppendValue(7L);
+        changeType.AppendBytes(Encoding.UTF8.GetBytes(ChangeDataWriter.DeleteChange));
+
+        var nestedType = (StructType)CdcNestedColumnSchema.Fields[2].DataType;
+        var nested = new StructColumnVector(nestedType, new ColumnVector[] { child }, new[] { false });
+        return new ManagedColumnBatch(
+            CdcNestedColumnSchema, new ColumnVector[] { id, name, nested, changeType }, 1);
     }
 
     // Builds a FlatSchema cdc file body (id, name, `_change_type`) — the physical layout ChangeDataWriter emits

@@ -298,15 +298,48 @@ internal static class BoundedDecode
     internal static readonly BoundedDecoder CheckpointDecoder =
         BoundedDecoder.FromSizing(DeriveDoorSizing(ProcessMemoryBytes, CheckpointMaxFootprintBytes), DecodeExecution.DedicatedThread);
 
-    /// <summary>The total count of detached (running-past-deadline) strands across both doors — exposed as the
-    /// <c>deltasharp.storage.decode.detached</c> observability gauge and for tests that assert strands drain.</summary>
-    internal static int DetachedDecodeCount => DataFileDecoder.DetachedDecodeCount + CheckpointDecoder.DetachedDecodeCount;
+    /// <summary>
+    /// The nested-write §2.4b footer RECONCILIATION door: DeltaSharp reading back the footer of a file it just
+    /// authored itself, to check the footer's <c>NumRows</c> against the batch-derived row total.
+    /// <para>It is a THIRD door, not the data-file one, because that door admits UNTRUSTED reads: sharing
+    /// would couple the two in both directions — a flood of hostile reads saturating the door would fail
+    /// otherwise-healthy WRITES with <c>DecoderSaturated</c>, and every write would consume an admission slot
+    /// sized for untrusted decodes.</para>
+    /// <para>It runs on a DEDICATED THREAD (as the checkpoint door does, and for the same reason): a footer
+    /// parse over an already-materialized window is predominantly synchronous CPU work, so it must not queue
+    /// behind ThreadPool work that untrusted decode strands can pin — a write must remain verifiable while
+    /// the pool is under pressure.</para>
+    /// <para>It is sized for a FOOTER-only footprint
+    /// (<see cref="Parquet.ParquetFileReader.MaxFooterMetadataBytes"/>, which is exactly what a strand of this
+    /// read can retain) rather than a whole-data-file one, so a write-verification strand is charged and
+    /// budgeted for the work it actually does.</para>
+    /// </summary>
+    internal static readonly BoundedDecoder ReconciliationDecoder =
+        BoundedDecoder.FromSizing(
+            DeriveDoorSizing(ProcessMemoryBytes, Parquet.ParquetFileReader.MaxFooterMetadataBytes),
+            DecodeExecution.DedicatedThread);
+
+    /// <summary>The total count of detached (running-past-deadline) strands across ALL THREE doors — exposed as
+    /// the <c>deltasharp.storage.decode.detached</c> observability gauge and for tests that assert strands
+    /// drain. The reconciliation door is included: a strand there holds a thread and bytes exactly like any
+    /// other, so leaving it out would make write-verification strands invisible to the detached-strand
+    /// gauge.</summary>
+    internal static int DetachedDecodeCount =>
+        DataFileDecoder.DetachedDecodeCount + CheckpointDecoder.DetachedDecodeCount
+        + ReconciliationDecoder.DetachedDecodeCount;
 
     /// <summary>The detached-strand count on the data-file door (observability gauge dimension).</summary>
     internal static int DataFileDetachedDecodeCount => DataFileDecoder.DetachedDecodeCount;
 
     /// <summary>The detached-strand count on the checkpoint door (observability gauge dimension).</summary>
     internal static int CheckpointDetachedDecodeCount => CheckpointDecoder.DetachedDecodeCount;
+
+    /// <summary>The detached-strand count on the §2.4b write-reconciliation door (observability gauge
+    /// dimension).</summary>
+    internal static int ReconciliationDetachedDecodeCount => ReconciliationDecoder.DetachedDecodeCount;
+
+    /// <summary>Whether the §2.4b write-reconciliation door is wedged (see <see cref="DataFileWedged"/>).</summary>
+    internal static int ReconciliationWedged => ReconciliationDecoder.IsWedged ? 1 : 0;
 
     /// <summary>Whether the data-file door is <b>wedged</b> — saturated with ZERO strand drain for
     /// <see cref="WedgedDrainStallWindow"/> (Round-8 High #1). Surfaced as <c>deltasharp.storage.decode.wedged</c>

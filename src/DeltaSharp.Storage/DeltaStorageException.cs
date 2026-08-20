@@ -161,8 +161,13 @@ internal sealed class DeltaStorageException : Exception
     /// stronger drop/minimization — BEFORE interpolation. The sweep test in
     /// <c>StorageHygieneSweepTests</c> enforces this for call sites known as of <c>76d2c8e</c>; new call sites must
     /// satisfy the same property.</para></summary>
-    public static DeltaStorageException UnsupportedFeature(string message) =>
-        new(StorageErrorKind.UnsupportedFeature, message);
+    /// <param name="message">The fully-composed, hygiene-satisfying message.</param>
+    /// <param name="innerException">The raw underlying cause, retained for server-side diagnostics only
+    /// (<see cref="ToString"/> deliberately omits it, #664). Supplying it is REQUIRED when the reject wraps a
+    /// foreign/unexpected fault, so a genuine DeltaSharp defect is not silently relabelled as an unsupported
+    /// shape with no trace (N3).</param>
+    public static DeltaStorageException UnsupportedFeature(string message, Exception? innerException = null) =>
+        new(StorageErrorKind.UnsupportedFeature, message, innerException);
 
     /// <summary>Creates a <see cref="StorageErrorKind.CorruptData"/> error naming the defect.</summary>
     /// <remarks><b>Message hygiene obligation:</b> see the type-level

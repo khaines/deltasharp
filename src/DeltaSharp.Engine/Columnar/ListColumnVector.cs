@@ -176,6 +176,31 @@ public sealed class ListColumnVector : MutableColumnVector
         return _child.Slice(start, length);
     }
 
+    /// <summary>
+    /// The <b>physically retained</b> element span of logical row <paramref name="index"/>, as a
+    /// <c>(Start, Length)</c> pair indexing <see cref="Elements"/> directly — <b>unmasked</b> by top-level
+    /// validity, so a <b>null</b> list row reports the span it physically occupies rather than the empty span
+    /// <see cref="ElementsAt"/>/<see cref="ElementLength"/> surface.
+    /// </summary>
+    /// <remarks>
+    /// <para><paramref name="index"/> is a LOGICAL row (rebased by this view's offset); <c>Start</c> is
+    /// <see cref="Elements"/>-relative (rebased by this view's element base
+    /// <c>offsets[Offset]</c>), so it indexes the already-sliced <see cref="Elements"/> view directly.</para>
+    /// <para>This is a <b>structural</b> affordance for a columnar encoder that must walk the element child in
+    /// one contiguous pass: a null list row may legitimately carry a non-zero physical span (only monotonicity
+    /// is enforced when offsets are supplied), and no other member can recover it. Element data under a null
+    /// row is <b>undefined</b> (Arrow semantics) — a consumer must gate on <see cref="IsNull"/> before reading
+    /// any value in the returned span.</para>
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> is outside <c>[0, Length)</c>.</exception>
+    public (int Start, int Length) RawElementSpan(int index)
+    {
+        CheckIndex(index);
+        int physical = _offset + index;
+        int elementBase = _offsets[_offset];
+        return (_offsets[physical] - elementBase, _offsets[physical + 1] - _offsets[physical]);
+    }
+
     /// <inheritdoc/>
     public override bool IsNull(int index)
     {
