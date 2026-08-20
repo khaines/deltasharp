@@ -133,10 +133,85 @@ public sealed class NestedParquetRowGroupPlanningTests
             Assert.Equal(1, reader.RowGroupCount);
         }
 
-        // And the split file still reads back every row, in order.
+        // And the split file still reads back every row, in order, WITH ITS VALUES: a row-count oracle would
+        // accept a split that mis-bases an element/entry span, which is precisely the defect the split path
+        // introduces. Keys and values are derived from the global row index, so any shift mismatches.
         output.Position = 0;
         int observed = 0;
         await foreach (ColumnBatch group in ReadAsync(output.ToArray(), schema))
+        {
+            if (shape == "array")
+            {
+                var list = (ListColumnVector)group.Column(0);
+                for (int i = 0; i < list.Length; i++)
+                {
+                    ColumnVector row = list.ElementsAt(i);
+                    Assert.Equal(4, row.Length);
+                    for (int e = 0; e < 4; e++)
+                    {
+                        Assert.Equal(((observed + i) * 4) + e, row.GetValue<int>(e));
+                    }
+                }
+
+                observed += list.Length;
+                continue;
+            }
+
+            List<List<(string Key, int? Value)>?> entries =
+                NestedVectors.ReadStringIntMap((MapColumnVector)group.Column(0));
+            for (int i = 0; i < entries.Count; i++)
+            {
+                List<(string Key, int? Value)> row = Assert.IsType<List<(string Key, int? Value)>>(entries[i]);
+                Assert.Equal(4, row.Count);
+                for (int e = 0; e < 4; e++)
+                {
+                    Assert.Equal($"k{observed + i}_{e}", row[e].Key);
+                    Assert.Equal(((observed + i) * 4) + e, row[e].Value);
+                }
+            }
+
+            observed += entries.Count;
+        }
+
+        Assert.Equal(rows, observed);
+    }
+
+    [Fact]
+    public async Task EveryNestedColumn_IsBudgetBounded_EvenAfterAnEarlierOneHasPlannedDownToOneRow()
+    {
+        // Q2: the planner must probe EVERY nested column. A narrow column that plans down to a single row must
+        // not short-circuit the probe of a later, far wider one — an unprobed column skips both its budget
+        // clamp and its single-row reject and falls through to the coarser addressability backstop.
+        var schema = DataTypes.CreateStructType(new[]
+        {
+            new StructField("narrow", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType), nullable: true),
+            new StructField("wide", DataTypes.CreateArrayType(DataTypes.IntegerType), nullable: true),
+        });
+
+        const int rows = 4;
+        MapColumnVector narrow = ((ManagedColumnBatch)WideMapBatch(rows, fanOut: 4)).Column(0) is MapColumnVector m
+            ? m
+            : throw new InvalidOperationException("expected a map vector");
+        ColumnVector wide = WideArrayBatch(rows, fanOut: 64).Column(0);
+        var batch = new ManagedColumnBatch(schema, new[] { (ColumnVector)narrow, wide }, rows);
+
+        // 64 bytes admits ONE map row (16 bytes/slot x 4 entries), so the map drives the plan to a single row
+        // first. The array's 64 elements/row cost 512 bytes even at one row, so it must still be seen — and at
+        // one row it is unsplittable, which is the only genuine reject.
+        using var output = new MemoryStream();
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new BudgetedParquetFileWriter(64)
+                .WriteAsync(output, schema, new[] { batch }, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("a single logical row contributes 64 Dremel level slot(s)", error.Message, StringComparison.Ordinal);
+        Assert.Equal(0, output.Length);
+
+        // Non-vacuity: with a budget that admits the wide column, the same two-column write succeeds and both
+        // columns round-trip — so the reject above is the budget probing the SECOND column, not a broken write.
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+        int observed = 0;
+        await foreach (ColumnBatch group in ReadAsync(bytes, schema))
         {
             observed += group.LogicalRowCount;
         }
@@ -165,7 +240,9 @@ public sealed class NestedParquetRowGroupPlanningTests
     public void PlanRowCount_ChargesAMapFourLevelStreamsAndAnArrayTwo()
     {
         // The byte cost is the number of int level streams the lane rents CONCURRENTLY. Getting this wrong is
-        // how a "resource" bound silently becomes a semantic one.
+        // how a "resource" bound silently becomes a semantic one. These returns are bound to the rents the
+        // lanes ACTUALLY issue by the source invariant in
+        // DeltaSharp.Core.Tests.WriteDoor.NestedShredderGuardWiringTests, so this cell is not self-referential.
         Assert.Equal(4 * sizeof(int), NestedColumnShredder.LevelBufferBytesPerSlot(MapSchema[0].DataType));
         Assert.Equal(2 * sizeof(int), NestedColumnShredder.LevelBufferBytesPerSlot(ArraySchema[0].DataType));
         Assert.Equal(

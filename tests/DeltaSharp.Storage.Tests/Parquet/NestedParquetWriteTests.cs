@@ -382,6 +382,93 @@ public sealed class NestedParquetWriteTests
     }
 
     [Fact]
+    public async Task Map_RoundTrips_AcrossRowGroupBoundaries()
+    {
+        // The row-group SPLIT is the mainline path for wide nested columns (§2.9.2), so its VALUE fidelity —
+        // not just its row count — has to be pinned. Every key and value here is derived from the GLOBAL
+        // logical row index, so an entry span mis-based by the segment start (a defect that only appears once
+        // a row group starts mid-batch) shows up as a wrong key/value rather than a right count. Neither the
+        // §2.4b footer reconciliation (counts agree) nor the §2.3c level guards (levels stay well-formed) can
+        // see that class of corruption.
+        var rows = new IReadOnlyList<(string Key, int? Value)>?[]
+        {
+            new[] { ("k0a", (int?)0), ("k0b", (int?)1) },
+            null,
+            Array.Empty<(string, int?)>(),
+            new[] { ("k3a", (int?)30), ("k3b", (int?)31) },
+            new[] { ("k4a", (int?)40), ("k4b", (int?)null) },
+            new[] { ("k5a", (int?)50), ("k5b", (int?)51) },
+            new[] { ("k6a", (int?)60), ("k6b", (int?)61) },
+            new[] { ("k7a", (int?)70), ("k7b", (int?)71) },
+        };
+
+        var schema = DataTypes.CreateStructType(
+            new[] { new StructField("m", StringIntMapType, nullable: true) });
+        var batch = new ManagedColumnBatch(
+            schema, new ColumnVector[] { NestedVectors.StringIntMap(StringIntMapType, rows) }, rows.Length);
+
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch }, rowGroupRowLimit: 2);
+        var decoded = new List<List<(string Key, int? Value)>?>();
+        await foreach (ColumnBatch group in ReadAsync(bytes, schema))
+        {
+            decoded.AddRange(NestedVectors.ReadStringIntMap((MapColumnVector)group.Column(0)));
+        }
+
+        NestedVectors.AssertMapsEqual(rows, decoded);
+
+        // Explicitly keyed to the global logical row index, so a shift/duplication across the split cannot be
+        // absorbed by an equally shifted expectation.
+        for (int i = 0; i < rows.Length; i++)
+        {
+            if (rows[i] is null)
+            {
+                Assert.Null(decoded[i]);
+                continue;
+            }
+
+            Assert.Equal(rows[i]!.Select(e => e.Key), decoded[i]!.Select(e => e.Key));
+            Assert.Equal(rows[i]!.Select(e => e.Value), decoded[i]!.Select(e => e.Value));
+        }
+    }
+
+    [Fact]
+    public async Task Struct_RoundTrips_AcrossRowGroupBoundaries()
+    {
+        // The struct sibling of the cell above: every child payload is keyed to the global logical row index,
+        // so a child span mis-based by the segment start fails on VALUE.
+        var rows = new (int? A, string? B)?[]
+        {
+            (0, "s0"),
+            null,
+            (20, "s2"),
+            (30, "s3"),
+            (40, null),
+            (null, "s5"),
+            (60, "s6"),
+            (70, "s7"),
+        };
+
+        var schema = DataTypes.CreateStructType(new[] { new StructField("s", InnerType, nullable: true) });
+        var batch = new ManagedColumnBatch(
+            schema, new ColumnVector[] { NestedVectors.IntStringStruct(InnerType, rows) }, rows.Length);
+
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch }, rowGroupRowLimit: 2);
+        var decoded = new List<(int? A, string? B)?>();
+        await foreach (ColumnBatch group in ReadAsync(bytes, schema))
+        {
+            decoded.AddRange(NestedVectors.ReadIntStringStruct((StructColumnVector)group.Column(0)));
+        }
+
+        NestedVectors.AssertStructsEqual(rows, decoded);
+
+        for (int i = 0; i < rows.Length; i++)
+        {
+            Assert.Equal(rows[i]?.A, decoded[i]?.A);
+            Assert.Equal(rows[i]?.B, decoded[i]?.B);
+        }
+    }
+
+    [Fact]
     public async Task Map_RoundTrips_AcrossMultipleInputBatches()
     {
         var first = new IReadOnlyList<(string Key, int? Value)>?[] { new[] { ("a", (int?)1) }, null };

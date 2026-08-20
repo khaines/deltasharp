@@ -274,7 +274,10 @@ internal class ParquetFileWriter
         long budget = NestedLevelBufferBudgetBytes;
         var probe = new List<Segment>();
         int planned = size;
-        for (int c = 0; c < schema.Count && planned > 1; c++)
+        // EVERY nested column is probed, even after one has already driven the plan down to a single row:
+        // an unprobed column skips both its budget clamp and its single-row reject, and would then fall
+        // through to the coarser MaxLeafSlotsPerRowGroup backstop.
+        for (int c = 0; c < schema.Count; c++)
         {
             if (schema[c].DataType is not (StructType or ArrayType or MapType))
             {

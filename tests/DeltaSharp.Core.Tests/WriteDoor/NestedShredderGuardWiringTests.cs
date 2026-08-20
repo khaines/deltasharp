@@ -88,6 +88,60 @@ public sealed class NestedShredderGuardWiringTests
     }
 
     [Fact]
+    public void LevelBufferCostPerSlot_MatchesTheIntStreamsEachLaneActuallyRents()
+    {
+        // Q3. §2.9.2's row-group planner sizes every split from LevelBufferBytesPerSlot. Asserting that table
+        // against a hand-written copy of itself is self-referential: a lane that starts renting a sixth level
+        // stream keeps a green suite while every row group silently rents more than the budget it was planned
+        // against. This binds the DECLARED cost to the rents the lanes actually issue, both read from source,
+        // so drift is a test failure rather than an invisible over-rent.
+        SyntaxNode shredder = Assert.Single(
+            StorageSourceFiles(),
+            t => Path.GetFileName(t.FilePath) == "NestedColumnShredder.cs").GetRoot();
+
+        var lanes = new (string Type, string Lane)[]
+        {
+            ("MapType", "WriteMapAsync"),
+            ("ArrayType", "WriteListAsync"),
+            ("StructType", "WriteStructAsync"),
+        };
+
+        MethodDeclarationSyntax cost = Assert.Single(
+            shredder.DescendantNodes().OfType<MethodDeclarationSyntax>(),
+            m => m.Identifier.ValueText == "LevelBufferBytesPerSlot");
+        SwitchExpressionSyntax table = Assert.Single(
+            cost.DescendantNodes().OfType<SwitchExpressionSyntax>());
+
+        foreach ((string type, string lane) in lanes)
+        {
+            MethodDeclarationSyntax method = Assert.Single(
+                shredder.DescendantNodes().OfType<MethodDeclarationSyntax>(),
+                m => m.Identifier.ValueText == lane);
+
+            int rented = method.DescendantNodes()
+                .OfType<InvocationExpressionSyntax>()
+                .Count(i => InvokedName(i.Expression) == "Rent"
+                    && i.Expression.ToString().Contains("ArrayPool<int>", StringComparison.Ordinal));
+            Assert.True(rented > 0, $"'{lane}' rents no int level buffer, so the cost table cannot be bound.");
+
+            SwitchExpressionArmSyntax arm = Assert.Single(
+                table.Arms, a => a.Pattern.ToString() == type);
+            Assert.Equal(rented, DeclaredIntStreams(arm.Expression, type));
+        }
+    }
+
+    // `n * sizeof(int)` declares n concurrent level streams; a bare `sizeof(int)` declares one.
+    private static int DeclaredIntStreams(ExpressionSyntax expression, string type) => expression switch
+    {
+        BinaryExpressionSyntax b when b.IsKind(SyntaxKind.MultiplyExpression)
+            && b.Left is LiteralExpressionSyntax literal => (int)literal.Token.Value!,
+        SizeOfExpressionSyntax => 1,
+        _ => throw new InvalidOperationException(
+            $"LevelBufferBytesPerSlot's '{type}' arm is not expressed as a count of int level streams: "
+            + expression.ToString()),
+    };
+
+    [Fact]
     public void RowGroupSegmentFaultSeam_IsATestOnlyOverride_NoProductionTypeCanPerturbSegments()
     {
         // N1. The §2.4b reconciliation is driven from a real WriteAsync by perturbing a row group's segments.

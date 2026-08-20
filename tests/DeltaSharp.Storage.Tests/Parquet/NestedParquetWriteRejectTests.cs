@@ -89,8 +89,11 @@ public sealed class NestedParquetWriteRejectTests
             () => ParquetTypeMapping.CreateField(
                 new StructField("outer", type, nullable: true), honorReferenceNullability: true));
 
-        Assert.DoesNotContain("SECRET_CHILD_NAME", error.Message, StringComparison.Ordinal);
-        Assert.DoesNotContain("DEEPER_SECRET", error.Message, StringComparison.Ordinal);
+        // Asserted on ToString(), not Message: A2 attaches the raw cause as an inner exception, and ToString()
+        // is the render an operator actually sees. Hygiene must hold on that whole rendering.
+        string rendered = error.ToString();
+        Assert.DoesNotContain("SECRET_CHILD_NAME", rendered, StringComparison.Ordinal);
+        Assert.DoesNotContain("DEEPER_SECRET", rendered, StringComparison.Ordinal);
         Assert.Contains("'struct'", error.Message, StringComparison.Ordinal);
         Assert.Contains("outer", error.Message, StringComparison.Ordinal);
     }
@@ -367,25 +370,45 @@ public sealed class NestedParquetWriteRejectTests
                 new DataField<int?>("element"), new[] { 0 }, new[] { 0 }, true, 0, 1, "a"),
             "not attached to a Parquet schema");
 
-    [Fact]
-    public void SlotBound_RejectsAPathologicalNestedFanOut()
+    [Theory]
+    [InlineData(4)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void SlotBound_RejectsAPathologicalNestedFanOut(int bytesPerSlot)
     {
-        // Quality N4: the per-row-group leaf slot ceiling. Driving a real >268M-element vector is not
-        // feasible in a unit test, so the bound itself is exercised directly — the arm is dead otherwise.
+        // The per-row-group leaf slot ceiling for callers that shred a hand-built segment list without
+        // planning first. Driving a real multi-hundred-million-element vector is not feasible in a unit test,
+        // so the bound itself is exercised directly — the arm is dead otherwise. It is denominated per LANE
+        // (Q2): every shape reaches it at the same transient BYTE footprint, so the map lane cannot rent four
+        // times what the struct lane may.
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
             () => NestedColumnShredder.CheckSlotBound(
-                NestedColumnShredder.MaxLeafSlotsPerRowGroup + 1L, "a"));
+                NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot) + 1L, "a", bytesPerSlot));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.Contains("Dremel level slot(s)", error.Message, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void SlotBound_AcceptsTheBoundExactly() =>
+    [Theory]
+    [InlineData(4)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void SlotBound_AcceptsTheBoundExactly(int bytesPerSlot) =>
         // Non-vacuity: the ceiling is inclusive, so a leaf sitting exactly on it is legal.
         Assert.Equal(
-            NestedColumnShredder.MaxLeafSlotsPerRowGroup,
-            NestedColumnShredder.CheckSlotBound(NestedColumnShredder.MaxLeafSlotsPerRowGroup, "a"));
+            NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot),
+            NestedColumnShredder.CheckSlotBound(
+                NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot), "a", bytesPerSlot));
+
+    [Fact]
+    public void SlotBound_IsTheSameByteFootprintForEveryLane() =>
+        // The backstop stands in for NestedLevelBufferBudgetBytes, so each lane's ceiling times its own
+        // per-slot cost must be that same budget — a type-blind ceiling would be 4x loose on the map lane.
+        Assert.All(
+            new[] { 4, 8, 16 },
+            bytesPerSlot => Assert.Equal(
+                ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes,
+                (long)NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot) * bytesPerSlot));
 
     private static void AssertRejected(Action act, string expectedFragment)
     {

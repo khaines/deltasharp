@@ -57,10 +57,14 @@ internal static class NestedColumnShredder
     /// <see cref="ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes"/> by SPLITTING, and this bound only
     /// exists for callers that shred a hand-built segment list without planning first. It is deliberately a
     /// RESOURCE bound, not a semantic one — §2.6 admits <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c>
-    /// unconditionally, so no fan-out width may narrow the acceptance set.
+    /// unconditionally, so no fan-out width may narrow the acceptance set. It is denominated PER LANE, in that
+    /// lane's own per-slot cost, so the backstop admits the same transient BYTES for every shape (a map's four
+    /// concurrent level streams reach it at a quarter of a struct's slot count) instead of being four times
+    /// looser on the widest lane.
     /// </summary>
-    internal const int MaxLeafSlotsPerRowGroup =
-        (int)(ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes / sizeof(int));
+    internal static int MaxLeafSlotsPerRowGroup(int bytesPerSlot) => (int)Math.Min(
+        ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes / Math.Max(bytesPerSlot, sizeof(int)),
+        int.MaxValue);
 
     /// <summary>
     /// The transient level-buffer bytes ONE logical slot of <paramref name="type"/> costs — the number of
@@ -280,7 +284,7 @@ internal static class NestedColumnShredder
         // segments the row group actually covers, never from `rowCount`. Comparing a `rowCount`-derived slice
         // length against `rowCount` is the tautology the council found; comparing this independently walked
         // total against it is a real invariant that a dropped/duplicated segment breaks.
-        int slots = TotalSegmentRows(segments, label);
+        int slots = TotalSegmentRows(segments, label, LevelBufferBytesPerSlot(structType));
 
         // D2: the struct's own null mask, captured ONCE from the SOURCE vectors as a bitmap (one bit per
         // logical row, ~16 KiB for a full row group) instead of holding one rented int[rowGroupRows] per
@@ -470,7 +474,7 @@ internal static class NestedColumnShredder
         // S4/§2.3c N4-c: the container level is derived from the SCHEMA-ATTACHED leaf through the guard's own
         // helper, so encoder and guard share one source of truth.
         int containerMaxDef = NestedLevelGuard.ContainerMaxDefinitionLevel(leaf);
-        int slots = CountListSlots(segments, label);
+        int slots = CountListSlots(segments, label, LevelBufferBytesPerSlot(arrayType));
 
         int[] def = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         int[] rep = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
@@ -589,7 +593,7 @@ internal static class NestedColumnShredder
                 + $"value leaf reports {valueContainerMaxDef}; both share one repeated key_value group.");
         }
 
-        int slots = CountMapSlots(segments, label);
+        int slots = CountMapSlots(segments, label, LevelBufferBytesPerSlot(mapType));
 
         int[] keyDef = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         int[] valueDef = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
@@ -718,7 +722,7 @@ internal static class NestedColumnShredder
 
     // ----- slot counting (raw offsets only — never Elements.Length, B-5) -----
 
-    private static int CountListSlots(IReadOnlyList<ColumnSegment> segments, string label)
+    private static int CountListSlots(IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot)
     {
         long slots = 0;
         foreach (ColumnSegment segment in segments)
@@ -732,10 +736,10 @@ internal static class NestedColumnShredder
             }
         }
 
-        return CheckSlotBound(slots, label);
+        return CheckSlotBound(slots, label, bytesPerSlot);
     }
 
-    private static int CountMapSlots(IReadOnlyList<ColumnSegment> segments, string label)
+    private static int CountMapSlots(IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot)
     {
         long slots = 0;
         foreach (ColumnSegment segment in segments)
@@ -749,16 +753,17 @@ internal static class NestedColumnShredder
             }
         }
 
-        return CheckSlotBound(slots, label);
+        return CheckSlotBound(slots, label, bytesPerSlot);
     }
 
-    internal static int CheckSlotBound(long slots, string label)
+    internal static int CheckSlotBound(long slots, string label, int bytesPerSlot)
     {
-        if (slots > MaxLeafSlotsPerRowGroup)
+        int ceiling = MaxLeafSlotsPerRowGroup(bytesPerSlot);
+        if (slots > ceiling)
         {
             throw DeltaStorageException.UnsupportedFeature(
                 $"Nested column '{label}' would emit {slots} Dremel level slot(s) in one row group, past the "
-                + $"addressable ceiling of {MaxLeafSlotsPerRowGroup}; a row group must be planned "
+                + $"addressable ceiling of {ceiling}; a row group must be planned "
                 + "(PlanRowCount) so a wide column is split across row groups rather than rented in one.");
         }
 
@@ -1387,7 +1392,7 @@ internal static class NestedColumnShredder
 
     // The logical row count the row group's segments describe, derived from the SEGMENTS — the independent
     // side of the struct lane's N4-a slot-count clause (B2).
-    private static int TotalSegmentRows(IReadOnlyList<ColumnSegment> segments, string label)
+    private static int TotalSegmentRows(IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot)
     {
         long rows = 0;
         foreach (ColumnSegment segment in segments)
@@ -1395,7 +1400,7 @@ internal static class NestedColumnShredder
             rows = checked(rows + segment.Length);
         }
 
-        return CheckSlotBound(rows, label);
+        return CheckSlotBound(rows, label, bytesPerSlot);
     }
 
     // #730/S2, per NESTED leaf: the mapped Parquet leaf's repetition (OPTIONAL vs REQUIRED) must equal the
