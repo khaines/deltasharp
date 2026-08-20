@@ -18,37 +18,28 @@ namespace DeltaSharp.Storage.Delta;
 /// </summary>
 /// <remarks>
 /// Extracted (#529) from the previously-duplicated per-consumer copies to remove drift risk. Nested column
-/// mapping is unsupported in this build: <see cref="ResolvePhysicalNames"/> rejects a nested top-level column
-/// fail-closed under <see cref="ColumnMappingMode.Name"/> rather than risk mis-associating columns.
+/// mapping (#676) is supported for the single-level surface: a <c>struct</c> is relabelled recursively
+/// (<see cref="BuildDataSchema"/> physical relabel + <see cref="BuildFullBatch"/> typed inverse relabel);
+/// <c>array</c>/<c>map</c> columns are relabelled at the top-level container only, their interior resolving
+/// structurally.
 /// </remarks>
 internal static class ColumnMappingProjection
 {
     /// <summary>
     /// The PHYSICAL name of each table-schema field, in field order: the declared
     /// <c>delta.columnMapping.physicalName</c> in <see cref="ColumnMappingMode.Name"/>, the field's own name
-    /// in <see cref="ColumnMappingMode.None"/>. A nested (struct/array/map) top-level column under name
-    /// mapping is rejected fail-closed here — nested column mapping is unsupported in this build (design
-    /// §2.9/§2.12.3), and only top-level (leaf) columns are mapped — rather than fail later in the Parquet
-    /// reader or risk a wrong relabel.
+    /// in <see cref="ColumnMappingMode.None"/>. For a nested (<c>struct</c>) column this is the <b>top-level</b>
+    /// container physical name; each interior struct child is relabelled structurally by
+    /// <see cref="BuildDataSchema"/> (#676). <c>array</c>/<c>map</c> columns are relabelled only at the
+    /// top-level container; their interior resolves structurally.
     /// </summary>
-    /// <exception cref="DeltaProtocolException">A nested top-level column is present under name mapping.</exception>
+    /// <exception cref="DeltaProtocolException">A column-mapped field carries no physical name.</exception>
     public static string[] ResolvePhysicalNames(StructType tableSchema, ColumnMappingMode mode)
     {
         var names = new string[tableSchema.Count];
         for (int i = 0; i < tableSchema.Count; i++)
         {
-            StructField field = tableSchema[i];
-            if (mode != ColumnMappingMode.None && field.DataType is StructType or ArrayType or MapType)
-            {
-                throw DeltaProtocolException.Unsupported(
-                    string.Create(
-                        CultureInfo.InvariantCulture,
-                        $"Column '{DiagnosticText.Sanitize(field.Name)}' is a nested ({field.DataType.TypeName}) type; nested column "
-                        + $"mapping is unsupported in this build (design §2.9/§2.12.3). Only top-level (leaf) "
-                        + $"columns are supported under column mapping (name or id mode)."));
-            }
-
-            names[i] = ColumnMapping.PhysicalName(field, mode);
+            names[i] = ColumnMapping.PhysicalName(tableSchema[i], mode);
         }
 
         return names;
@@ -86,10 +77,40 @@ internal static class ColumnMappingProjection
                 continue;
             }
 
-            dataFields.Add(new StructField(physicalNames[i], field.DataType, field.Nullable, field.Metadata));
+            // #676: relabel the top-level container to its physical name AND, for a struct, recursively
+            // relabel each interior struct child to its own physical name (an array/map interior carries no
+            // mapping and rides verbatim). In none mode / OPTIMIZE (physical == logical) the recursion is an
+            // identity because no child carries a physicalName.
+            dataFields.Add(new StructField(
+                physicalNames[i], BuildPhysicalDataType(field.DataType), field.Nullable, field.Metadata));
         }
 
         return new StructType(dataFields);
+    }
+
+    // Recursively relabels a logical DataType to its physical shape for the READ data schema (#676): a struct
+    // relabels each child to its own delta.columnMapping.physicalName (falling back to the logical name when
+    // absent — none mode / OPTIMIZE), carrying each child's metadata through; an array/map interior rides
+    // verbatim (no interior mapping, C1). Single-level scope, so recursion depth is bounded.
+    private static DataType BuildPhysicalDataType(DataType type)
+    {
+        if (type is not StructType structType)
+        {
+            return type;
+        }
+
+        var children = new List<StructField>(structType.Count);
+        foreach (StructField child in structType)
+        {
+            string childPhysical =
+                child.Metadata.TryGetString(ColumnMapping.PhysicalNameKey, out string? p) && p.Length > 0
+                    ? p
+                    : child.Name;
+            children.Add(new StructField(
+                childPhysical, BuildPhysicalDataType(child.DataType), child.Nullable, child.Metadata));
+        }
+
+        return new StructType(children);
     }
 
     /// <summary>
@@ -149,7 +170,12 @@ internal static class ColumnMappingProjection
             int dataOrdinal = dataOrdinalByField[i];
             if (dataOrdinal >= 0)
             {
-                columns[i] = dataBatch.Column(dataOrdinal);
+                // #676: a data column is taken (no copy) from its physical ordinal, then — for a nested struct
+                // read under a physical schema — re-typed back to its LOGICAL struct type (physical→logical
+                // child-name substitution), zero-copy. Array/map/scalar columns carry no relabellable field
+                // names and pass through unchanged.
+                columns[i] = RelabelDataColumn(
+                    dataBatch.Column(dataOrdinal), tableSchema[i].DataType, tableSchema[i].Name);
                 continue;
             }
 
@@ -159,5 +185,67 @@ internal static class ColumnMappingProjection
         }
 
         return new ManagedColumnBatch(tableSchema, columns, rowCount);
+    }
+
+    // Re-types a physically-read column back to its LOGICAL type (#676, the name-mode read-exit inverse
+    // relabel). Only a nested STRUCT needs relabelling — its physical children carry physical names that must
+    // be substituted for the logical names — and only when the read type actually differs (name mode). An
+    // array/map/scalar column, or a struct already carrying the logical type (none mode), passes through
+    // unchanged. The physical struct type is validated for ORDERED congruence against the logical type (equal
+    // count, same order, per-child DataType congruent recursively, equal nullability) and fails closed as a
+    // typed DeltaStorageException.SchemaMismatch (sanitized path) BEFORE the batch is constructed — never a
+    // bare ArgumentException from the zero-copy re-type, and never echoing a raw physical field name.
+    private static ColumnVector RelabelDataColumn(ColumnVector column, DataType logicalType, string logicalName)
+    {
+        if (logicalType is not StructType logicalStruct || column is not StructColumnVector structColumn)
+        {
+            return column;
+        }
+
+        if (structColumn.Type.Equals(logicalStruct))
+        {
+            return column;
+        }
+
+        AssertStructCongruent(structColumn.Type, logicalStruct, logicalName);
+        return structColumn.RelabelTo(logicalStruct);
+    }
+
+    // Validates that a physically-read struct type is congruent with its logical struct type — the same field
+    // count, in the same order, each child's DataType congruent (recursively, name-independently for a nested
+    // struct; DataType.Equals for a scalar/array/map), and each child's nullability equal — so a positional
+    // zero-copy re-type is sound. A COUNT-ONLY check is deliberately avoided: it would silently relabel a
+    // reordered or type-mismatched physical struct. Fail closed with a sanitized-path SchemaMismatch.
+    private static void AssertStructCongruent(DataType physical, StructType logical, string path)
+    {
+        if (physical is not StructType physicalStruct || physicalStruct.Count != logical.Count)
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Column '{DiagnosticText.Sanitize(path)}': the physically-read struct shape does not match the "
+                + "logical schema (differing field count or kind); the read is rejected fail-closed.");
+        }
+
+        for (int i = 0; i < logical.Count; i++)
+        {
+            StructField physicalChild = physicalStruct[i];
+            StructField logicalChild = logical[i];
+            if (physicalChild.Nullable != logicalChild.Nullable)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"Column '{DiagnosticText.Sanitize(path + "." + logicalChild.Name)}': the physically-read struct "
+                    + "child nullability does not match the logical schema; the read is rejected fail-closed.");
+            }
+
+            if (logicalChild.DataType is StructType logicalNested)
+            {
+                AssertStructCongruent(physicalChild.DataType, logicalNested, path + "." + logicalChild.Name);
+            }
+            else if (!physicalChild.DataType.Equals(logicalChild.DataType))
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"Column '{DiagnosticText.Sanitize(path + "." + logicalChild.Name)}': the physically-read struct "
+                    + "child type does not match the logical schema; the read is rejected fail-closed.");
+            }
+        }
     }
 }

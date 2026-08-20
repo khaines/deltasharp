@@ -9,6 +9,7 @@ using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
 using StructField = DeltaSharp.Types.StructField;
+using PqStructField = Parquet.Schema.StructField;
 
 namespace DeltaSharp.Storage.Parquet;
 
@@ -1472,12 +1473,15 @@ internal sealed class ParquetFileReader
 
     // One requested column resolved against the file: a present scalar leaf (Scalar), a present nested Field
     // graph (Nested; #571), or Absent (not in the file, to be null-filled per #497). Exactly one state holds.
+    // A nested column resolved under id mode carries the footer field-id map (NestedFieldId) so the decoder
+    // binds each struct child by id within the resolved container (#676 §2.5); it is null for name/none mode.
     internal readonly struct ResolvedColumn
     {
-        private ResolvedColumn(DataField? scalar, Field? nested, bool absent)
+        private ResolvedColumn(DataField? scalar, Field? nested, IReadOnlyDictionary<int, DataField>? nestedFieldId, bool absent)
         {
             Scalar = scalar;
             Nested = nested;
+            NestedFieldId = nestedFieldId;
             IsAbsent = absent;
         }
 
@@ -1485,13 +1489,16 @@ internal sealed class ParquetFileReader
 
         internal Field? Nested { get; }
 
+        internal IReadOnlyDictionary<int, DataField>? NestedFieldId { get; }
+
         internal bool IsAbsent { get; }
 
-        internal static ResolvedColumn ForScalar(DataField field) => new(field, null, absent: false);
+        internal static ResolvedColumn ForScalar(DataField field) => new(field, null, null, absent: false);
 
-        internal static ResolvedColumn ForNested(Field field) => new(null, field, absent: false);
+        internal static ResolvedColumn ForNested(Field field, IReadOnlyDictionary<int, DataField>? nestedFieldId = null) =>
+            new(null, field, nestedFieldId, absent: false);
 
-        internal static ResolvedColumn Missing() => new(null, null, absent: true);
+        internal static ResolvedColumn Missing() => new(null, null, null, absent: true);
     }
 
     // Resolves each requested column to the matching file field (validating physical type/nullability for a
@@ -1507,8 +1514,9 @@ internal sealed class ParquetFileReader
     //
     // The by-name map is built from the file schema's TOP-LEVEL fields (not the flattened leaves), so a nested
     // column resolves to its container Field. For a flat file the top-level fields ARE the leaf DataFields, so
-    // the scalar path is unchanged. Nested columns are not (yet) supported under column-mapping id mode or
-    // null-fill: both fail closed rather than risk a wrong read.
+    // the scalar path is unchanged. #676: the top-level by-name map is DUPLICATE-INTOLERANT (mode-independent)
+    // — the precondition for id-mode container binding (§2.5 step 1) and a name-mode safety guard; a nested
+    // struct is bound under id mode by containment (struct<scalars> only; array/map id mode → #839).
     internal static ResolvedColumn[] ResolveFileFields(
         ParquetSchema fileSchema, StructType requested, bool nullFillMissingColumns, bool allowTypeWideningPromotion,
         IReadOnlyDictionary<int, DataField>? byFieldId)
@@ -1516,7 +1524,31 @@ internal sealed class ParquetFileReader
         var byName = new Dictionary<string, Field>(StringComparer.Ordinal);
         foreach (Field field in fileSchema.Fields)
         {
-            byName[field.Name] = field;
+            // #676: a duplicate top-level physical column name is an ambiguous/foreign shape (and would let an
+            // id-mode container bind to the wrong group), so fail closed rather than resolve last-wins.
+            if (!byName.TryAdd(field.Name, field))
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"The Parquet file declares more than one top-level column named "
+                    + $"'{DiagnosticText.Sanitize(field.Name)}' — a duplicate physical column name cannot be resolved safely.");
+            }
+        }
+
+        // #676: in name/none mode BuildFieldIdMap (which enforces decoded-leaf physical-path uniqueness) does
+        // not run, so enforce that uniqueness here as defense-in-depth — a duplicate nested leaf physical path
+        // must fail closed rather than resolve by luck.
+        if (byFieldId is null)
+        {
+            var seenLeafPaths = new HashSet<PhysicalPathKey>();
+            foreach (DataField leaf in fileSchema.DataFields)
+            {
+                if (!seenLeafPaths.Add(PhysicalPathKey.From(leaf.Path)))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        "The Parquet file decodes multiple leaf columns at the same physical path — a nested read "
+                        + "requires each physical leaf path to be unique.");
+                }
+            }
         }
 
         // Id mode only (#658): the set of file columns that carry a footer field_id. A requested column with NO
@@ -1545,13 +1577,45 @@ internal sealed class ParquetFileReader
 
             if (requestedField.DataType is ArrayType or MapType or StructType)
             {
-                // Nested column (#571/#829). BuildFieldIdMap is leaf-path-aware, but this reader still lacks
-                // nested id-mode container binding — fail closed rather than resolve a nested container through
-                // leaf ids before the full nested column-mapping contract lands.
+                // Nested column. Under ID mode (#676 §2.5) only struct<scalars> is supported — bound by
+                // CONTAINMENT: resolve the container group by its physical name, then bind each child by
+                // field_id within that container's own leaves. array/map under id mode fail closed (#839).
                 if (byFieldId is not null)
                 {
-                    throw DeltaStorageException.UnsupportedFeature(
-                        $"Column '{DiagnosticText.Sanitize(name)}': reading a nested column under column-mapping id mode is not supported.");
+                    if (requestedField.DataType is not StructType idStructType)
+                    {
+                        throw DeltaStorageException.UnsupportedFeature(
+                            $"Column '{DiagnosticText.Sanitize(name)}' is an {requestedField.DataType.TypeName} under "
+                            + "column-mapping id mode; id-mode nested array/map column mapping is deferred to #839.");
+                    }
+
+                    if (!byName.TryGetValue(name, out Field? containerField))
+                    {
+                        throw DeltaStorageException.ColumnNotPresentInFile(name);
+                    }
+
+                    if (containerField is not PqStructField container)
+                    {
+                        throw DeltaStorageException.SchemaMismatch(
+                            $"Column '{DiagnosticText.Sanitize(name)}': its container physical name resolves to a non-struct "
+                            + "file column; the id-mode nested read fails closed.");
+                    }
+
+                    // The container group carries NO footer field_id; its declared id is structural-only. A
+                    // container whose declared id is nonetheless found stamped on a footer leaf is forged — fail
+                    // closed (a container id must never be footer-resolvable).
+                    if (ColumnMapping.TryGetId(requestedField, out long containerId)
+                        && containerId is >= 1 and <= int.MaxValue
+                        && byFieldId.ContainsKey((int)containerId))
+                    {
+                        throw DeltaStorageException.SchemaMismatch(
+                            $"Column '{DiagnosticText.Sanitize(name)}': the struct container's declared column-mapping id is "
+                            + "stamped on a footer leaf, but a container id must be structural-only; the id-mode read fails closed.");
+                    }
+
+                    NestedParquetColumnReader.ValidateStructShapeById(container, idStructType, byFieldId, name);
+                    resolved[c] = ResolvedColumn.ForNested(container, byFieldId);
+                    continue;
                 }
 
                 if (!byName.TryGetValue(name, out Field? nestedField))
@@ -1919,11 +1983,13 @@ internal sealed class ParquetFileReader
                     ResolvedColumn resolved = fileFields[c];
                     if (resolved.Nested is { } nestedField)
                     {
-                        // Nested column (#571): reconstruct an immutable nested vector from the raw Dremel
+                        // Nested column (#571/#676): reconstruct an immutable nested vector from the raw Dremel
                         // levels. NestedParquetColumnReader owns its own allocation ceiling and null-correct
-                        // reassembly.
+                        // reassembly. Under id mode the field-id map is threaded so struct children bind by id
+                        // within the resolved container (containment-scoped); it is null for name/none mode.
                         columns[c] = await NestedParquetColumnReader.ReadAsync(
-                            rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, nestedBudget, decodeToken)
+                            rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, nestedBudget,
+                            resolved.NestedFieldId, decodeToken)
                             .ConfigureAwait(false);
                         continue;
                     }

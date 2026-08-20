@@ -100,14 +100,17 @@ internal static class ParquetTypeMapping
     {
         string label = DiagnosticText.Sanitize(field.Name);
 
-        // §2.5/§2.7 — NONE-mode only. ColumnMapping.EnsureLeaf already rejects a nested top-level column in
-        // BOTH name and id mode, so this is a structural backstop rather than a reachable door: nested leaf
-        // field_id stamping (and therefore mapped-mode nested write) is #676's scope.
-        if (ColumnMapping.TryGetId(field, out _))
+        // #676: column-mapping id mode is supported for a STRUCT container (its scalar children each carry a
+        // delta.columnMapping.id that is stamped as the leaf field_id below; the struct GROUP node carries no
+        // field_id — Parquet.Net has no public setter for one, and the container binds by physical name).
+        // array/map under id mode is deferred to #839 and rejected fail-closed here as defense-in-depth
+        // (ValidateColumnMappingSchema is the primary gate, at commit and load).
+        bool idMode = ColumnMapping.TryGetId(field, out _);
+        if (idMode && field.DataType is ArrayType or MapType)
         {
             throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet mapping for nested column '{label}': column-mapping id mode for a nested column is "
-                + "not supported (deferred, #676).");
+                $"Parquet mapping for nested column '{label}': column-mapping id mode for an "
+                + $"{field.DataType.TypeName} column is deferred to #839.");
         }
 
         // §2.4a — Field.IsNullable has no public setter in Parquet.Net 6.1.0, so a nested container is always
@@ -150,9 +153,8 @@ internal static class ParquetTypeMapping
                         StructField child = structType[i];
                         // §2.8: identify the offending child by ORDINAL, never by name — the child name is
                         // foreign schema text and a struct can carry thousands of them.
-                        children[i] = CreateNestedLeaf(
-                            child.DataType, child.Nullable, child.Name,
-                            $"struct column '{label}' field {i}", honorReferenceNullability);
+                        children[i] = CreateStructChildLeaf(
+                            child, idMode, $"struct column '{label}' field {i}", honorReferenceNullability);
                     }
 
                     return new PqStructField(field.Name, children);
@@ -176,10 +178,51 @@ internal static class ParquetTypeMapping
         }
     }
 
-    // Builds one nested LEAF field (an array element, a map key/value, or a struct field). A nested child that
+    // Builds a STRUCT CHILD leaf (#676). In NAME/none mode the child carries no mapping metadata, so the leaf
+    // gets no field_id (a name-mode physical file is field_id-free). In ID mode every mapped struct child MUST
+    // carry a stampable delta.columnMapping.id — an unstamped leaf would commit a permanently-unreadable file,
+    // so a missing id fails closed at the write door (the "every mapped struct-leaf stamped + range-guarded"
+    // assertion; the range guard itself lives in CreateScalarField). Passing the child through with its id
+    // metadata makes CreateScalarField stamp the leaf field_id = the child's id.
+    private static DataField CreateStructChildLeaf(
+        StructField child, bool idMode, string context, bool honorReferenceNullability)
+    {
+        if (child.DataType is ArrayType or MapType or StructType)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: a nested type within a nested type ('{child.DataType.TypeName}') is not "
+                + "supported (deferred, #585).");
+        }
+
+        if (idMode && !ColumnMapping.TryGetId(child, out _))
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: a mapped struct child under id mode has no "
+                + "'delta.columnMapping.id' to stamp as its Parquet field_id; an unstamped leaf would be unreadable.");
+        }
+
+        try
+        {
+            // In id mode carry the child's mapping metadata through so CreateScalarField stamps + range-guards
+            // the leaf field_id; in name/none mode strip it (a synthesized StructField with no mapping metadata).
+            StructField leafField = idMode
+                ? child
+                : new StructField(child.Name, child.DataType, child.Nullable);
+            return CreateScalarField(leafField, honorReferenceNullability);
+        }
+        catch (DeltaStorageException ex)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: the leaf type '{DiagnosticText.DescribeType(child.DataType)}' has no "
+                + "supported Parquet mapping.",
+                ex);
+        }
+    }
+
+    // Builds one nested LEAF field (an array element, a map key/value). A nested child that
     // is itself nested is the #585 boundary and fails closed here — before any bytes. The leaf carries NO
-    // field_id (design §2.5/F9): the synthesized StructField below has no column-mapping metadata, so
-    // CreateScalarField's stamp is structurally unreachable for a nested leaf.
+    // field_id (design §2.5/F9 / C1): array/map interiors are not StructFields, so the synthesized StructField
+    // below has no column-mapping metadata and CreateScalarField's stamp is structurally unreachable for it.
     private static DataField CreateNestedLeaf(
         DataType type, bool nullable, string name, string context, bool honorReferenceNullability)
     {
