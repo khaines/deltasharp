@@ -51,18 +51,118 @@ internal static class NestedColumnShredder
     /// vector that the row group being written covers.</summary>
     internal readonly record struct ColumnSegment(ColumnVector Vector, int Start, int Length);
 
-    /// <summary>The largest per-row nested fan-out the shredder will encode: the number of array elements or
-    /// map entries one logical row may contribute to a single leaf's level stream.</summary>
-    internal const int MaxNestedFanOutPerRow = 256;
-
-    /// <summary>The per-row-group ceiling on a single leaf's total level slots — the pathological fan-out
-    /// bound. Derived from the DEFAULT row-group ceiling times a plausible per-row fan-out rather than a bare
-    /// power of two: the old <c>1 &lt;&lt; 28</c> admitted a 1 GiB <c>int[]</c> per level stream (~4 GiB
-    /// transient across the map lane's four buffers) for a row group holding at most
-    /// <see cref="ParquetFileWriter.DefaultRowGroupRowLimit"/> logical rows. A leaf that reaches this bound
-    /// describes an implausibly wide nested fan-out and fails closed rather than driving that rent.</summary>
+    /// <summary>
+    /// The absolute int-domain backstop on a single leaf's level slots in one row group. Real writes never
+    /// approach it: <see cref="PlanRowCount"/> keeps every row group inside
+    /// <see cref="ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes"/> by SPLITTING, and this bound only
+    /// exists for callers that shred a hand-built segment list without planning first. It is deliberately a
+    /// RESOURCE bound, not a semantic one — §2.6 admits <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c>
+    /// unconditionally, so no fan-out width may narrow the acceptance set.
+    /// </summary>
     internal const int MaxLeafSlotsPerRowGroup =
-        ParquetFileWriter.DefaultRowGroupRowLimit * MaxNestedFanOutPerRow;
+        (int)(ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes / sizeof(int));
+
+    /// <summary>
+    /// The transient level-buffer bytes ONE logical slot of <paramref name="type"/> costs — the number of
+    /// <c>int</c> level streams the lane rents concurrently, times <c>sizeof(int)</c>. A map nests key and
+    /// value in one repeated group and therefore holds four streams; an array holds definition + repetition;
+    /// a struct holds one definition stream, reused across children (D2), at exactly one slot per row.
+    /// </summary>
+    internal static int LevelBufferBytesPerSlot(DataType type) => type switch
+    {
+        MapType => 4 * sizeof(int),
+        ArrayType => 2 * sizeof(int),
+        StructType => sizeof(int),
+        _ => 0,
+    };
+
+    /// <summary>
+    /// §2.9.2 row-group PLANNING. Returns the largest number of LEADING logical rows of
+    /// <paramref name="segments"/> whose Dremel level buffers fit <paramref name="budgetBytes"/>.
+    /// </summary>
+    /// <remarks>
+    /// The row-group ceiling is a byte proxy (§2.9.2), so a wide nested column must make the row group
+    /// SMALLER — it must never make the column unwritable. §2.6 admits <c>array&lt;scalar&gt;</c> and
+    /// <c>map&lt;scalar,scalar&gt;</c> unconditionally, so a 1536-dimension embedding or a 1440-bucket series
+    /// is ordinary in-scope data: it simply costs more slots per row, and the writer answers by emitting more,
+    /// smaller row groups. The ONLY genuine reject is a SINGLE row whose own fan-out cannot fit any row group,
+    /// because there is nothing left to split.
+    /// </remarks>
+    internal static int PlanRowCount(
+        StructField schemaField, IReadOnlyList<ColumnSegment> segments, int rowCount, long budgetBytes)
+    {
+        ArgumentNullException.ThrowIfNull(schemaField);
+        ArgumentNullException.ThrowIfNull(segments);
+
+        int bytesPerSlot = LevelBufferBytesPerSlot(schemaField.DataType);
+        if (bytesPerSlot == 0 || rowCount <= 0)
+        {
+            return rowCount;
+        }
+
+        string label = DiagnosticText.Sanitize(schemaField.Name);
+        long maxSlots = Math.Max(budgetBytes / bytesPerSlot, 1);
+        if (schemaField.DataType is StructType)
+        {
+            // Exactly one slot per row, so the plan is a pure division — no vector walk needed.
+            return (int)Math.Min(rowCount, maxSlots);
+        }
+
+        try
+        {
+            long slots = 0;
+            int planned = 0;
+            int row = 0;
+            foreach (ColumnSegment segment in segments)
+            {
+                for (int j = 0; j < segment.Length && row < rowCount; j++, row++)
+                {
+                    long rowSlots = RowSlots(schemaField.DataType, segment.Vector, segment.Start + j, label);
+                    if (rowSlots > maxSlots)
+                    {
+                        throw DeltaStorageException.UnsupportedFeature(
+                            $"Nested column '{label}': a single logical row contributes {rowSlots} Dremel level "
+                            + $"slot(s), whose level buffers alone exceed the {budgetBytes}-byte per-column "
+                            + "budget for one row group; the row group cannot be split any further.");
+                    }
+
+                    if (slots + rowSlots > maxSlots)
+                    {
+                        return planned;
+                    }
+
+                    slots += rowSlots;
+                    planned = row + 1;
+                }
+            }
+
+            return planned;
+        }
+        catch (Exception ex) when (IsForeignVectorFault(ex))
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested write for column '{label}' of kind "
+                + $"'{DiagnosticText.DescribeType(schemaField.DataType)}': the column vector could not be "
+                + "measured for row-group planning.",
+                ex);
+        }
+    }
+
+    // The level slots ONE logical row of a repeated container contributes: one slot for a null or empty
+    // container, otherwise one per element/entry, counted from the RAW offsets (never Elements.Length, B-5).
+    private static long RowSlots(DataType type, ColumnVector vector, int row, string label)
+    {
+        if (type is ArrayType)
+        {
+            ListColumnVector list = ExpectListVector(vector, label);
+            (_, int length) = list.RawElementSpan(row);
+            return list.IsNull(row) || length == 0 ? 1 : length;
+        }
+
+        MapColumnVector map = ExpectMapVector(vector, label);
+        (_, int entries) = map.RawEntrySpan(row);
+        return map.IsNull(row) || entries == 0 ? 1 : entries;
+    }
 
     /// <summary>
     /// Shreds <paramref name="schemaField"/>'s nested column over <paramref name="segments"/> and writes every
@@ -657,8 +757,9 @@ internal static class NestedColumnShredder
         if (slots > MaxLeafSlotsPerRowGroup)
         {
             throw DeltaStorageException.UnsupportedFeature(
-                $"Nested column '{label}' would emit {slots} Dremel level slot(s) in one row group, exceeding "
-                + $"the supported bound of {MaxLeafSlotsPerRowGroup}.");
+                $"Nested column '{label}' would emit {slots} Dremel level slot(s) in one row group, past the "
+                + $"addressable ceiling of {MaxLeafSlotsPerRowGroup}; a row group must be planned "
+                + "(PlanRowCount) so a wide column is split across row groups rather than rented in one.");
         }
 
         return (int)slots;

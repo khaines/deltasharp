@@ -53,6 +53,23 @@ internal class ParquetFileWriter
     private readonly int _rowGroupRowLimit;
 
     /// <summary>
+    /// The default transient level-buffer budget one NESTED column may rent while shredding a single row
+    /// group (§2.9.2). The row-group row ceiling is itself only a byte proxy, so a nested column whose
+    /// per-row fan-out is large makes the row group SMALLER rather than making the column unwritable —
+    /// <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c> are admitted unconditionally by §2.6, and a
+    /// resource control must never narrow that acceptance set.
+    /// </summary>
+    internal const long DefaultNestedLevelBufferBudgetBytes = 256L * 1024 * 1024;
+
+    /// <summary>
+    /// The level-buffer budget this writer plans row groups against. Overridable so a test can drive the
+    /// SPLIT path (and the single-row reject) without authoring hundreds of megabytes of data; production
+    /// writers use <see cref="DefaultNestedLevelBufferBudgetBytes"/>. Lowering it cannot corrupt a file — it
+    /// only moves row-group boundaries, which is always legal.
+    /// </summary>
+    protected virtual long NestedLevelBufferBudgetBytes => DefaultNestedLevelBufferBudgetBytes;
+
+    /// <summary>
     /// A TEST-ONLY extension point invoked after <see cref="CollectSegments"/> for each row group, returning
     /// the number of logical rows the (possibly perturbed) segments now describe. The base implementation is
     /// the identity, and NO production type derives from this writer, so a shipping <see cref="ParquetFileWriter"/>
@@ -187,7 +204,9 @@ internal class ParquetFileWriter
             while (emitted < totalRows)
             {
                 cancellationToken.ThrowIfCancellationRequested();
-                int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
+                int size = PlanRowGroupSize(
+                    schema, selectedColumns, batchRowCounts, cursorBatch, cursorRow,
+                    (int)Math.Min(_rowGroupRowLimit, totalRows - emitted));
                 CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
 
                 // §2.4b test seam. The base hook is the identity, so `written == size` in production. A test
@@ -234,6 +253,47 @@ internal class ParquetFileWriter
     }
 
     /// <summary>
+    /// §2.9.2. Shrinks the next row group until every NESTED column's transient level buffers fit
+    /// <see cref="NestedLevelBufferBudgetBytes"/>. Deterministic and side-effect free — the N9 pre-pass and
+    /// the write loop both call it with the same cursors, so they segment identically.
+    /// </summary>
+    /// <remarks>
+    /// The row limit alone is a poor proxy for a nested column: a 1536-dimension <c>array&lt;float&gt;</c>
+    /// contributes 1536 level slots per row, so 131,072 rows would rent gigabytes. Capping the FAN-OUT
+    /// instead would reject that column outright, and §2.6 admits it unconditionally — so the answer is more,
+    /// smaller row groups. Only a single row that cannot fit any row group is a genuine reject.
+    /// </remarks>
+    private int PlanRowGroupSize(
+        StructType schema,
+        List<ColumnVector[]> selectedColumns,
+        int[] batchRowCounts,
+        int cursorBatch,
+        int cursorRow,
+        int size)
+    {
+        long budget = NestedLevelBufferBudgetBytes;
+        var probe = new List<Segment>();
+        int planned = size;
+        for (int c = 0; c < schema.Count && planned > 1; c++)
+        {
+            if (schema[c].DataType is not (StructType or ArrayType or MapType))
+            {
+                continue;
+            }
+
+            int probeBatch = cursorBatch;
+            int probeRow = cursorRow;
+            CollectSegments(batchRowCounts, ref probeBatch, ref probeRow, planned, probe);
+            planned = NestedColumnShredder.PlanRowCount(
+                schema[c], BuildNestedSegments(selectedColumns, c, probe), planned, budget);
+        }
+
+        // A single row always fits or has already failed closed inside PlanRowCount, so the loop can never
+        // stall the writer by planning zero rows.
+        return Math.Max(planned, 1);
+    }
+
+    /// <summary>
     /// The §2.9 N9 PRE-PASS: runs the complete nested shredding pipeline — level computation, the §2.4a
     /// required-lane value guards, the §2.3c per-leaf <see cref="NestedLevelGuard"/> and both cross-leaf
     /// guards — over EVERY row-group segmentation this write will produce, writing nothing. Any reject
@@ -268,7 +328,9 @@ internal class ParquetFileWriter
         while (emitted < totalRows)
         {
             cancellationToken.ThrowIfCancellationRequested();
-            int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
+            int size = PlanRowGroupSize(
+                schema, selectedColumns, batchRowCounts, cursorBatch, cursorRow,
+                (int)Math.Min(_rowGroupRowLimit, totalRows - emitted));
             CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
             int written = OnRowGroupSegmentsCollected(segments, size);
             for (int c = 0; c < schema.Count; c++)

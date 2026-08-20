@@ -162,14 +162,17 @@ internal static class ParquetTypeMapping
                         $"Parquet mapping for column '{label}' of type '{field.DataType.TypeName}' is not supported.");
             }
         }
-        catch (ArgumentException)
+        catch (ArgumentException ex)
         {
             // A4/Security note 4: Parquet.Net's own Field constructors raise raw ArgumentExceptions (a map's
             // key cannot be nullable; a struct requires at least one element; an empty field name). Map them
-            // onto the typed contract with a bounded message that echoes no library text.
+            // onto the typed contract with a bounded message that echoes no library text. A2: the raw cause is
+            // retained as the INNER exception (never surfaced by ToString, #664) so a genuine defect here is
+            // still diagnosable rather than being flattened into "the shape could not be constructed".
             throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for nested column '{label}' of kind '{field.DataType.TypeName}': the nested "
-                + "Parquet shape could not be constructed.");
+                + "Parquet shape could not be constructed.",
+                ex);
         }
     }
 
@@ -194,7 +197,7 @@ internal static class ParquetTypeMapping
         {
             return CreateScalarField(new StructField(name, type, nullable), honorReferenceNullability);
         }
-        catch (DeltaStorageException)
+        catch (DeltaStorageException ex)
         {
             // §2.8 (Security #3): CreateScalarField identifies the offending field BY NAME, and here that name
             // is a nested CHILD name — foreign schema text that must never reach a diagnostic, and which
@@ -203,7 +206,8 @@ internal static class ParquetTypeMapping
             // leaf KIND, so the failing COLUMN is correctly attributed and no child name is echoed.
             throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for {context}: the leaf type '{DiagnosticText.DescribeType(type)}' has no "
-                + "supported Parquet mapping.");
+                + "supported Parquet mapping.",
+                ex);
         }
     }
 
