@@ -35,9 +35,19 @@ A golden failure means the emitted bytes drifted. This is **expected** on a legi
 
 - [ ] Confirm the drift is intentional (an encoding/compression/`created_by` change, not a correctness
       regression) by round-tripping the affected shapes through the reader (the #841 round-trip oracle).
-- [ ] Regenerate the goldens deliberately: run the golden tests with `DELTASHARP_REGEN_WRITE_GOLDENS=1`, paste
-      the emitted `(shape → sha256)` constants into `NestedParquetWriteGoldenTests.Goldens`, and commit them in
-      a **reviewed** commit that explicitly states the encoding change and the Parquet.Net versions involved.
+- [ ] Regenerate the goldens deliberately: run the golden tests with `DELTASHARP_REGEN_WRITE_GOLDENS=1` (regen
+      mode **emits the fresh constants and then fails** — it is never green), paste the emitted
+      `(shape → sha256)` constants into `NestedParquetWriteGoldenTests.Goldens`, unset the env var, and commit
+      them in a **reviewed** commit that explicitly states the encoding change and the Parquet.Net versions
+      involved.
+- [ ] The goldens are **version-coupled**: the hashed bytes embed the Parquet.Net `created_by` version string
+      **and** DeltaSharp's own writer metadata, so regenerate against the version that actually ships. Never
+      carry goldens generated at one pin onto a branch that lands a different pin — that is a guaranteed (and
+      correct) golden failure; regenerate in the same commit that changes the pin.
+- [ ] The goldens are a **cross-platform** byte commitment. Parquet.Net's default codec (managed Snappy) and
+      metadata emission are expected to be platform/arch-independent; confirm the first multi-OS/arch CI run is
+      green. A genuine platform divergence would itself be a legitimate catch by this gate — escalate it as a
+      Parquet.Net determinism finding rather than papering over it with a per-platform golden.
 
 ## 4 · Sign-off
 

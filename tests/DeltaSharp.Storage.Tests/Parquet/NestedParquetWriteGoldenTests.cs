@@ -24,9 +24,14 @@ namespace DeltaSharp.Storage.Tests.Parquet;
 /// well-defined.</para>
 /// <para><b>Regeneration (reviewed).</b> A legitimate encoding change (or a sanctioned Parquet.Net bump) is
 /// expected to change these hashes. To regenerate, run with <c>DELTASHARP_REGEN_WRITE_GOLDENS=1</c>: the test
-/// emits the new <c>(shape → sha256)</c> constants to the test output, which are then pasted into
-/// <see cref="Goldens"/> in a reviewed commit. The regeneration is deliberate and diff-visible — it is NOT an
-/// auto-heal. See <c>docs/engineering/parquet-net-upgrade-checklist.md</c>.</para>
+/// emits the new <c>(shape → sha256)</c> constants to the test output <b>and then fails</b> (regen mode can
+/// never be green), which are then pasted into <see cref="Goldens"/> in a reviewed commit. The regeneration is
+/// deliberate and diff-visible — it is NOT an auto-heal. See
+/// <c>docs/engineering/checklists/parquet-net-upgrade-checklist.md</c>.</para>
+/// <para><b>Version coupling.</b> The hashed bytes embed the Parquet.Net <c>created_by</c> version string and
+/// DeltaSharp's own writer metadata, so these goldens are pinned to the exact dependency + writer version this
+/// branch builds against (Parquet.Net 6.1.0). Regenerate them against whatever version actually ships if the
+/// pin ever changes.</para>
 /// </remarks>
 public sealed class NestedParquetWriteGoldenTests
 {
@@ -95,11 +100,18 @@ public sealed class NestedParquetWriteGoldenTests
 
         if (IsRegen)
         {
+            // Emit the fresh constant, then FAIL (SEC-1): regen mode must NEVER report green, so a stale/leaked
+            // DELTASHARP_REGEN_WRITE_GOLDENS in any environment can't silently turn the drift gate into a no-op.
+            // The paste-into-Goldens + unset-the-var step is thus forced to be a deliberate, reviewed act.
             _output.WriteLine($"[golden] [\"{shape}\"] = \"{actual}\",  // len={bytes.Length}");
-            return;
+            Assert.Fail(
+                $"{RegenEnvVar} is set: emitted the fresh golden for shape '{shape}' above. Paste it into "
+                + $"Goldens, commit it (reviewed), and unset {RegenEnvVar} — regen mode is intentionally never green.");
         }
 
         Assert.True(
+            // The __REGEN__ sentinel guard is load-bearing: a NEWLY-ADDED shape whose golden was not yet
+            // regenerated sits at "__REGEN__" and MUST fail here rather than silently pass.
             Goldens.TryGetValue(shape, out string? golden) && golden != "__REGEN__",
             $"No committed golden for shape '{shape}'. Run with {RegenEnvVar}=1 to emit one, then commit it.");
         Assert.True(
