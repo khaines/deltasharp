@@ -5,6 +5,7 @@ using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
 using Parquet;
 using Parquet.Schema;
+using ColumnSegment = DeltaSharp.Storage.Parquet.NestedColumnShredder.ColumnSegment;
 using StructField = DeltaSharp.Types.StructField;
 
 namespace DeltaSharp.Storage.Parquet;
@@ -34,6 +35,25 @@ internal sealed class ParquetFileWriter
     // every 16384 rows so a large single-row-group write stays cancellable without a per-row token read.
     // (Fixed-width schemas and every row-group boundary are already checked at the WriteAsync while loop.)
     private const int CancellationCheckMask = 0x3FFF;
+
+    // The §2.4b footer reconciliation's reader. Stateless and hoisted to a single static instance so the
+    // self-check adds no per-write allocation. It keeps the DEFAULT decode limits — the check must fail CLOSED
+    // under the same wall-clock bounds every other footer read obeys, and a write whose own footer cannot be
+    // read within the data-file budget is precisely a write that must not be published.
+    //
+    // It does NOT share the process-wide data-file door. That door admits UNTRUSTED reads; this read-back is
+    // DeltaSharp verifying bytes it just authored itself (design §5: "no new external input on the write
+    // path"). Sharing would couple the two in both directions: a flood of hostile reads saturating the door
+    // would fail otherwise-healthy WRITES with DecoderSaturated, and every write would consume an admission
+    // slot sized for untrusted decodes. The isolated door is sized identically but runs on a DEDICATED THREAD
+    // (as the checkpoint door does, and for the same reason): a footer parse over an already-materialized
+    // window is predominantly synchronous CPU work, so it must not queue behind ThreadPool work that untrusted
+    // decode strands can pin — a write must remain verifiable while the pool is under pressure.
+    private static readonly ParquetFileReader ReconciliationReader = new(
+        dataFileDecoder: BoundedDecoder.FromSizing(
+            BoundedDecode.DeriveDoorSizing(
+                BoundedDecode.ProcessMemoryBytes, BoundedDecode.DataFileMaxFootprintBytes),
+            DecodeExecution.Pool));
 
     private readonly int _rowGroupRowLimit;
 
@@ -68,12 +88,13 @@ internal sealed class ParquetFileWriter
         ArgumentNullException.ThrowIfNull(batches);
 
         int columnCount = schema.Count;
-        var fields = new DataField[columnCount];
+        var fields = new Field[columnCount];
         for (int c = 0; c < columnCount; c++)
         {
             // honorReferenceNullability: the WRITTEN footer's physical repetition must match the
             // declared schemaString, so a "nullable":false string/binary column is emitted REQUIRED
-            // rather than Parquet.Net's reference-type always-nullable default (#730).
+            // rather than Parquet.Net's reference-type always-nullable default (#730). CreateField also
+            // fails the out-of-scope nested shapes closed here, BEFORE any byte is written.
             fields[c] = ParquetTypeMapping.CreateField(schema[c], honorReferenceNullability: true);
         }
 
@@ -102,6 +123,24 @@ internal sealed class ParquetFileWriter
                     nameof(batches));
             }
 
+            // §2.8 selection-vector fail-closed PRE-PASS. SelectedColumn calls ColumnVector.Select, which
+            // the nested vectors raise a raw NotSupportedException from (a selection cannot be pushed
+            // through offsets without re-shredding the child). Reject BEFORE the loop so the door fails on
+            // the typed, bounded contract rather than on a library-shaped exception mid-write.
+            if (batch.Selection is not null)
+            {
+                for (int c = 0; c < columnCount; c++)
+                {
+                    if (schema[c].DataType is StructType or ArrayType or MapType)
+                    {
+                        throw DeltaStorageException.UnsupportedFeature(
+                            $"Parquet write for nested column '{DiagnosticText.Sanitize(schema[c].Name)}' of "
+                            + $"kind '{DiagnosticText.DescribeType(schema[c].DataType)}': writing a batch that "
+                            + "carries a selection vector is not supported; materialize the selection first.");
+                    }
+                }
+            }
+
             var columns = new ColumnVector[columnCount];
             for (int c = 0; c < columnCount; c++)
             {
@@ -119,31 +158,112 @@ internal sealed class ParquetFileWriter
             [DeltaSchemaJson.WriterMetadataKey] = WriterIdentity,
         };
 
-        await using ParquetWriter writer =
+        long startPosition = output.CanSeek ? output.Position : 0L;
+        await using (ParquetWriter writer =
             await ParquetWriter.CreateAsync(new ParquetSchema(fields), output, null, false, cancellationToken)
-                .ConfigureAwait(false);
-        writer.CustomMetadata = metadata;
-
-        // L2: a pre-test loop, so zero input rows produce ZERO row groups (never one empty group).
-        int cursorBatch = 0;
-        int cursorRow = 0;
-        long emitted = 0;
-        var segments = new List<Segment>();
-        while (emitted < totalRows)
+                .ConfigureAwait(false))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
-            CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
+            writer.CustomMetadata = metadata;
 
-            using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
-            for (int c = 0; c < columnCount; c++)
+            // L2: a pre-test loop, so zero input rows produce ZERO row groups (never one empty group).
+            int cursorBatch = 0;
+            int cursorRow = 0;
+            long emitted = 0;
+            var segments = new List<Segment>();
+            while (emitted < totalRows)
             {
-                await WriteColumnAsync(
-                    rowGroup, fields[c], schema[c], selectedColumns, c, segments, size, cancellationToken)
-                    .ConfigureAwait(false);
-            }
+                cancellationToken.ThrowIfCancellationRequested();
+                int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
+                CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
 
-            emitted += size;
+                using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
+                for (int c = 0; c < columnCount; c++)
+                {
+                    if (schema[c].DataType is StructType or ArrayType or MapType)
+                    {
+                        // A nested column fans out to N leaf writes inside ONE row group — the shredder owns
+                        // the Dremel encoding, the level guard, and the required-lane checks.
+                        await NestedColumnShredder.WriteColumnAsync(
+                            rowGroup, fields[c], schema[c],
+                            BuildNestedSegments(selectedColumns, c, segments), size, cancellationToken)
+                            .ConfigureAwait(false);
+                        continue;
+                    }
+
+                    await WriteColumnAsync(
+                        rowGroup, (DataField)fields[c], schema[c], selectedColumns, c, segments, size,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                emitted += size;
+            }
+        }
+
+        // §2.4b POST-WRITE footer row-count reconciliation. The nested write door multiplies the ways a row
+        // can be LOST or DUPLICATED without any exception: a slot-count/level defect writes a well-formed
+        // file whose row count silently disagrees with the batches it came from, and the #497 schema door
+        // only compares TYPES. So read the just-written footer back and reconcile its NumRows against the
+        // batch-derived total. The reference is deliberately the LogicalRowCount sum computed above — never
+        // statistics.NumRecords, which is nullable-by-policy and would degrade to a vacuous 0 == 0 check
+        // exactly when statistics are disabled. Binding this inside WriteAsync's core binds all three
+        // production write paths (DeltaWriteTarget.StageAsync, DeltaOptimize.WriteCompactedFileAsync,
+        // ChangeDataWriter) at once.
+        await ReconcileFooterRowCountAsync(output, startPosition, totalRows, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    // Projects the row group's (batch, start, length) segments onto ONE column's already-selection-resolved
+    // vectors, which is the shape the shredder walks.
+    private static ColumnSegment[] BuildNestedSegments(
+        List<ColumnVector[]> selectedColumns, int columnIndex, List<Segment> segments)
+    {
+        var projected = new ColumnSegment[segments.Count];
+        for (int i = 0; i < segments.Count; i++)
+        {
+            Segment segment = segments[i];
+            projected[i] = new ColumnSegment(
+                selectedColumns[segment.Batch][columnIndex], segment.Start, segment.Length);
+        }
+
+        return projected;
+    }
+
+    // Reads back the footer of the file just written into `output` (from `startPosition` to the current
+    // position) and fails closed unless its NumRows equals `expectedRows`.
+    internal static async Task ReconcileFooterRowCountAsync(
+        Stream output, long startPosition, long expectedRows, CancellationToken cancellationToken)
+    {
+        if (!output.CanSeek)
+        {
+            // Parquet.Net itself requires a seekable output to write a footer, so this is unreachable in
+            // practice — but an unverifiable write must fail CLOSED, never silently skip the check.
+            throw DeltaStorageException.CorruptData(
+                "The Parquet write could not be reconciled against its footer because the output stream is "
+                + "not seekable.");
+        }
+
+        long endPosition = output.Position;
+        long actualRows;
+        try
+        {
+            // A NON-OWNING window over the just-written bytes: ParquetFileReader.OpenAsync constructs its
+            // reader with leaveStreamOpen:false, so it would otherwise dispose the caller's output stream.
+            var window = new NonOwningWindowStream(output, startPosition, endPosition - startPosition);
+            actualRows = await ReconciliationReader.GetRowCountAsync(window, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            // WriteWithStatisticsAsync measures byteSize as (Position - startPosition), so the read-back
+            // must leave the stream exactly where the write left it.
+            output.Position = endPosition;
+        }
+
+        if (actualRows != expectedRows)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"The written Parquet file reports {actualRows} row(s) in its footer but {expectedRows} "
+                + "row(s) were written; the file is structurally inconsistent.");
         }
     }
 
@@ -313,8 +433,9 @@ internal sealed class ParquetFileWriter
                     .ConfigureAwait(false);
                 break;
             default:
-                // #705 predicate: the scalar kinds are cased above; nested types are rejected earlier by
-                // ParquetTypeMapping.ToParquetField, so this arm is reached only for a scalar today. DescribeType
+                // #705 predicate: the scalar kinds are cased above; nested types are routed to
+                // NestedColumnShredder by WriteAsync (and the out-of-scope ones are rejected earlier by
+                // ParquetTypeMapping.CreateField), so this arm is reached only for a scalar today. DescribeType
                 // (== the atomic SimpleString literal here) bounds a defensively-reachable nested type instead of
                 // recursing into raw nested field names.
                 throw DeltaStorageException.UnsupportedFeature(

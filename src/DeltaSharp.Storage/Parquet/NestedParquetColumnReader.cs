@@ -1151,10 +1151,13 @@ internal static class NestedParquetColumnReader
     //      required leaf (maxDef == containerMaxDef) and an optional leaf (maxDef == containerMaxDef + 1) are
     //      accepted.
     // Fail closed CorruptData on either mismatch, at shape resolution (BEFORE any reconstruction). Internal so
-    // the guard can be pinned by direct unit tests for the list/map positions, whose wrong-level leaves the
-    // released Parquet.Net write door cannot author (its ListField/MapField constructors force element/key/
-    // value maxRep = 1); the struct-field maxRep masquerade IS authorable end-to-end (a 1-level repeated
-    // primitive under a struct).
+    // the guard can be pinned by direct unit tests for the list/map positions, whose wrong-level leaves no
+    // Parquet.Net-based write door can author — including DeltaSharp's own nested write path (#841), which
+    // builds its schema through the same ListField/MapField constructors, and those force element/key/value
+    // maxRep = 1; the struct-field maxRep masquerade IS authorable end-to-end (a 1-level repeated primitive
+    // under a struct). The levels DeltaSharp's shredder emits are separately bounded against these same
+    // schema-derived maxima by NestedLevelGuard before every write, so this guard remains a hostile-FILE
+    // control rather than a check on our own encoder.
     internal static void ValidateLeafStructuralLevels(
         DataField leaf, int expectedMaxRepetition, int containerMaxDef, string context)
     {

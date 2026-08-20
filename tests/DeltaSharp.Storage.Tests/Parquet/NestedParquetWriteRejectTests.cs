@@ -1,0 +1,353 @@
+using DeltaSharp.Engine.Columnar;
+using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Types;
+using Parquet.Schema;
+using Xunit;
+using StructField = DeltaSharp.Types.StructField;
+
+namespace DeltaSharp.Storage.Tests.Parquet;
+
+/// <summary>
+/// The nested write door's FAIL-CLOSED matrix (§2.4a/§2.6/§2.7/§2.8) and the §2.3c pre-write level-invariant
+/// guard's negative cells.
+/// </summary>
+/// <remarks>
+/// Every case here is a shape or an encoding the writer must refuse <b>before any byte is published</b>. The
+/// level-guard cells are fault-injected directly into <see cref="NestedLevelGuard"/> rather than provoked
+/// through the shredder: the guard exists precisely to catch a shredder defect, so a test that could only
+/// reach it through a correct shredder would be vacuous.
+/// </remarks>
+public sealed class NestedParquetWriteRejectTests
+{
+    private static readonly ArrayType IntArrayType = DataTypes.CreateArrayType(DataTypes.IntegerType);
+
+    // ----- schema-shape rejects (§2.6 → #585, §2.4a) -----
+
+    public static TheoryData<string, DataType, bool> OutOfScopeShapes() => new()
+    {
+        // Nested within nested — the #585 boundary, in all three container positions.
+        { "array-of-array", DataTypes.CreateArrayType(DataTypes.CreateArrayType(DataTypes.LongType)), true },
+        { "array-of-struct", DataTypes.CreateArrayType(
+            DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) })), true },
+        { "array-of-map", DataTypes.CreateArrayType(
+            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType)), true },
+        { "map-value-nested", DataTypes.CreateMapType(
+            DataTypes.StringType, DataTypes.CreateArrayType(DataTypes.LongType)), true },
+        { "map-key-nested", DataTypes.CreateMapType(
+            DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) }),
+            DataTypes.LongType), true },
+        { "struct-of-struct", DataTypes.CreateStructType(new[]
+        {
+            new StructField("x", DataTypes.LongType),
+            new StructField(
+                "y", DataTypes.CreateStructType(new[] { new StructField("z", DataTypes.LongType) })),
+        }), true },
+        { "struct-of-array", DataTypes.CreateStructType(new[]
+        {
+            new StructField("x", DataTypes.CreateArrayType(DataTypes.LongType)),
+        }), true },
+
+        // A zero-field struct (§2.4a/NEW-5): Parquet.Net's own ctor raises a raw ArgumentException for it.
+        { "zero-field-struct", DataTypes.CreateStructType(Array.Empty<StructField>()), true },
+
+        // A declared-REQUIRED nested container (§2.4a/#730): Parquet.Net emits every nested container as
+        // OPTIONAL, so writing one would make the footer contradict the committed schemaString.
+        { "required-array", DataTypes.CreateArrayType(DataTypes.LongType), false },
+        { "required-map", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType), false },
+        { "required-struct", DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) }), false },
+
+        // An unsupported LEAF inside an in-scope container: rejected on the same door, not silently widened.
+        { "array-of-void", DataTypes.CreateArrayType(DataTypes.NullType), true },
+    };
+
+    [Theory]
+    [MemberData(nameof(OutOfScopeShapes))]
+    public void CreateField_RejectsOutOfScopeNestedShapes_FailClosed(string label, DataType type, bool nullable)
+    {
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetTypeMapping.CreateField(
+                new StructField("c", type, nullable), honorReferenceNullability: true));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.NotEmpty(label);
+    }
+
+    [Fact]
+    public void CreateField_NestedShapeMessages_NeverEchoANestedFieldName()
+    {
+        // §2.8 diagnostic hygiene: the message identifies the offending child by ORDINAL and the offending
+        // type by KIND, so no foreign nested field name (and no recursive SimpleString) reaches a log.
+        var type = DataTypes.CreateStructType(new[]
+        {
+            new StructField("harmless", DataTypes.LongType),
+            new StructField(
+                "SECRET_CHILD_NAME",
+                DataTypes.CreateStructType(new[] { new StructField("DEEPER_SECRET", DataTypes.LongType) })),
+        });
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetTypeMapping.CreateField(
+                new StructField("outer", type, nullable: true), honorReferenceNullability: true));
+
+        Assert.DoesNotContain("SECRET_CHILD_NAME", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain("DEEPER_SECRET", error.Message, StringComparison.Ordinal);
+        Assert.Contains("'struct'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("outer", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CreateField_RejectsNestedColumnCarryingAColumnMappingId_DeferredTo676()
+    {
+        // §2.5/§2.7: NONE mode only. A nested column carrying delta.columnMapping.id would need per-LEAF
+        // field_id stamping, which is #676's scope — so the door refuses rather than stamping the container.
+        var metadata = FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
+        {
+            ["delta.columnMapping.id"] = MetadataValue.Long(7),
+        });
+        var field = new StructField("c", IntArrayType, nullable: true, metadata);
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetTypeMapping.CreateField(field, honorReferenceNullability: true));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("#676", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CreateField_StampsNoFieldIdOnANestedLeaf()
+    {
+        // §2.5/F9: the synthesized leaf StructFields carry no column-mapping metadata, so a nested leaf is
+        // structurally never field_id-stamped — the property #676 will build on.
+        var inner = DataTypes.CreateStructType(new[]
+        {
+            new StructField("a", DataTypes.IntegerType, nullable: true),
+            new StructField("b", DataTypes.StringType, nullable: true),
+        });
+
+        var parquetStruct = (global::Parquet.Schema.StructField)ParquetTypeMapping.CreateField(
+            new StructField("s", inner, nullable: true), honorReferenceNullability: true);
+
+        foreach (Field child in parquetStruct.Fields)
+        {
+            Assert.Equal(-1, ((DataField)child).FieldId);
+        }
+    }
+
+    // ----- runtime value rejects (§2.4a required lane) -----
+
+    [Fact]
+    public async Task RequiredArrayElement_HoldingANull_FailsClosedBeforeAnyByte()
+    {
+        var type = DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: false);
+        var schema = DataTypes.CreateStructType(new[] { new StructField("a", type, nullable: true) });
+        ListColumnVector vector = NestedVectors.IntList(type, new int?[]?[] { new int?[] { 1, null } });
+
+        DeltaStorageException error = await AssertWriteFailsAsync(schema, vector);
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("non-nullable element", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task RequiredMapValue_HoldingANull_FailsClosedBeforeAnyByte()
+    {
+        var type = DataTypes.CreateMapType(
+            DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: false);
+        var schema = DataTypes.CreateStructType(new[] { new StructField("m", type, nullable: true) });
+        MapColumnVector vector = NestedVectors.StringIntMap(
+            type, new IReadOnlyList<(string Key, int? Value)>?[] { new[] { ("a", (int?)null) } });
+
+        DeltaStorageException error = await AssertWriteFailsAsync(schema, vector);
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("non-nullable value", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NonNullableStructField_HoldingANull_FailsClosedBeforeAnyByte()
+    {
+        var inner = DataTypes.CreateStructType(new[]
+        {
+            new StructField("a", DataTypes.IntegerType, nullable: false),
+            new StructField("b", DataTypes.StringType, nullable: true),
+        });
+        var schema = DataTypes.CreateStructType(new[] { new StructField("s", inner, nullable: true) });
+        StructColumnVector vector = NestedVectors.IntStringStruct(
+            inner, new (int? A, string? B)?[] { (1, "ok"), (null, "boom") });
+
+        DeltaStorageException error = await AssertWriteFailsAsync(schema, vector);
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains("declared non-nullable", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NullMapKey_IsUnrepresentableAtTheVectorLayer()
+    {
+        // §2.4a's key lane is REQUIRED on the wire. MapColumnVector already refuses to hold a null key, so
+        // the shredder's null-key guard is unreachable defence-in-depth rather than the primary control —
+        // pinned here so a future relaxation of the vector invariant surfaces as a failure in THIS file,
+        // next to the guard it would activate.
+        var type = DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType);
+        MutableColumnVector keys = ColumnVectors.Create(DataTypes.StringType, 2);
+        MutableColumnVector values = ColumnVectors.Create(DataTypes.IntegerType, 2);
+        keys.AppendBytes(System.Text.Encoding.UTF8.GetBytes("a"));
+        values.AppendValue(1);
+        keys.AppendNull();
+        values.AppendValue(2);
+
+        Assert.Throws<ArgumentException>(
+            () => new MapColumnVector(type, keys, values, new[] { 0, 2 }));
+    }
+
+    // ----- selection-vector reject (§2.8) -----
+
+    [Fact]
+    public async Task SelectionVectorOverANestedColumn_FailsClosedBeforeTheWriter()
+    {
+        var schema = DataTypes.CreateStructType(new[] { new StructField("a", IntArrayType, nullable: true) });
+        var rows = new int?[]?[] { new int?[] { 1 }, null, new int?[] { 2 } };
+        var batch = new ManagedColumnBatch(
+            schema, new ColumnVector[] { NestedVectors.IntList(IntArrayType, rows) }, rows.Length);
+        ColumnBatch selected = batch.WithSelection(new SelectionVector(new[] { 0, 2 }));
+
+        using var output = new MemoryStream();
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileWriter().WriteAsync(output, schema, new[] { selected }, CancellationToken.None));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("selection vector", error.Message, StringComparison.Ordinal);
+        Assert.Equal(0, output.Length);
+    }
+
+    // ----- §2.3c level-guard negative cells -----
+
+    private static DataField RepeatedLeaf()
+    {
+        var list = new ListField("a", new DataField<int?>("element"));
+        _ = new ParquetSchema(list);
+        return (DataField)list.Item;
+    }
+
+    private static DataField StructLeaf()
+    {
+        var structField = new global::Parquet.Schema.StructField("s", new DataField<int?>("x"));
+        _ = new ParquetSchema(structField);
+        return (DataField)structField.Fields[0];
+    }
+
+    [Fact]
+    public void LevelGuard_AcceptsTheNormativeEncoding()
+    {
+        // Non-vacuity: the exact stream NestedParquetLevelStreamTests reads off the wire must PASS, or every
+        // negative below could be passing for the wrong reason.
+        NestedLevelGuard.Validate(
+            RepeatedLeaf(), new[] { 3, 3, 0, 1, 2, 3 }, new[] { 0, 1, 0, 0, 0, 0 }, hasRepetitions: true,
+            valueCount: 3, rowCount: 5, "a");
+
+        NestedLevelGuard.Validate(
+            StructLeaf(), new[] { 2, 0, 1, 2 }, ReadOnlySpan<int>.Empty, hasRepetitions: false,
+            valueCount: 2, rowCount: 4, "s");
+    }
+
+    [Fact]
+    public void LevelGuard_RejectsADefinitionLevelAboveTheLeafMaximum() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 4, 0 }, new[] { 0, 0 }, true, 0, 2, "a"),
+            "outside [0, 3]");
+
+    [Fact]
+    public void LevelGuard_RejectsARepetitionLevelAboveTheLeafMaximum() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3 }, new[] { 0, 2 }, true, 2, 1, "a"),
+            "outside [0, 1]");
+
+    [Fact]
+    public void LevelGuard_RejectsAFirstSlotThatContinuesAnUnopenedRow() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3 }, new[] { 1, 1 }, true, 2, 1, "a"),
+            "never opened");
+
+    [Fact]
+    public void LevelGuard_RejectsAContinuationOfAnEmptyContainerSlot() =>
+        // The design's run-legality cell: def=[1,3,3] rep=[0,1,0]. Slot 0 encodes an EMPTY list, which
+        // occupies exactly one slot and can never be continued.
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 1, 3, 3 }, new[] { 0, 1, 0 }, true, 2, 2, "a"),
+            "absent or empty");
+
+    [Fact]
+    public void LevelGuard_RejectsAContinuationOfANullContainerSlot() =>
+        // The sibling cell: def=[0,3,3] rep=[0,1,0]. Slot 0 encodes a NULL list.
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 0, 3, 3 }, new[] { 0, 1, 0 }, true, 2, 2, "a"),
+            "absent or empty");
+
+    [Fact]
+    public void LevelGuard_RejectsAContinuationSlotAtAnAbsentDefinitionLevel() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 1 }, new[] { 0, 1 }, true, 1, 1, "a"),
+            "encodes an absent or empty container");
+
+    [Fact]
+    public void LevelGuard_RejectsAValueCountThatDisagreesWithTheLevels() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3, 0 }, new[] { 0, 1, 0 }, true, 3, 2, "a"),
+            "were packed");
+
+    [Fact]
+    public void LevelGuard_RejectsARowCountThatDisagreesWithTheRowOpenings() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3 }, new[] { 0, 1 }, true, 2, 7, "a"),
+            "open 1 row(s)");
+
+    [Fact]
+    public void LevelGuard_RejectsANonRepeatedLeafStreamOfTheWrongLength() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                StructLeaf(), new[] { 2, 2 }, ReadOnlySpan<int>.Empty, false, 2, 3, "s"),
+            "the row group covers 3 row(s)");
+
+    [Fact]
+    public void LevelGuard_RejectsARepeatedLeafWithNoRepetitionStream() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3 }, ReadOnlySpan<int>.Empty, false, 1, 1, "a"),
+            "without a repetition stream");
+
+    [Fact]
+    public void LevelGuard_RejectsANonRepeatedLeafCarryingARepetitionStream() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                StructLeaf(), new[] { 2 }, new[] { 0 }, true, 1, 1, "s"),
+            "with a repetition stream");
+
+    [Fact]
+    public void LevelGuard_RejectsMismatchedStreamLengths() =>
+        AssertRejected(
+            () => NestedLevelGuard.Validate(
+                RepeatedLeaf(), new[] { 3, 3 }, new[] { 0 }, true, 2, 1, "a"),
+            "different lengths");
+
+    private static void AssertRejected(Action act, string expectedFragment)
+    {
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(act);
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+        Assert.Contains(expectedFragment, error.Message, StringComparison.Ordinal);
+    }
+
+    private static async Task<DeltaStorageException> AssertWriteFailsAsync(StructType schema, ColumnVector column)
+    {
+        var batch = new ManagedColumnBatch(schema, new[] { column }, column.Length);
+        using var output = new MemoryStream();
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => new ParquetFileWriter().WriteAsync(output, schema, new[] { batch }, CancellationToken.None));
+
+        return error;
+    }
+}

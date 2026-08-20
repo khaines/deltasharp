@@ -3,6 +3,9 @@ using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Types;
 using Parquet.Schema;
+using PqListField = Parquet.Schema.ListField;
+using PqMapField = Parquet.Schema.MapField;
+using PqStructField = Parquet.Schema.StructField;
 using StructField = DeltaSharp.Types.StructField;
 
 namespace DeltaSharp.Storage.Parquet;
@@ -35,9 +38,21 @@ internal static class ParquetTypeMapping
     private static readonly UInt128 MaxDecimalMagnitude = UInt128.MaxValue >> 32;
 
     /// <summary>
-    /// Builds the Parquet <see cref="DataField"/> for <paramref name="field"/>, choosing the nullable
-    /// Parquet field when <see cref="StructField.Nullable"/> is set.
+    /// Builds the Parquet <see cref="Field"/> for <paramref name="field"/> — a <see cref="DataField"/> for a
+    /// scalar column, or the recursively-built nested container for the three single-level nested shapes the
+    /// writer supports (design §2.9: <c>struct&lt;scalars&gt;</c>, <c>array&lt;scalar&gt;</c>,
+    /// <c>map&lt;scalar,scalar&gt;</c>). This is the <b>WRITE door</b>; the read path uses the
+    /// <see cref="DataField"/>-returning <see cref="CreateScalarField"/> so its raw-echo bound (a scalar
+    /// <c>SimpleString</c> is a bounded literal) is retained by construction.
     /// </summary>
+    /// <remarks>
+    /// Fail-closed boundaries (design §2.4a/§2.6), all <b>before any byte is written</b>: a nested type
+    /// nested WITHIN one of the three shapes (→ #585); a <c>nullable:false</c> nested container (Parquet.Net
+    /// 6.1.0 exposes no public <c>Field.IsNullable</c> setter, so every container is OPTIONAL on the wire and
+    /// honoring the declaration is impossible — #730 divergence refused); a zero-field struct; and a nested
+    /// column carrying column-mapping metadata (nested leaf <c>field_id</c> stamping is deferred to #676,
+    /// design §2.5/§2.7 — this PR is NONE-mode only).
+    /// </remarks>
     /// <param name="field">The engine field to map.</param>
     /// <param name="honorReferenceNullability">
     /// When <see langword="true"/>, string/binary (reference-typed) columns follow the declared
@@ -64,10 +79,135 @@ internal static class ParquetTypeMapping
     /// </param>
     /// <exception cref="DeltaStorageException">
     /// The field's type has no supported Parquet mapping
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>): a nested-within-nested type, a
+    /// <c>nullable:false</c> nested container, a zero-field struct, the void type, or a decimal
+    /// with precision &gt; 28.
+    /// </exception>
+    public static Field CreateField(StructField field, bool honorReferenceNullability)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return field.DataType switch
+        {
+            ArrayType or MapType or StructType => CreateNestedField(field, honorReferenceNullability),
+            _ => CreateScalarField(field, honorReferenceNullability),
+        };
+    }
+
+    // Builds one of the three single-level nested shapes (design §2.9). Every reject here is fail-closed
+    // BEFORE any row group is written (§2.6), and every raw Parquet.Net Field-construction fault is wrapped
+    // into the typed contract (§2.4, Security note 4) so no library exception escapes the write door.
+    private static Field CreateNestedField(StructField field, bool honorReferenceNullability)
+    {
+        string label = DiagnosticText.Sanitize(field.Name);
+
+        // §2.5/§2.7 — NONE-mode only. ColumnMapping.EnsureLeaf already rejects a nested top-level column in
+        // BOTH name and id mode, so this is a structural backstop rather than a reachable door: nested leaf
+        // field_id stamping (and therefore mapped-mode nested write) is #676's scope.
+        if (ColumnMapping.TryGetId(field, out _))
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for nested column '{label}': column-mapping id mode for a nested column is "
+                + "not supported (deferred, #676).");
+        }
+
+        // §2.4a — Field.IsNullable has no public setter in Parquet.Net 6.1.0, so a nested container is always
+        // OPTIONAL on the wire. Emitting a declared-REQUIRED container as OPTIONAL is exactly the footer↔log
+        // divergence #730 exists to remove, so refuse it rather than write a file whose repetition contradicts
+        // the committed schemaString.
+        if (!field.Nullable)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for nested column '{label}': a non-nullable ('nullable':false) nested "
+                + $"container ('{field.DataType.TypeName}') cannot be written — Parquet.Net emits every nested "
+                + "container as OPTIONAL, which would diverge from the declared schema (#730).");
+        }
+
+        try
+        {
+            switch (field.DataType)
+            {
+                case ArrayType array:
+                    return new PqListField(
+                        field.Name,
+                        CreateNestedLeaf(array.ElementType, array.ContainsNull, "element", $"array column '{label}' element", honorReferenceNullability));
+                case MapType map:
+                    return new PqMapField(
+                        field.Name,
+                        CreateNestedLeaf(map.KeyType, nullable: false, "key", $"map column '{label}' key", honorReferenceNullability),
+                        CreateNestedLeaf(map.ValueType, map.ValueContainsNull, "value", $"map column '{label}' value", honorReferenceNullability));
+                case StructType structType:
+                    if (structType.Count == 0)
+                    {
+                        // NEW-5: Parquet.Net's StructField ctor raises a raw ArgumentException for this; reject
+                        // it on the typed contract instead, matching EnsureReadSupported's read-side reject.
+                        throw DeltaStorageException.UnsupportedFeature(
+                            $"Parquet mapping for struct column '{label}': a zero-field struct is not supported.");
+                    }
+
+                    var children = new Field[structType.Count];
+                    for (int i = 0; i < structType.Count; i++)
+                    {
+                        StructField child = structType[i];
+                        // §2.8: identify the offending child by ORDINAL, never by name — the child name is
+                        // foreign schema text and a struct can carry thousands of them.
+                        children[i] = CreateNestedLeaf(
+                            child.DataType, child.Nullable, child.Name,
+                            $"struct column '{label}' field {i}", honorReferenceNullability);
+                    }
+
+                    return new PqStructField(field.Name, children);
+                default:
+                    // Unreachable: CreateField routes only Array/Map/Struct here.
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet mapping for column '{label}' of type '{field.DataType.TypeName}' is not supported.");
+            }
+        }
+        catch (ArgumentException)
+        {
+            // A4/Security note 4: Parquet.Net's own Field constructors raise raw ArgumentExceptions (a map's
+            // key cannot be nullable; a struct requires at least one element; an empty field name). Map them
+            // onto the typed contract with a bounded message that echoes no library text.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for nested column '{label}' of kind '{field.DataType.TypeName}': the nested "
+                + "Parquet shape could not be constructed.");
+        }
+    }
+
+    // Builds one nested LEAF field (an array element, a map key/value, or a struct field). A nested child that
+    // is itself nested is the #585 boundary and fails closed here — before any bytes. The leaf carries NO
+    // field_id (design §2.5/F9): the synthesized StructField below has no column-mapping metadata, so
+    // CreateScalarField's stamp is structurally unreachable for a nested leaf.
+    private static DataField CreateNestedLeaf(
+        DataType type, bool nullable, string name, string context, bool honorReferenceNullability)
+    {
+        if (type is ArrayType or MapType or StructType)
+        {
+            // #683/#686: `type` is statically nested here, so SimpleString would recurse into every nested
+            // field name verbatim; echo the bounded KIND instead (`context` already carries the sanitized
+            // column label identifying WHICH column is at fault).
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: a nested type within a nested type ('{type.TypeName}') is not "
+                + "supported (deferred, #585).");
+        }
+
+        return CreateScalarField(new StructField(name, type, nullable), honorReferenceNullability);
+    }
+
+    /// <summary>
+    /// Builds the Parquet <see cref="DataField"/> for a <b>scalar</b> <paramref name="field"/>, choosing the
+    /// nullable Parquet field when <see cref="StructField.Nullable"/> is set, and rejecting every nested type.
+    /// This is the entry point the READ path uses: because it never returns a nested field, a caller may echo
+    /// a requested scalar's <c>SimpleString</c> raw (a bounded literal), which the nested
+    /// <see cref="CreateField"/> would not permit.
+    /// </summary>
+    /// <param name="field">The engine field to map.</param>
+    /// <param name="honorReferenceNullability">See <see cref="CreateField"/>.</param>
+    /// <exception cref="DeltaStorageException">
+    /// The field's type has no supported Parquet mapping
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>): a nested type, the void type, or a decimal
     /// with precision &gt; 28.
     /// </exception>
-    public static DataField CreateField(StructField field, bool honorReferenceNullability)
+    public static DataField CreateScalarField(StructField field, bool honorReferenceNullability)
     {
         ArgumentNullException.ThrowIfNull(field);
         bool nullable = field.Nullable;
@@ -116,9 +256,11 @@ internal static class ParquetTypeMapping
             // unbounded aggregate (a 5,000-field struct renders ~124,000 chars). This arm matches ONLY
             // Array/Map/Struct, so the bounded KIND ("array"/"map"/"struct") carries the same diagnosis
             // alongside the already-sanitized column label, with no unbounded foreign content.
+            // A nested type is unmappable HERE by design: this is the SCALAR entry point (the read path's, and
+            // the nested builder's leaf lane). The write door's nested shapes are built by CreateField.
             ArrayType or MapType or StructType => throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet mapping for column '{DiagnosticText.Sanitize(field.Name)}': nested types (phased, design §2.9) — "
-                + $"'{field.DataType.TypeName}'."),
+                $"Parquet mapping for column '{DiagnosticText.Sanitize(field.Name)}': a nested type is not a scalar "
+                + $"Parquet field — '{field.DataType.TypeName}'."),
             _ => throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for column '{DiagnosticText.Sanitize(field.Name)}' of type '{DiagnosticText.Sanitize(field.DataType.SimpleString)}' "
                 + "is not supported."),
@@ -153,12 +295,14 @@ internal static class ParquetTypeMapping
     /// Validates that a requested read column is a shape the <see cref="ParquetFileReader"/> can decode,
     /// throwing <see cref="StorageErrorKind.UnsupportedFeature"/> otherwise — BEFORE any row group is
     /// decoded, so an unsupported projection fails deterministically without materializing a partial batch.
-    /// Beyond the scalar mappings <see cref="CreateField"/> accepts, the reader also decodes the three
+    /// Beyond the scalar mappings <see cref="CreateScalarField"/> accepts, the reader also decodes the three
     /// single-level nested shapes (#571): a <b>struct of scalars</b>, an <b>array of a scalar</b>, and a
     /// <b>map of scalar→scalar</b>. Any nested type nested WITHIN one of those (array-of-struct, struct-of-
     /// list, map-of-map, …) is deliberately <b>not</b> in this increment and fails closed here rather than
     /// producing a partial/wrong read — Spark-parity fail-closed behavior. This does not widen the
-    /// <b>writer</b>: <see cref="CreateField"/> still rejects every nested type (the writer stays scalar-only).
+    /// <b>writer</b>'s scope: the write door (<see cref="CreateField"/>) accepts exactly these three shapes
+    /// (design §2.9), and <see cref="CreateScalarField"/> — the entry point used here — still rejects every
+    /// nested type.
     /// </summary>
     /// <exception cref="DeltaStorageException">The requested column's type (or a nested leaf type) has no
     /// supported Parquet read mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
@@ -198,14 +342,14 @@ internal static class ParquetTypeMapping
                 // honorReferenceNullability: false — this is a READ-path validation that only asks "does this
                 // type map at all"; the returned field is discarded, so the repetition it carries is
                 // immaterial and the read default is kept for continuity with ValidateFileField.
-                _ = CreateField(field, honorReferenceNullability: false);
+                _ = CreateScalarField(field, honorReferenceNullability: false);
                 break;
         }
     }
 
     // A requested nested LEAF type (array element, map key/value, or struct field) must itself be a supported
     // SCALAR — a nested-within-nested leaf fails closed (#571 scopes only single-level nesting). Reuses
-    // CreateField's scalar validation (rejecting void and decimal precision > 28) so the read path accepts
+    // CreateScalarField's scalar validation (rejecting void and decimal precision > 28) so the read path accepts
     // exactly the scalars the write path can round-trip.
     private static void EnsureScalarReadable(DataType type, string context)
     {
@@ -221,7 +365,7 @@ internal static class ParquetTypeMapping
 
         // honorReferenceNullability: false — a discarded probe of the LEAF type's mappability; the
         // returned field's repetition is never observed.
-        _ = CreateField(new StructField("_leaf", type, nullable: true), honorReferenceNullability: false);
+        _ = CreateScalarField(new StructField("_leaf", type, nullable: true), honorReferenceNullability: false);
     }
 
     /// <summary>
@@ -493,17 +637,57 @@ internal static class ParquetTypeMapping
     }
 
     /// <summary>
-    /// Reconstructs the DeltaSharp data <see cref="StructType"/> a written Parquet footer encodes (each
-    /// <see cref="ParquetSchema.DataFields"/> mapped via <see cref="ToDataType"/>, in footer order). This is
-    /// the ACTUAL physical schema of the bytes on disk, used by the write-door for #497 physical
-    /// write-schema validation. Compared by name + logical type only: the reconstructed
-    /// <see cref="StructField.Nullable"/> is the footer's physical REPETITION, which since #730 matches the
-    /// declared schema for files DeltaSharp writes but need not on a foreign or pre-#730 file, and field
-    /// metadata is not carried in a footer at all — neither is footer-faithful.
+    /// Reconstructs the DeltaSharp data <see cref="StructType"/> a written Parquet footer encodes, walking
+    /// <see cref="ParquetSchema.Fields"/> <b>recursively</b> — the inverse of <see cref="CreateField"/>, so a
+    /// nested (<c>list</c>/<c>map</c>/<c>struct</c>) footer column maps back to its DECLARED LOGICAL shape
+    /// rather than to its flattened leaves. This is the ACTUAL physical schema of the bytes on disk, used by
+    /// the write-door for #497 physical write-schema validation. Compared by name + logical type only: the
+    /// reconstructed <see cref="StructField.Nullable"/> is the footer's physical REPETITION, which since #730
+    /// matches the declared schema for files DeltaSharp writes but need not on a foreign or pre-#730 file, and
+    /// field metadata is not carried in a footer at all — neither is footer-faithful.
     /// </summary>
-    /// <exception cref="DeltaStorageException">A footer field has no supported DeltaSharp mapping
+    /// <remarks>
+    /// <para><b>Consumer scope (design §2.4, Decision 5).</b> Recursion is confined to the #497 write door
+    /// (<c>ParquetFileReader.ReadDataSchemaAsync</c>), which reads DeltaSharp's OWN just-written bytes. The
+    /// one foreign, attacker-controlled footer-schema consumer — CDF-EE-08 (#662) — keeps its historical
+    /// leaf-flattening shape via <see cref="ToDataLeafSchema"/>, so its accept/reject acceptance set is
+    /// unchanged by this recursion.</para>
+    /// <para><b>Depth bound (N2).</b> The walk is depth-capped at <see cref="MaxFooterTypeDepth"/> type levels
+    /// (mirroring <c>DeltaWriteSchemaEligibility.MaxDepth</c>) and the cap is enforced on ENTRY to each level,
+    /// so the recursion can never exceed that many frames — an uncatchable <see cref="StackOverflowException"/>
+    /// is a pod abort the caller's fail-closed boundary could not catch, whereas a footer deeper than the cap
+    /// fails closed on the typed <see cref="StorageErrorKind.UnsupportedFeature"/> contract.</para>
+    /// </remarks>
+    /// <exception cref="DeltaStorageException">A footer field has no supported DeltaSharp mapping, or the
+    /// footer's type tree is deeper than <see cref="MaxFooterTypeDepth"/>
     /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
     public static StructType ToDataSchema(ParquetSchema schema)
+    {
+        ArgumentNullException.ThrowIfNull(schema);
+        var fields = new List<StructField>(schema.Fields.Count);
+        foreach (Field field in schema.Fields)
+        {
+            fields.Add(new StructField(field.Name, ToDataType(field, depth: 1), IsFieldNullable(field)));
+        }
+
+        return new StructType(fields);
+    }
+
+    /// <summary>
+    /// Reconstructs the DeltaSharp data <see cref="StructType"/> a Parquet footer encodes by <b>flattening it
+    /// to leaves</b> (each <see cref="ParquetSchema.DataFields"/> mapped via <see cref="ToDataType(DataField)"/>,
+    /// in footer order, named by its leaf-local name) — the historical <c>ToDataSchema</c> behavior, retained
+    /// verbatim for CDF-EE-08 (#662).
+    /// </summary>
+    /// <remarks>
+    /// Design §2.4 / Decision 5: <c>ParquetFileReader.ReadDataLeafColumnsAsync</c> is the ONLY foreign,
+    /// attacker-controlled footer-schema consumer, and it interpolates a leaf's reconstructed type into a
+    /// user-visible message. Keeping it on this leaf-flattening shaping function makes its accept/reject
+    /// acceptance set <b>invariant</b> across the nested-write change and keeps every type it can see atomic.
+    /// </remarks>
+    /// <exception cref="DeltaStorageException">A footer leaf has no supported DeltaSharp mapping
+    /// (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    public static StructType ToDataLeafSchema(ParquetSchema schema)
     {
         ArgumentNullException.ThrowIfNull(schema);
         var fields = new List<StructField>();
@@ -514,6 +698,57 @@ internal static class ParquetTypeMapping
 
         return new StructType(fields);
     }
+
+    /// <summary>The hard cap on a footer type tree's depth for the recursive <see cref="ToDataSchema"/>,
+    /// mirroring <c>DeltaWriteSchemaEligibility.MaxDepth</c>. A deeper footer fails closed (N2).</summary>
+    internal const int MaxFooterTypeDepth = 64;
+
+    // Maps one footer Field (leaf or container) at nesting `depth` (1 = a top-level column). The cap is
+    // checked BEFORE recursing, so the call depth is bounded by MaxFooterTypeDepth + 1 frames.
+    private static DataType ToDataType(Field field, int depth)
+    {
+        if (depth > MaxFooterTypeDepth)
+        {
+            // Message hygiene (#653): the footer is foreign on some paths, so no field name is echoed — the
+            // bound itself is the whole diagnosis.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"A Parquet footer declares a type tree deeper than the supported limit of {MaxFooterTypeDepth} "
+                + "type levels.");
+        }
+
+        switch (field)
+        {
+            case DataField leaf:
+                return ToDataType(leaf);
+            case PqListField list:
+                return DataTypes.CreateArrayType(
+                    ToDataType(list.Item, depth + 1), containsNull: IsFieldNullable(list.Item));
+            case PqMapField map:
+                return DataTypes.CreateMapType(
+                    ToDataType(map.Key, depth + 1),
+                    ToDataType(map.Value, depth + 1),
+                    valueContainsNull: IsFieldNullable(map.Value));
+            case PqStructField structField:
+                var children = new List<StructField>(structField.Fields.Count);
+                foreach (Field child in structField.Fields)
+                {
+                    children.Add(new StructField(
+                        child.Name, ToDataType(child, depth + 1), IsFieldNullable(child)));
+                }
+
+                return DataTypes.CreateStructType(children);
+            default:
+                // Message hygiene (#653): a foreign footer's field name is never echoed; the bounded Parquet
+                // schema-kind vocabulary is sufficient to diagnose the unmappable shape.
+                throw DeltaStorageException.UnsupportedFeature(
+                    $"A Parquet footer column has schema kind '{field.SchemaType}', which has no supported "
+                    + "DeltaSharp type mapping.");
+        }
+    }
+
+    // A container's own repetition. Parquet.Net models a top-level nested container as OPTIONAL (it exposes no
+    // public IsNullable setter), so this is the footer's physical repetition — never re-derived.
+    private static bool IsFieldNullable(Field field) => field.IsNullable;
 
     private static DataField Value<T>(string name, bool nullable)
         where T : unmanaged =>

@@ -890,17 +890,22 @@ internal sealed class ChangeFeedReader
 
                 if (!expectedField.DataType.Equals(fileType))
                 {
-                    // `fileType` is a ParquetLeafColumn.Type: ParquetTypeMapping.ToDataSchema builds it from
-                    // Parquet.Net's LEAF DataFields, so it is atomic/decimal BY DATA SOURCE and SimpleString
-                    // is a bounded literal there (and `decimal(10,2)` is what makes a decimal mismatch
-                    // diagnosable). `expectedField.DataType` is NOT: it is copied verbatim out of the foreign
+                    // `fileType` is a ParquetLeafColumn.Type: ParquetTypeMapping.ToDataLeafSchema builds it
+                    // from Parquet.Net's LEAF DataFields, so it is atomic/decimal BY DATA SOURCE. It is
+                    // nonetheless routed through the BOUNDED DescribeType (which renders an atomic/decimal
+                    // type as exactly its SimpleString, so `decimal(10,2)` still diagnoses a decimal
+                    // mismatch): the nested-write change made a RECURSIVE footer shaping function exist in
+                    // this codebase, and a defensive future re-pointing of this door at it must not be able
+                    // to echo an unbounded foreign nested field name here. `expectedField.DataType` is NOT
+                    // leaf-shaped either: it is copied verbatim out of the foreign
                     // schemaString by BuildDataSchema, which does not flatten — so it must go through the
                     // bounded renderer. (Unreachable with a struct TODAY, because id mode implies
                     // ResolvePhysicalNames already rejected a nested top-level column; routed anyway so the
                     // two branches cannot drift if that upstream guard is ever relaxed.)
                     throw NewCdcSchemaMismatch(
                         version,
-                        $"the data column with column-mapping id {id} has leaf type {fileType.SimpleString} but "
+                        $"the data column with column-mapping id {id} has leaf type "
+                        + $"{DiagnosticText.DescribeType(fileType)} but "
                         + $"the version's metadata declares {DiagnosticText.DescribeType(expectedField.DataType)}");
                 }
 
@@ -971,7 +976,8 @@ internal sealed class ChangeFeedReader
                 // message from a single crafted commit.
                 throw NewCdcSchemaMismatch(
                     version,
-                    $"data column '{DiagnosticText.Sanitize(expectedField.Name)}' has leaf type {fileType.SimpleString} but the version's "
+                    $"data column '{DiagnosticText.Sanitize(expectedField.Name)}' has leaf type "
+                    + $"{DiagnosticText.DescribeType(fileType)} but the version's "
                     + $"metadata declares {DiagnosticText.DescribeType(expectedField.DataType)}");
             }
 

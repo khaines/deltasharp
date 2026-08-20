@@ -1541,12 +1541,23 @@ public sealed class StorageHygieneSweepTests
             AssertNeutralizedAndBounded(type.SimpleString, p);
         }
 
-        // (2) …and the NESTED types are intercepted before those arms, by an arm that renders only the KIND.
+        // (2) …and the OUT-OF-SCOPE nested types are intercepted before those arms, by an arm that renders
+        // only the KIND. Since #841 a single-level struct-of-scalars is WRITABLE, so the poison is carried on
+        // the shape that still fails closed: a nested type within a nested type (#585). The mapping must
+        // still name neither the offending child nor any of the 40 poisoned sibling names.
+        var deeplyNested = new StructType([new StructField("deep", nested, nullable: true)]);
         DeltaStorageException mapping = Assert.ThrowsAny<DeltaStorageException>(
-            () => ParquetTypeMapping.CreateField(new StructField("c", nested, nullable: true), honorReferenceNullability: false));
-        Assert.Contains("nested types (phased", mapping.Message, StringComparison.Ordinal);
+            () => ParquetTypeMapping.CreateField(
+                new StructField("c", deeplyNested, nullable: true), honorReferenceNullability: false));
+        Assert.Contains("a nested type within a nested type", mapping.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("' of type '", mapping.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(mapping.Message, p);
+
+        // The in-scope struct-of-scalars, by contrast, now MAPS — and its poisoned child names travel only
+        // into the Parquet schema (where they are data, not diagnostics), never into a message.
+        Assert.NotNull(
+            ParquetTypeMapping.CreateField(
+                new StructField("c", nested, nullable: true), honorReferenceNullability: false));
 
         DeltaStorageException shape = Assert.ThrowsAny<DeltaStorageException>(
             () => NestedParquetColumnReader.ValidateShape(
