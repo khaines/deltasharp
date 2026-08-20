@@ -1245,28 +1245,25 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.DoesNotContain(3, ids.Values);
     }
 
-    // Fail-closed parity preserved for an OUT-OF-SCOPE id-mode shape (#572): a nested (struct) top-level
-    // column under id mapping is rejected fail-closed at create rather than mis-stamped — exactly as name
-    // mode rejects it. Only FLAT top-level id-mode columns are in scope for this build.
+    // #676/#839: a single-level struct<scalars> top-level column now COMMITS + reads under id mode
+    // (containment-scoped). An ARRAY/MAP top-level column under id mode remains out of scope: AssignFreshMapping
+    // mints the mapping (it is mode-independent), but the commit's ValidateColumnMappingSchema gate fails closed
+    // naming #839 — so the id-mode CREATE fails at commit rather than bricking as a permanently-unreadable table.
     [Fact]
-    public async Task IdMode_Create_NestedTopLevelColumn_IsRejectedFailClosed()
+    public async Task IdMode_Create_NestedArrayColumn_FailsClosed_839()
     {
         var nested = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, nullable: false),
-            new StructField("payload", new StructType(new[]
-            {
-                new StructField("inner", DataTypes.LongType, nullable: true),
-            }), nullable: true),
+            new StructField("tags", new ArrayType(DataTypes.LongType), nullable: true),
         });
 
-        // AssignFreshMapping rejects a nested top-level column via EnsureLeaf BEFORE any staging, so no data
-        // batch is needed (and none could be built — the columnar batch would reject the struct column too).
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames());
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(() => target.CreateIdMappedTableAsync(
             nested, Array.Empty<string>(), Array.Empty<ColumnBatch>(), new SeededPhysicalNameSource(Seed)));
-        Assert.Contains("nested", ex.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("#839", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("id mode", ex.Message, StringComparison.OrdinalIgnoreCase);
 
         // The table was NOT created (fail-closed leaves no _delta_log).
         using var backend = new LocalFileSystemBackend(_root);
@@ -2976,10 +2973,12 @@ public sealed class ColumnMappingTests : IDisposable
     }
 
     [Fact]
-    public void EvolveNameModeMapping_NestedNewColumn_FailsClosed_Issue541()
+    public void EvolveNameModeMapping_NestedWithinNestedNewColumn_FailsClosed_585()
     {
-        // Nested column mapping is unsupported in this build, so an evolved schema whose NEW column is a nested
-        // (struct/array/map) type is rejected fail-closed rather than minted.
+        // #676: a NEW single-level struct<scalar> child now evolves successfully (minting only the new child —
+        // see NameMode_EvolveAddStructChild_* below). A NEW NESTED-WITHIN-NESTED column (e.g.
+        // payload: struct<inner: struct<x>>) remains out of scope (#585) and is rejected fail-closed rather
+        // than minted — the assignment/evolve door refuses it before any id is minted.
         (StructType current, long maxColumnId) =
             ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed));
         System.Collections.Immutable.ImmutableSortedDictionary<string, string> config =
@@ -2990,13 +2989,21 @@ public sealed class ColumnMappingTests : IDisposable
             new StructField("score", DataTypes.LongType, nullable: true),
             new StructField("name", DataTypes.StringType, nullable: true),
             new StructField(
-                "payload", new StructType(new[] { new StructField("x", DataTypes.LongType, nullable: true) }),
+                "payload",
+                new StructType(new[]
+                {
+                    new StructField(
+                        "inner",
+                        new StructType(new[] { new StructField("x", DataTypes.LongType, nullable: true) }),
+                        nullable: true),
+                }),
                 nullable: true),
         });
 
-        Assert.Throws<DeltaProtocolException>(
+        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
             () => ColumnMapping.EvolveNameModeMapping(
                 nestedEvolved, current, config, new SeededPhysicalNameSource(EvolveSeed)));
+        Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

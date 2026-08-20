@@ -486,13 +486,17 @@ internal static class ColumnMapping
             // Id-mode array/map gate (#839): an array/map column carries no representable interior id (C1;
             // nested.ids unimplemented) and the Parquet group node cannot carry one, so id-mode array/map is
             // out of scope. Reject at BOTH commit and load so an id-mode CREATE/ALTER fails at commit rather
-            // than bricking as a permanently-unreadable table.
+            // than bricking as a permanently-unreadable table. Thrown as DeltaProtocolException (like every
+            // other reject in this method) so it wraps to DeltaReadException at load and surfaces as a protocol
+            // rejection at commit.
             if (mode == ColumnMappingMode.Id && field.DataType is ArrayType or MapType)
             {
-                throw DeltaStorageException.UnsupportedFeature(
-                    $"Column '{DiagnosticText.Sanitize(path)}' is an {field.DataType.TypeName} under column-mapping id "
-                    + $"mode; id-mode nested array/map column mapping is deferred to #839. Use name mode for nested "
-                    + $"array/map columns.");
+                throw DeltaProtocolException.Unsupported(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column '{DiagnosticText.Sanitize(path)}' is an {field.DataType.TypeName} under column-mapping id "
+                        + $"mode; id-mode nested array/map column mapping is deferred to #839. Use name mode for nested "
+                        + $"array/map columns."));
             }
 
             // Reject a foreign delta.columnMapping.nested.ids on any mapped field (C1 corollary): DeltaSharp

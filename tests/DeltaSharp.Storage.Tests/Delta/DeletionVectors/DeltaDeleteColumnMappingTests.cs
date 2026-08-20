@@ -299,34 +299,29 @@ public sealed class DeltaDeleteColumnMappingTests : IDisposable
     [InlineData("struct")]
     [InlineData("array")]
     [InlineData("map")]
-    public void ResolvePhysicalNames_NameMode_RejectsNestedTopLevelColumn(string kind)
+    public void ResolvePhysicalNames_NameMode_NestedTopLevelColumn_ReturnsContainerPhysicalName(string kind)
     {
-        // Security/QueryExec nit (#529): the DELETE (and read) path resolves physical names through the shared
-        // ColumnMappingProjection, which fails closed on a nested (struct/array/map) top-level column under
-        // name mapping — nested column mapping is unsupported in this build — rather than risk mis-associating
-        // columns and deleting the wrong rows. Pin that guard directly for each nested kind.
+        // #676: nested (struct/array/map) top-level column mapping is now SUPPORTED in name mode, so the shared
+        // ColumnMappingProjection.ResolvePhysicalNames no longer fails closed on a nested column — it returns the
+        // container's TOP-LEVEL physical name (the interior is relabelled structurally by BuildDataSchema). The
+        // DELETE (and read) path resolves physical names through this same projection, so pin the positive
+        // contract directly for each nested kind: the mapped container physical name is returned in field order.
         DataType nested = kind switch
         {
             "struct" => new StructType(new[] { new StructField("x", DataTypes.LongType, nullable: true) }),
             "array" => new ArrayType(DataTypes.LongType),
             _ => new MapType(DataTypes.StringType, DataTypes.LongType),
         };
-        // Give BOTH fields valid name-mode physicalName metadata so the ONLY reason ResolvePhysicalNames can
-        // throw is the nested-type guard: if that guard were removed, PhysicalName would resolve every field
-        // successfully (no incidental "missing physicalName" throw), so this oracle stays load-bearing even if
-        // the message assertions below were ever loosened. `payload` is FIRST so the nested check fires before
-        // any PhysicalName call.
         var schema = new StructType(new[]
         {
             NameMapped("payload", nested, nullable: true),
             NameMapped("id", DataTypes.LongType, nullable: false),
         });
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMappingProjection.ResolvePhysicalNames(schema, ColumnMappingMode.Name));
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(schema, ColumnMappingMode.Name);
 
-        Assert.Contains("nested", ex.Message, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("payload", ex.Message, StringComparison.Ordinal);
+        // The container relabels to its own physical name (col-<logical>), interior resolved structurally.
+        Assert.Equal(new[] { "col-payload", "col-id" }, physicalNames);
     }
 
     [Fact]

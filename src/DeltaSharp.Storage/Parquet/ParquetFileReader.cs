@@ -8,8 +8,8 @@ using DeltaSharp.Types;
 using Parquet;
 using Parquet.Data;
 using Parquet.Schema;
-using StructField = DeltaSharp.Types.StructField;
 using PqStructField = Parquet.Schema.StructField;
+using StructField = DeltaSharp.Types.StructField;
 
 namespace DeltaSharp.Storage.Parquet;
 
