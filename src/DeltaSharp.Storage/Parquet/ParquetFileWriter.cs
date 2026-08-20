@@ -22,7 +22,7 @@ namespace DeltaSharp.Storage.Parquet;
 /// <c>add</c> action (STORY-05.6.3 AC1), collected by <see cref="ParquetStatisticsCollector"/> under a
 /// <see cref="StatisticsPolicy"/>.</para>
 /// </summary>
-internal sealed class ParquetFileWriter
+internal class ParquetFileWriter
 {
     /// <summary>The default maximum number of logical rows per row group. This is a <b>row-count
     /// proxy</b> for the design's ≈128&#160;MiB byte target (§2.9.2): a byte-aware flush that sizes row
@@ -53,12 +53,14 @@ internal sealed class ParquetFileWriter
     private readonly int _rowGroupRowLimit;
 
     /// <summary>
-    /// A TEST-ONLY seam that may perturb a row group's collected segments (and report the row count they now
-    /// describe) after <see cref="CollectSegments"/>. Null in production — the §2.4b reconciliation has no
-    /// other way to be driven from a real <see cref="WriteAsync"/>, because every in-tree code path produces
-    /// segments that trivially sum to the batch total.
+    /// A TEST-ONLY extension point invoked after <see cref="CollectSegments"/> for each row group, returning
+    /// the number of logical rows the (possibly perturbed) segments now describe. The base implementation is
+    /// the identity, and NO production type derives from this writer, so a shipping <see cref="ParquetFileWriter"/>
+    /// instance carries no mutable corruption switch (N1) — a test must author a subclass to perturb anything.
+    /// The seam exists because §2.4b's post-write reconciliation cannot otherwise be driven from a real
+    /// <see cref="WriteAsync"/>: every in-tree code path produces segments that trivially sum to the batch total.
     /// </summary>
-    internal Func<List<Segment>, int, int>? RowGroupSegmentFault { get; init; }
+    protected virtual int OnRowGroupSegmentsCollected(List<Segment> segments, int size) => size;
 
     /// <summary>Creates a writer with the given row-group row cap.</summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="rowGroupRowLimit"/> is not positive.</exception>
@@ -188,12 +190,12 @@ internal sealed class ParquetFileWriter
                 int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
                 CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
 
-                // §2.4b test seam. Production leaves this null, so `written == size` and the call is a no-op.
-                // A fault delegate may drop or duplicate a segment (and report the row count the perturbed
-                // segments now describe) to produce a file that is LOCALLY level-valid in every leaf yet whose
-                // footer NumRows no longer equals the batch-derived total — the exact class §2.3c is blind to
-                // and only the post-write reconciliation catches.
-                int written = RowGroupSegmentFault is null ? size : RowGroupSegmentFault(segments, size);
+                // §2.4b test seam. The base hook is the identity, so `written == size` in production. A test
+                // SUBCLASS may drop or duplicate a segment (and report the row count the perturbed segments now
+                // describe) to produce a file that is LOCALLY level-valid in every leaf yet whose footer NumRows
+                // no longer equals the batch-derived total — the exact class §2.3c is blind to and only the
+                // post-write reconciliation catches.
+                int written = OnRowGroupSegmentsCollected(segments, size);
 
                 using ParquetRowGroupWriter rowGroup = writer.CreateRowGroup();
                 for (int c = 0; c < columnCount; c++)
@@ -268,7 +270,7 @@ internal sealed class ParquetFileWriter
             cancellationToken.ThrowIfCancellationRequested();
             int size = (int)Math.Min(_rowGroupRowLimit, totalRows - emitted);
             CollectSegments(batchRowCounts, ref cursorBatch, ref cursorRow, size, segments);
-            int written = RowGroupSegmentFault is null ? size : RowGroupSegmentFault(segments, size);
+            int written = OnRowGroupSegmentsCollected(segments, size);
             for (int c = 0; c < schema.Count; c++)
             {
                 if (schema[c].DataType is StructType or ArrayType or MapType)

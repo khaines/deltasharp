@@ -637,6 +637,52 @@ public sealed class NestedParquetWriteTests
         return new ListColumnVector(type, elements, offsets, nulls);
     }
 
+    [Fact]
+    public async Task WideStruct_RoundTrips_WithoutHoldingOneLevelBufferPerChild()
+    {
+        // D2. Struct width is unbounded (CreateField rejects only the ZERO-field struct), and the lane used to
+        // rent one int[rowGroupRows] per child and hold them all live so the children could be compared to each
+        // other — O(width x row-group rows), ~512 MiB for a 1000-field struct on a full row group. The lane now
+        // captures the struct's null mask ONCE as a bitmap and validates each child incrementally, so it holds
+        // exactly one level buffer. This pins that a wide struct still round-trips through every branch of the
+        // level table (present / null-struct / null-field).
+        const int width = 256;
+        var fields = new StructField[width];
+        for (int i = 0; i < width; i++)
+        {
+            fields[i] = new StructField($"f{i}", DataTypes.IntegerType, nullable: true);
+        }
+
+        var inner = DataTypes.CreateStructType(fields);
+        var schema = DataTypes.CreateStructType(new[] { new StructField("s", inner, nullable: true) });
+
+        const int rows = 3;
+        var children = new ColumnVector[width];
+        for (int i = 0; i < width; i++)
+        {
+            MutableColumnVector child = ColumnVectors.Create(DataTypes.IntegerType, rows);
+            child.AppendValue(i);          // present struct, present field
+            child.AppendNull();            // null struct (the child's own cell is irrelevant)
+            child.AppendNull();            // present struct, null field
+            children[i] = child;
+        }
+
+        var vector = new StructColumnVector(inner, children, new[] { false, true, false });
+        ColumnBatch decoded = await WriteThenReadAsync(schema, vector);
+        var actual = (StructColumnVector)decoded.Column(0);
+
+        Assert.Equal(rows, actual.Length);
+        Assert.False(actual.IsNull(0));
+        Assert.True(actual.IsNull(1));
+        Assert.False(actual.IsNull(2));
+        for (int i = 0; i < width; i++)
+        {
+            ColumnVector child = actual.Child(i);
+            Assert.Equal(i, child.GetValue<int>(0));
+            Assert.True(child.IsNull(2));
+        }
+    }
+
     // ----- H1-e: unsliced vectors whose raw offsets do NOT start at 0 / do not end at Elements.Length -----
 
     [Fact]

@@ -19,8 +19,22 @@ internal sealed class NonOwningWindowStream : Stream
     private readonly long _length;
     private long _position;
 
+    /// <exception cref="ArgumentNullException"><paramref name="inner"/> is <see langword="null"/>.</exception>
+    /// <exception cref="ArgumentOutOfRangeException"><paramref name="offset"/> or <paramref name="length"/> is
+    /// negative, or the window runs past the end of <paramref name="inner"/> (N2). A window that overruns its
+    /// backing stream would let the footer reader seek from an END that does not exist, so it fails closed at
+    /// construction rather than mid-parse.</exception>
     internal NonOwningWindowStream(Stream inner, long offset, long length)
     {
+        ArgumentNullException.ThrowIfNull(inner);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        if (inner.CanSeek)
+        {
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(offset, inner.Length);
+            ArgumentOutOfRangeException.ThrowIfGreaterThan(length, inner.Length - offset);
+        }
+
         _inner = inner;
         _offset = offset;
         _length = length;

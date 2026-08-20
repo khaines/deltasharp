@@ -99,62 +99,78 @@ public sealed class NestedCrossLeafGuardTests
             "different lengths");
     }
 
-    // ----- struct: N children, one nullity -----
+    // ----- struct: every child vs the SOURCE null mask -----
+
+    // Packs a per-row struct-null mask into the bitmap shape the shredder captures from the source vectors.
+    private static ulong[] NullMask(params bool[] rows)
+    {
+        var words = new ulong[NestedColumnShredder.NullBitmapWords(rows.Length)];
+        for (int i = 0; i < rows.Length; i++)
+        {
+            if (rows[i])
+            {
+                words[i >> 6] |= 1UL << (i & 63);
+            }
+        }
+
+        return words;
+    }
 
     [Fact]
     public void StructGuard_AcceptsTheNormativeEncoding()
     {
         // Rows {1,"x"} / null / {null,"y"} / {3,null} at structMaxDef 1 — the children disagree about their
-        // OWN nullity at rows 2 and 3 (which is legal and expected) but agree about the STRUCT's at all four.
+        // OWN nullity at rows 2 and 3 (which is legal and expected) but both agree with the STRUCT's own null
+        // mask at all four rows.
+        ulong[] mask = NullMask(false, true, false, false);
         NestedColumnShredder.ValidateStructNullParity(
-            new int[]?[] { new[] { 2, 0, 1, 2 }, new[] { 2, 0, 2, 1 } },
-            childCount: 2,
-            structMaxDef: 1,
-            rowCount: 4,
-            label: "s");
+            new[] { 2, 0, 1, 2 }, mask, ordinal: 0, structMaxDef: 1, label: "s");
+        NestedColumnShredder.ValidateStructNullParity(
+            new[] { 2, 0, 2, 1 }, mask, ordinal: 1, structMaxDef: 1, label: "s");
     }
 
     [Fact]
-    public void StructGuard_RejectsChildrenThatDisagreeOnTheStructsNullity()
+    public void StructGuard_RejectsAChildThatDisagreesWithTheSourceNullMask()
     {
-        // Row 1: child 0 emits def 0 (below structMaxDef 1 — "the STRUCT is null") while child 1 emits def 2
-        // (a present value inside a present struct). Each stream is individually well-formed.
+        // Row 1: the source says the struct is PRESENT, but this child emits def 0 (below structMaxDef 1 —
+        // "the struct is null"). The stream is individually well-formed, and a sibling encoding def 2 at the
+        // same row would keep the file structurally plausible while Spark read the wrong rows.
         AssertRejected(
             () => NestedColumnShredder.ValidateStructNullParity(
-                new int[]?[] { new[] { 2, 0 }, new[] { 2, 2 } },
-                childCount: 2,
-                structMaxDef: 1,
-                rowCount: 2,
-                label: "s"),
-            "disagree on the struct's presence at row 1");
+                new[] { 2, 0 }, NullMask(false, false), ordinal: 0, structMaxDef: 1, label: "s"),
+            "at row 1 encodes the struct as null but the source column vector reports it present");
     }
 
     [Fact]
     public void StructGuard_RejectsTheDisagreementInEitherDirection()
     {
-        // The mirror of the cell above — the guard is symmetric, so neither child is privileged.
+        // The mirror: the source says NULL and the child encodes a present struct. Binding to the source (D2)
+        // rather than to a sibling is what makes both directions detectable on a SINGLE child — the old
+        // sibling-to-sibling comparison was satisfied by construction whenever every child walked the same mask.
         AssertRejected(
             () => NestedColumnShredder.ValidateStructNullParity(
-                new int[]?[] { new[] { 2, 2 }, new[] { 2, 0 } },
-                childCount: 2,
-                structMaxDef: 1,
-                rowCount: 2,
-                label: "s"),
-            "disagree on the struct's presence at row 1");
+                new[] { 2, 2 }, NullMask(false, true), ordinal: 1, structMaxDef: 1, label: "s"),
+            "at row 1 encodes the struct as present but the source column vector reports it null");
     }
 
     [Fact]
     public void StructGuard_RejectsADisagreementOnAThirdChild()
     {
-        // Parity is over ALL children, not just the first pair.
+        // Parity is checked for EVERY child, not just the first pair — the ordinal is reported so the failing
+        // child is attributable.
         AssertRejected(
             () => NestedColumnShredder.ValidateStructNullParity(
-                new int[]?[] { new[] { 0 }, new[] { 0 }, new[] { 1 } },
-                childCount: 3,
-                structMaxDef: 1,
-                rowCount: 1,
-                label: "s"),
-            "disagree on the struct's presence at row 0");
+                new[] { 1 }, NullMask(true), ordinal: 2, structMaxDef: 1, label: "s"),
+            "field 2: the shredded definition level at row 0");
+    }
+
+    [Fact]
+    public void StructGuard_IsInertForARequiredStruct()
+    {
+        // structMaxDef 0 means the struct itself cannot be null, so there is no parity to check and the guard
+        // must not read the mask at all.
+        NestedColumnShredder.ValidateStructNullParity(
+            new[] { 0, 0 }, Array.Empty<ulong>(), ordinal: 0, structMaxDef: 0, label: "s");
     }
 
     private static void AssertRejected(Action act, string expectedFragment)

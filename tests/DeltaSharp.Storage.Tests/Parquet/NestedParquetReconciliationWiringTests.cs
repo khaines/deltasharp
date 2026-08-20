@@ -25,25 +25,41 @@ public sealed class NestedParquetReconciliationWiringTests
 {
     private static readonly ArrayType IntArrayType = DataTypes.CreateArrayType(DataTypes.IntegerType);
 
-    // Truncates the last segment of every row group by one row — the row-LOSING defect.
-    private static int DropOneRow(List<ParquetFileWriter.Segment> segments, int size)
+    /// <summary>
+    /// The test-only writer subclass that perturbs a row group's segments. The seam is a <c>protected virtual</c>
+    /// hook rather than a settable delegate, so no shipping <see cref="ParquetFileWriter"/> instance carries a
+    /// mutable corruption switch — perturbing anything requires authoring this subclass (N1).
+    /// </summary>
+    private sealed class FaultingParquetFileWriter : ParquetFileWriter
     {
-        ParquetFileWriter.Segment last = segments[^1];
-        if (last.Length <= 1)
+        private readonly bool _drop;
+
+        internal FaultingParquetFileWriter(bool drop, int rowGroupRowLimit = DefaultRowGroupRowLimit)
+            : base(rowGroupRowLimit) => _drop = drop;
+
+        protected override int OnRowGroupSegmentsCollected(List<Segment> segments, int size)
+            => _drop ? DropOneRow(segments, size) : DuplicateOneSegment(segments, size);
+
+        // Truncates the last segment of every row group by one row — the row-LOSING defect.
+        private static int DropOneRow(List<Segment> segments, int size)
         {
-            return size;
+            Segment last = segments[^1];
+            if (last.Length <= 1)
+            {
+                return size;
+            }
+
+            segments[^1] = new Segment(last.Batch, last.Start, last.Length - 1);
+            return size - 1;
         }
 
-        segments[^1] = new ParquetFileWriter.Segment(last.Batch, last.Start, last.Length - 1);
-        return size - 1;
-    }
-
-    // Re-emits the last segment — the row-DUPLICATING defect.
-    private static int DuplicateOneSegment(List<ParquetFileWriter.Segment> segments, int size)
-    {
-        ParquetFileWriter.Segment last = segments[^1];
-        segments.Add(last);
-        return size + last.Length;
+        // Re-emits the last segment — the row-DUPLICATING defect.
+        private static int DuplicateOneSegment(List<Segment> segments, int size)
+        {
+            Segment last = segments[^1];
+            segments.Add(last);
+            return size + last.Length;
+        }
     }
 
     [Theory]
@@ -52,10 +68,7 @@ public sealed class NestedParquetReconciliationWiringTests
     public async Task WriteAsync_FailsClosedWhenTheFooterRowCountDivergesFromTheBatches(bool drop)
     {
         (StructType schema, ManagedColumnBatch batch) = NestedBatch();
-        var writer = new ParquetFileWriter
-        {
-            RowGroupSegmentFault = drop ? DropOneRow : DuplicateOneSegment,
-        };
+        var writer = new FaultingParquetFileWriter(drop);
 
         using var output = new MemoryStream();
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
@@ -72,10 +85,7 @@ public sealed class NestedParquetReconciliationWiringTests
         // The fault fires per row group, so with a 2-row cap over 5 rows the divergence accumulates across
         // three groups. This pins that the reference is the WHOLE-FILE batch total, not a per-group check.
         (StructType schema, ManagedColumnBatch batch) = NestedBatch();
-        var writer = new ParquetFileWriter(rowGroupRowLimit: 2)
-        {
-            RowGroupSegmentFault = DropOneRow,
-        };
+        var writer = new FaultingParquetFileWriter(drop: true, rowGroupRowLimit: 2);
 
         using var output = new MemoryStream();
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
@@ -115,7 +125,7 @@ public sealed class NestedParquetReconciliationWiringTests
         }
 
         var batch = new ManagedColumnBatch(schema, new ColumnVector[] { column }, 4);
-        var writer = new ParquetFileWriter { RowGroupSegmentFault = DropOneRow };
+        var writer = new FaultingParquetFileWriter(drop: true);
 
         using var output = new MemoryStream();
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
@@ -136,7 +146,7 @@ public sealed class NestedParquetReconciliationWiringTests
         // only after the write returns, so a reconciliation failure must leave the backend untouched.
         var backend = new InMemoryStorageBackend();
         var writer = new ChangeDataWriter(
-            backend, new ParquetFileWriter { RowGroupSegmentFault = DropOneRow });
+            backend, new FaultingParquetFileWriter(drop: true));
 
         var schema = DataTypes.CreateStructType(new[]
         {

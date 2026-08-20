@@ -51,11 +51,18 @@ internal static class NestedColumnShredder
     /// vector that the row group being written covers.</summary>
     internal readonly record struct ColumnSegment(ColumnVector Vector, int Start, int Length);
 
+    /// <summary>The largest per-row nested fan-out the shredder will encode: the number of array elements or
+    /// map entries one logical row may contribute to a single leaf's level stream.</summary>
+    internal const int MaxNestedFanOutPerRow = 256;
+
     /// <summary>The per-row-group ceiling on a single leaf's total level slots — the pathological fan-out
-    /// bound (Quality N4). A row group is capped at <c>ParquetFileWriter.RowGroupRowLimit</c> logical rows, so
-    /// a leaf whose slot count reaches this bound describes an implausibly wide nested fan-out and fails
-    /// closed rather than driving an unbounded rent.</summary>
-    internal const int MaxLeafSlotsPerRowGroup = 1 << 28;
+    /// bound. Derived from the DEFAULT row-group ceiling times a plausible per-row fan-out rather than a bare
+    /// power of two: the old <c>1 &lt;&lt; 28</c> admitted a 1 GiB <c>int[]</c> per level stream (~4 GiB
+    /// transient across the map lane's four buffers) for a row group holding at most
+    /// <see cref="ParquetFileWriter.DefaultRowGroupRowLimit"/> logical rows. A leaf that reaches this bound
+    /// describes an implausibly wide nested fan-out and fails closed rather than driving that rent.</summary>
+    internal const int MaxLeafSlotsPerRowGroup =
+        ParquetFileWriter.DefaultRowGroupRowLimit * MaxNestedFanOutPerRow;
 
     /// <summary>
     /// Shreds <paramref name="schemaField"/>'s nested column over <paramref name="segments"/> and writes every
@@ -140,14 +147,21 @@ internal static class NestedColumnShredder
             throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet nested write for column '{label}' of kind "
                 + $"'{DiagnosticText.DescribeType(schemaField.DataType)}': the column vector could not be "
-                + "shredded into its Parquet leaves.");
+                + "shredded into its Parquet leaves.",
+                ex);
         }
     }
 
+    // N3: the surfaced reject is bounded and typed, but the CAUSE is retained as the inner exception (see
+    // DeltaStorageException.UnsupportedFeature) so a genuine DeltaSharp defect inside the shredder is still
+    // diagnosable rather than being relabelled "the column vector could not be shredded" with no trace.
+    // ObjectDisposedException is deliberately NOT swallowed: a disposed vector/stream is a caller lifecycle
+    // defect, not a foreign vector shape, and must surface as itself.
     private static bool IsForeignVectorFault(Exception ex) =>
         ex is NotSupportedException or InvalidOperationException or IndexOutOfRangeException
             or ArgumentException or NullReferenceException
-        && ex is not DeltaStorageException;
+        && ex is not DeltaStorageException
+        && ex is not ObjectDisposedException;
 
     // ----- struct -----
 
@@ -161,21 +175,33 @@ internal static class NestedColumnShredder
         CancellationToken cancellationToken)
     {
         int childCount = structType.Count;
-        var leaves = new DataField[childCount];
-        var defs = new int[childCount][];
 
         // N4-a slot provenance (B2): the number of level slots a struct lane emits is derived HERE from the
         // segments the row group actually covers, never from `rowCount`. Comparing a `rowCount`-derived slice
         // length against `rowCount` is the tautology the council found; comparing this independently walked
         // total against it is a real invariant that a dropped/duplicated segment breaks.
         int slots = TotalSegmentRows(segments, label);
-        int structMaxDef = -1;
+
+        // D2: the struct's own null mask, captured ONCE from the SOURCE vectors as a bitmap (one bit per
+        // logical row, ~16 KiB for a full row group) instead of holding one rented int[rowGroupRows] per
+        // child alive until the method returns. Struct width is unbounded, so the old shape peaked at
+        // O(width x row-group rows) — ~512 MiB for a 1000-field struct. It is also a STRONGER guard: the
+        // sibling-to-sibling comparison it replaces was satisfiable by construction (every child walked the
+        // same `vector.IsNull`), whereas binding each child's emitted levels back to the source mask is a
+        // real check on the encoder.
+        int words = NullBitmapWords(slots);
+        ulong[] structNulls = ArrayPool<ulong>.Shared.Rent(words);
+        int[]? def = null;
         try
         {
+            structNulls.AsSpan(0, words).Clear();
+            CaptureStructNulls(segments, slots, label, structNulls.AsSpan(0, words));
+
+            int structMaxDef = -1;
+            def = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
             for (int i = 0; i < childCount; i++)
             {
                 DataField leaf = ExpectLeaf(parquetStruct.Fields[i], label);
-                leaves[i] = leaf;
                 EnsureLeafRepetition(leaf, structType[i].Nullable, label, $"field {i}");
 
                 // §2.3c N4-c / S4: the container level comes from ONE shared helper off the schema-attached
@@ -194,9 +220,8 @@ internal static class NestedColumnShredder
                         + "struct shares the struct's definition level.");
                 }
 
-                defs[i] = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
                 int emitted = ComputeStructLevels(
-                    segments, i, structMaxDef, leaf.MaxDefinitionLevel, label, defs[i].AsSpan(0, slots));
+                    segments, i, structMaxDef, leaf.MaxDefinitionLevel, label, def.AsSpan(0, slots));
                 if (emitted != rowCount)
                 {
                     throw DeltaStorageException.CorruptData(
@@ -204,30 +229,61 @@ internal static class NestedColumnShredder
                         + $"slot(s) for {rowCount} logical row(s); an unrepeated leaf emits exactly one slot "
                         + "per row.");
                 }
-            }
 
-            // §2.3c cross-leaf, PRE-write: every child must agree, at every row, on whether the struct is
-            // null. A per-leaf guard passes a struct where child A emits def < structMaxDef at a row where
-            // sibling B emits def == maxDef — the file persists silently, DeltaSharp reads an availability
-            // error and Spark reads WRONG rows.
-            ValidateStructNullParity(defs, childCount, structMaxDef, rowCount, label);
+                // §2.3c cross-leaf, PRE-write and PER CHILD: this child's emitted levels must agree, at every
+                // row, with the struct's own null mask — and therefore with every sibling. A per-leaf guard
+                // passes a struct where child A emits def < structMaxDef at a row where sibling B emits
+                // def == maxDef: the file persists silently, DeltaSharp reads an availability error and Spark
+                // reads WRONG rows.
+                ValidateStructNullParity(
+                    def.AsSpan(0, rowCount), structNulls.AsSpan(0, words), i, structMaxDef, label);
 
-            for (int i = 0; i < childCount; i++)
-            {
                 cancellationToken.ThrowIfCancellationRequested();
                 await WriteLeafAsync(
-                    rowGroup, leaves[i], structType[i].DataType, defs[i].AsMemory(0, rowCount), rep: null,
+                    rowGroup, leaf, structType[i].DataType, def.AsMemory(0, rowCount), rep: null,
                     rowCount, label, new StructValueSource(segments, i), cancellationToken).ConfigureAwait(false);
             }
         }
         finally
         {
-            foreach (int[]? buffer in defs)
+            if (def is not null)
             {
-                if (buffer is not null)
+                ArrayPool<int>.Shared.Return(def, clearArray: true);
+            }
+
+            ArrayPool<ulong>.Shared.Return(structNulls, clearArray: true);
+        }
+    }
+
+    // D2: the number of 64-bit words a `slots`-bit null bitmap needs (at least one, so an empty row group
+    // still rents a usable buffer).
+    internal static int NullBitmapWords(int slots) => Math.Max((slots + 63) / 64, 1);
+
+    // D2: walks the segments ONCE and records, per logical row, whether the struct itself is null. This is the
+    // SOURCE side of the cross-leaf parity clause — it reads `vector.IsNull`, never a previously emitted
+    // definition level, so it cannot be satisfied by construction from the encoder's own output.
+    private static void CaptureStructNulls(
+        IReadOnlyList<ColumnSegment> segments, int slots, string label, Span<ulong> structNulls)
+    {
+        int slot = 0;
+        foreach (ColumnSegment segment in segments)
+        {
+            StructColumnVector vector = ExpectStructVector(segment.Vector, label);
+            for (int j = 0; j < segment.Length; j++)
+            {
+                if (slot >= slots)
                 {
-                    ArrayPool<int>.Shared.Return(buffer, clearArray: true);
+                    throw DeltaStorageException.CorruptData(
+                        $"Struct column '{label}': the segments describe more rows than the null bitmap was "
+                        + "sized for.");
                 }
+
+                if (vector.IsNull(segment.Start + j))
+                {
+                    structNulls[slot >> 6] |= 1UL << (slot & 63);
+                }
+
+                slot++;
             }
         }
     }
@@ -1135,29 +1191,32 @@ internal static class NestedColumnShredder
     // ----- cross-leaf guards (§2.3c) -----
 
     /// <summary>
-    /// §2.3c cross-leaf struct clause: all children of an OPTIONAL struct must agree, at every row, on
-    /// whether the struct itself is null. <b>internal</b> so it can be driven directly by fault-injected
-    /// negatives — a guard with no negative test is indistinguishable from a no-op (B4).
+    /// §2.3c cross-leaf struct clause: every child of an OPTIONAL struct must agree, at every row, with the
+    /// struct's own null mask — and therefore with every sibling. Validated INCREMENTALLY, one child's
+    /// definition levels at a time, against the source-derived bitmap
+    /// (<see cref="CaptureStructNulls"/>), so the lane holds one level buffer rather than one per child (D2).
+    /// <b>internal</b> so it can be driven directly by fault-injected negatives — a guard with no negative
+    /// test is indistinguishable from a no-op (B4).
     /// </summary>
     internal static void ValidateStructNullParity(
-        int[]?[] defs, int childCount, int structMaxDef, int rowCount, string label)
+        ReadOnlySpan<int> def, ReadOnlySpan<ulong> structNulls, int ordinal, int structMaxDef, string label)
     {
-        if (structMaxDef <= 0 || childCount == 0)
+        if (structMaxDef <= 0)
         {
             return;
         }
 
-        for (int row = 0; row < rowCount; row++)
+        for (int row = 0; row < def.Length; row++)
         {
-            bool structNull = defs[0]![row] < structMaxDef;
-            for (int i = 1; i < childCount; i++)
+            bool encodedNull = def[row] < structMaxDef;
+            bool sourceNull = (structNulls[row >> 6] & (1UL << (row & 63))) != 0;
+            if (encodedNull != sourceNull)
             {
-                if ((defs[i]![row] < structMaxDef) != structNull)
-                {
-                    throw DeltaStorageException.CorruptData(
-                        $"Struct column '{label}': the shredded child leaves disagree on the struct's presence "
-                        + $"at row {row}; all children of an optional struct must agree on whether it is null.");
-                }
+                throw DeltaStorageException.CorruptData(
+                    $"Struct column '{label}' field {ordinal}: the shredded definition level at row {row} "
+                    + $"encodes the struct as {(encodedNull ? "null" : "present")} but the source column "
+                    + $"vector reports it {(sourceNull ? "null" : "present")}; all children of an optional "
+                    + "struct must agree with the struct's own null mask.");
             }
         }
     }

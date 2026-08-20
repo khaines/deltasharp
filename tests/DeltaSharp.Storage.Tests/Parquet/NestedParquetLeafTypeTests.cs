@@ -29,6 +29,31 @@ public sealed class NestedParquetLeafTypeTests
         int ValueCount)
     {
         public override string ToString() => Name;
+
+        /// <summary>
+        /// D3. <c>Assert.Equal</c> over BOXED floating-point values compares by
+        /// <see cref="object.Equals(object)"/>, and <c>((object)(-0.0)).Equals((object)0.0)</c> is
+        /// <see langword="true"/> in .NET — so a shredder that lost the SIGN OF ZERO passed the boundary cell.
+        /// The float/double lanes are therefore compared BIT-EXACTLY (which also pins the exact NaN payload);
+        /// every other lane keeps value equality.
+        /// </summary>
+        public void AssertValue(object? expected, object? actual)
+        {
+            switch (expected)
+            {
+                case double d:
+                    Assert.IsType<double>(actual);
+                    Assert.Equal(BitConverter.DoubleToInt64Bits(d), BitConverter.DoubleToInt64Bits((double)actual!));
+                    break;
+                case float f:
+                    Assert.IsType<float>(actual);
+                    Assert.Equal(BitConverter.SingleToInt32Bits(f), BitConverter.SingleToInt32Bits((float)actual!));
+                    break;
+                default:
+                    Assert.Equal(expected, actual);
+                    break;
+            }
+        }
     }
 
     private static LeafCase Fixed<T>(string name, DataType type, Func<int, T> value, int count = 4)
@@ -184,7 +209,11 @@ public sealed class NestedParquetLeafTypeTests
             }
         }
 
-        Assert.Equal(expected, flattened);
+        Assert.Equal(expected.Count, flattened.Count);
+        for (int i = 0; i < expected.Count; i++)
+        {
+            leaf.AssertValue(expected[i], flattened[i]);
+        }
     }
 
     [Theory]
@@ -223,7 +252,7 @@ public sealed class NestedParquetLeafTypeTests
         for (int i = 0; i < rows - 1; i++)
         {
             Assert.False(actual.IsNull(i));
-            Assert.Equal(expected[i], actualChild.IsNull(i) ? null : leaf.Read(actualChild, i));
+            leaf.AssertValue(expected[i], actualChild.IsNull(i) ? null : leaf.Read(actualChild, i));
         }
     }
 
@@ -269,7 +298,7 @@ public sealed class NestedParquetLeafTypeTests
             Assert.Equal(
                 i == expected.Count - 1 ? "null-value" : $"k{i}",
                 Encoding.UTF8.GetString(actualKeys.GetBytes(i)));
-            Assert.Equal(expected[i], actualValues.IsNull(i) ? null : leaf.Read(actualValues, i));
+            leaf.AssertValue(expected[i], actualValues.IsNull(i) ? null : leaf.Read(actualValues, i));
         }
     }
 
