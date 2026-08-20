@@ -43,7 +43,13 @@
            - TimeSpanDataField/TimeOnlyDataField were replaced by a single TimeDataField whose ClrType is a
              RAW int (millis) / long (micros, nanos) instead of TimeSpan/TimeOnly. That is a FAIL-OPEN hazard:
              a TIME column now shape-matches a requested int/bigint, so DeltaSharp must reject TIME on its own
-             annotation (ParquetTypeMapping.IsTimeColumn) rather than relying on an unmapped CLR type. -->
+             annotation (ParquetTypeMapping.IsTimeColumn) rather than relying on an unmapped CLR type.
+
+         VERSION-BUMP GATE (#843): bumping this version can silently change the EMITTED bytes (compression,
+         encoding, `created_by`, footer metadata) even when the read path is unaffected. The byte-level
+         SHA-256 goldens in NestedParquetWriteGoldenTests fail on any such drift; on a sanctioned bump,
+         regenerate them (DELTASHARP_REGEN_WRITE_GOLDENS=1) in a reviewed commit and follow
+         docs/engineering/checklists/parquet-net-upgrade-checklist.md. -->
     <PackageVersion Include="Parquet.Net" Version="6.1.0" />
     <!-- STORY-05.3 observability (#479): Microsoft.Extensions.Logging.Abstractions supplies
          ILogger<T>, the [LoggerMessage] source generator (allocation-free structured logging,
