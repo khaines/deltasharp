@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Security.Cryptography;
+using System.Text;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Types;
@@ -692,55 +693,67 @@ internal sealed class DeltaTableWriter
     /// </summary>
     /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
     /// source column is absent, or the target name collides with an existing column.</exception>
-    internal async Task<DeltaCommitResult> RenameColumnAsync(
+    internal Task<DeltaCommitResult> RenameColumnAsync(
         string fromName, string toName, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
     {
+        // #840: the flat top-level door DELEGATES to the segment-array door with a single-element path, so
+        // there is exactly ONE code path — top-level behavior is byte-identical to a length-1 nested rename.
         ArgumentException.ThrowIfNullOrEmpty(fromName);
+        return RenameColumnAsync(new[] { fromName }, toName, constraintEnforcer, cancellationToken);
+    }
+
+    /// <summary>
+    /// Renames a <b>nested struct child</b> (or a top-level column, via a 1-segment path) in a name-mode
+    /// column-mapping table (#840) — a <b>metadata-only</b> operation. The target is addressed by an ordered
+    /// <paramref name="path"/> of <b>logical</b> field names, top-level column first, the renamed child last
+    /// (e.g. <c>["address","zip"]</c>); a dotted string is <b>never</b> parsed or composed anywhere (§2.4/§5).
+    /// The target keeps its <c>delta.columnMapping.{id,physicalName}</c>, <c>DataType</c>, and <c>Nullable</c>
+    /// verbatim — only its logical <c>Name</c> changes — so every existing data file resolves unchanged under
+    /// the new logical name (zero rewrite). Commits a lone <c>metaData</c> action under
+    /// <see cref="DeltaReadScope.WholeTable"/>; <c>delta.columnMapping.maxColumnId</c> is unchanged.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
+    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #585), or a second struct hop (F4b,
+    /// #585); or the target name ordinally collides with a sibling at its parent level (F6a).</exception>
+    internal async Task<DeltaCommitResult> RenameColumnAsync(
+        IReadOnlyList<string> path, string toName, IWriteConstraintEnforcer? constraintEnforcer = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(path);
         ArgumentException.ThrowIfNullOrEmpty(toName);
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // Guard ordering (§2.5/§3): (1) RequireNameMode (F5) FIRST, so an id-mode fixture cannot pass a later
+        // guard vacuously; (2) empty-path (F1); (3) segment descent (F2/F3/F4/F4b) with F6a collision at the
+        // target's parent level; (4) partition parity; (5) commit-time F6b/F10.
         RequireNameMode(snapshot);
-
-        StructType schema = snapshot.Schema;
-        if (!schema.TryGetField(fromName, out StructField target))
+        if (path.Count == 0)
         {
             throw new InvalidOperationException(
-                $"Cannot rename column '{DiagnosticText.Sanitize(fromName)}': no such column in the table schema.");
+                "Cannot rename: an empty column path addresses no field.");
         }
 
-        if (!string.Equals(fromName, toName, StringComparison.Ordinal) && schema.IndexOf(toName) >= 0)
-        {
-            // #683: `toName` appears TWICE, so a raw oversized name is a 3x flood amplifier. Same idiom as
-            // DropColumnAsync below.
-            throw new InvalidOperationException(
-                $"Cannot rename column '{DiagnosticText.Sanitize(fromName)}' to '{DiagnosticText.Sanitize(toName)}': a column named '{DiagnosticText.Sanitize(toName)}' already exists.");
-        }
+        // The SOLE place addressing happens: descend segment-by-segment over the logical StructType, rebuild
+        // the ancestor spine with fresh immutable nodes (siblings carried by reference), substituting only the
+        // target's Name. No dotted string is ever parsed or composed here.
+        var renamedSchema = DescendAndRebuild(snapshot.Schema, path, SchemaChangeOp.Rename, toName);
 
-        var fields = new List<StructField>(schema.Count);
-        foreach (StructField field in schema)
-        {
-            // ReferenceEquals invariant: TryGetField/schema enumeration return the SAME StructField instance
-            // for the matched column, so identity comparison uniquely selects the target (no name re-match).
-            fields.Add(
-                ReferenceEquals(field, target)
-                    ? new StructField(toName, field.DataType, field.Nullable, field.Metadata)
-                    : field);
-        }
-
-        // MEDIUM#4: metaData.partitionColumns holds LOGICAL names (HIGH#1), so renaming a PARTITION column
-        // must update its logical entry there too. physicalName/id are unchanged, and add.partitionValues
-        // stay keyed by physical name, so existing data files still resolve — this is metadata-only.
+        // Top-level partition-column parity (retained from the flat door): a LENGTH-1 rename of a top-level
+        // partition column updates metaData.partitionColumns (LOGICAL names). A nested child is never a
+        // partition column (F8), so a path of length > 1 never touches partitionColumns.
         ImmutableArray<string>? updatedPartitions = null;
-        if (snapshot.Metadata.PartitionColumns.Contains(fromName, StringComparer.Ordinal))
+        if (path.Count == 1 && snapshot.Metadata.PartitionColumns.Contains(path[0], StringComparer.Ordinal))
         {
             updatedPartitions = snapshot.Metadata.PartitionColumns
-                .Select(p => string.Equals(p, fromName, StringComparison.Ordinal) ? toName : p)
+                .Select(p => string.Equals(p, path[0], StringComparison.Ordinal) ? toName : p)
                 .ToImmutableArray();
         }
 
-        // #616: refuse fail-closed if a surviving named CHECK still depends on the renamed column (its
-        // predicate would no longer resolve against the post-rename schema — a dangling-CHECK brick).
-        var renamedSchema = new StructType(fields);
+        // #616 (F10): refuse fail-closed if a surviving named CHECK still depends on the renamed field (its
+        // predicate would no longer resolve against the post-rename schema — a dangling-CHECK brick). The
+        // enforcer resolves each CHECK's user SQL against the post-ALTER schema, so a NESTED reference
+        // (address.zip) surfaces as UnresolvedStructField → DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE.
         EnsureNoDependentConstraints(snapshot, renamedSchema, constraintEnforcer, "ALTER TABLE RENAME COLUMN");
 
         return await CommitSchemaChangeAsync(snapshot, renamedSchema, updatedPartitions, cancellationToken)
@@ -756,48 +769,254 @@ internal sealed class DeltaTableWriter
     /// </summary>
     /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
     /// column is absent, or dropping it would be a partition column (out of scope here).</exception>
-    internal async Task<DeltaCommitResult> DropColumnAsync(
+    internal Task<DeltaCommitResult> DropColumnAsync(
         string name, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
     {
+        // #840: the flat top-level door DELEGATES to the segment-array door with a single-element path (one
+        // code path); top-level behavior is byte-identical to a length-1 nested drop.
         ArgumentException.ThrowIfNullOrEmpty(name);
+        return DropColumnAsync(new[] { name }, constraintEnforcer, cancellationToken);
+    }
+
+    /// <summary>
+    /// Drops a <b>nested struct child</b> (or a top-level column, via a 1-segment path) from a name-mode
+    /// column-mapping table (#840) — a <b>logical-only</b> operation. The target is addressed by an ordered
+    /// <paramref name="path"/> of <b>logical</b> field names (e.g. <c>["address","zip"]</c>); a dotted string
+    /// is <b>never</b> parsed or composed (§2.4/§5). The field is removed from its parent struct in the logical
+    /// schema; the physical column stays unreferenced in existing data files (no rewrite), and
+    /// <c>delta.columnMapping.maxColumnId</c> is <b>unchanged</b> — a dropped id is never reused (a subsequent
+    /// re-add mints a fresh id + physicalName, §3.4). Old snapshots (time travel) still expose the dropped
+    /// child. Commits a lone <c>metaData</c> action under <see cref="DeltaReadScope.WholeTable"/>.
+    /// </summary>
+    /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
+    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #585), or a second struct hop (F4b,
+    /// #585); or the target is a top-level partition column (F7).</exception>
+    internal async Task<DeltaCommitResult> DropColumnAsync(
+        IReadOnlyList<string> path, IWriteConstraintEnforcer? constraintEnforcer = null,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(path);
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
+
+        // Guard ordering (§2.5/§3): (1) RequireNameMode (F5) FIRST; (2) empty-path (F1); (3) segment descent
+        // (F2/F3/F4/F4b); (4) partition guard (F7/F8); (5) commit-time F10.
         RequireNameMode(snapshot);
-
-        StructType schema = snapshot.Schema;
-        if (!schema.TryGetField(name, out StructField target))
+        if (path.Count == 0)
         {
             throw new InvalidOperationException(
-                $"Cannot drop column '{DiagnosticText.Sanitize(name)}': no such column in the table schema.");
+                "Cannot drop: an empty column path addresses no field.");
         }
 
-        // MEDIUM#5: the partition-column guard checks the LOGICAL name against metaData.partitionColumns
-        // (which holds LOGICAL names under name mode — HIGH#1), not the physical name.
-        if (snapshot.Metadata.PartitionColumns.Contains(name, StringComparer.Ordinal))
+        // The SOLE place addressing happens: descend to the target's parent, rebuild the spine OMITTING
+        // exactly the target child (ReferenceEquals-selected, no name re-match).
+        var droppedSchema = DescendAndRebuild(snapshot.Schema, path, SchemaChangeOp.Drop, toName: null);
+
+        // Partition guard (F7 top-level partition column; F8 — a nested child of a partition column — is
+        // defensively unreachable, since a partition column is a scalar top-level field, so a length > 1 path
+        // is already pre-empted by the F3 scalar-intermediate descent gate; the check on path[0] covers both).
+        if (snapshot.Metadata.PartitionColumns.Contains(path[0], StringComparer.Ordinal))
         {
             throw new InvalidOperationException(
-                $"Cannot drop partition column '{DiagnosticText.Sanitize(name)}'; dropping a partition column is out of scope.");
+                $"Cannot drop partition column '{DiagnosticText.Sanitize(path[0])}'; dropping a partition "
+                + "column is out of scope.");
         }
 
-        var fields = new List<StructField>(schema.Count - 1);
-        foreach (StructField field in schema)
-        {
-            // ReferenceEquals invariant: TryGetField returns the SAME StructField instance as the matched
-            // column, so identity comparison uniquely excludes exactly the target (no name re-match).
-            if (!ReferenceEquals(field, target))
-            {
-                fields.Add(field);
-            }
-        }
-
-        // #616: refuse fail-closed if a surviving named CHECK still depends on the dropped column — the same
-        // dangling-CHECK brick #601/#598 guard on the write door, on the ALTER DROP door (Delta's
-        // DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE).
-        var droppedSchema = new StructType(fields);
+        // #616 (F10): refuse fail-closed if a surviving named CHECK still depends on the dropped field — the
+        // enforcer resolves each CHECK's user SQL against the post-drop schema, so a nested reference is
+        // caught (UnresolvedStructField → DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE).
         EnsureNoDependentConstraints(snapshot, droppedSchema, constraintEnforcer, "ALTER TABLE DROP COLUMN");
 
         return await CommitSchemaChangeAsync(snapshot, droppedSchema, partitionColumns: null, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>Which metadata-only schema transform <see cref="DescendAndRebuild"/> applies at the target
+    /// (#840): rename the target's logical <c>Name</c>, or drop the target from its parent struct.</summary>
+    internal enum SchemaChangeOp
+    {
+        /// <summary>Rename the target <see cref="StructField"/> (id/physicalName/DataType/Nullable verbatim).</summary>
+        Rename,
+
+        /// <summary>Drop the target <see cref="StructField"/> from its parent struct.</summary>
+        Drop,
+    }
+
+    // #840: the SOLE place segment-array addressing happens. Descends the logical StructType segment-by-segment
+    // and rebuilds each ancestor StructType up the spine with fresh immutable nodes (plan-node immutability),
+    // substituting exactly the target StructField (rename) or omitting it (drop). Siblings are carried by
+    // REFERENCE (untouched); the target is selected by ReferenceEquals identity (no name re-match). NEVER parses
+    // or composes a dotted string. `path.Count >= 1` is guaranteed by the caller (F1 checked at the door).
+    // Exposed `internal` (not private) SOLELY so the F4b single-hop gate — unconstructible via a loaded snapshot
+    // today because the load-time C1 gate ColumnMapping.RejectNestedWithinNested pre-empts a struct<struct<…>>
+    // schema (§2.4, §3.12) — can be exercised directly against a hand-built StructType that bypasses the load
+    // door. When #585 relaxes that load gate the same gate becomes load-bearing through the door.
+    internal static StructType DescendAndRebuild(
+        StructType schema, IReadOnlyList<string> path, SchemaChangeOp op, string? toName)
+    {
+        // Defense-in-depth F1: the door already rejects an empty path (guard step 2, before this call), so this
+        // never fires through the door — but keeping it here makes the helper self-contained (it can be
+        // exercised directly, and can never index into an empty path).
+        if (path.Count == 0)
+        {
+            throw new InvalidOperationException(
+                $"Cannot {OpVerb(op)}: an empty column path addresses no field.");
+        }
+
+        return RebuildLevel(schema, path, depth: 0, op, toName);
+    }
+
+    private static StructType RebuildLevel(
+        StructType current, IReadOnlyList<string> path, int depth, SchemaChangeOp op, string? toName)
+    {
+        string segment = path[depth];
+        bool isLast = depth == path.Count - 1;
+
+        if (!current.TryGetField(segment, out StructField field))
+        {
+            // F2: absent segment (intermediate or last). At depth 0 this is a top-level column; deeper it
+            // names the sanitized PARTIAL path resolved so far so the operator can locate the miss.
+            throw AbsentSegment(op, path, depth, segment);
+        }
+
+        if (isLast)
+        {
+            // The last segment names the target StructField in its immediate parent struct `current`.
+            if (op == SchemaChangeOp.Rename)
+            {
+                // Same-name carve-out (matches the flat door): renaming a field to its own last-segment Name
+                // under StringComparison.Ordinal is a NO-OP — skip the F6a collision gate. Otherwise a sibling
+                // ordinally equal to `toName` at this level is an F6a collision AT THE DOOR. F6b (case-
+                // insensitive) is NOT checked here; the committer's recursive per-level guard catches it.
+                if (!string.Equals(field.Name, toName, StringComparison.Ordinal) && current.IndexOf(toName!) >= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"Cannot rename {RenderPath(path)}: a field named '{DiagnosticText.Sanitize(toName)}' "
+                        + "already exists at this level.");
+                }
+
+                // id/physicalName (carried in Metadata), DataType, and Nullable are copied VERBATIM; only Name
+                // changes — the metadata-only, read-through invariant (§2.6).
+                var renamed = new StructField(toName!, field.DataType, field.Nullable, field.Metadata);
+                return RebuildWithReplacement(current, field, renamed);
+            }
+
+            // Drop: omit exactly the target child from its parent (maxColumnId unchanged; id never reused).
+            return RebuildWithout(current, field);
+        }
+
+        // Intermediate segment: it MUST resolve to a StructType child (you cannot address a child of a
+        // non-struct), and under the single-level scope ONLY the top-level column (depth == 0) may be a struct
+        // intermediate — a SECOND struct hop is fail-closed naming #585 (F4b).
+        switch (field.DataType)
+        {
+            case StructType childStruct:
+                if (depth >= 1)
+                {
+                    // F4b: a struct<struct<…>> intermediate — caught by NEITHER F3 (scalar) NOR F4 (array/map).
+                    throw new InvalidOperationException(
+                        $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is a "
+                        + "nested-within-nested struct; nested-within-nested rename/drop is not supported "
+                        + "(#585); only a single-level nested child is addressable.");
+                }
+
+                StructType rebuiltChild = RebuildLevel(childStruct, path, depth + 1, op, toName);
+                var rebuiltField = new StructField(field.Name, rebuiltChild, field.Nullable, field.Metadata);
+                return RebuildWithReplacement(current, field, rebuiltField);
+
+            case ArrayType:
+            case MapType:
+                // F4: descending into an array element / map key/value interior — a non-addressable node (C1),
+                // out of scope, fail-closed naming #585.
+                throw new InvalidOperationException(
+                    $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is an "
+                    + "array/map; rename/drop of an array element / map key/value is not supported (#585).");
+
+            default:
+                // F3: a scalar intermediate — cannot address a child of a scalar.
+                throw new InvalidOperationException(
+                    $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is not a "
+                    + "struct; cannot descend.");
+        }
+    }
+
+    // Rebuilds `current` replacing exactly `oldField` (ReferenceEquals-selected) with `newField`; every other
+    // sibling is carried by REFERENCE (untouched). Plan-node immutability: a fresh StructType is returned.
+    private static StructType RebuildWithReplacement(StructType current, StructField oldField, StructField newField)
+    {
+        var fields = new List<StructField>(current.Count);
+        foreach (StructField f in current)
+        {
+            fields.Add(ReferenceEquals(f, oldField) ? newField : f);
+        }
+
+        return new StructType(fields);
+    }
+
+    // Rebuilds `current` OMITTING exactly `target` (ReferenceEquals-selected, no name re-match); siblings by
+    // reference.
+    private static StructType RebuildWithout(StructType current, StructField target)
+    {
+        var fields = new List<StructField>(current.Count - 1);
+        foreach (StructField f in current)
+        {
+            if (!ReferenceEquals(f, target))
+            {
+                fields.Add(f);
+            }
+        }
+
+        return new StructType(fields);
+    }
+
+    // F2 message builder: at depth 0 the miss is a top-level column (flat parity — "no such column …"); deeper
+    // it names the sanitized PARTIAL path resolved so far plus the missing segment.
+    private static InvalidOperationException AbsentSegment(
+        SchemaChangeOp op, IReadOnlyList<string> path, int depth, string segment)
+    {
+        if (depth == 0)
+        {
+            // Flat-door parity: a length-1 miss reads "no such column" (unchanged message from the pre-#840
+            // flat overload), single-echo so it stays length-bounded under a poisoned/oversized name.
+            return new InvalidOperationException(
+                $"Cannot {OpVerb(op)} column '{DiagnosticText.Sanitize(segment)}': no such column in the "
+                + "table schema.");
+        }
+
+        return new InvalidOperationException(
+            $"Cannot {OpVerb(op)} {RenderPath(path)}: no such field '{DiagnosticText.Sanitize(segment)}' "
+            + $"under {RenderPath(path, depth)}.");
+    }
+
+    private static string OpVerb(SchemaChangeOp op) => op == SchemaChangeOp.Rename ? "rename" : "drop";
+
+    // Renders a segment path for a diagnostic in a BOUNDARY-PRESERVING, non-collapsing per-segment bracket-
+    // quote form — ["address"].["zip"] — with EACH segment individually DiagnosticText.Sanitize'd INSIDE its
+    // own ["…"] bracket (§7). This is load-bearing: a legal segment can itself contain a '.', so a naïve dotted
+    // render a.b.zip would collapse the boundary between a segment `a.b` and a child `zip`, becoming
+    // indistinguishable from a path into a→b→zip — exactly the ambiguity the segment-array contract forbids
+    // (§5/§6). This is a ONE-WAY diagnostic render of a sanitized segment array, NEVER re-parsed as an address.
+    private static string RenderPath(IReadOnlyList<string> path) => RenderPath(path, path.Count);
+
+    private static string RenderPath(IReadOnlyList<string> path, int count)
+    {
+        if (count <= 0)
+        {
+            return "[]";
+        }
+
+        var builder = new StringBuilder();
+        for (int i = 0; i < count; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append('.');
+            }
+
+            builder.Append("[\"").Append(DiagnosticText.Sanitize(path[i])).Append("\"]");
+        }
+
+        return builder.ToString();
     }
 
     /// <summary>
