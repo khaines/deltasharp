@@ -2474,6 +2474,112 @@ public sealed class NestedParquetReadTests
         Assert.Equal("[(L=100,D=1.5,Flag=true),(L=-7,D=2.5,Flag=false)]", Describe(arr, 1));
     }
 
+    // -------------------------------------------------------------------------------------------------
+    // §3.1 cells 14/15/16 — the recursive map guards (EnsureCanonicalMapChildNames / EnsureRequiredMapKey)
+    // must fire at the INNER (depth-2) map, not only at the top-level map. Parquet.Net binds a map's
+    // key_value children POSITIONALLY (MapField.Assign: first → Key, second → Value), so a mis-named or
+    // key/value-transposed INNER map<T,T> silently transposes past the type/level guards — a silent
+    // data-corruption class. 585a runs both map guards on EVERY map node the shape validator visits
+    // (NestedParquetColumnReader.ValidateNode :183-184); these cells pin the DEPTH-2 application. No released
+    // writer can author these footers (the MapField ctor forbids a nullable key and always emits canonical
+    // names), so — mirroring the depth-1 sibling in NestedColumnMappingGuardCoverageTests and the internal
+    // crafted-stream cells here — the malformed file field tree is hand-built and driven straight through the
+    // shape-resolution door (ValidateShape), which fails closed BEFORE any data page is read.
+    // -------------------------------------------------------------------------------------------------
+
+    [Fact]
+    public void NonCanonicalMapChildNames_AtInnerMap_FailsClosed()
+    {
+        // §3.1-14: a depth-2 shape array<map<string,long>> whose INNER map's key_value children are named
+        // 'k'/'v' (not the canonical 'key'/'value'). The OUTER container is a well-formed list (name-agnostic —
+        // single-child lists have no transposition hazard, so the list arm runs no name check), so the ONLY
+        // guard that can fire is the recursive EnsureCanonicalMapChildNames applied at the INNER map node. A
+        // reader that stopped recursing the map guard into inner maps would read this transposition-prone shape
+        // silently. Expect a typed SchemaMismatch.
+        var fileField = new global::Parquet.Schema.ListField(
+            "Arr",
+            new global::Parquet.Schema.MapField(
+                "element",
+                new global::Parquet.Schema.DataField<string>("k", false),
+                new global::Parquet.Schema.DataField<long>("v")));
+        var requested = DataTypes.CreateArrayType(
+            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType, valueContainsNull: true),
+            containsNull: true);
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "Arr"));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("not named the canonical", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void MapWithNullableKey_AtDepth2_FailsClosed()
+    {
+        // §3.1-15: a depth-2 shape array<map<string,long>> whose INNER map has a NULLABLE key. Parquet.Net's
+        // MapField ctor itself forbids a nullable key ("map's key cannot be nullable"), so no released writer —
+        // and no ctor path — can author this footer; the malformed state is synthesized by lifting the inner
+        // key leaf's definition level one above its map's own level (exactly the shape a nullable key would
+        // have). The inner map's children ARE canonically named, so EnsureCanonicalMapChildNames passes and the
+        // ONLY guard that can fire is the recursive EnsureRequiredMapKey applied at the INNER map node. Expect a
+        // typed SchemaMismatch.
+        var innerMap = new global::Parquet.Schema.MapField(
+            "element",
+            new global::Parquet.Schema.DataField<string>("key", false),
+            new global::Parquet.Schema.DataField<long>("value"));
+        var fileField = new global::Parquet.Schema.ListField("Arr", innerMap);
+
+        // Force the inner map's key to LOOK nullable: a required map key has MaxDefinitionLevel == the map's own
+        // MaxDefinitionLevel; a nullable key is one higher. The setter is internal to Parquet.Net, so reflect.
+        System.Reflection.PropertyInfo maxDef = typeof(global::Parquet.Schema.Field).GetProperty(
+            "MaxDefinitionLevel", System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance)!;
+        maxDef.GetSetMethod(nonPublic: true)!.Invoke(innerMap.Key, new object[] { innerMap.MaxDefinitionLevel + 1 });
+        Assert.NotEqual(innerMap.MaxDefinitionLevel, innerMap.Key.MaxDefinitionLevel); // fixture precondition
+
+        var requested = DataTypes.CreateArrayType(
+            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType, valueContainsNull: true),
+            containsNull: true);
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "Arr"));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("map key is nullable", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void InnerMapKeyValueTransposed_WitnessDisjoint_FailsClosed()
+    {
+        // §3.1-16 (the crux — silent-data-corruption cell): a depth-2 shape map<string, map<long,long>> whose
+        // INNER map has a REQUIRED value and its key/value children SWAPPED. Both inner children are `long` and
+        // both REQUIRED, so the type guard, the leaf structural-level guard, and EnsureRequiredMapKey are all a
+        // WITNESS-DISJOINT no-op here — none can separate the two children. ONLY the recursive
+        // EnsureCanonicalMapChildNames, applied at the INNER map, catches the transposition. The OUTER map is
+        // fully well-formed (canonical 'key'/'value', required string key), so this cell fires SPECIFICALLY
+        // because the guard RECURSES into the inner map: a regression that guarded only the top-level map would
+        // ship this silent key/value transposition of an inner map<long,long>. This mirrors the depth-1
+        // map<long,long> transposition witness (design §3 ncm transposition cell) lifted to DEPTH 2. Expect a
+        // typed SchemaMismatch.
+        var innerTransposed = new global::Parquet.Schema.MapField(
+            "value",
+            new global::Parquet.Schema.DataField<long>("value"),  // positionally the KEY, mis-named 'value'
+            new global::Parquet.Schema.DataField<long>("key"));   // positionally the VALUE, mis-named 'key'
+        var fileField = new global::Parquet.Schema.MapField(
+            "M",
+            new global::Parquet.Schema.DataField<string>("key", false),
+            innerTransposed);
+        var requested = DataTypes.CreateMapType(
+            DataTypes.StringType,
+            DataTypes.CreateMapType(DataTypes.LongType, DataTypes.LongType, valueContainsNull: false),
+            valueContainsNull: true);
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "M"));
+
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+        Assert.Contains("not named the canonical", error.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void DecimalPrecision29_AtDepth_FailsClosed_UnsupportedFeature()
     {
