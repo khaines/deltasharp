@@ -215,7 +215,9 @@ public sealed class NestedParquetLevelStreamTests
         Assert.Equal(new[] { 0, 1, 0, 0 }, rep);
     }
 
-    private static async Task<byte[]> WriteAsync(StructType schema, ColumnVector column)
+    // Shared with NestedWriteModelEncoderTests (#844): the model-encoder differential writes vectors and reads
+    // back raw level streams through the SAME two primitives this file already pins.
+    internal static async Task<byte[]> WriteAsync(StructType schema, ColumnVector column)
     {
         var batch = new ManagedColumnBatch(schema, new[] { column }, column.Length);
         return await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
@@ -223,7 +225,7 @@ public sealed class NestedParquetLevelStreamTests
 
     // Reads one leaf's raw level streams straight out of the file with Parquet.Net, bypassing DeltaSharp's
     // read path entirely — that independence is what makes this a differential rather than a tautology.
-    private static async Task<(DataField Field, int[] Definitions, int[] Repetitions)> ReadLeafAsync(
+    internal static async Task<(DataField Field, int[] Definitions, int[] Repetitions)> ReadLeafAsync(
         byte[] bytes, params string[] path)
     {
         using var stream = new MemoryStream(bytes, writable: false);
