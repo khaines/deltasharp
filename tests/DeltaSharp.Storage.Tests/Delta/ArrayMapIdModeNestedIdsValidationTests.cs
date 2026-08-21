@@ -224,6 +224,44 @@ public sealed class ArrayMapIdModeNestedIdsValidationTests
         Assert.Contains(ColumnMapping.NestedIdsKey, ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void NoneMode_ArrayMap_WithForeignNestedIds_FailsClosed()
+    {
+        // §3.16b none-mode arm. The design §2.4 gate enumerates "name OR none mode" foreign nested.ids as the
+        // unconditional fail-closed reject. VERIFIED against the production door (ColumnMapping.cs
+        // ValidateColumnMappingSchema): mode == None short-circuits at the method entry
+        // (`if (mode == ColumnMappingMode.None) return;`) BEFORE ValidateMappedLevel's `!inScopeIdArrayMap &&
+        // hasNestedIds` reject is reached — so the schema-validation door does NOT throw for a none-mode
+        // container carrying a stray nested.ids. This is SAFE (not the #676 regression the design guards for
+        // NAME mode): none mode binds every column by its LOGICAL name and NEVER consults a field_id or
+        // nested.ids, so a stray nested.ids is structurally INERT (it can never mis-attribute an interior
+        // leaf the way a name-mode field_id-adjacent key could). This test PINS that actual behavior — the
+        // none-mode door is a no-op accept — and contrasts it with the name-mode reject above so a future
+        // change that either (a) starts binding none-mode interiors by nested.ids or (b) removes the name-mode
+        // reject is caught. (The design's "(and none-mode) ... unconditional reject" prose is aspirational
+        // relative to the none-mode early-return; the impl's inert no-op is the shipped, verified contract.)
+        foreach (StructType schema in new[]
+        {
+            OneContainer("array", "col-c", 2, NestedIds(("col-c.element", MetadataValue.Long(3)))),
+            OneContainer("map", "col-c", 2, NestedIds(
+                ("col-c.key", MetadataValue.Long(3)), ("col-c.value", MetadataValue.Long(4)))),
+        })
+        {
+            // None mode: inert no-op accept (never binds by nested.ids) — the door does not throw.
+            Exception? noneResult = Record.Exception(() =>
+                ColumnMapping.ValidateColumnMappingSchema(
+                    ColumnMappingMode.None, schema, new Dictionary<string, string>()));
+            Assert.Null(noneResult);
+
+            // Contrast: the SAME foreign nested.ids under NAME mode IS the unconditional fail-closed reject —
+            // name mode has physicalName binding, so accepting-and-ignoring would regress #676's guarantee.
+            DeltaProtocolException nameEx = Assert.Throws<DeltaProtocolException>(
+                () => ColumnMapping.ValidateColumnMappingSchema(
+                    ColumnMappingMode.Name, schema, ColumnMapping.NameModeConfiguration(ConfiguredMax)));
+            Assert.Contains(ColumnMapping.NestedIdsKey, nameEx.Message, StringComparison.Ordinal);
+        }
+    }
+
     // -------------------------------------------------------------------------------------------------
     // §3.17 · interior-id uniqueness (interior↔top-level, interior↔interior)
     // -------------------------------------------------------------------------------------------------
@@ -328,6 +366,7 @@ public sealed class ArrayMapIdModeNestedIdsValidationTests
     [InlineData("map<string,struct>")]
     [InlineData("array<array>")]
     [InlineData("map<string,map>")]
+    [InlineData("struct<array<struct>>")]
     public void ArrayMapIdMode_NestedWithinNested_RejectedBeforeGate_Naming585(string shape)
     {
         StructType logical = new(new[] { NestedWithinNested(shape) });
@@ -383,6 +422,67 @@ public sealed class ArrayMapIdModeNestedIdsValidationTests
         Assert.Equal(phys, PhysicalOf(after));
         Assert.True(ColumnMapping.TryGetArrayElementId(after, phys, out long elementIdAfter));
         Assert.Equal(elementIdBefore, elementIdAfter);
+    }
+
+    [Fact]
+    public void Evolve_ContainerTypeChangesArrayToMap_RetiresInteriorIdentities_NotReParented()
+    {
+        // §3.24 · the §2.4 EvolveNameModeMapping contract: "a container whose TYPE changes retires its
+        // interior identities, never re-parents". VERIFIED against production (ColumnMapping.cs
+        // ResolveEvolveNestedIds): array→map IS reachable via EvolveNameModeMapping (the container is matched
+        // by LOGICAL name across the evolve, an overwriteSchema type change). At that point:
+        //   * EvolveMappedField reuses the existing container's (id, physicalName) verbatim (rename-immutable);
+        //   * ResolveEvolveNestedIds sees `SameNestedKind(map, array) == false`, so it does NOT reuse the old
+        //     interior nested.ids — it mints FRESH key/value ids after the container id (pre-order).
+        // So the OLD array `.element` identity is RETIRED (dropped, never carried onto the new map interior),
+        // fresh map key/value ids are minted, maxColumnId is bumped, and no old id is re-parented.
+        (StructType current, long curMax) = ColumnMapping.AssignFreshMapping(
+            new StructType(new[] { LogicalArray("c", DataTypes.LongType) }),
+            new SeededPhysicalNameSource("typechg-base"), ColumnMappingMode.Id);
+        StructField beforeContainer = current.Fields[0];
+        string physBefore = PhysicalOf(beforeContainer);
+        long containerIdBefore = beforeContainer.Metadata[ColumnMapping.IdKey].AsLong();
+        Assert.True(ColumnMapping.TryGetArrayElementId(beforeContainer, physBefore, out long oldElementId));
+        Assert.Equal(2L, curMax); // container(1) + element(2)
+
+        // Evolve: SAME logical name 'c', TYPE CHANGES array<long> → map<string,long> (overwriteSchema).
+        var evolved = new StructType(new[] { LogicalMap("c", DataTypes.StringType, DataTypes.LongType) });
+        (StructType mappedEvolved, ImmutableSortedDictionary<string, string> config) =
+            ColumnMapping.EvolveNameModeMapping(
+                evolved, current, ColumnMapping.IdModeConfiguration(curMax),
+                new SeededPhysicalNameSource("typechg-evolve"), ColumnMappingMode.Id);
+
+        StructField afterContainer = mappedEvolved.Fields[0];
+        string physAfter = PhysicalOf(afterContainer);
+
+        // Container identity is PRESERVED per the impl's actual contract (same-name reuse of id + physicalName;
+        // the physical name is reused so any future data keyed by it stays valid).
+        Assert.Equal(physBefore, physAfter);
+        Assert.Equal(containerIdBefore, afterContainer.Metadata[ColumnMapping.IdKey].AsLong());
+
+        // The OLD array `.element` interior identity is RETIRED — the new map's nested.ids carries NO
+        // `.element` key (not carried onto / re-parented onto the new interior).
+        Assert.False(
+            ColumnMapping.TryGetArrayElementId(afterContainer, physAfter, out _),
+            "the retired array element identity must not survive onto the new map interior");
+
+        // FRESH interior ids are minted for the new map key/value, strictly AFTER (exceeding) the retired
+        // element id — never reusing/re-parenting the old id.
+        Assert.True(ColumnMapping.TryGetMapKeyValueIds(afterContainer, physAfter, out long keyId, out long valueId));
+        Assert.NotEqual(oldElementId, keyId);
+        Assert.NotEqual(oldElementId, valueId);
+        Assert.NotEqual(keyId, valueId);
+        Assert.True(keyId > oldElementId, "fresh map key id minted strictly after the retired element id");
+        Assert.True(valueId > oldElementId, "fresh map value id minted strictly after the retired element id");
+
+        // maxColumnId is bumped by exactly 2 (key + value); the container id is preserved, not re-minted.
+        long newMax = long.Parse(
+            config["delta.columnMapping.maxColumnId"], System.Globalization.CultureInfo.InvariantCulture);
+        Assert.Equal(curMax + 2, newMax);
+
+        // The retired old element id was NOT re-parented (it is distinct from BOTH fresh interior ids), and the
+        // evolved id-mode schema validates cleanly (fresh interior ids in range, globally unique, key-shaped).
+        ColumnMapping.ValidateColumnMappingSchema(ColumnMappingMode.Id, mappedEvolved, config);
     }
 
     // -------------------------------------------------------------------------------------------------
@@ -682,6 +782,19 @@ public sealed class ArrayMapIdModeNestedIdsValidationTests
         "map<string,map>" => new StructField(
             "c",
             new MapType(DataTypes.StringType, new MapType(DataTypes.StringType, DataTypes.LongType, true), true),
+            nullable: true),
+        // The design's nested-within-nested variant one level deeper: a struct whose child is itself an
+        // array<struct>. The #585 pre-gate must reject the interior nested-within-nested BEFORE the #839
+        // id-mode array/map gate is ever reached.
+        "struct<array<struct>>" => new StructField(
+            "c",
+            DataTypes.CreateStructType(new[]
+            {
+                LogicalArray("inner", DataTypes.CreateStructType(new[]
+                {
+                    new StructField("x", DataTypes.LongType, nullable: true),
+                })),
+            }),
             nullable: true),
         _ => throw new ArgumentOutOfRangeException(nameof(shape)),
     };
