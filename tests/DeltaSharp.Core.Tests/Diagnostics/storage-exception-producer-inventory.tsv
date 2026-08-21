@@ -84,7 +84,21 @@ Delta/DeltaLogActionReader.cs	DeltaSharp.Storage.Delta.DeltaLogActionReader	GetS
 Delta/DeltaLogActionReader.cs	DeltaSharp.Storage.Delta.DeltaLogActionReader	GetStringMap	prop	fixed	Always passed a compile-time string literal by the reader (the Delta action key / required field name / fixed 'MUST NOT ...' reason phrase / 'definition'|'repetition' level kind), never a raw JSON key from the commit.
 Delta/DeltaLogActionReader.cs	DeltaSharp.Storage.Delta.DeltaLogActionReader	RequireObject	action	fixed	Always passed a compile-time string literal by the reader (the Delta action key / required field name / fixed 'MUST NOT ...' reason phrase / 'definition'|'repetition' level kind), never a raw JSON key from the commit.
 Delta/DeltaLogActionWriter.cs	DeltaSharp.Storage.Delta.DeltaLogActionWriter	WriteAction	action.GetType().Name	type-name	A .NET type name (System.Type.Name) — a fixed framework identifier, not tenant data.
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	AbsentSegment	OpVerb(op)	fixed	OpVerb(op) returns a fixed 'rename'/'drop' verb literal (DeltaTableWriter.cs:991); no caller data.
+
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	AbsentSegment	RenderPath(path)	sanitized-upstream	RenderPath renders a boundary-preserving path with EACH segment DiagnosticText.Sanitize'd inside its own bracket before interpolation (DeltaTableWriter.cs:999-1024).
+
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	AbsentSegment	RenderPath(path, depth)	sanitized-upstream	RenderPath renders a boundary-preserving path with EACH segment DiagnosticText.Sanitize'd inside its own bracket before interpolation (DeltaTableWriter.cs:999-1024).
+
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	DescendAndRebuild	OpVerb(op)	fixed	OpVerb(op) returns a fixed 'rename'/'drop' verb literal (DeltaTableWriter.cs:991); no caller data.
+
 Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	EnsureNoDependentConstraints	operation	fixed	A fixed caller-supplied operation literal ('Reading'/'Writing'/'Listing'/'Opening a staged write for'/...).
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	RebuildLevel	OpVerb(op)	fixed	OpVerb(op) returns a fixed 'rename'/'drop' verb literal (DeltaTableWriter.cs:991); no caller data.
+
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	RebuildLevel	RenderPath(path)	sanitized-upstream	RenderPath renders a boundary-preserving path with EACH segment DiagnosticText.Sanitize'd inside its own bracket before interpolation (DeltaTableWriter.cs:999-1024).
+
+Delta/DeltaTableWriter.cs	DeltaSharp.Storage.Delta.DeltaTableWriter	RebuildLevel	RenderPath(path, depth + 1)	sanitized-upstream	RenderPath renders a boundary-preserving path with EACH segment DiagnosticText.Sanitize'd inside its own bracket before interpolation (DeltaTableWriter.cs:999-1024).
+
 Delta/RetentionPolicy.cs	DeltaSharp.Storage.Delta.RetentionPolicy	ResolveTableLogRetention	LogRetentionDurationKey	fixed	A compile-time constant protocol key / reserved column name / feature name; value-conditional producers only echo it on a match against this bounded literal (it cannot carry a payload).
 Delta/RetentionPolicy.cs	DeltaSharp.Storage.Delta.RetentionPolicy	ResolveTableRetention	DeletedFileRetentionDurationKey	fixed	A compile-time constant protocol key / reserved column name / feature name; value-conditional producers only echo it on a match against this bounded literal (it cannot carry a payload).
 Parquet/NestedColumnShredder.cs	DeltaSharp.Storage.Parquet.NestedColumnShredder	CaptureStructNulls	label	sanitized-upstream	Routed through DiagnosticText.Sanitize before it reaches the producer: the nested write door computes label = DiagnosticText.Sanitize(schemaField.Name) once, at NestedColumnShredder.WriteColumnAsync/ValidateColumnAsync / ParquetTypeMapping.CreateNestedField entry, and threads that single sanitized value through every nested producer.
