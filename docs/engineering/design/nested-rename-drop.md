@@ -156,10 +156,28 @@ mitigation for the `.`-in-logical-name collision (§5).
 2. Start at the top-level `StructType schema = snapshot.Schema`. For each segment `s[k]` for
    `k = 0 … n-2` (every segment except the last):
    - `current.TryGetField(s[k], out field)` (case-sensitive ordinal, same lookup as the flat door). Absent →
-     fail-closed `InvalidOperationException` with the **sanitized** partial path.
+     fail-closed `InvalidOperationException` with the **sanitized** partial path (F2).
    - `field.DataType` **must** be a `StructType` (an intermediate must be a struct). If it is a scalar → error
-     (cannot address a child of a scalar). If it is an `ArrayType`/`MapType` → **fail-closed naming #585**
-     (descending into an array/map interior is out of scope; C1 §2.2). Descend: `current = (StructType)field.DataType`.
+     (F3, cannot address a child of a scalar). If it is an `ArrayType`/`MapType` → **fail-closed naming #585**
+     (F4, descending into an array/map interior is out of scope; C1 §2.2).
+   - **Explicit single-hop descent gate (F4b).** The *only* legal struct intermediate is the **top-level
+     column** (`k == 0`). Under the single-level scope (§1), a rename/drop of a single-level nested child is a
+     **length-2** path, so descent takes **exactly one** struct hop and after it you must be **at** the target
+     child. A struct intermediate at `k ≥ 1` — a **second** struct hop, i.e. a `struct<struct<…>>`
+     intermediate — is **fail-closed naming #585**. This gate is what catches the `StructType` intermediate
+     that is covered by **neither F3 (scalar) nor F4 (`ArrayType`/`MapType`)**: a `struct<struct<…>>`
+     intermediate is a `StructType`, so absent this explicit gate it would slip past both. Descend:
+     `current = (StructType)field.DataType`.
+
+   > **Defense-in-depth attribution (F4b).** *Today*, no loaded mapped snapshot can even **present** a struct
+   > child below the top level: the parent's **load-time C1 gate** `RejectNestedWithinNested`
+   > (`ColumnMapping.cs:1332`, `DeltaProtocolException.Unsupported`), invoked via `ValidateColumnMappingSchema`
+   > at the load door (`ColumnMapping.cs:414`), rejects any `struct<struct<…>>` schema **before** it can be
+   > loaded — so this door's single-hop gate is currently **defense-in-depth** (belt-and-suspenders), not the
+   > sole guard. **#585 will relax `RejectNestedWithinNested`** to admit nested-within-nested schemas; at that
+   > point a struct-within-struct intermediate becomes loadable and **this door's own single-hop gate becomes
+   > load-bearing** (it is then the guard that keeps this single-level door from silently descending a second
+   > hop). Cross-reference **#585**.
 3. The **last** segment `s[n-1]` names the target `StructField` in `current` (its immediate parent struct):
    `current.TryGetField(s[n-1], out target)`. Absent → fail-closed `InvalidOperationException`, sanitized path.
    For **rename**, the target may be any `StructField` (scalar or a whole nested struct/array/map column — a
@@ -215,11 +233,13 @@ note `toName` appears multiple times in a rename message, so the amplification f
 | F2 | **Non-existent segment** at any level (intermediate or last) | both | `InvalidOperationException` | names the sanitized **partial** path resolved so far + the missing segment |
 | F3 | **Intermediate segment resolves to a scalar** (cannot address a child of a scalar) | both | `InvalidOperationException` | "segment '…' is not a struct; cannot descend" |
 | F4 | **Intermediate segment resolves to an `ArrayType`/`MapType`** (array/map interior) | both | `InvalidOperationException` **naming #585** | "rename/drop of an array element / map key/value is not supported (#585)" |
+| F4b | **Intermediate segment beyond the top-level column resolves to a `StructType`** (a *second* struct hop — a `struct<struct<…>>` intermediate; caught by **neither** F3 nor F4) | both | `InvalidOperationException` **naming #585** | "nested-within-nested rename/drop is not supported (#585); only a single-level nested child is addressable" |
 | F5 | **Not name mode** (`RequireNameMode`) | both | `InvalidOperationException` | existing `RequireNameMode` message (mode named) |
-| F6 | **Rename collides** with an existing sibling at the **same parent level** — case-sensitive ordinal, **and** the OrdinalIgnoreCase merged-schema collision rule (#676 §2.12) | rename | `InvalidOperationException` | "a field named '…' already exists at this level" |
+| F6a | **Rename collides** with an existing sibling at the **same parent struct level** — **case-sensitive ordinal** (`schema.IndexOf(toName) >= 0`; `StructType.IndexOf` is ordinal, `StructType.cs:146`), with the **same-name carve-out** (renaming a field to its own `Name` under `StringComparison.Ordinal` is a **no-op**, not a collision — §2.6; matches the flat door `DeltaTableWriter.cs:711`) | rename | `InvalidOperationException` **at the door** | "a field named '…' already exists at this level" |
+| F6b | **Rename produces a case-insensitive sibling collision** (`struct<city,CITY>`) at the **same parent struct level** — there is **no inline OrdinalIgnoreCase check at the door**; enforced at **commit** by the recursive per-level `ColumnMapping.EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:1077`, throwing at `:1093`) invoked from `DeltaCommitter` (`DeltaCommitter.cs:377`) | rename | `DeltaProtocolException.Inconsistent` **at commit** | "Schema column '…' collides case-insensitively with '…'" (the committer's message, sanitized) |
 | F7 | **Target is a top-level partition column** (flat guard, retained) | drop | `InvalidOperationException` | existing partition-column message; **rename** updates `metaData.partitionColumns` for a top-level partition column (§2.6) |
 | F8 | **Path targets a nested child of a partition column** | both | `InvalidOperationException` | guard stated for completeness: partition columns cannot be nested struct children today (partition columns are scalar top-level), so a path of length > 1 can never hit a partition column; the guard rejects the impossible case defensively |
-| F9 | **Ambiguity** (a segment matching two siblings) | both | cannot occur (`StructType` ctor rejects duplicate ordinal names at `:157`); a case-insensitive sibling pair is caught by F6's OrdinalIgnoreCase rule on rename and by the load-gate `EnsureNoCaseInsensitiveDuplicateColumns` (#676) on read | typed, sanitized |
+| F9 | **Ambiguity** (a segment matching two siblings) | both | cannot occur — the `StructType` ctor rejects duplicate **ordinal** names (`StructType.cs:98-105`, throwing **`SchemaValidationException`**, *not* `InvalidOperationException`); a case-insensitive sibling pair is caught by **F6b** on rename (at commit) and by the load gate `EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:1077`, via `ValidateColumnMappingSchema` `ColumnMapping.cs:414`) on read | typed (`SchemaValidationException`/`DeltaProtocolException.Inconsistent`), sanitized |
 | F10 | **Dependent CHECK** references the renamed/dropped nested field (§2.6) | both | `DeltaConstraintDependentColumnException` (`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE`) | enforcer names the offending column + dependent CHECKs |
 
 No fail-closed message echoes a raw segment; each is `DiagnosticText.Sanitize`d (§5, §7).
@@ -232,10 +252,26 @@ struct child resolves **by `field_id` within the container subtree** (id mode) o
 struct level (name mode); both are rename-stable, and the container binds by its own rename-stable
 `physicalName`. Therefore **every existing data file resolves unchanged** under the new logical name — **zero
 rewrite**. The commit is exactly **one `metaData`** (merged schema), **zero `add`/`remove`**, and
-`delta.columnMapping.maxColumnId` is **unchanged** (no identity is minted). A rename collision (F6) is rejected
-fail-closed against sibling names at the **same parent level** under **both** the case-sensitive ordinal rule
-**and** the OrdinalIgnoreCase merged-schema collision rule (#676 §2.12), so `struct<city,CITY>` cannot be
-produced by a rename.
+`delta.columnMapping.maxColumnId` is **unchanged** (no identity is minted). A rename collision is rejected
+fail-closed against sibling names at the **same parent struct level** by **two distinct enforcers at two
+distinct stages**: **(F6a)** the **case-sensitive ordinal** door check (`schema.IndexOf(toName) >= 0`;
+`StructType.IndexOf` is ordinal, `StructType.cs:146`) throws `InvalidOperationException` **at the door**; and
+**(F6b)** the **case-insensitive** sibling collision is enforced at **commit** — **not** at the door (there is
+**no inline OrdinalIgnoreCase check** in the door) — by the recursive per-level
+`ColumnMapping.EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:1077`) invoked from `DeltaCommitter`
+(`DeltaCommitter.cs:377`), throwing `DeltaProtocolException.Inconsistent` (this realizes the parent design
+#676 §2.2/§2.3 recursive case-insensitive collision contract; the parent doc **ends at §2.9** and has no
+§2.12). So `struct<city,CITY>` cannot be produced by a rename — the committer's per-level check rejects it.
+
+**Rename-to-same-name is a no-op (carve-out, matching the flat door).** As the flat door does
+(`DeltaTableWriter.cs:711`:
+`if (!string.Equals(fromName, toName, StringComparison.Ordinal) && schema.IndexOf(toName) >= 0)`), the nested
+door **skips the sibling-collision gate (F6a) when the target's last-segment `Name` equals `toName` under
+`StringComparison.Ordinal`**. Renaming a nested child to its own name — e.g. `["address","zip"] → "zip"` — is
+therefore a **no-op**, never a false-reject: the collision gate is skipped and the metaData is re-committed
+unchanged (still exactly one `metaData`, zero `add`/`remove`, `maxColumnId` unchanged). Without this carve-out
+the nested spec would false-reject `["address","zip"] → "zip"` (the target `zip` already "exists" at its
+level), diverging from the flat-door DDL semantics; with it, the nested door matches the flat door exactly.
 
 *Top-level partition-column parity (retained from the flat door):* if a **length-1** path renames a top-level
 partition column, `metaData.partitionColumns` (which holds **logical** names) is updated to the new logical
@@ -257,10 +293,10 @@ whose predicate references the field by its **dotted logical reference** in *use
 `CHECK (address.zip > 0)`). Crucially this matching is a **read-only dependency check that is entirely
 separate from the writer's segment-array addressing**: `EnsureNoDependentConstraints` passes the **post-ALTER**
 `StructType` to the enforcer, which parses each CHECK's SQL and *resolves* it against that schema
-(`ConstraintExpressionFrontend.ParseResolveWithInput`, `DeltaSinkFactory.cs:302`). If the nested rename/drop
+(`ConstraintExpressionFrontend.ParseResolveWithInput`, `DeltaSinkFactory.cs:295`). If the nested rename/drop
 removed the field the CHECK reads, resolution throws `UnresolvedStructField` (#600/#618), which the enforcer
 reclassifies — normalizing the nested reference `address.zip` to its **top-level** column `address` — into
-`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE` (`DeltaSinkFactory.cs:305-347`). So:
+`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE` (`DeltaSinkFactory.cs:296-347`). So:
 
 - The **writer** never parses or composes a dotted path; it addresses by segment array only (§2.4).
 - The **constraint predicate** is user SQL whose dotted field reference is matched by the **analyzer** during
@@ -291,7 +327,7 @@ reclassifies — normalizing the nested reference `address.zip` to its **top-lev
 | #834/#828 nested Parquet **write** (`WriteAllPartsAsync`) | **merged** | authors the nested physical Parquet whose files must remain byte-identical across a rename/drop (§3.1 SHA-256 assertion); the write-facade cannot encode nested batches, so §3 round-trips pair the merged real nested writer with hand-authored `_delta_log` (§3, §8) |
 | #616 dangling-CHECK guard (`EnsureNoDependentConstraints`) | **merged** | the constraint dependency door extended in reasoning to nested paths (§2.6) |
 | #600/#618 nested constraint reference resolution | **merged** | the analyzer path that surfaces a broken nested CHECK dependency as `UnresolvedStructField`→`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE` (§2.6) |
-| #585 nested-within-nested rename/drop | **open** | scope boundary (fail-closed, F4) |
+| #585 nested-within-nested rename/drop | **open** | scope boundary (fail-closed; array/map interior F4, struct-within-struct F4b) |
 | #839 array/map id-mode nested | **open** | scope boundary (this door is name-mode only; array/map interior rename is C1-forbidden regardless) |
 | #675 nested CDF/column-mapping oracle | **open** | downstream consumer — reads an old file through this door's preserved nested-rename mapping (§3.5) |
 
@@ -369,18 +405,65 @@ reproduction line) at the house-precedent **200** iterations.
 8. `NestedStructChildRename_SiblingsCarriedByReference_SpineRebuiltFresh` — `ReferenceEquals` identity: only
    the target field and its ancestor spine are new instances; untouched siblings are reference-identical.
 
-**Fail-closed matrix (each asserts the exact exception type + sanitized path)**
-9. `EmptyPath_FailsClosed` (F1).
+**Fail-closed matrix — vacuity-guarded (the #675 lesson applied).** Six cells — **F1** (empty path), **F2**
+(absent segment), **F3** (scalar intermediate), **F6a** (case-sensitive collision), **F7** and **F8**
+(partition) — all throw the **same** `InvalidOperationException`. Asserting only the exception **type** + "path
+sanitized" does **not** prove the **target** guard fired: an earlier door — e.g. F2 (absent-segment) or F5
+(`RequireNameMode`, which runs **first**) — could catch a mis-authored fixture and pass the assertion
+**vacuously**. Therefore **every shared-`InvalidOperationException` cell additionally asserts its DISTINCT §2.5
+message SHAPE** (not merely the type), and each fixture is constructed so **only the target guard can fire**.
+The **guard ordering inside each door** is fixed and load-bearing: **(1)** `RequireNameMode` (F5) runs
+**first** → **(2)** empty-path (F1) → **(3)** segment descent (F2 absent-segment → F3 scalar-intermediate → F4
+array/map-intermediate → F4b struct-within-struct) → **(4)** door-time sibling collision (F6a) and partition
+guards (F7/F8) → **(5)** commit-time case-insensitive collision (F6b) and dependent-CHECK (F10). Per-cell
+fixture construction that **isolates** each guard:
+
+- **F1 (empty path)** and **F3 (scalar intermediate)** fixtures are on a **name-mode** table, so F5
+  (`RequireNameMode`, which runs first) does **not** pre-empt the target guard.
+- **F2 (absent segment)** fixture places a **present** intermediate before the missing segment (so F3/F4/F4b
+  cannot fire first) and asserts the message names the **sanitized partial path** resolved so far.
+- **F3 / F4 / F4b (typed intermediate)** fixtures make **every** intermediate **exist** (a real scalar / array
+  / map / struct child), so F2 (absent-segment) does **not** pre-empt; each asserts its **distinct** message
+  shape ("not a struct; cannot descend" vs "array element / map key/value … #585" vs "nested-within-nested …
+  #585").
+- **F6a (case-sensitive collision)** fixture uses a target whose last-segment `Name` **differs** from `toName`
+  (else the same-name carve-out, §2.6, makes it a no-op) and a sibling that **ordinally equals** `toName`.
+- **F7 / F8 (partition)** fixtures are name-mode with the guard's exact precondition present.
+
+This is the **#675** vacuity lesson (a same-typed exception shared across cells makes type-only assertions
+vacuous) applied to this door.
+
+**Fail-closed matrix (each asserts the exact exception type, its DISTINCT §2.5 message shape, and a sanitized path)**
+9. `EmptyPath_FailsClosed` (F1) — name-mode fixture (so F5 does not pre-empt); asserts the F1 message shape.
 10. `NonExistentSegment_AtIntermediate_FailsClosed` and `NonExistentSegment_AtTarget_FailsClosed` (F2) — the
-    message names the sanitized **partial** path.
-11. `IntermediateSegmentIsScalar_FailsClosed` (F3).
+    message names the sanitized **partial** path resolved so far; the intermediate before the missing segment
+    **exists** so F3/F4/F4b cannot pre-empt.
+11. `IntermediateSegmentIsScalar_FailsClosed` (F3) — the intermediate **exists** as a scalar (so F2 does not
+    pre-empt); asserts the "not a struct; cannot descend" message shape.
 12. `IntermediateSegmentIsArray_FailsClosed_Naming585` and `IntermediateSegmentIsMap_FailsClosed_Naming585`
-    (F4) — descending into an array/map interior fails closed naming **#585**.
+    (F4) — descending into an array/map interior fails closed naming **#585** (intermediate **exists**, so F2
+    does not pre-empt). **Companion `StructWithinStructIntermediate_FailsClosed_Naming585` (F4b)** — a
+    **second** struct hop (`struct<struct<…>>` intermediate). **Note: this cell is unconstructible today via a
+    loaded snapshot** — the parent's **load-time C1 gate** `RejectNestedWithinNested` (`ColumnMapping.cs:1332`,
+    `DeltaProtocolException.Unsupported`, via `ValidateColumnMappingSchema` at the load door,
+    `ColumnMapping.cs:414`) rejects the `struct<struct<…>>` schema **before** it can be loaded, pre-empting
+    this door's gate. So the test targets **the door's single-hop gate directly** with a **hand-built**
+    `StructType` (bypassing the load door) to assert the F4b message shape, **and** carries a companion
+    **`pending #585`** integration cell that will exercise the loaded-snapshot path once #585 relaxes
+    `RejectNestedWithinNested` (at which point the door's gate becomes load-bearing, §2.4).
 13. `IdMode_NestedRename_FailsClosed_RequireNameMode` and `IdMode_NestedDrop_FailsClosed_RequireNameMode`
-    (F5) — same gate as the flat path.
-14. `Rename_CollidesWithSibling_CaseSensitive_FailsClosed` and
-    `Rename_CollidesWithSibling_OrdinalIgnoreCase_FailsClosed` (F6) — the merged-schema OrdinalIgnoreCase rule
-    rejects `struct<city,CITY>` by rename.
+    (F5) — same gate as the flat path; asserts the `RequireNameMode` message shape.
+14. `Rename_CollidesWithSibling_CaseSensitive_FailsClosed` (F6a) — asserts `InvalidOperationException` **at the
+    door** with the "already exists at this level" message shape (target's last-segment `Name` differs from
+    `toName`, so the same-name carve-out does not apply). `Rename_CollidesWithSibling_OrdinalIgnoreCase_FailsClosed`
+    (F6b) — asserts `DeltaProtocolException.Inconsistent` **at commit** (from
+    `ColumnMapping.EnsureNoCaseInsensitiveDuplicateColumns` via `DeltaCommitter.cs:377`, **not**
+    `InvalidOperationException`), rejecting `struct<city,CITY>` by rename. The two cells assert **distinct
+    exception types** at **distinct stages** (door vs commit), so a mis-authored fixture cannot pass one guard
+    while claiming the other. Companion `Rename_ToSameName_IsNoOp_CollisionSkipped` — renaming a nested child
+    to its own last-segment `Name` under `StringComparison.Ordinal` (`["address","zip"] → "zip"`) **skips F6a**
+    and commits a **no-op** metaData (one `metaData`, zero `add`/`remove`, `maxColumnId` unchanged), matching
+    the flat door (`DeltaTableWriter.cs:711`).
 15. `Drop_TopLevelPartitionColumn_FailsClosed` (F7, retained flat guard) and
     `Rename_TopLevelPartitionColumn_UpdatesPartitionColumnsLogicalName_MetadataOnly` (top-level parity).
 16. `DependentCheckOnNestedField_Rename_FailsClosed_AsDependentColumnChange` and its drop dual (F10) — a
@@ -393,7 +476,13 @@ reproduction line) at the house-precedent **200** iterations.
 **Message hygiene (#683)**
 17. `NestedRenameDrop_FailClosedMessages_AreSanitized_NoRawSegment` — no raw path segment (oversized /
     control-char / lookalike) appears in any fail-closed message; each is `DiagnosticText.Sanitize`d, and the
-    rename message's multiple `toName` occurrences are all sanitized (amplification pin).
+    rename message's multiple `toName` occurrences are all sanitized (amplification pin). **Companion
+    `NestedRenameDrop_DiagnosticRender_IsBoundaryPreserving_NonCollapsing`** (with §3.7) — a fail-closed
+    message for a path containing a **dot-in-name** segment (a field literally named `a.b`, §3.7) renders each
+    segment in its **own** `["…"]` bracket (or a JSON-array form), so `["a.b"].["zip"]` is **not** collapsed to
+    an ambiguous `a.b.zip`; the test asserts the render is **non-collapsing / unambiguous** (a path into
+    `a`→`b`→`zip` and a path `["a.b","zip"]` render **distinguishably**), not merely that each segment is
+    `Sanitize`d (§7).
 
 **Concurrency**
 18. `NestedRename_ConcurrentCommit_AbortsUnderWholeTableScope` — a concurrent commit between snapshot load and
@@ -401,11 +490,25 @@ reproduction line) at the house-precedent **200** iterations.
 
 **Seeded property harness**
 19. `NestedRenameDrop_Property_MetadataOnlyInvariant` — random `struct<scalars>` shapes (field count, sibling
-    count, scalar types, disjoint per-child value domains); random rename/drop of a random reachable segment
-    path; assert the §3.1 conjunction (1 `metaData` ∧ 0 `add`/`remove` ∧ every-file SHA-256 identical ∧
-    `maxColumnId` unchanged ∧ round-trip identity) **or** a typed fail-closed (∈ {`InvalidOperationException`,
-    `DeltaConstraintDependentColumnException`, `DeltaStorageException`}); a shrunk failing draw lands as a
-    permanent minimized regression (not a bare seed), 200 iterations.
+    count, scalar types, **disjoint** per-child value domains). The harness draws from **two** generators and
+    asserts the **matching** branch (the prior harness generated **only reachable** paths, so its "conjunction
+    **or** typed fail-closed" left the fail-closed disjunct **never exercised** — vacuous; drawing from both
+    generators closes that):
+    - a **reachable-path generator** (a random valid segment path) → assert the §3.1 conjunction (1 `metaData`
+      ∧ 0 `add`/`remove` ∧ every-file SHA-256 identical ∧ `maxColumnId` unchanged ∧ round-trip identity);
+    - an **enumerated malformed-path tamper-operator set** (the write-door analog of the parent §3.33 tamper
+      set) → assert the **SPECIFIC typed fail-closed** for each operator, not a generic "or fail-closed":
+      **empty path** (F1, `InvalidOperationException`); **non-existent segment** — *intermediate* **and**
+      *last* (F2, `InvalidOperationException`); **scalar intermediate** (F3, `InvalidOperationException`);
+      **array/map intermediate** (F4, `InvalidOperationException` naming #585); **struct-within-struct
+      intermediate** (F4b, `InvalidOperationException` naming #585 — **hand-built** to bypass the load gate,
+      per §3.12); **sibling collision** — *case-sensitive* (F6a, `InvalidOperationException` **at the door**)
+      **and** *case-insensitive* (F6b, `DeltaProtocolException.Inconsistent` **at commit**); **dependent-CHECK
+      reference** (F10, `DeltaConstraintDependentColumnException`); **rename-to-same-name** (the no-op
+      carve-out, §2.6 — asserts the §3.1 **conjunction**, *not* a fail-closed).
+    A shrunk failing draw lands as a permanent minimized regression (not a bare seed). Reuses
+    `tests/Shared/TestSeed.cs` (`Resolve`/`Combine`, `DELTASHARP_TEST_SEED`, the `[deltasharp-seed]`
+    reproduction line) at the house-precedent **200** iterations.
 
 **Acceptance-criteria mapping (#840):** AC-segment-array-addressing → §3.6–3.8; AC-rename-read-through →
 §3.1–3.3, 3.5; AC-drop-no-reuse → §3.4; AC-fail-closed → §3.9–3.17; AC-constraint-dependency → §3.16;
@@ -436,7 +539,9 @@ AC-name-mode-only → §3.13.
 - **The segment array *is* the injection mitigation.** A dotted-string address (`"address.zip"`) is ambiguous
   with a legal logical field literally named `address.zip` — the exact `.`-in-logical-name collision that the
   structured `ColumnPathKey`/#830 was built to close. This door **never** parses or composes a dotted string
-  (§2.4); addressing is an ordered `IReadOnlyList<string>` descended structurally. A caller cannot smuggle a
+  **for addressing** (§2.4); addressing is an ordered `IReadOnlyList<string>` descended structurally. The
+  **only** dotted-ish form anywhere is a **one-way, sanitized, boundary-preserving diagnostic render** (§7)
+  that is **never re-parsed** into an address. A caller cannot smuggle a
   path traversal or a wrong-field mutation through a crafted name, because each segment is matched by exact
   ordinal `TryGetField` at exactly one struct level, and the target is `ReferenceEquals`-selected.
 - **Sanitized diagnostics (the crux).** Segment arrays are attacker-influenced when the ALTER text is
@@ -473,10 +578,10 @@ graph LR
 
 | STRIDE | Surface | Threat | Mitigation |
 |---|---|---|---|
-| **Tampering** | dotted-string address | a crafted logical name `a.b` collides with a path into `a`→`b` → wrong-field mutation | **segment-array addressing** (§2.4); no dotted parse/compose anywhere; ordinal `TryGetField` per level + `ReferenceEquals` target selection |
+| **Tampering** | dotted-string address | a crafted logical name `a.b` collides with a path into `a`→`b` → wrong-field mutation | **segment-array addressing** (§2.4); no dotted parse/compose **for addressing** anywhere (the only dotted-ish form is the one-way, boundary-preserving §7 diagnostic render, never re-parsed); ordinal `TryGetField` per level + `ReferenceEquals` target selection |
 | **Tampering** | rename re-points a logical name at a different physical column | data mis-attribution on read | **id/physicalName preserved verbatim** on rename (§2.6); a rename only changes `Name`; §3.3 asserts identity byte-equality |
 | **Tampering** | drop-then-re-add aliases old physical column | dropped column's stale data resurfaces under a re-added name | `maxColumnId` never reused; re-add mints a **fresh** id+physicalName (§3.4) |
-| **Elevation** | descend into an array/map interior or nested-within-nested | mutate a non-addressable node (C1 says it has no identity) | **fail-closed naming #585** (F4); intermediate must resolve to a `StructType` |
+| **Elevation** | descend into an array/map interior or nested-within-nested | mutate a non-addressable node (C1 says it has no identity) | **fail-closed naming #585** (F4 array/map interior, F4b struct-within-struct); intermediate must resolve to a `StructType` **and** only the top-level column may be a struct intermediate |
 | **Spoofing** | id-mode nested rename/drop | write an id-mode table (unsupported everywhere) | `RequireNameMode` gate (F5) — same as the flat path |
 | **Info disclosure** | fail-closed messages | raw oversized/control-char/lookalike segment echoed → log flood / injection | **`DiagnosticText.Sanitize`** on every echoed component (§5, §3.17); the #683 amplification cap |
 | **Tampering** | dangling CHECK after nested rename/drop | a surviving `CHECK (address.zip > 0)` brick / silent enforce on a missing field | `EnsureNoDependentConstraints` — analyzer resolves the CHECK against the post-ALTER schema, `UnresolvedStructField`→`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE` (F10, §2.6) |
@@ -484,7 +589,8 @@ graph LR
 | **Tampering** | concurrent commit races the ALTER | committing against a stale schema | `DeltaReadScope.WholeTable` — any concurrent commit aborts the ALTER (§3.18) |
 
 **Residual:** array/map interior and nested-within-nested rename/drop are out of scope, fail-closed (#585).
-The parent-doc flat-mode id-anchor residuals (#676 §6) are inherited unchanged and are not re-opened by this
+The parent-doc **nested-analogue** id-anchor residuals (#676 §6 (i)/(ii) — the nested analogue of DeltaSharp's
+flat-mode posture, `ColumnMappingIdentity.cs:78-92`) are inherited unchanged and are not re-opened by this
 door (a rename preserves the anchor; a drop retires it). No new data-integrity residual is introduced — the
 operation is metadata-only.
 
@@ -494,9 +600,17 @@ operation is metadata-only.
 
 - **Logging:** fail-closed rejections surface via the existing sanitized
   `InvalidOperationException`/`DeltaConstraintDependentColumnException`/`DeltaStorageException` path; the
-  message carries the **sanitized** nested path (e.g. `address.zip`) — the only place a rendered dotted form
-  appears, and it is a *diagnostic render of a sanitized segment array*, never a parsed address. No new
-  happy-path log site (the ALTER already logs its `metaData` commit at the committer).
+  message carries the sanitized nested path rendered in an **unambiguous, boundary-preserving** per-segment
+  bracket-quote form — `["address"].["zip"]` (each segment individually `DiagnosticText.Sanitize`d **inside**
+  its own `["…"]` bracket), **never** a boundary-collapsing dotted string. This is load-bearing because a
+  legal segment can itself contain a `.` (§3.7, a field literally named `a.b`): a naïve dotted render
+  `a.b.zip` would **collapse** the boundary between the segment `a.b` and a child `zip`, becoming
+  indistinguishable from a path into `a`→`b`→`zip` — exactly the ambiguity §5/§6 forbid. The bracket-quote
+  form (equivalently a JSON-array render `["a.b","zip"]`) **preserves every segment boundary** and is a
+  **one-way diagnostic render of a sanitized segment array, never re-parsed as an address**. This is the only
+  place a dotted-ish rendering appears, and it does not contradict §5/§6's "never composes/parses a dotted
+  string **for addressing**". No new happy-path log site (the ALTER already logs its `metaData` commit at the
+  committer).
 - **Metrics:** none — schema transform, no runtime hot path; the commit is one `metaData` action counted by
   the existing commit metrics.
 - **Correlation:** violations and the successful commit surface under the existing table-path/version fields on
@@ -539,9 +653,13 @@ operation is metadata-only.
    into an array/map interior fails closed naming **#585**. The whole top-level array/map *column* remains
    renamable/droppable as a 1-segment path (it **is** a `StructField`).
 2. **Nested-within-nested rename (`struct<struct<…>>`, `array<struct>`, …) — RESOLVED: out of scope (#585),
-   fail-closed (F4).** The single-level scope allows exactly one struct hop (top-level column → its scalar/
-   container children). A second struct hop is deferred to **#585**; an intermediate that is itself a nested
-   container fails closed at the descent.
+   fail-closed (F4b for a `struct<struct<…>>` intermediate; F4 for an array/map intermediate).** The
+   single-level scope allows exactly one struct hop (top-level column → its scalar/
+   container children). A **second** struct hop is deferred to **#585** and rejected by the explicit single-hop
+   descent gate (F4b, §2.4); an intermediate that is itself an array/map container fails closed (F4). Today the
+   parent's load-time C1 gate `RejectNestedWithinNested` (`ColumnMapping.cs:1332`) pre-empts a loaded
+   `struct<struct<…>>`, so the F4b gate is defense-in-depth; when **#585** relaxes that load gate, the F4b gate
+   becomes load-bearing (§2.4).
 3. **Id-mode nested rename/drop — RESOLVED: name-mode only (F5, same `RequireNameMode` gate as the flat
    path).** Id-mode nested struct is *readable* per #676, but **writing** an id-mode table is fail-closed
    everywhere (`storage-delta-architecture.md` §2.12.3: the centralized `DeltaCommitter` id-write gate +
@@ -579,10 +697,17 @@ operation is metadata-only.
 - Code anchors — `src/DeltaSharp.Storage/Delta/DeltaTableWriter.cs`: `RenameColumnAsync`/`DropColumnAsync`
   flat overloads (`:695`/`:759`, the `ReferenceEquals`-rebuild idiom `:721-730`/`:769-777`), `RequireNameMode`
   (`:893`), `EnsureNoDependentConstraints` (`:1010`), `CommitSchemaChangeAsync` (`:1040`).
-  `src/DeltaSharp.Abstractions/StructType.cs`: `TryGetField` (`:133`), `IndexOf` (`:146`), duplicate-name
-  ctor reject (`:157`), `StructField.Equals` (Name/Nullable/DataType/**Metadata**).
+  `src/DeltaSharp.Abstractions/StructType.cs`: `TryGetField` (`:133`), `IndexOf` (`:146`, ordinal),
+  duplicate-name ctor reject (`:98-105`, throwing **`SchemaValidationException`** — *not*
+  `InvalidOperationException`), `StructField.Equals` (Name/Nullable/DataType/**Metadata**).
+  `src/DeltaSharp.Storage/Delta/ColumnMapping.cs`: `RejectNestedWithinNested` (`:1332`,
+  `DeltaProtocolException.Unsupported`, via `ValidateColumnMappingSchema` `:414` at the load door),
+  `EnsureNoCaseInsensitiveDuplicateColumns` (`:1077`, recursive per level, throwing
+  `DeltaProtocolException.Inconsistent` at `:1093`).
+  `src/DeltaSharp.Storage/Delta/DeltaCommitter.cs`: commit-time case-insensitive dup enforcement
+  (`:377`, calls `ColumnMapping.EnsureNoCaseInsensitiveDuplicateColumns`).
   `src/DeltaSharp.Executor/Storage/DeltaSinkFactory.cs`: constraint dependency reclassification
-  (`ParseResolveWithInput` `:302`, `UnresolvedStructField`→`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE`
-  `:305-347`).
+  (`ParseResolveWithInput` `:295`, `UnresolvedStructField`→`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE`
+  `:296-347`, throwing `DeltaConstraintDependentColumnException`).
   `src/DeltaSharp.Abstractions/SchemaJson.cs`: `WriteType` metadata slot on `StructField` only (the C1 basis).
   `src/DeltaSharp.Storage/Delta/ColumnMappingIdentity.cs`: structured `ColumnPathKey` (`:143`).
