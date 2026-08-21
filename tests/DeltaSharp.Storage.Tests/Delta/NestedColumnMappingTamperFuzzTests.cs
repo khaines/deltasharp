@@ -404,11 +404,13 @@ public sealed class NestedColumnMappingTamperFuzzTests
     }
 
     // =========================================================================================
-    // §3.24 · nested.ids reject + case-insensitive sibling collision
+    // §3.16b · name-mode foreign nested.ids reject (a #676 C1 corollary — nested.ids is meaningful
+    //           ONLY under id mode on an array/map; a stray one on a name-mode field fails closed and
+    //           is NEVER accepted-and-ignored)
     // =========================================================================================
 
     [Fact]
-    public void MappedSchemaCarryingNestedIds_ValidateFailsClosed_NamesNestedIdsAnd839()
+    public void MappedSchemaCarryingNestedIds_NameMode_ValidateFailsClosed_ForeignKey()
     {
         var meta = ImmutableDictionary<string, MetadataValue>.Empty
             .Add(IdKey, MetadataValue.Long(2))
@@ -423,7 +425,7 @@ public sealed class NestedColumnMappingTamperFuzzTests
             () => ColumnMapping.ValidateColumnMappingSchema(
                 ColumnMappingMode.Name, schema, ColumnMapping.NameModeConfiguration(2)));
         Assert.Contains(ColumnMapping.NestedIdsKey, ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#839", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("id mode", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
