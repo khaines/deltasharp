@@ -117,7 +117,7 @@ public sealed class NestedParquetRowGroupPlanningTests
             ? (ArraySchema, WideArrayBatch(rows, fanOut))
             : (MapSchema, WideMapBatch(rows, fanOut));
 
-        int perSlot = NestedColumnShredder.LevelBufferBytesPerSlot(schema[0].DataType);
+        int perSlot = NestedColumnShredder.RowGroupTransientBytesPerSlot(schema[0].DataType);
         long maxSlots = Math.Max(budget / perSlot, 1);
         int rowsPerGroup = Math.Max((int)(maxSlots / fanOut), 1);
         int expectedGroups = (rows + rowsPerGroup - 1) / rowsPerGroup;
@@ -204,10 +204,10 @@ public sealed class NestedParquetRowGroupPlanningTests
             new StructField("a", DataTypes.CreateArrayType(DataTypes.StringType), nullable: true),
         });
 
-        // The value fold is real: array<string> costs strictly more per slot than array<int>.
+        // The value fold is real: array<string> costs strictly more per SPLIT slot than array<int>.
         Assert.True(
-            NestedColumnShredder.LevelBufferBytesPerSlot(stringSchema[0].DataType)
-                > NestedColumnShredder.LevelBufferBytesPerSlot(ArraySchema[0].DataType),
+            NestedColumnShredder.RowGroupTransientBytesPerSlot(stringSchema[0].DataType)
+                > NestedColumnShredder.RowGroupTransientBytesPerSlot(ArraySchema[0].DataType),
             "the folded per-slot cost must charge the string leaf's value width");
 
         ColumnBatch stringBatch = WideStringArrayBatch(stringSchema, rows, fanOut);
@@ -356,26 +356,28 @@ public sealed class NestedParquetRowGroupPlanningTests
     [Fact]
     public void PlanRowCount_ChargesLevelStreamsPlusLeafValueWidthPerSlot()
     {
-        // The per-slot cost is the number of int level streams the lane rents CONCURRENTLY (bound to the rents
-        // the lanes ACTUALLY issue by the source invariant in
+        // The SPLIT cost is the number of int level streams the lane rents CONCURRENTLY (bound to the rents the
+        // lanes ACTUALLY issue by the source invariant in
         // DeltaSharp.Core.Tests.WriteDoor.NestedShredderGuardWiringTests, so the level portion is not
-        // self-referential) PLUS the physical width of the leaf value(s) each slot stages (#845 item 2). Getting
-        // the level portion wrong silently turns a "resource" bound into a semantic one; OMITTING the value
-        // portion lets array<string>/array<decimal> rent ~2-3x the named budget, which the fold closes so ONE
-        // budget governs the whole per-column transient. The string leaf's 32-byte per-slot proxy is
+        // self-referential) PLUS the physical width of the leaf value(s) each slot stages (#845 item 2). This
+        // folded cost drives SPLITTING only (RowGroupTransientBytesPerSlot); the ACCEPTANCE/reject surface uses
+        // the level-only LevelBufferBytesPerSlot, so the fold can never narrow the §2.6 acceptance set (pinned
+        // by TheValueFold_NeverNarrowsTheAcceptanceSet_OnlySplitsSmaller). OMITTING the value portion here lets
+        // array<string>/array<decimal> rent ~2-3x the named budget before splitting, which the fold closes so
+        // ONE budget governs the whole per-column transient. The string leaf's 32-byte per-slot proxy is
         // NestedColumnShredder.VariableLeafValueBytesPerSlot (a 16-byte ReadOnlyMemory descriptor + a 16-byte
         // payload estimate).
         Assert.Equal(
             (4 * sizeof(int)) + 32 + sizeof(int),   // key/value def+rep + string key (32) + int value (4)
-            NestedColumnShredder.LevelBufferBytesPerSlot(MapSchema[0].DataType));
+            NestedColumnShredder.RowGroupTransientBytesPerSlot(MapSchema[0].DataType));
         Assert.Equal(
             (2 * sizeof(int)) + sizeof(int),        // element def+rep + int element (4)
-            NestedColumnShredder.LevelBufferBytesPerSlot(ArraySchema[0].DataType));
+            NestedColumnShredder.RowGroupTransientBytesPerSlot(ArraySchema[0].DataType));
         Assert.Equal(
             sizeof(int) + sizeof(int),              // one def stream (reused across children) + int child (4)
-            NestedColumnShredder.LevelBufferBytesPerSlot(
+            NestedColumnShredder.RowGroupTransientBytesPerSlot(
                 DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.IntegerType, nullable: true) })));
-        Assert.Equal(0, NestedColumnShredder.LevelBufferBytesPerSlot(DataTypes.IntegerType));
+        Assert.Equal(0, NestedColumnShredder.RowGroupTransientBytesPerSlot(DataTypes.IntegerType));
     }
 
     [Fact]
@@ -392,6 +394,55 @@ public sealed class NestedParquetRowGroupPlanningTests
                 ArraySchema[0], segments, 64, ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes));
     }
 
+    [Theory]
+    [InlineData("array", 100)]
+    [InlineData("map", 50)]
+    public async Task TheValueFold_NeverNarrowsTheAcceptanceSet_OnlySplitsSmaller(string shape, int fanOut)
+    {
+        // §2.6 non-narrowing invariant (RFL #850 / #845 item 2). array<scalar>/map<scalar,scalar> are admitted
+        // UNCONDITIONALLY, so the leaf value-width fold (RowGroupTransientBytesPerSlot) may only make row groups
+        // SMALLER (splitting) — it must NEVER decide whether a write is REJECTED. The decorrelated red-team's
+        // exact case: a SINGLE row of a high null/empty fan-out, whose TRUE per-value transient is 0, must be
+        // ACCEPTED whenever it fits the LEVEL budget, regardless of the (much larger) FOLDED budget. Before the
+        // fix the 32-byte string/binary value proxy was folded into the reject surface and rejected this legal
+        // row (rowSlots > budget/foldedCost), narrowing the acceptance set below the level-only baseline.
+        const long budget = 1024;
+        (StructType schema, ColumnBatch batch) = shape == "array"
+            ? (NullElementStringArraySchema, NullElementStringArrayBatch(fanOut))
+            : (NullValueStringMapSchema, NullValueStringMapBatch(fanOut));
+
+        DataType type = schema[0].DataType;
+        long maxLevelSlots = Math.Max(budget / NestedColumnShredder.LevelBufferBytesPerSlot(type), 1);
+        long maxFoldedSlots = Math.Max(budget / NestedColumnShredder.RowGroupTransientBytesPerSlot(type), 1);
+
+        // Non-vacuity: this fan-out FITS the level budget (so it is legal, unconditionally admitted) but EXCEEDS
+        // the folded budget — so if the reject were (wrongly) wired to the folded cost it WOULD throw. That gap
+        // is exactly the acceptance-set narrowing this cell pins closed.
+        Assert.True(fanOut <= maxLevelSlots, "the fan-out must fit the LEVEL budget");
+        Assert.True(fanOut > maxFoldedSlots, "the fan-out must exceed the FOLDED budget, so a folded reject would narrow acceptance");
+
+        // PlanRowCount must ACCEPT the single row (plans >= 1), identically to a level-only plan — never throw.
+        var segments = new[] { new NestedColumnShredder.ColumnSegment(batch.Column(0), 0, 1) };
+        Assert.Equal(1, NestedColumnShredder.PlanRowCount(schema[0], segments, 1, budget));
+
+        // And end to end: the row writes and reads back, so acceptance is real, not just a planning artifact.
+        byte[] bytes;
+        using (var output = new MemoryStream())
+        {
+            await new BudgetedParquetFileWriter(budget)
+                .WriteAsync(output, schema, new[] { batch }, CancellationToken.None);
+            bytes = output.ToArray();
+        }
+
+        int observed = 0;
+        await foreach (ColumnBatch group in ReadAsync(bytes, schema))
+        {
+            observed += group.LogicalRowCount;
+        }
+
+        Assert.Equal(1, observed);
+    }
+
     private static readonly StructType ArraySchema = DataTypes.CreateStructType(new[]
     {
         new StructField("a", DataTypes.CreateArrayType(DataTypes.IntegerType), nullable: true),
@@ -401,6 +452,51 @@ public sealed class NestedParquetRowGroupPlanningTests
     {
         new StructField("m", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType), nullable: true),
     });
+
+    private static readonly StructType NullElementStringArraySchema = DataTypes.CreateStructType(new[]
+    {
+        new StructField("a", DataTypes.CreateArrayType(DataTypes.StringType), nullable: true),
+    });
+
+    private static readonly StructType NullValueStringMapSchema = DataTypes.CreateStructType(new[]
+    {
+        new StructField("m", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.StringType), nullable: true),
+    });
+
+    // A single row of NULL string elements: the true per-value transient is 0, but the 32-byte string proxy
+    // over-charges each slot. It fits the LEVEL budget yet exceeds the FOLDED budget — the §2.6 case the fold
+    // must SPLIT (or here, pack as one row), never REJECT.
+    private static ColumnBatch NullElementStringArrayBatch(int fanOut)
+    {
+        var type = (ArrayType)NullElementStringArraySchema[0].DataType;
+        MutableColumnVector elements = ColumnVectors.Create(DataTypes.StringType, fanOut);
+        for (int e = 0; e < fanOut; e++)
+        {
+            elements.AppendNull();
+        }
+
+        var offsets = new[] { 0, fanOut };
+        var vector = new ListColumnVector(type, elements, offsets, new bool[1]);
+        return new ManagedColumnBatch(NullElementStringArraySchema, new ColumnVector[] { vector }, 1);
+    }
+
+    // A single map row whose (required) keys are tiny and whose string VALUES are all null: again a 0-byte true
+    // value transient over-charged by two 32-byte proxies (key + value) folded per slot.
+    private static ColumnBatch NullValueStringMapBatch(int fanOut)
+    {
+        var type = (MapType)NullValueStringMapSchema[0].DataType;
+        MutableColumnVector keys = ColumnVectors.Create(DataTypes.StringType, fanOut);
+        MutableColumnVector values = ColumnVectors.Create(DataTypes.StringType, fanOut);
+        for (int e = 0; e < fanOut; e++)
+        {
+            keys.AppendBytes(Encoding.UTF8.GetBytes($"k{e}"));
+            values.AppendNull();
+        }
+
+        var offsets = new[] { 0, fanOut };
+        var vector = new MapColumnVector(type, keys, values, offsets, new bool[1]);
+        return new ManagedColumnBatch(NullValueStringMapSchema, new ColumnVector[] { vector }, 1);
+    }
 
     private static ColumnBatch WideArrayBatch(int rows, int fanOut)
     {

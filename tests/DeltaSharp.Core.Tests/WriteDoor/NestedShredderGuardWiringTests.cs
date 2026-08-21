@@ -130,11 +130,15 @@ public sealed class NestedShredderGuardWiringTests
                     && i.Expression.ToString().Contains("ArrayPool<int>", StringComparison.Ordinal));
             Assert.True(rented > 0, $"'{lane}' rents no int level buffer, so the cost table cannot be bound.");
 
-            // The arm binds its own type into a declaration pattern (`MapType map => …`) because it folds that
-            // type's leaf value width; match on the declared type, then extract the level-stream count from the
-            // `n * sizeof(int)` SUB-EXPRESSION.
+            // Each arm binds its own type as a bare type pattern (`MapType => n * sizeof(int)`) — the LEVEL-ONLY
+            // cost, with no value-width fold (that lives in RowGroupTransientBytesPerSlot). At the SYNTAX layer
+            // a bare type name in an arm is a ConstantPattern wrapping an IdentifierName; match on that, then
+            // read the level-stream count from the `n * sizeof(int)` (or bare `sizeof(int)`) expression.
             SwitchExpressionArmSyntax arm = Assert.Single(
-                table.Arms, a => a.Pattern is DeclarationPatternSyntax d && d.Type.ToString() == type);
+                table.Arms,
+                a => a.Pattern is ConstantPatternSyntax c
+                    && c.Expression is IdentifierNameSyntax id
+                    && id.Identifier.ValueText == type);
             Assert.Equal(rented, DeclaredIntStreams(arm.Expression, type));
 
             // #845 item 1: the lane feeds LevelBufferBytesPerSlot(<its OWN type var>) into its slot-count helper.
@@ -150,22 +154,19 @@ public sealed class NestedShredderGuardWiringTests
         }
     }
 
-    // `n * sizeof(int)` declares n concurrent level streams; a bare `sizeof(int)` declares one. The arm folds a
-    // leaf value-width term (#845 item 2), so the level-stream count is the `n * sizeof(int)` (or bare
-    // `sizeof(int)`) SUB-EXPRESSION, not the whole arm.
+    // `n * sizeof(int)` declares n concurrent level streams; a bare `sizeof(int)` declares one. Each arm is
+    // now the LEVEL-ONLY cost (no value-width fold — that moved to RowGroupTransientBytesPerSlot, #845 item 2),
+    // so the whole arm expression is exactly the `n * sizeof(int)` (or bare `sizeof(int)`) level-stream count.
     private static int DeclaredIntStreams(ExpressionSyntax expression, string type)
     {
-        foreach (SyntaxNode node in expression.DescendantNodesAndSelf())
+        if (expression is BinaryExpressionSyntax b && b.IsKind(SyntaxKind.MultiplyExpression)
+            && b.Left is LiteralExpressionSyntax literal
+            && b.Right is SizeOfExpressionSyntax)
         {
-            if (node is BinaryExpressionSyntax b && b.IsKind(SyntaxKind.MultiplyExpression)
-                && b.Left is LiteralExpressionSyntax literal
-                && b.Right is SizeOfExpressionSyntax)
-            {
-                return (int)literal.Token.Value!;
-            }
+            return (int)literal.Token.Value!;
         }
 
-        if (expression.DescendantNodesAndSelf().OfType<SizeOfExpressionSyntax>().Any())
+        if (expression is SizeOfExpressionSyntax)
         {
             return 1;
         }

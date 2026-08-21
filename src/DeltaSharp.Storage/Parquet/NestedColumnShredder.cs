@@ -82,24 +82,44 @@ internal static class NestedColumnShredder
         int.MaxValue);
 
     /// <summary>
-    /// The transient bytes ONE logical slot of <paramref name="type"/> costs across the WHOLE per-column
-    /// write — the <c>int</c> level streams the lane rents concurrently (times <c>sizeof(int)</c>) PLUS the
-    /// physical width of the leaf value(s) each slot stages (#845 item 2). A map nests key and value in one
-    /// repeated group and holds four level streams plus both leaf values; an array holds definition +
-    /// repetition plus its element value; a struct holds one definition stream, reused across children (D2),
-    /// at one slot per row, plus its children's values.
-    /// <para><b>Why the value width is folded in.</b> The level buffers were budgeted alone, but the leaf
-    /// value array and the string/binary UTF-16/byte scratch are CONCURRENT with them, so the true per-column
-    /// transient for <c>array&lt;string&gt;</c>/<c>array&lt;decimal&gt;</c> was ~2-3x the level budget.
-    /// Folding the value width here makes ONE budget (<see cref="ParquetFileWriter.NestedLevelBufferBudgetBytes"/>)
-    /// govern the whole per-column transient; the tightening splits value-heavy columns into smaller row
-    /// groups but never rejects legal data at the default budget.</para>
+    /// The transient level-buffer bytes ONE logical slot of <paramref name="type"/> costs — the number of
+    /// <c>int</c> level streams the lane rents concurrently, times <c>sizeof(int)</c>. A map nests key and
+    /// value in one repeated group and therefore holds four streams; an array holds definition + repetition;
+    /// a struct holds one definition stream, reused across children (D2), at exactly one slot per row.
+    /// <para>This is the LEVEL-ONLY cost and is the ONLY cost the ACCEPTANCE/reject surfaces
+    /// (<see cref="PlanRowCount"/>'s single-row guard and <see cref="CheckSlotBound"/>) may use, so it
+    /// exactly preserves the §2.6 acceptance set: <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c>
+    /// are admitted unconditionally and no fan-out VALUE width may narrow that set. The wider level+value
+    /// cost that governs SPLITTING lives in <see cref="RowGroupTransientBytesPerSlot"/>.</para>
     /// </summary>
     internal static int LevelBufferBytesPerSlot(DataType type) => type switch
     {
-        MapType map => (4 * sizeof(int)) + LeafValueBytesPerSlot(map.KeyType) + LeafValueBytesPerSlot(map.ValueType),
-        ArrayType array => (2 * sizeof(int)) + LeafValueBytesPerSlot(array.ElementType),
-        StructType structType => sizeof(int) + StructValueBytesPerSlot(structType),
+        MapType => 4 * sizeof(int),
+        ArrayType => 2 * sizeof(int),
+        StructType => sizeof(int),
+        _ => 0,
+    };
+
+    /// <summary>
+    /// The transient bytes ONE logical slot of <paramref name="type"/> costs across the WHOLE per-column
+    /// write — the <c>int</c> level streams the lane rents concurrently
+    /// (<see cref="LevelBufferBytesPerSlot"/>) PLUS the physical width of the leaf value(s) each slot stages
+    /// (#845 item 2). A map holds four level streams plus both leaf values; an array holds definition +
+    /// repetition plus its element value; a struct holds one definition stream, reused across children (D2),
+    /// at one slot per row, plus its children's values.
+    /// <para><b>SPLIT-ONLY — never a reject.</b> The leaf value array and the string/binary UTF-16/byte
+    /// scratch are CONCURRENT with the level buffers, so this folded cost is the true peak per-column
+    /// transient. It bounds how SMALL row groups are (the multi-row SPLIT decision in
+    /// <see cref="PlanRowCount"/>) so ONE budget (<see cref="ParquetFileWriter.NestedLevelBufferBudgetBytes"/>)
+    /// governs the whole per-column peak. It is DELIBERATELY NOT used for any reject surface, so it can never
+    /// narrow the §2.6 acceptance set — a row that fits the level budget is always writable, split as
+    /// finely as this folded budget requires.</para>
+    /// </summary>
+    internal static int RowGroupTransientBytesPerSlot(DataType type) => type switch
+    {
+        MapType map => LevelBufferBytesPerSlot(map) + LeafValueBytesPerSlot(map.KeyType) + LeafValueBytesPerSlot(map.ValueType),
+        ArrayType array => LevelBufferBytesPerSlot(array) + LeafValueBytesPerSlot(array.ElementType),
+        StructType structType => LevelBufferBytesPerSlot(structType) + StructValueBytesPerSlot(structType),
         _ => 0,
     };
 
@@ -156,18 +176,21 @@ internal static class NestedColumnShredder
         ArgumentNullException.ThrowIfNull(schemaField);
         ArgumentNullException.ThrowIfNull(segments);
 
-        int bytesPerSlot = LevelBufferBytesPerSlot(schemaField.DataType);
-        if (bytesPerSlot == 0 || rowCount <= 0)
+        int splitBytesPerSlot = RowGroupTransientBytesPerSlot(schemaField.DataType);
+        if (splitBytesPerSlot == 0 || rowCount <= 0)
         {
             return rowCount;
         }
 
         string label = DiagnosticText.Sanitize(schemaField.Name);
-        long maxSlots = Math.Max(budgetBytes / bytesPerSlot, 1);
+        long maxSplitSlots = Math.Max(budgetBytes / splitBytesPerSlot, 1);
+        int levelBytesPerSlot = LevelBufferBytesPerSlot(schemaField.DataType);
+        long maxLevelSlots = Math.Max(budgetBytes / levelBytesPerSlot, 1);
         if (schemaField.DataType is StructType)
         {
-            // Exactly one slot per row, so the plan is a pure division — no vector walk needed.
-            return (int)Math.Min(rowCount, maxSlots);
+            // Exactly one slot per row, so the plan is a pure division — no vector walk needed. A struct
+            // never rejects (its per-row slot count is fixed at 1), so it packs on the folded SPLIT budget.
+            return (int)Math.Min(rowCount, maxSplitSlots);
         }
 
         try
@@ -180,15 +203,22 @@ internal static class NestedColumnShredder
                 for (int j = 0; j < segment.Length && row < rowCount; j++, row++)
                 {
                     long rowSlots = RowSlots(schemaField.DataType, segment.Vector, segment.Start + j, label);
-                    if (rowSlots > maxSlots)
+
+                    // ACCEPTANCE (reject) is LEVEL-ONLY: a single row is only unwritable when its own level
+                    // buffers alone cannot fit any row group (nothing left to split). The folded value width
+                    // must NEVER reach this surface, or it would narrow the §2.6 acceptance set.
+                    if (rowSlots > maxLevelSlots)
                     {
                         throw DeltaStorageException.UnsupportedFeature(
                             $"Nested column '{label}': a single logical row contributes {rowSlots} Dremel level "
-                            + $"slot(s), whose level and value buffers exceed the {budgetBytes}-byte per-column "
+                            + $"slot(s), whose level buffers alone exceed the {budgetBytes}-byte per-column "
                             + "budget for one row group; the row group cannot be split any further.");
                     }
 
-                    if (slots + rowSlots > maxSlots)
+                    // SPLITTING packs on the tighter FOLDED budget, but always guarantees at least one row so
+                    // a row that passed the level reject is writable even if it alone exceeds the split budget:
+                    // row 0 is always packed (planned > 0 guard); subsequent rows split on the folded budget.
+                    if (planned > 0 && slots + rowSlots > maxSplitSlots)
                     {
                         return planned;
                     }
