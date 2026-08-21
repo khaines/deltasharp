@@ -99,10 +99,13 @@ public sealed class NestedParquetWriteRejectTests
     }
 
     [Fact]
-    public void CreateField_RejectsNestedColumnCarryingAColumnMappingId_DeferredTo676()
+    public void CreateField_RejectsNestedArrayColumnCarryingAColumnMappingId_DeferredTo839()
     {
-        // §2.5/§2.7: NONE mode only. A nested column carrying delta.columnMapping.id would need per-LEAF
-        // field_id stamping, which is #676's scope — so the door refuses rather than stamping the container.
+        // §2.5/#839: an ARRAY (or map) column carrying delta.columnMapping.id under id mode is rejected at the
+        // write door — its interior (element/key/value) is not a StructField and carries no representable
+        // field_id, so id-mode nested array/map column mapping is deferred to #839. (A struct<scalar> container
+        // carrying ids DOES write — its scalar children stamp their own field_id; see the sibling positive
+        // test below.)
         var metadata = FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
         {
             ["delta.columnMapping.id"] = MetadataValue.Long(7),
@@ -113,7 +116,74 @@ public sealed class NestedParquetWriteRejectTests
             () => ParquetTypeMapping.CreateField(field, honorReferenceNullability: true));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
-        Assert.Contains("#676", error.Message, StringComparison.Ordinal);
+        Assert.Contains("#839", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void CreateField_IdModeStructWithStampedChildren_StampsEachChildLeafFieldId()
+    {
+        // §2.5/#676 positive: a struct<scalars> container whose children each carry a delta.columnMapping.id
+        // writes successfully under id mode — each scalar child leaf is stamped with ITS OWN field_id (= the
+        // child StructField's id). The container GROUP node carries no field_id (Parquet.Net exposes no public
+        // setter — the container binds by physical name). The container's own id is structural-only, never
+        // stamped on the wire.
+        var inner = DataTypes.CreateStructType(new[]
+        {
+            new StructField(
+                "a", DataTypes.LongType, nullable: true,
+                FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
+                {
+                    ["delta.columnMapping.id"] = MetadataValue.Long(11),
+                })),
+            new StructField(
+                "b", DataTypes.LongType, nullable: true,
+                FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
+                {
+                    ["delta.columnMapping.id"] = MetadataValue.Long(12),
+                })),
+        });
+        var container = new StructField(
+            "s", inner, nullable: true,
+            FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
+            {
+                ["delta.columnMapping.id"] = MetadataValue.Long(2),
+            }));
+
+        var parquetStruct = (global::Parquet.Schema.StructField)ParquetTypeMapping.CreateField(
+            container, honorReferenceNullability: true);
+
+        var stampedIds = parquetStruct.Fields.Cast<DataField>().Select(f => f.FieldId).OrderBy(x => x).ToArray();
+        Assert.Equal(new[] { 11, 12 }, stampedIds); // every struct-child leaf carries its own field_id
+    }
+
+    [Fact]
+    public void CreateField_IdModeStructWithUnstampedChild_FailsClosed_UnstampedLeafUnreadable()
+    {
+        // §2.5/#676 write-door assertion: under id mode EVERY mapped struct child leaf MUST carry a stampable
+        // delta.columnMapping.id — an unstamped leaf would commit a permanently-unreadable file. A struct whose
+        // container carries an id but whose child does NOT fails closed rather than emitting an unreadable leaf.
+        var inner = DataTypes.CreateStructType(new[]
+        {
+            new StructField(
+                "a", DataTypes.LongType, nullable: true,
+                FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
+                {
+                    ["delta.columnMapping.id"] = MetadataValue.Long(11),
+                })),
+            new StructField("b", DataTypes.LongType, nullable: true), // NO id — the unstamped leaf
+        });
+        var container = new StructField(
+            "s", inner, nullable: true,
+            FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
+            {
+                ["delta.columnMapping.id"] = MetadataValue.Long(2),
+            }));
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetTypeMapping.CreateField(container, honorReferenceNullability: true));
+
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("unstamped leaf would be unreadable", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

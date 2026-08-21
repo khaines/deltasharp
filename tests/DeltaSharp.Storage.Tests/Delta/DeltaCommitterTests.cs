@@ -190,12 +190,15 @@ public sealed class DeltaCommitterTests : IDisposable
         + "{\"name\":\"score\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
         + "{\"delta.columnMapping.id\":-3,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
 
-    private const string NestedMappedColumnSchemaJson =                    // top-level 'info' is a struct (non-leaf)
+    // #676/#839: a top-level 'info' ARRAY column under id mode. A single-level struct<scalars> now commits +
+    // loads under id mode (containment-scoped, §2.5); an array/map under id mode remains fail-closed at the
+    // ValidateColumnMappingSchema gate (commit AND load) naming #839, because its interior carries no
+    // representable field_id. A single-level struct is exercised on the happy path elsewhere.
+    private const string NestedArrayMappedColumnSchemaJson =                // top-level 'info' is an array (id mode → #839)
         "{\"type\":\"struct\",\"fields\":["
         + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":false,\"metadata\":"
         + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-A\"}},"
-        + "{\"name\":\"info\",\"type\":{\"type\":\"struct\",\"fields\":["
-        + "{\"name\":\"inner\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}}]},"
+        + "{\"name\":\"info\",\"type\":{\"type\":\"array\",\"elementType\":\"long\",\"containsNull\":true},"
         + "\"nullable\":true,\"metadata\":"
         + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-B\"}}]}";
 
@@ -397,13 +400,14 @@ public sealed class DeltaCommitterTests : IDisposable
     }
 
     [Fact]
-    public async Task RejectsCommit_IdModeSchema_NestedMappedColumn_FailsClosed_AtCommit()
+    public async Task RejectsCommit_IdModeSchema_NestedArrayColumn_FailsClosed_AtCommit_839()
     {
-        // deltaspec N3/R4 finding #2: the reader/projection maps only top-level LEAF columns; a nested
-        // (struct/array/map) top-level mapped column commits + loads today but throws "nested column mapping
-        // is unsupported" at projection. The write doors reject it via EnsureLeaf, but a RAW committed metaData
-        // bypasses that door, so the hardened shared validator now enforces the leaf contract at COMMIT (and
-        // load). Here top-level 'info' is a struct carrying column-mapping metadata → refused fail-closed.
+        // #676/#839: a single-level struct<scalars> top-level column now commits + loads under id mode
+        // (containment-scoped, §2.5). An ARRAY/MAP top-level column under id mode remains out of scope and
+        // fails closed at the shared validator (ValidateColumnMappingSchema, which sits on BOTH commit and
+        // load) naming #839 — its interior carries no representable field_id, so an id-mode nested array/map
+        // cannot be resolved without inventing a non-Delta wire format. Reject at COMMIT so an id-mode CREATE
+        // fails here rather than bricking as a permanently-unreadable table. Here top-level 'info' is an array.
         Snapshot genesis = GenesisSnapshot();
 
         DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(
@@ -412,11 +416,11 @@ public sealed class DeltaCommitterTests : IDisposable
                 new DeltaAction[]
                 {
                     ColumnMapping.IdModeProtocol(),
-                    IdModeMetadata(NestedMappedColumnSchemaJson, 2),
+                    IdModeMetadata(NestedArrayMappedColumnSchemaJson, 2),
                     Add("part-0.parquet"),
                 },
                 DeltaReadScope.BlindAppend));
-        Assert.Contains("Only top-level (leaf) columns", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#839", ex.Message, StringComparison.Ordinal);
 
         Assert.Null(await new DeltaLog(_backend).GetLatestCommitVersionAsync(CancellationToken.None));
     }

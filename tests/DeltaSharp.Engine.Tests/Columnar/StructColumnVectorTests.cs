@@ -313,4 +313,84 @@ public class StructColumnVectorTests
         Assert.Equal(1, s.Length);
         Assert.True(s.Child(0).IsNull(0));
     }
+
+    // ----- RelabelTo (#676 zero-copy re-type) -----
+
+    [Fact]
+    public void RelabelTo_ZeroCopy_PreservesValuesAndSubstitutesNamesAndMetadata()
+    {
+        var physical = new StructColumnVector(
+            PersonType, new ColumnVector[] { Ints(1, 2), Strings("a", "b") }, nulls: new[] { false, true });
+        var logical = new StructType(new[]
+        {
+            new StructField("logical_id", IntegerType.Instance),
+            new StructField("logical_name", StringType.Instance),
+        });
+
+        StructColumnVector relabelled = physical.RelabelTo(logical);
+
+        Assert.Equal(logical, relabelled.Type); // names substituted
+        Assert.Equal(2, relabelled.Length);
+        Assert.True(relabelled.IsNull(1)); // null mask preserved
+        Assert.Equal(1, relabelled.Child(0).GetValue<int>(0)); // child buffers shared (values intact)
+        Assert.Equal("a", Encoding.UTF8.GetString(relabelled.Child(1).GetBytes(0)));
+    }
+
+    [Fact]
+    public void RelabelTo_OnSlicedVector_PreservesWindowAndNullMask()
+    {
+        var whole = new StructColumnVector(
+            PersonType, new ColumnVector[] { Ints(0, 1, 2, 3), Strings("n0", "n1", "n2", "n3") },
+            nulls: new[] { false, true, false, false });
+        var view = (StructColumnVector)whole.Slice(1, 2); // rows 1..2
+        var logical = new StructType(new[]
+        {
+            new StructField("logical_id", IntegerType.Instance),
+            new StructField("logical_name", StringType.Instance),
+        });
+
+        StructColumnVector relabelled = view.RelabelTo(logical);
+
+        Assert.Equal(2, relabelled.Length);
+        Assert.True(relabelled.IsNull(0)); // original row 1 (null) at window index 0
+        Assert.Equal(1, relabelled.Child(0).GetValue<int>(0)); // windowed value
+        Assert.Equal(2, relabelled.Child(0).GetValue<int>(1));
+    }
+
+    [Fact]
+    public void RelabelTo_ChildCountMismatch_Throws()
+    {
+        var s = new StructColumnVector(PersonType, new ColumnVector[] { Ints(1), Strings("a") });
+        Assert.Throws<ArgumentException>(() => s.RelabelTo(
+            new StructType(new[] { new StructField("only", IntegerType.Instance) })));
+    }
+
+    [Fact]
+    public void RelabelTo_ChildTypeMismatch_Throws()
+    {
+        var s = new StructColumnVector(PersonType, new ColumnVector[] { Ints(1), Strings("a") });
+        Assert.Throws<ArgumentException>(() => s.RelabelTo(new StructType(new[]
+        {
+            new StructField("a", IntegerType.Instance),
+            new StructField("b", IntegerType.Instance), // was string physically
+        })));
+    }
+
+    [Fact]
+    public void RelabelTo_SealsSource_SharedBuffersCannotBeMutated()
+    {
+        var builder = new StructColumnVector(PersonType, capacity: 1);
+        ((MutableColumnVector)builder.Child(0)).AppendValue(1);
+        ((MutableColumnVector)builder.Child(1)).AppendBytes(Encoding.UTF8.GetBytes("a"));
+        builder.EndStruct();
+
+        _ = builder.RelabelTo(new StructType(new[]
+        {
+            new StructField("x", IntegerType.Instance),
+            new StructField("y", StringType.Instance),
+        }));
+
+        // Source is sealed after a view is taken — further row commits are rejected.
+        Assert.Throws<InvalidOperationException>(() => builder.EndStruct());
+    }
 }

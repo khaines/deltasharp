@@ -71,10 +71,12 @@ internal readonly struct ColumnMappingIdentity
     /// <para>A logical rename (column-mapping) keeps id + physical name but changes the logical path, so it
     /// changes the key: it is neither falsely flagged (legal) nor able to mask a reassignment of a
     /// still-present logical column (that column stays keyed and is compared).</para>
-    /// <para>Alternate structured paths with the same dotted spelling (literal-dot vs nested) are unreachable
-    /// for mapped tables today because mapped complex columns are rejected upstream by
-    /// <c>ColumnMapping.EnsureLeaf</c> and <c>ColumnMappingProjection.ResolvePhysicalNames</c>. #676 must
-    /// preserve or extend that coverage before nested column mapping is enabled.</para>
+    /// <para>Alternate structured paths with the same dotted spelling (literal-dot vs nested) are handled by
+    /// the structured <c>ColumnPathKey</c> (a literal top-level <c>"a.b"</c> is one segment; nested
+    /// <c>a</c>→<c>b</c> is two). Under #676 nested column mapping is enabled for the single-level surface:
+    /// <see cref="Collect"/> already descends DIRECT struct children, so a struct child's (id, physicalName)
+    /// participates in this immutability compare. Array-element / map-value STRUCTS are a nested-within-nested
+    /// shape deferred to #585 and rejected fail-closed upstream, so no array/map interior descent is needed here.</para>
     /// <para><b>Rename-equivalent residual (not a preventable mismap).</b> Dropping a logical column
     /// <c>victim(id=1, phys=col-A)</c> and adding a NEW logical column <c>attacker(id=1, phys=col-A)</c> that
     /// REUSES the dropped id/physical name is byte-identical, in the metadata, to a legal RENAME of
@@ -109,11 +111,12 @@ internal readonly struct ColumnMappingIdentity
     // logical path. That makes a literal top-level name such as "a.b" (one segment) distinct from nested
     // a→b (two segments), so CDF compares identities across retained versions without a literal-dot collision.
     //
-    // Recurses DIRECT StructField.DataType structs only. It intentionally does NOT descend through array
-    // element or map key/value structs today. Those nested StructFields do carry Delta column-mapping identity,
-    // but mapped complex types are currently rejected fail-closed upstream by ColumnMapping.EnsureLeaf and
-    // ColumnMappingProjection.ResolvePhysicalNames before CDF reads can rely on this gate. #676 MUST extend
-    // this collection to descend array element and map key/value structs before relaxing that upstream reject.
+    // Recurses DIRECT StructField.DataType structs only (#676 §2.8 H6 discharge). Under C1 this fully covers a
+    // mapped table's identity: mapping attaches to StructFields at every depth, and a struct child's identity
+    // is descended here. It intentionally does NOT descend through array element or map key/value structs —
+    // those nested StructFields would carry Delta column-mapping identity too, but an array/map interior struct
+    // is a nested-within-nested shape deferred to #585 and rejected fail-closed upstream (ColumnMapping's
+    // assignment/validation doors), so no array/map interior descent is needed until #585 lands.
     private static void Collect(
         StructType schema,
         ImmutableArray<string> prefix,

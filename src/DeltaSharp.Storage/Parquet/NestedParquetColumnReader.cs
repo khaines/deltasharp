@@ -143,6 +143,7 @@ internal static class NestedParquetColumnReader
                         $"Column '{columnName}': requested a map but the file column is not a map.");
                 }
 
+                EnsureCanonicalMapChildNames(fileMap, columnName);
                 EnsureRequiredMapKey(fileMap, columnName);
                 _ = ExpectScalarLeaf(
                     fileMap.Key, mapType.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
@@ -201,6 +202,7 @@ internal static class NestedParquetColumnReader
         int rowCount,
         string columnName,
         NestedDecodeBudget budget,
+        IReadOnlyDictionary<int, DataField>? byFieldId,
         CancellationToken cancellationToken)
     {
         // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
@@ -211,8 +213,10 @@ internal static class NestedParquetColumnReader
 
         return requestedType switch
         {
+            // #676: a non-null byFieldId routes struct-child binding through the id-keyed containment path
+            // (id mode); array/map under id mode are rejected upstream (#839), so they never reach here.
             StructType structType => await ReadStructAsync(
-                rowGroup, ExpectStruct(fileField, columnName), structType, rowCount, columnName, budget, cancellationToken)
+                rowGroup, ExpectStruct(fileField, columnName), structType, rowCount, columnName, budget, byFieldId, cancellationToken)
                 .ConfigureAwait(false),
             ArrayType arrayType => await ReadListAsync(
                 rowGroup, ExpectList(fileField, columnName), arrayType, rowCount, columnName, budget, cancellationToken)
@@ -238,6 +242,7 @@ internal static class NestedParquetColumnReader
         int rowCount,
         string columnName,
         NestedDecodeBudget budget,
+        IReadOnlyDictionary<int, DataField>? byFieldId,
         CancellationToken cancellationToken)
     {
         // Charge the struct's OWN per-row null arrays against the shared row-group budget before its fields are
@@ -254,7 +259,12 @@ internal static class NestedParquetColumnReader
         for (int i = 0; i < requested.Count; i++)
         {
             StructField field = requested[i];
-            DataField leaf = ResolveStructField(fileStruct, field, columnName);
+            // #676: id mode binds each child by field_id within the resolved container (containment-scoped,
+            // never by name); name/none mode binds by physical name. Both return the SAME leaf DataField the
+            // decode reads from — the sole per-leaf validator.
+            DataField leaf = byFieldId is not null
+                ? ResolveStructFieldById(fileStruct, field, byFieldId, columnName)
+                : ResolveStructField(fileStruct, field, columnName);
 
             // A struct field is one value per top-level row (max repetition 0), so its leaf declares exactly
             // rowCount values with definition levels aligned to rows — the field child is built with a present
@@ -1078,6 +1088,28 @@ internal static class NestedParquetColumnReader
         }
     }
 
+    // Parquet.Net binds a map's key_value children POSITIONALLY (MapField.Assign: first child → Key, second →
+    // Value, in ThriftFooter declaration order), NOT by name. A map<T,T> with a required value therefore
+    // silently TRANSPOSES key/value past the type/level/EnsureRequiredMapKey guards (both children same
+    // physical type, both REQUIRED, identical rep/def). This guard asserts the canonical child names before
+    // the children are consumed so a non-canonical / transposed map fails closed (#676 §2.5). Map-only: a
+    // single-child list has no transposition hazard, and a list/element-name check would fail-close legitimate
+    // legacy-shaped foreign lists. Mode-independent (also closes the pre-existing none-mode #571 exposure).
+    private static void EnsureCanonicalMapChildNames(PqMapField fileMap, string columnName)
+    {
+        if (!string.Equals(fileMap.Key.Name, "key", StringComparison.Ordinal)
+            || !string.Equals(fileMap.Value.Name, "value", StringComparison.Ordinal))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Map column '{columnName}': the file map key_value children are not named the canonical "
+                + "'key'/'value'; Parquet.Net binds them positionally, so a non-canonically-named map cannot be "
+                + "read safely (its key and value may be transposed).");
+        }
+    }
+
+    // Resolves a struct child in NAME/none mode: matches the requested (physical) child by name against the
+    // file struct's fields, DUPLICATE-INTOLERANTLY (#676) — two file fields sharing the requested name is an
+    // ambiguous/foreign shape and fails closed rather than resolving to the first by luck.
     private static DataField ResolveStructField(PqStructField fileStruct, StructField requested, string columnName)
     {
         Field? match = null;
@@ -1085,8 +1117,14 @@ internal static class NestedParquetColumnReader
         {
             if (string.Equals(candidate.Name, requested.Name, StringComparison.Ordinal))
             {
+                if (match is not null)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"Struct column '{columnName}' has more than one file field named "
+                        + $"'{DiagnosticText.Sanitize(requested.Name)}'; a duplicate struct child name cannot be resolved safely.");
+                }
+
                 match = candidate;
-                break;
             }
         }
 
@@ -1099,6 +1137,81 @@ internal static class NestedParquetColumnReader
         return ExpectScalarLeaf(
             match, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
             $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'");
+    }
+
+    // Resolves a struct child in ID mode (#676 §2.5): binds by the child's delta.columnMapping.id within the
+    // resolved container — NEVER by name. The child's id is looked up in the path-keyed footer field-id map
+    // (#829); the resolved leaf MUST be one of the container's OWN direct leaf children (containment) so a
+    // forged footer that stamps the id on a top-level / sibling-container leaf fails closed rather than
+    // mis-attributing a column. The id-selected leaf — and only it — is then type/level-validated via
+    // ExpectScalarLeaf. A child that declares no id, whose id is absent from the footer, or whose id resolves
+    // outside the container fails closed with NO name fallback.
+    private static DataField ResolveStructFieldById(
+        PqStructField fileStruct, StructField requested, IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
+    {
+        if (!ColumnMapping.TryGetId(requested, out long id))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}' has no column-mapping id "
+                + "under id mode; the schema is inconsistent and cannot be read safely.");
+        }
+
+        if (id is < 1 or > int.MaxValue || !byFieldId.TryGetValue((int)id, out DataField? leaf))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}' declares a column-mapping id "
+                + "that is absent from the file footer field ids; the id-mode read fails closed (no name fallback).");
+        }
+
+        if (!IsDirectLeafChild(fileStruct, leaf))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}': its column-mapping id resolves "
+                + "to a footer leaf outside the resolved container's own children; the id-mode read fails closed to avoid "
+                + "cross-column mis-attribution.");
+        }
+
+        return ExpectScalarLeaf(
+            leaf, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
+            $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'");
+    }
+
+    // True when <paramref name="leaf"/> is one of <paramref name="container"/>'s OWN direct leaf children,
+    // compared by full physical path (the #829 footer↔decoder bijection makes path a unique physical-location
+    // identity). This is the containment check that scopes an id-mode struct-child lookup to its declared
+    // container's subtree.
+    private static bool IsDirectLeafChild(PqStructField container, DataField leaf)
+    {
+        var leafKey = ParquetFileReader.PhysicalPathKey.From(leaf.Path);
+        foreach (Field child in container.Fields)
+        {
+            if (child is DataField childLeaf && ParquetFileReader.PhysicalPathKey.From(childLeaf.Path).Equals(leafKey))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Validates an id-mode struct<scalars> container against its requested (physical) struct type WITHOUT
+    // reading any data page (#676 §2.5): each requested child is resolved by id within the container and
+    // type/level-validated. The struct arm MUST NOT name-match in id mode — the id-selected leaf is the sole
+    // per-leaf validator.
+    public static void ValidateStructShapeById(
+        PqStructField container, StructType requested, IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
+    {
+        columnName = DiagnosticText.Sanitize(columnName);
+        if (requested.Count == 0)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested read for struct column '{columnName}': a zero-field struct is not supported.");
+        }
+
+        foreach (StructField child in requested)
+        {
+            _ = ResolveStructFieldById(container, child, byFieldId, columnName);
+        }
     }
 
     private static DataField ExpectScalarLeaf(

@@ -193,6 +193,48 @@ public sealed class StructColumnVector : MutableColumnVector
             : throw new KeyNotFoundException($"No field named '{name}' in {_structType.SimpleString}.");
     }
 
+    /// <summary>
+    /// Returns a <b>zero-copy</b> re-typed view of this struct vector under <paramref name="logicalType"/>,
+    /// reusing the existing child vectors and validity buffer (#676 — the column-mapping name-mode read-exit
+    /// inverse relabel). The supplied type must be structurally <b>congruent</b> with this vector's own type:
+    /// equal field count, in the same order, each child's declared <see cref="ColumnVector.Type"/> equal to
+    /// the corresponding <paramref name="logicalType"/> child's <see cref="StructField.DataType"/> — differing
+    /// only in the field <b>names</b> (and per-field metadata) being substituted at this level. It maps a
+    /// physically-read struct (whose fields carry physical names) back to its logical schema without copying
+    /// any child buffer. The window (<see cref="Offset"/>/<see cref="Length"/>) and null mask are preserved.
+    /// </summary>
+    /// <param name="logicalType">The logical struct type to re-label onto the shared children.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="logicalType"/> is null.</exception>
+    /// <exception cref="ArgumentException">The field count or a child's <see cref="ColumnVector.Type"/> is not
+    /// congruent with <paramref name="logicalType"/> — the caller (the column-mapping projection) validates
+    /// congruence and fails closed with a typed storage error before this backstop is reached.</exception>
+    public StructColumnVector RelabelTo(StructType logicalType)
+    {
+        ArgumentNullException.ThrowIfNull(logicalType);
+        if (logicalType.Count != _children.Length)
+        {
+            throw new ArgumentException(
+                $"Cannot relabel a {_children.Length}-field struct to '{logicalType.SimpleString}' "
+                + $"({logicalType.Count} field(s)); the field counts differ.", nameof(logicalType));
+        }
+
+        for (int i = 0; i < _children.Length; i++)
+        {
+            if (!_children[i].Type.Equals(logicalType[i].DataType))
+            {
+                throw new ArgumentException(
+                    $"Cannot relabel field {i} to '{logicalType[i].DataType.SimpleString}'; the child vector has "
+                    + $"type '{_children[i].Type.SimpleString}'.", nameof(logicalType));
+            }
+        }
+
+        // Zero-copy: share the children, validity buffer, and window — only the logical struct TYPE (its field
+        // names + per-field metadata) changes. Seal the source so the shared buffers cannot be mutated out
+        // from under the returned view (mirrors Slice).
+        SealForView();
+        return new StructColumnVector(logicalType, _children, _validity, _offset, _length, _nullCount);
+    }
+
     /// <inheritdoc/>
     public override bool IsNull(int index)
     {

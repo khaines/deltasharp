@@ -98,9 +98,11 @@ internal sealed class SeededPhysicalNameSource : IColumnPhysicalNameSource
 /// stamps the <c>field_id</c>. In BOTH mapped modes partition-value keys and statistics stay keyed by the
 /// physical name. An unrecognized mode is rejected fail-closed (never guessed).</para>
 ///
-/// <para><b>Scope.</b> Only top-level (leaf) struct fields are mapped in this build; nested struct/array/map
-/// column mapping is phased (the Parquet writer already rejects nested physical types, design §2.9). A
-/// nested top-level field in a column-mapped schema is rejected fail-closed (<see cref="EnsureLeaf"/>).</para>
+/// <para><b>Scope (#676).</b> Column mapping attaches to <see cref="StructField"/>s at every depth (C1):
+/// a <c>struct&lt;scalars&gt;</c> is mapped recursively (name + id mode); an <c>array&lt;scalar&gt;</c>/
+/// <c>map&lt;scalar,scalar&gt;</c> receives a top-level id only (name mode; id-mode array/map is deferred to
+/// #839). Nested-within-nested (array&lt;struct&gt;, struct&lt;struct&gt;, …) is deferred to #585 and rejected
+/// fail-closed at the assignment/validation door (<see cref="RejectNestedWithinNested"/>).</para>
 /// </summary>
 internal static class ColumnMapping
 {
@@ -119,6 +121,13 @@ internal static class ColumnMapping
 
     /// <summary>The per-field metadata key holding the column's stable physical Parquet name.</summary>
     public const string PhysicalNameKey = "delta.columnMapping.physicalName";
+
+    /// <summary>The Delta per-field metadata key that assigns <c>field_id</c>s to an <c>array</c>/<c>map</c>
+    /// interior (element / key / value). DeltaSharp does <b>not</b> implement it (C1, #676): mapping attaches
+    /// to <see cref="StructField"/>s only, so a mapped schema carrying this key describes an array/map interior
+    /// id DeltaSharp cannot honor — it is rejected fail-closed (deferred to #839) rather than silently ignored
+    /// (which could mis-read a Spark-authored array/map interior).</summary>
+    public const string NestedIdsKey = "delta.columnMapping.nested.ids";
 
     private const string NoneMode = "none";
     private const string NameMode = "name";
@@ -414,38 +423,120 @@ internal static class ColumnMapping
 
         long maxColumnId = ReadMaxColumnId(configuration);
 
-        var physicalNames = new HashSet<string>(StringComparer.Ordinal);
+        // #676: validate the full nested StructField tree (C1 — mapping attaches to StructFields at every
+        // depth, never to an array element / map key / value). Global id uniqueness + the maxColumnId ceiling
+        // hold across the whole tree; physicalName uniqueness is per struct LEVEL (the physical Parquet path is
+        // <parentPhysical>.<childPhysical>, so sibling uniqueness suffices). Fail closed at load AND commit
+        // BEFORE any column resolves.
         var ids = new HashSet<long>();
-        foreach (StructField field in schema)
+        ValidateMappedLevel(schema, mode, parentPath: null, isTopLevel: true, ids, maxColumnId);
+
+        // #676: run the recursive case-insensitive sibling-collision guard from THIS load choke point too, so
+        // a foreign mapped table with a nested case-insensitive collision (struct<city,CITY>) fails closed at
+        // load — matching a case-insensitive reader such as Spark (COLUMN_ALREADY_EXISTS). It also runs at the
+        // committer/evolve path; running it here additionally covers a RAW/foreign committed metaData read.
+        EnsureNoCaseInsensitiveDuplicateColumns(schema);
+    }
+
+    // Validates one struct LEVEL of a mapped schema and recurses into nested struct children (#676). Each
+    // StructField at this level must carry a valid (id, physicalName); ids are unique globally (via the shared
+    // <paramref name="ids"/> set) and within the maxColumnId ceiling; physicalNames are unique within this
+    // sibling set. An array/map interior carries no mapping (C1). Fail-closed doors, in most-specific-first
+    // order: a nested-within-nested interior (#585); an id-mode array/map column (#839); a foreign nested.ids
+    // key; an unsafe physical name; a duplicate physical name / id; a missing/out-of-range/over-ceiling id.
+    private static void ValidateMappedLevel(
+        StructType level, ColumnMappingMode mode, string? parentPath, bool isTopLevel,
+        HashSet<long> ids, long maxColumnId)
+    {
+        var physicalNames = new HashSet<string>(StringComparer.Ordinal);
+        foreach (StructField field in level)
         {
-            // Leaf-only invariant (#572 deltaspec N3/R4): the reader resolves — and this build maps — only
-            // top-level LEAF columns; a nested (struct/array/map) mapped column would later throw "nested
-            // column mapping is unsupported" at projection. The write doors reject it via EnsureLeaf, but a
-            // RAW committed or foreign metaData bypasses that door, so enforce the same contract at this
-            // shared choke point (load AND commit) BEFORE any column resolves. Checked first so a nested
-            // column is reported as nested (its most specific defect) rather than tripping a later id check.
-            EnsureLeaf(field);
+            string path = parentPath is null ? field.Name : parentPath + "." + field.Name;
+
+            // Nested-within-nested (#585) — the most specific defect for a container whose interior is itself
+            // nested (array<struct>, struct<struct>, map<_,struct>, array<array>, …). Checked first so such a
+            // shape is reported as #585 regardless of mode, BEFORE the id-mode array/map (#839) gate.
+            switch (field.DataType)
+            {
+                case StructType nestedStruct:
+                    if (nestedStruct.Count == 0)
+                    {
+                        throw DeltaProtocolException.Unsupported(
+                            string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"Column '{DiagnosticText.Sanitize(path)}' is a zero-field struct; a mapped struct must have "
+                                + $"at least one field."));
+                    }
+
+                    foreach (StructField child in nestedStruct)
+                    {
+                        RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    }
+
+                    break;
+                case ArrayType array:
+                    RejectNestedWithinNested(array.ElementType, path + ".element");
+                    break;
+                case MapType map:
+                    RejectNestedWithinNested(map.KeyType, path + ".key");
+                    RejectNestedWithinNested(map.ValueType, path + ".value");
+                    break;
+            }
+
+            // Id-mode array/map gate (#839): an array/map column carries no representable interior id (C1;
+            // nested.ids unimplemented) and the Parquet group node cannot carry one, so id-mode array/map is
+            // out of scope. Reject at BOTH commit and load so an id-mode CREATE/ALTER fails at commit rather
+            // than bricking as a permanently-unreadable table. Thrown as DeltaProtocolException (like every
+            // other reject in this method) so it wraps to DeltaReadException at load and surfaces as a protocol
+            // rejection at commit.
+            if (mode == ColumnMappingMode.Id && field.DataType is ArrayType or MapType)
+            {
+                throw DeltaProtocolException.Unsupported(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column '{DiagnosticText.Sanitize(path)}' is an {field.DataType.TypeName} under column-mapping id "
+                        + $"mode; id-mode nested array/map column mapping is deferred to #839. Use name mode for nested "
+                        + $"array/map columns."));
+            }
+
+            // Reject a foreign delta.columnMapping.nested.ids on any mapped field (C1 corollary): DeltaSharp
+            // does not implement it, so honoring it is impossible — fail closed rather than silently ignore an
+            // array/map interior id and risk mis-reading a Spark-authored interior.
+            if (field.Metadata.ContainsKey(NestedIdsKey))
+            {
+                throw DeltaProtocolException.Unsupported(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Column '{DiagnosticText.Sanitize(path)}' carries '{NestedIdsKey}', which assigns ids to an "
+                        + $"array/map interior; DeltaSharp does not implement nested.ids (deferred to #839) and cannot "
+                        + $"honor it, so the schema is rejected fail-closed."));
+            }
 
             string physical = PhysicalName(field, mode);
 
-            // Path-safety invariant (#572 deltaspec R6): the physical name is used as a Parquet column name
-            // AND a Hive partition-directory path segment ("physicalName=value/"), so reject any name that is
-            // not a safe single path segment. Checked right after the name is read (before the uniqueness
-            // check) so a malformed name is reported as unsafe — its most specific defect.
-            EnsureSafePhysicalName(field.Name, physical);
+            // Path-safety: a TOP-LEVEL physical name is a partition-directory path segment AND a Parquet column
+            // name, so it gets the full safe-segment contract. A NESTED physical name is a Parquet path
+            // component only (a nested column is never a partition column), so it gets the control-char/
+            // separator contract PLUS a stricter embedded-dot reject (defense-in-depth — a legitimate
+            // col-<uuid> never contains a dot; #676 §2.2).
+            if (isTopLevel)
+            {
+                EnsureSafePhysicalName(field.Name, physical);
+            }
+            else
+            {
+                EnsureNestedPhysicalNameSafe(path, physical);
+            }
 
             if (!physicalNames.Add(physical))
             {
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        // #683: do NOT rely on EnsureSafePhysicalName having neutralized this token — it
-                        // rejects `char.IsControl` (Unicode Cc) but NOT U+2028/U+2029 (Zl/Zp), which
-                        // DiagnosticText.IsInjectionUnsafe exists to close. A path-safety guard is not a
-                        // log-injection guard. Same cap class as the physicalName echo above.
-                        $"Column mapping physical name '{SanitizeEchoedToken(physical)}' is assigned to more than one column; "
-                        + $"under column mapping every top-level field (data and partition) MUST have a unique "
-                        + $"'{PhysicalNameKey}'. The schema is inconsistent and cannot be read safely."));
+                        $"Column mapping physical name '{SanitizeEchoedToken(physical)}' is assigned to more than one column "
+                        + $"at the same struct level (near '{DiagnosticText.Sanitize(path)}'); under column mapping every "
+                        + $"sibling field MUST have a unique '{PhysicalNameKey}'. The schema is inconsistent and cannot "
+                        + $"be read safely."));
             }
 
             if (!TryGetId(field, out long id))
@@ -453,23 +544,15 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{DiagnosticText.Sanitize(field.Name)}' has no '{IdKey}' but the table uses column mapping; the schema is inconsistent and cannot be read safely."));
+                        $"Column '{DiagnosticText.Sanitize(path)}' has no '{IdKey}' but the table uses column mapping; the schema is inconsistent and cannot be read safely."));
             }
 
-            // Id lower-bound invariant (#572 deltaspec N3/R4): Delta column-mapping ids start at 1
-            // (AssignFreshMapping mints 1, 2, …) — an id <= 0 is a value the writer NEVER emits and would
-            // fail a later append at the Parquet field_id stamp guard (ParquetTypeMapping.CreateField), so
-            // reject it here fail-closed at load AND commit. Checked before the uniqueness/max checks so a
-            // non-positive id is reported as out-of-range (its most specific defect). The UPPER bound
-            // (id > int.MaxValue) stays a read-layer concern (the long->int32 cast guard + reader bound), so a
-            // table whose maxColumnId itself exceeds int.MaxValue still loads and is caught at read — see
-            // IdMode_RequestedIdAboveInt32Max_IsRejectedFailClosed.
             if (id <= 0)
             {
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{DiagnosticText.Sanitize(field.Name)}' has '{IdKey}'={id} which is outside the valid column-mapping "
+                        $"Column '{DiagnosticText.Sanitize(path)}' has '{IdKey}'={id} which is outside the valid column-mapping "
                         + $"id range [1, int.MaxValue] (Delta column-mapping ids start at 1). The schema is "
                         + $"inconsistent and cannot be read safely."));
             }
@@ -487,10 +570,39 @@ internal static class ColumnMapping
                 throw DeltaProtocolException.Inconsistent(
                     string.Create(
                         CultureInfo.InvariantCulture,
-                        $"Column '{DiagnosticText.Sanitize(field.Name)}' has '{IdKey}'={id} which exceeds the tracked "
+                        $"Column '{DiagnosticText.Sanitize(path)}' has '{IdKey}'={id} which exceeds the tracked "
                         + $"'{MaxColumnIdKey}'={maxColumnId}; the schema is inconsistent and cannot be read "
                         + $"safely."));
             }
+
+            if (field.DataType is StructType recurse)
+            {
+                ValidateMappedLevel(recurse, mode, path, isTopLevel: false, ids, maxColumnId);
+            }
+        }
+    }
+
+    // Enforces the physical-name contract for a NESTED (non-top-level) mapped StructField (#676 §2.2): the
+    // control-char/separator/format-control safe-segment set (shared with the top-level check) PLUS a stricter
+    // embedded-'.' reject. A nested physical name is a Parquet path component, never a partition-directory
+    // segment, so it need not be partition-safe — but it must be a single dot-free segment because the physical
+    // Parquet path joins parent and child with '.', and a dot inside a name would ambiguously split the path.
+    private static void EnsureNestedPhysicalNameSafe(string path, string physical)
+    {
+        string? reason = FindUnsafePathSegmentReason(physical);
+        if (reason is null && physical.Contains('.', StringComparison.Ordinal))
+        {
+            reason = "contain a '.' (a nested physical name must be a single dot-free path segment)";
+        }
+
+        if (reason is not null)
+        {
+            throw DeltaProtocolException.Inconsistent(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Nested column '{DiagnosticText.Sanitize(path)}' has a '{PhysicalNameKey}' ('{SanitizeEchoedToken(physical)}') "
+                    + $"that is not a safe path component; a nested physical name MUST NOT {reason}. The schema is "
+                    + $"inconsistent and cannot be read safely."));
         }
     }
 
@@ -578,12 +690,18 @@ internal static class ColumnMapping
 
     /// <summary>
     /// Assigns a fresh column mapping to a logical <paramref name="schema"/> (name-mode table creation):
-    /// every top-level field is given a monotonically increasing <c>delta.columnMapping.id</c> (1..N) and a
-    /// stable <c>delta.columnMapping.physicalName</c> from <paramref name="nameSource"/>. Existing per-field
-    /// metadata is preserved. Returns the mapped schema and the resulting <c>maxColumnId</c> (N).
+    /// every <see cref="StructField"/> <b>at every depth</b> (#676, design §2.2) is given a monotonically
+    /// increasing <c>delta.columnMapping.id</c> (1..N, pre-order) and a stable
+    /// <c>delta.columnMapping.physicalName</c> from <paramref name="nameSource"/>. Mapping attaches to
+    /// <see cref="StructField"/>s only — never to an <c>array</c> element or a <c>map</c> key/value (C1): a
+    /// <c>struct&lt;scalars&gt;</c> recurses into its children, while an <c>array&lt;scalar&gt;</c>/
+    /// <c>map&lt;scalar,scalar&gt;</c> column receives a top-level id only. Existing per-field metadata is
+    /// preserved. Returns the mapped schema and the resulting <c>maxColumnId</c> (N — a count of assigned
+    /// <see cref="StructField"/>s).
     /// </summary>
-    /// <exception cref="DeltaProtocolException">A field is a nested (struct/array/map) type — nested column
-    /// mapping is phased in this build.</exception>
+    /// <exception cref="DeltaProtocolException">A nested-within-nested shape (e.g. <c>array&lt;struct&gt;</c>,
+    /// <c>struct&lt;struct&gt;</c>, <c>map&lt;_,struct&gt;</c>) — deferred to #585 — or a zero-field mapped
+    /// struct is encountered; both fail closed before any id is minted for the offending column.</exception>
     public static (StructType Schema, long MaxColumnId) AssignFreshMapping(
         StructType schema, IColumnPhysicalNameSource nameSource)
     {
@@ -594,29 +712,61 @@ internal static class ColumnMapping
         var mapped = new List<StructField>(schema.Count);
         foreach (StructField field in schema)
         {
-            EnsureLeaf(field);
-            long id = ++nextId;
-            string physicalName = nameSource.NextPhysicalName();
-
-            var entries = new List<KeyValuePair<string, MetadataValue>>(field.Metadata.Count + 2);
-            foreach (KeyValuePair<string, MetadataValue> existing in field.Metadata)
-            {
-                if (!string.Equals(existing.Key, IdKey, StringComparison.Ordinal)
-                    && !string.Equals(existing.Key, PhysicalNameKey, StringComparison.Ordinal))
-                {
-                    entries.Add(existing);
-                }
-            }
-
-            entries.Add(new KeyValuePair<string, MetadataValue>(IdKey, MetadataValue.Long(id)));
-            entries.Add(new KeyValuePair<string, MetadataValue>(
-                PhysicalNameKey, MetadataValue.String(physicalName)));
-
-            mapped.Add(new StructField(
-                field.Name, field.DataType, field.Nullable, FieldMetadata.FromValues(entries)));
+            mapped.Add(AssignMappedField(field, field.Name, nameSource, ref nextId));
         }
 
         return (new StructType(mapped), nextId);
+    }
+
+    // Assigns a fresh (id, physicalName) to <paramref name="field"/> in pre-order, then recursively assigns
+    // its nested struct children (#676, C1). The container id/name are minted BEFORE descending, so the
+    // committed id order is pre-order (container, then its children) — matching the design §2.4 example.
+    private static StructField AssignMappedField(
+        StructField field, string path, IColumnPhysicalNameSource nameSource, ref long nextId)
+    {
+        long id = ++nextId;
+        string physicalName = nameSource.NextPhysicalName();
+        DataType mappedType = AssignMappedType(field.DataType, path, nameSource, ref nextId);
+        return WithMapping(field, mappedType, id, physicalName);
+    }
+
+    // Recurses the single-level nested surface (#676, design §2.2): a struct recurses into its scalar
+    // children (each a StructField that is assigned its own id/physicalName); an array/map carries NO interior
+    // id (its element/key/value are not StructFields, C1). A nested-within-nested interior fails closed naming
+    // #585 BEFORE any child id is minted, so a partial maxColumnId advance can never leak past the reject.
+    private static DataType AssignMappedType(
+        DataType type, string path, IColumnPhysicalNameSource nameSource, ref long nextId)
+    {
+        switch (type)
+        {
+            case StructType structType:
+                if (structType.Count == 0)
+                {
+                    throw DeltaProtocolException.Unsupported(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Column '{DiagnosticText.Sanitize(path)}' is a zero-field struct; a mapped struct must have "
+                            + $"at least one field."));
+                }
+
+                var mappedChildren = new List<StructField>(structType.Count);
+                foreach (StructField child in structType)
+                {
+                    RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    mappedChildren.Add(AssignMappedField(child, path + "." + child.Name, nameSource, ref nextId));
+                }
+
+                return new StructType(mappedChildren);
+            case ArrayType array:
+                RejectNestedWithinNested(array.ElementType, path + ".element");
+                return type;
+            case MapType map:
+                RejectNestedWithinNested(map.KeyType, path + ".key");
+                RejectNestedWithinNested(map.ValueType, path + ".value");
+                return type;
+            default:
+                return type;
+        }
     }
 
     /// <summary>
@@ -639,7 +789,8 @@ internal static class ColumnMapping
     /// (#572): the current configuration's mode key is preserved verbatim.
     /// </summary>
     /// <exception cref="DeltaProtocolException">The current schema's <c>maxColumnId</c> is missing/malformed,
-    /// a retained column-mapped column carries no id, or an evolved field is a nested type.</exception>
+    /// a retained column-mapped column carries no id, or an evolved field is a nested-within-nested type
+    /// (#585) / a zero-field mapped struct.</exception>
     public static (StructType Schema, ImmutableSortedDictionary<string, string> Configuration) EvolveNameModeMapping(
         StructType evolvedSchema,
         StructType currentMappedSchema,
@@ -655,55 +806,96 @@ internal static class ColumnMapping
         var mapped = new List<StructField>(evolvedSchema.Count);
         foreach (StructField field in evolvedSchema)
         {
-            EnsureLeaf(field);
-
-            long id;
-            string physicalName;
-            if (currentMappedSchema.TryGetField(field.Name, out StructField existing))
-            {
-                // Existing (or applied-widened) column: reuse its identity verbatim — never re-mint, so
-                // committed data files under the prior physical name still resolve.
-                physicalName = PhysicalName(existing, ColumnMappingMode.Name);
-                if (!TryGetId(existing, out id))
-                {
-                    throw DeltaProtocolException.Inconsistent(
-                        string.Create(
-                            CultureInfo.InvariantCulture,
-                            $"Name-mode column '{DiagnosticText.Sanitize(field.Name)}' has no '{IdKey}'; the table schema is "
-                            + $"inconsistent and cannot be evolved."));
-                }
-            }
-            else
-            {
-                // New column (#541): mint a fresh physical name + a fresh monotonic id, bumping maxColumnId.
-                id = ++nextId;
-                physicalName = nameSource.NextPhysicalName();
-            }
-
-            // Preserve every non-mapping metadata entry (e.g. delta.typeChanges, a column comment) the merged
-            // field carries, then set the authoritative id + physicalName.
-            var entries = new List<KeyValuePair<string, MetadataValue>>(field.Metadata.Count + 2);
-            foreach (KeyValuePair<string, MetadataValue> entry in field.Metadata)
-            {
-                if (!string.Equals(entry.Key, IdKey, StringComparison.Ordinal)
-                    && !string.Equals(entry.Key, PhysicalNameKey, StringComparison.Ordinal))
-                {
-                    entries.Add(entry);
-                }
-            }
-
-            entries.Add(new KeyValuePair<string, MetadataValue>(IdKey, MetadataValue.Long(id)));
-            entries.Add(new KeyValuePair<string, MetadataValue>(
-                PhysicalNameKey, MetadataValue.String(physicalName)));
-
-            mapped.Add(new StructField(
-                field.Name, field.DataType, field.Nullable, FieldMetadata.FromValues(entries)));
+            StructField? existing = currentMappedSchema.TryGetField(field.Name, out StructField match) ? match : null;
+            mapped.Add(EvolveMappedField(field, existing, field.Name, nameSource, ref nextId));
         }
 
         ImmutableSortedDictionary<string, string> configuration =
             currentConfiguration.SetItem(MaxColumnIdKey, nextId.ToString(CultureInfo.InvariantCulture));
         return (new StructType(mapped), configuration);
     }
+
+    // Reconciles one evolved field against its existing mapped counterpart (matched by LOGICAL name per level,
+    // #676). An existing column reuses its (id, physicalName) verbatim — never re-minted, so committed data
+    // files under the prior physical name still resolve; a NEW column (or a NEW nested child) mints a fresh
+    // monotonic id + physical name, bumping the counter. A column whose TYPE changed (e.g. struct→array under
+    // overwriteSchema) keeps its own identity but its former struct children have no same-typed counterpart to
+    // match against, so any struct children of the NEW type are minted fresh — the old children's identities
+    // are retired (never re-parented), exactly like a dropped column.
+    private static StructField EvolveMappedField(
+        StructField evolvedField, StructField? existingField, string path,
+        IColumnPhysicalNameSource nameSource, ref long nextId)
+    {
+        long id;
+        string physicalName;
+        if (existingField is { } existing)
+        {
+            physicalName = PhysicalName(existing, ColumnMappingMode.Name);
+            if (!TryGetId(existing, out id))
+            {
+                throw DeltaProtocolException.Inconsistent(
+                    string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Name-mode column '{DiagnosticText.Sanitize(path)}' has no '{IdKey}'; the table schema is "
+                        + $"inconsistent and cannot be evolved."));
+            }
+        }
+        else
+        {
+            id = ++nextId;
+            physicalName = nameSource.NextPhysicalName();
+        }
+
+        DataType mappedType = EvolveMappedType(
+            evolvedField.DataType, existingField?.DataType, path, nameSource, ref nextId);
+        return WithMapping(evolvedField, mappedType, id, physicalName);
+    }
+
+    // Recurses the single-level nested surface during an evolve (#676). A struct matches each evolved child
+    // against the existing struct's SAME-named child (only when the existing field is itself a struct — a
+    // type change retires the old children); an array/map carries no interior identity. Nested-within-nested
+    // fails closed naming #585 before any id is minted.
+    private static DataType EvolveMappedType(
+        DataType evolvedType, DataType? existingType, string path,
+        IColumnPhysicalNameSource nameSource, ref long nextId)
+    {
+        switch (evolvedType)
+        {
+            case StructType structType:
+                if (structType.Count == 0)
+                {
+                    throw DeltaProtocolException.Unsupported(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Column '{DiagnosticText.Sanitize(path)}' is a zero-field struct; a mapped struct must have "
+                            + $"at least one field."));
+                }
+
+                StructType? existingStruct = existingType as StructType;
+                var children = new List<StructField>(structType.Count);
+                foreach (StructField child in structType)
+                {
+                    RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    StructField? existingChild =
+                        existingStruct is not null && existingStruct.TryGetField(child.Name, out StructField ec)
+                            ? ec
+                            : null;
+                    children.Add(EvolveMappedField(child, existingChild, path + "." + child.Name, nameSource, ref nextId));
+                }
+
+                return new StructType(children);
+            case ArrayType array:
+                RejectNestedWithinNested(array.ElementType, path + ".element");
+                return evolvedType;
+            case MapType map:
+                RejectNestedWithinNested(map.KeyType, path + ".key");
+                RejectNestedWithinNested(map.ValueType, path + ".value");
+                return evolvedType;
+            default:
+                return evolvedType;
+        }
+    }
+
 
     /// <summary>The <b>physical</b> schema for a mapped logical <paramref name="schema"/>: the same field
     /// order and types, but each field renamed to its physical name. In <c>name</c> mode the column-mapping
@@ -724,8 +916,7 @@ internal static class ColumnMapping
         var physical = new List<StructField>(schema.Count);
         foreach (StructField field in schema)
         {
-            EnsureLeaf(field);
-            physical.Add(ToPhysicalField(field.Name, field.DataType, field.Nullable, PhysicalName(field, mode), field, mode));
+            physical.Add(ToPhysicalField(field, field, mode, field.Name));
         }
 
         return new StructType(physical);
@@ -759,7 +950,6 @@ internal static class ColumnMapping
         var fields = new List<StructField>(writeSchema.Count);
         foreach (StructField field in writeSchema)
         {
-            EnsureLeaf(field);
             if (!tableMappedSchema.TryGetField(field.Name, out StructField tableField))
             {
                 throw DeltaProtocolException.Inconsistent(
@@ -771,9 +961,10 @@ internal static class ColumnMapping
 
             // Physical NAME + id come from the TABLE's existing mapping (reused verbatim, never re-minted);
             // the write column's own type/nullability rides so the staged bytes line up with the partitioner
-            // output. In id mode the id is carried so the staged Parquet stamps the field_id.
-            fields.Add(ToPhysicalField(
-                field.Name, field.DataType, field.Nullable, PhysicalName(tableField, mode), tableField, mode));
+            // output. In id mode the id is carried so the staged Parquet stamps the field_id. For a nested
+            // struct the same rule recurses per child (#676): the child's physical name + id come from the
+            // table mapping, its type/nullability from the write field.
+            fields.Add(ToPhysicalField(field, tableField, mode, field.Name));
         }
 
         return new StructType(fields);
@@ -1018,31 +1209,91 @@ internal static class ColumnMapping
     // Parquet writer stamps the field_id an id-mode reader resolves by; in name mode it carries no
     // column-mapping metadata (a name-mode physical file is field_id-free — #523 AC3). <paramref name="logicalName"/>
     // is used only for a precise fail-closed diagnostic.
+    // Builds one PHYSICAL StructField from a WRITE field (<paramref name="writeField"/> — its type/nullability
+    // ride) and the table's MAPPED counterpart (<paramref name="mappedField"/> — the authoritative
+    // physicalName + id). In name mode the physical field carries NO column-mapping metadata (a name-mode
+    // physical file is field_id-free — #523 AC3, byte-unchanged output); in id mode it carries ONLY its
+    // delta.columnMapping.id so the Parquet writer stamps the field_id an id-mode reader resolves by (#572).
+    // For a nested struct the same rule recurses per child (#676, design §2.2): child physical names + ids come
+    // from the mapped struct, matched by logical name, in WRITE order; array/map interiors ride verbatim (their
+    // element/key/value are not StructFields, C1). Nested-within-nested fails closed naming #585.
     private static StructField ToPhysicalField(
-        string logicalName, DataType dataType, bool nullable, string physicalName, StructField idSource, ColumnMappingMode mode)
+        StructField writeField, StructField mappedField, ColumnMappingMode mode, string logicalPath)
     {
+        string physicalName = PhysicalName(mappedField, mode);
+        DataType physicalType = ToPhysicalType(writeField.DataType, mappedField.DataType, mode, logicalPath);
+
         if (mode != ColumnMappingMode.Id)
         {
-            return new StructField(physicalName, dataType, nullable);
+            return new StructField(physicalName, physicalType, writeField.Nullable);
         }
 
-        if (!TryGetId(idSource, out long id))
+        if (!TryGetId(mappedField, out long id))
         {
             throw DeltaProtocolException.Inconsistent(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"Column '{DiagnosticText.Sanitize(logicalName)}' has no '{IdKey}' but the table uses column mapping 'id' mode; the "
+                    $"Column '{DiagnosticText.Sanitize(logicalPath)}' has no '{IdKey}' but the table uses column mapping 'id' mode; the "
                     + $"schema is inconsistent and cannot be written safely."));
         }
 
         return new StructField(
             physicalName,
-            dataType,
-            nullable,
+            physicalType,
+            writeField.Nullable,
             FieldMetadata.FromValues(new[]
             {
                 new KeyValuePair<string, MetadataValue>(IdKey, MetadataValue.Long(id)),
             }));
+    }
+
+    // Recursively relabels a write DataType to its physical shape: a struct relabels each child (name only,
+    // + id in id mode) matched against the mapped struct by logical name, in WRITE order; an array/map carries
+    // its interior verbatim (no interior mapping, C1). A struct child absent from the mapped struct — or a
+    // nested-within-nested interior (#585) — fails closed.
+    private static DataType ToPhysicalType(
+        DataType writeType, DataType mappedType, ColumnMappingMode mode, string logicalPath)
+    {
+        switch (writeType)
+        {
+            case StructType writeStruct:
+                if (mappedType is not StructType mappedStruct)
+                {
+                    throw DeltaProtocolException.Inconsistent(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Column '{DiagnosticText.Sanitize(logicalPath)}' is a struct in the write schema but not in the "
+                            + $"{ModeName(mode)}-mode table schema; the write is rejected fail-closed."));
+                }
+
+                var children = new List<StructField>(writeStruct.Count);
+                foreach (StructField writeChild in writeStruct)
+                {
+                    RejectNestedWithinNested(writeChild.DataType, logicalPath + "." + writeChild.Name);
+                    if (!mappedStruct.TryGetField(writeChild.Name, out StructField mappedChild))
+                    {
+                        throw DeltaProtocolException.Inconsistent(
+                            string.Create(
+                                CultureInfo.InvariantCulture,
+                                $"Write struct field '{DiagnosticText.Sanitize(logicalPath + "." + writeChild.Name)}' is not present in "
+                                + $"the {ModeName(mode)}-mode table schema, so it has no '{PhysicalNameKey}' to stage under; "
+                                + $"the write is rejected fail-closed."));
+                    }
+
+                    children.Add(ToPhysicalField(writeChild, mappedChild, mode, logicalPath + "." + writeChild.Name));
+                }
+
+                return new StructType(children);
+            case ArrayType array:
+                RejectNestedWithinNested(array.ElementType, logicalPath + ".element");
+                return writeType;
+            case MapType map:
+                RejectNestedWithinNested(map.KeyType, logicalPath + ".key");
+                RejectNestedWithinNested(map.ValueType, logicalPath + ".value");
+                return writeType;
+            default:
+                return writeType;
+        }
     }
 
     private static string ModeName(ColumnMappingMode mode) => mode switch
@@ -1052,16 +1303,43 @@ internal static class ColumnMapping
         _ => NoneMode,
     };
 
-    private static void EnsureLeaf(StructField field)
+    // Builds a StructField carrying <paramref name="mappedType"/> and the authoritative (id, physicalName),
+    // preserving every other per-field metadata entry (a column comment, a delta.typeChanges entry) exactly
+    // as the flat mapping does. Shared by the fresh-assign and evolve paths (#676).
+    private static StructField WithMapping(StructField field, DataType mappedType, long id, string physicalName)
     {
-        if (field.DataType is StructType or ArrayType or MapType)
+        var entries = new List<KeyValuePair<string, MetadataValue>>(field.Metadata.Count + 2);
+        foreach (KeyValuePair<string, MetadataValue> existing in field.Metadata)
+        {
+            if (!string.Equals(existing.Key, IdKey, StringComparison.Ordinal)
+                && !string.Equals(existing.Key, PhysicalNameKey, StringComparison.Ordinal))
+            {
+                entries.Add(existing);
+            }
+        }
+
+        entries.Add(new KeyValuePair<string, MetadataValue>(IdKey, MetadataValue.Long(id)));
+        entries.Add(new KeyValuePair<string, MetadataValue>(PhysicalNameKey, MetadataValue.String(physicalName)));
+
+        return new StructField(field.Name, mappedType, field.Nullable, FieldMetadata.FromValues(entries));
+    }
+
+    // Fail-closed guard for the nested-within-nested boundary (#676 scope, design §1): the enabled surface is
+    // single-level — a struct of scalars, an array of a scalar, a map of scalar→scalar. A struct child, array
+    // element, or map key/value that is ITSELF a struct/array/map (array<struct>, struct<struct>,
+    // map<_,struct>, array<array>, …) is deferred to #585 and rejected here, at the assignment/validation
+    // door, BEFORE any interior id is minted — so a reject never leaves a partial maxColumnId advance.
+    private static void RejectNestedWithinNested(DataType interior, string path)
+    {
+        if (interior is StructType or ArrayType or MapType)
         {
             throw DeltaProtocolException.Unsupported(
                 string.Create(
                     CultureInfo.InvariantCulture,
-                    $"Column '{DiagnosticText.Sanitize(field.Name)}' is a nested ({field.DataType.TypeName}) type; nested column "
-                    + $"mapping is phased in this build (design §2.9/§2.12.3). Only top-level (leaf) columns "
-                    + $"are supported in column mapping 'name'/'id' mode."));
+                    $"Column '{DiagnosticText.Sanitize(path)}' is a nested type within a nested type "
+                    + $"('{interior.TypeName}'); nested-within-nested column mapping is deferred to #585. This build "
+                    + $"maps single-level nested columns only (a struct of scalars, an array of a scalar, a map of "
+                    + $"scalar to scalar)."));
         }
     }
 }
