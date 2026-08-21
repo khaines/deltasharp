@@ -86,14 +86,28 @@ namespace DeltaSharp.Storage.Parquet;
 internal static class NestedParquetColumnReader
 {
     /// <summary>
+    /// The hard cap on the reconstruction recursion depth for a nested-within-nested read (585a, design §2.6).
+    /// Set to <b>64</b> = the write cap (<c>ParquetTypeMapping.MaxFooterTypeDepth</c> /
+    /// <c>DeltaWriteSchemaEligibility.MaxDepth</c>), so the read cap is <b>≥ every write/log/footer cap</b> and
+    /// never over-rejects a schema DeltaSharp can write/admit (no read-after-write parity gap). Checked at
+    /// <see cref="ValidateShape"/> / <c>DecodeNode</c> entry BEFORE any allocation or descent, so a maliciously
+    /// deep schema fails closed <see cref="StorageErrorKind.UnsupportedFeature"/> deterministically — never a
+    /// <see cref="StackOverflowException"/> (which would bypass the fail-closed contract).
+    /// </summary>
+    internal const int MaxNestedReadDepth = 64;
+
+    /// <summary>
     /// Structurally validates that <paramref name="fileField"/> matches the requested nested
-    /// <paramref name="requestedType"/> (correct container kind, every requested leaf present and its physical
-    /// type an EXACT match — no widening for nested leaves) WITHOUT reading any data page, so a schema
-    /// disagreement fails before any batch is yielded (mirrors the flat path's up-front validation).
+    /// <paramref name="requestedType"/> to ARBITRARY DEPTH (585a): the correct container kind at every level,
+    /// every requested leaf present with an EXACT physical-type match (no widening for nested leaves — that is
+    /// 585b), and every per-level structural guard (canonical/required map key, leaf structural-level
+    /// consistency) applied recursively — WITHOUT reading any data page, so a schema disagreement fails before
+    /// any batch is yielded (mirrors the flat path's up-front validation).
     /// </summary>
     /// <exception cref="DeltaStorageException">The shapes disagree
-    /// (<see cref="StorageErrorKind.SchemaMismatch"/>) or the requested shape nests further than this
-    /// increment supports (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
+    /// (<see cref="StorageErrorKind.SchemaMismatch"/>), a leaf type is unsupported or the schema nests deeper
+    /// than <see cref="MaxNestedReadDepth"/> (<see cref="StorageErrorKind.UnsupportedFeature"/>), or a crafted
+    /// footer declares structurally-inconsistent levels (<see cref="StorageErrorKind.CorruptData"/>).</exception>
     public static void ValidateShape(Field fileField, DataType requestedType, string columnName)
     {
         // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
@@ -101,6 +115,23 @@ internal static class NestedParquetColumnReader
         // ONCE at the entry point (control-char strip + length cap) so a crafted/foreign schema name cannot
         // inject line breaks into a structured-log sink or render unbounded.
         columnName = DiagnosticText.Sanitize(columnName);
+        ValidateNode(fileField, requestedType, columnName, depth: 0);
+    }
+
+    // 585a — recursive shape/level validator. Keys each container's leaf-structural-level guards off THAT
+    // container node's own MaxRepetitionLevel/MaxDefinitionLevel, so it generalizes the single-level guards to
+    // any depth; a scalar leaf routes to ExpectScalarLeaf (exact physical type + level guard), a nested child
+    // recurses. The map-transposition + canonical-name + required-key guards run at EVERY map node.
+    private static void ValidateNode(Field fileField, DataType requestedType, string context, int depth)
+    {
+        if (depth > MaxNestedReadDepth)
+        {
+            // DoS bound, checked BEFORE any descent (design §2.6): a maliciously deep schema fails closed here,
+            // at shape resolution, before a single data page is read — never a StackOverflowException.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested read for column '{context}': the requested type nests deeper than the "
+                + $"supported limit of {MaxNestedReadDepth} levels.");
+        }
 
         switch (requestedType)
         {
@@ -108,7 +139,7 @@ internal static class NestedParquetColumnReader
                 if (fileField is not PqStructField fileStruct)
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{columnName}': requested a struct but the file column is not a struct.");
+                        $"Column '{context}': requested a struct but the file column is not a struct.");
                 }
 
                 if (structType.Count == 0)
@@ -116,12 +147,15 @@ internal static class NestedParquetColumnReader
                     // Defensive parity with EnsureReadSupported: a zero-field struct has no leaf to drive the
                     // row count and would reconstruct a length-0 vector — fail closed on the contract.
                     throw DeltaStorageException.UnsupportedFeature(
-                        $"Parquet nested read for struct column '{columnName}': a zero-field struct is not supported.");
+                        $"Parquet nested read for struct column '{context}': a zero-field struct is not supported.");
                 }
 
                 foreach (StructField field in structType)
                 {
-                    _ = ResolveStructField(fileStruct, field, columnName);
+                    Field childNode = ResolveStructChildNode(fileStruct, field, context);
+                    ValidateChild(
+                        childNode, field.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
+                        $"struct column '{context}' field '{DiagnosticText.Sanitize(field.Name)}'", depth + 1);
                 }
 
                 break;
@@ -129,37 +163,56 @@ internal static class NestedParquetColumnReader
                 if (fileField is not PqListField fileList)
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{columnName}': requested an array but the file column is not a list.");
+                        $"Column '{context}': requested an array but the file column is not a list.");
                 }
 
-                _ = ExpectScalarLeaf(
+                ValidateChild(
                     fileList.Item, arrayType.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
-                    $"array column '{columnName}' element");
+                    $"array column '{context}' element", depth + 1);
                 break;
             case MapType mapType:
                 if (fileField is not PqMapField fileMap)
                 {
                     throw DeltaStorageException.SchemaMismatch(
-                        $"Column '{columnName}': requested a map but the file column is not a map.");
+                        $"Column '{context}': requested a map but the file column is not a map.");
                 }
 
-                EnsureCanonicalMapChildNames(fileMap, columnName);
-                EnsureRequiredMapKey(fileMap, columnName);
-                _ = ExpectScalarLeaf(
+                // The map key/value transposition + canonical-name guards run at EVERY map node (design §2.6):
+                // a map<T,T> with a required value can silently transpose past the type/level guards, so assert
+                // the canonical child names and required key on THIS map before its children are validated.
+                EnsureCanonicalMapChildNames(fileMap, context);
+                EnsureRequiredMapKey(fileMap, context);
+                ValidateChild(
                     fileMap.Key, mapType.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-                    $"map column '{columnName}' key");
-                _ = ExpectScalarLeaf(
+                    $"map column '{context}' key", depth + 1);
+                ValidateChild(
                     fileMap.Value, mapType.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-                    $"map column '{columnName}' value");
+                    $"map column '{context}' value", depth + 1);
                 break;
             default:
                 // #705 predicate: struct/array/map are handled by the cases above, so this arm fires only for
-                // a SCALAR requestedType — DescribeType renders it as a bounded atomic literal (== SimpleString
-                // for atomics), but is used instead of raw SimpleString so a hypothetical future non-atomic kind
-                // is bounded by default rather than recursing into raw nested field names.
+                // a SCALAR requestedType at a CONTAINER position (a nested column whose top type is scalar) —
+                // DescribeType renders it as a bounded atomic literal.
                 throw DeltaStorageException.UnsupportedFeature(
-                    $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.DescribeType(requestedType)}' "
+                    $"Parquet nested read for column '{context}' of type '{DiagnosticText.DescribeType(requestedType)}' "
                     + "is not supported.");
+        }
+    }
+
+    // Validates one requested child (array element / map key/value / struct field) against its file node:
+    // a scalar child routes to the exact-physical-type + structural-level leaf guard; a nested child recurses
+    // (guarded by MaxNestedReadDepth at ValidateNode entry). `parentMaxRep`/`parentMaxDef` are the IMMEDIATE
+    // parent container node's own levels — the thresholds the leaf structural-level guard needs at any depth.
+    private static void ValidateChild(
+        Field fileChild, DataType requested, int parentMaxRep, int parentMaxDef, string context, int depth)
+    {
+        if (requested is ArrayType or MapType or StructType)
+        {
+            ValidateNode(fileChild, requested, context, depth);
+        }
+        else
+        {
+            _ = ExpectScalarLeaf(fileChild, requested, parentMaxRep, parentMaxDef, context);
         }
     }
 
@@ -212,25 +265,65 @@ internal static class NestedParquetColumnReader
         // inject line breaks into a structured-log sink or render unbounded.
         columnName = DiagnosticText.Sanitize(columnName);
 
+        // A top-level nested column: parentMaxRep/parentMaxDef = 0 (its owner is the record itself, always
+        // present), ownerCells = rowCount, depth = 0.
+        return await DecodeNode(
+            rowGroup, fileField, requestedType, rowCount, columnName, budget, byFieldId, interiorIds,
+            depth: 0, parentMaxRep: 0, parentMaxDef: 0, cancellationToken).ConfigureAwait(false);
+    }
+
+    // 585a — the recursive shredder-inverse. Dispatches on the requested type, reconstructing an arbitrary-depth
+    // nested ColumnVector from the raw Dremel levels. `ownerCells` is the number of parent cells that reach this
+    // node position (rowCount at the top; the parent container's present-element/entry count one level down);
+    // the returned vector's length is the number of cells this node contributes to its parent (a struct child
+    // returns parent.Length; a list element / map key/value returns the parent's total element/entry count).
+    // `parentMaxRep`/`parentMaxDef` are the IMMEDIATE parent container node's own Dremel levels — the owner-cell
+    // boundary + present-parent thresholds a nested repeated level needs (design §2.2).
+    private static async ValueTask<ColumnVector> DecodeNode(
+        ParquetRowGroupReader rowGroup,
+        Field fileField,
+        DataType requestedType,
+        int ownerCells,
+        string columnName,
+        NestedDecodeBudget budget,
+        IReadOnlyDictionary<int, DataField>? byFieldId,
+        NestedInteriorIds? interiorIds,
+        int depth,
+        int parentMaxRep,
+        int parentMaxDef,
+        CancellationToken cancellationToken)
+    {
+        if (depth > MaxNestedReadDepth)
+        {
+            // DoS bound, checked BEFORE any allocation or descent (design §2.6): decode only ever runs after
+            // ValidateShape (which enforces the same bound up front), so this is defense in depth — a
+            // deterministic typed rejection, never a StackOverflowException.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested read for column '{columnName}': the schema nests deeper than the supported "
+                + $"limit of {MaxNestedReadDepth} levels.");
+        }
+
         return requestedType switch
         {
             // #676: a non-null byFieldId routes struct-child binding through the id-keyed containment path
             // (id mode). #839: an id-mode array/map (non-null byFieldId + interiorIds) routes the interior
             // element/key/value leaf binding through the same containment/identity-selection path; name/none
-            // mode (null interiorIds) binds the interior positionally.
+            // mode (null interiorIds) binds the interior positionally. 585a: name/none mode may recurse into a
+            // nested interior (DecodeNode), threading ownerCells/depth/parentMaxRep/parentMaxDef. The two
+            // interior paths are mutually exclusive — id mode is always a SCALAR interior (nested-within-nested
+            // id mode is rejected upstream), so it never recurses.
             StructType structType => await ReadStructAsync(
-                rowGroup, ExpectStruct(fileField, columnName), structType, rowCount, columnName, budget, byFieldId, cancellationToken)
-                .ConfigureAwait(false),
+                rowGroup, ExpectStruct(fileField, columnName), structType, ownerCells, columnName, budget, byFieldId,
+                depth, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false),
             ArrayType arrayType => await ReadListAsync(
-                rowGroup, ExpectList(fileField, columnName), arrayType, rowCount, columnName, budget, byFieldId, interiorIds, cancellationToken)
-                .ConfigureAwait(false),
+                rowGroup, ExpectList(fileField, columnName), arrayType, ownerCells, columnName, budget,
+                byFieldId, interiorIds, depth, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false),
             MapType mapType => await ReadMapAsync(
-                rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, budget, byFieldId, interiorIds, cancellationToken)
-                .ConfigureAwait(false),
+                rowGroup, ExpectMap(fileField, columnName), mapType, ownerCells, columnName, budget,
+                byFieldId, interiorIds, depth, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false),
             _ => throw DeltaStorageException.UnsupportedFeature(
                 // #705 predicate: struct/array/map are the three explicit switch arms above, so this `_` arm
-                // fires only for a SCALAR requestedType. DescribeType bounds it (== the atomic SimpleString
-                // literal today) and keeps a future non-atomic kind from recursing into raw nested names.
+                // fires only for a SCALAR requestedType at a container position. DescribeType bounds it.
                 $"Parquet nested read for column '{columnName}' of type '{DiagnosticText.DescribeType(requestedType)}' "
                 + "is not supported."),
         };
@@ -242,12 +335,17 @@ internal static class NestedParquetColumnReader
         ParquetRowGroupReader rowGroup,
         PqStructField fileStruct,
         StructType requested,
-        int rowCount,
+        int ownerCells,
         string columnName,
         NestedDecodeBudget budget,
         IReadOnlyDictionary<int, DataField>? byFieldId,
+        int depth,
+        int parentMaxRep,
+        int parentMaxDef,
         CancellationToken cancellationToken)
     {
+        int rowCount = ownerCells;
+
         // Charge the struct's OWN per-row null arrays against the shared row-group budget before its fields are
         // read: the reconstruction builds a transient bool[rows] mask AND StructColumnVector copies it into a
         // final validity bitmap (NestedValidity.Build), so charge 2 bytes/row (both live at the copy). The
@@ -257,37 +355,105 @@ internal static class NestedParquetColumnReader
         // A struct's own definition level: a row whose definition level is BELOW this marks a NULL struct
         // (vs a present struct with a null field, whose level sits at/above this but below the field's max).
         int structMaxDef = fileStruct.MaxDefinitionLevel;
+        int structMaxRep = fileStruct.MaxRepetitionLevel;
+
+        // A struct nested under a repeated ancestor (structMaxRep > 0) is NOT one-value-per-row: its scalar
+        // fields' leaves carry the ancestor's null/empty-container placeholder slots. Such a field is collected
+        // with a present floor at the PARENT's own level (parentMaxDef) so exactly one cell is materialized per
+        // struct owner cell (a present parent element), and its per-owner-cell def stream is EXTRACTED (clamped
+        // at structMaxDef) rather than taken raw. A TOP-LEVEL struct (structMaxRep == 0) keeps the original
+        // one-per-row path (presentFloor 0, raw def) — byte-identical, no #571 regression.
+        bool underRepeatedAncestor = structMaxRep > 0;
         var children = new ColumnVector[requested.Count];
         int[]?[] fieldDefs = new int[requested.Count][]; // each field's definition-level stream (null if required)
         for (int i = 0; i < requested.Count; i++)
         {
             StructField field = requested[i];
-            // #676: id mode binds each child by field_id within the resolved container (containment-scoped,
-            // never by name); name/none mode binds by physical name. Both return the SAME leaf DataField the
-            // decode reads from — the sole per-leaf validator.
-            DataField leaf = byFieldId is not null
-                ? ResolveStructFieldById(fileStruct, field, byFieldId, columnName)
-                : ResolveStructField(fileStruct, field, columnName);
 
-            // A struct field is one value per top-level row (max repetition 0), so its leaf declares exactly
-            // rowCount values with definition levels aligned to rows — the field child is built with a present
-            // floor of 0 (every row yields a cell: a value, a null field, or a null belonging to a null struct).
-            (MutableColumnVector child, int[]? def, _, int numValues) = await ReadScalarLeafAsync(
-                rowGroup, leaf, field.DataType, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
-            RejectNullInRequiredNestedLeaf(def, leaf, field.DataType, field.Nullable);
-            if (numValues != rowCount)
+            // #676: id mode binds each child by field_id within the resolved container (containment-scoped,
+            // never by name); name/none mode binds by physical name. Id mode supports ONLY top-level
+            // struct<scalars> (nested-within-nested column mapping is out of scope, #676/#839), so it is always
+            // one-value-per-row.
+            if (byFieldId is not null)
             {
-                throw DeltaStorageException.CorruptData(
-                    $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(field.Name)}' declares {numValues} values for a "
-                    + $"{rowCount}-row group (a struct field must be one value per row).");
+                DataField leaf = ResolveStructFieldById(fileStruct, field, byFieldId, columnName);
+                (MutableColumnVector child, int[]? def, _, int numValues) = await ReadScalarLeafAsync(
+                    rowGroup, leaf, field.DataType, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                RejectNullInRequiredNestedLeaf(def, leaf, field.DataType, field.Nullable);
+                EnsureStructFieldRowCount(numValues, rowCount, columnName, field.Name);
+                children[i] = child;
+                fieldDefs[i] = def;
+                continue;
             }
 
-            children[i] = child;
-            fieldDefs[i] = def;
+            Field childNode = ResolveStructChildNode(fileStruct, field, columnName);
+            string childContext = $"struct column '{columnName}' field '{DiagnosticText.Sanitize(field.Name)}'";
+
+            if (field.DataType is ArrayType or MapType or StructType)
+            {
+                // A nested struct child (585a): recurse. The child contributes one cell per struct owner cell.
+                // Its driving-leaf def (clamped at structMaxDef, one per owner cell) reports the STRUCT's
+                // presence — feed that to the cross-field null-mask parity guard.
+                DataField drivingLeaf = FirstDataField(childNode);
+                DataType deepScalar = FirstScalarType(field.DataType);
+                (_, int[]? drivingDef, int[]? drivingRep, int drivingNumValues) = await ReadScalarLeafAsync(
+                    rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                fieldDefs[i] = ExtractOwnerCellDefs(
+                    drivingDef, drivingRep, drivingNumValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, childContext);
+
+                // A struct is TRANSPARENT to repetition: its children share the struct's OWN owner cells and
+                // parent boundary (even a null-struct row yields a null child cell). So recurse with the
+                // struct's parentMaxRep/parentMaxDef UNCHANGED — NOT structMaxRep/structMaxDef.
+                children[i] = await DecodeNode(
+                    rowGroup, childNode, field.DataType, rowCount, childContext, budget, byFieldId: null,
+                    interiorIds: null, depth + 1, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            // A scalar struct field.
+            DataField scalarLeaf = ExpectScalarLeaf(
+                childNode, field.DataType, structMaxRep, structMaxDef, childContext);
+            int scalarPresentFloor = underRepeatedAncestor ? parentMaxDef : 0;
+            (MutableColumnVector scalarChild, int[]? scalarDef, int[]? scalarRep, int scalarNumValues) = await ReadScalarLeafAsync(
+                rowGroup, scalarLeaf, field.DataType, scalarPresentFloor, budget, cancellationToken).ConfigureAwait(false);
+            RejectNullInRequiredNestedLeaf(scalarDef, scalarLeaf, field.DataType, field.Nullable);
+
+            if (underRepeatedAncestor)
+            {
+                // The child materialized one cell per present parent element (present floor = parentMaxDef);
+                // its per-owner-cell def is extracted (clamped at structMaxDef) for the null-mask parity guard.
+                if (scalarChild.Length != rowCount)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(field.Name)}' reconstructed "
+                        + $"{scalarChild.Length} cell(s) but the struct has {rowCount} owner cell(s).");
+                }
+
+                fieldDefs[i] = ExtractOwnerCellDefs(
+                    scalarDef, scalarRep, scalarNumValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, childContext);
+            }
+            else
+            {
+                // A top-level struct field is one value per row (byte-identical single-level path).
+                EnsureStructFieldRowCount(scalarNumValues, rowCount, columnName, field.Name);
+                fieldDefs[i] = scalarDef;
+            }
+
+            children[i] = scalarChild;
         }
 
         bool[]? nulls = BuildStructNullMask(fieldDefs, structMaxDef, rowCount, columnName);
         return new StructColumnVector(requested, children, nulls is null ? default : nulls.AsSpan());
+    }
+
+    private static void EnsureStructFieldRowCount(int numValues, int rowCount, string columnName, string fieldName)
+    {
+        if (numValues != rowCount)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(fieldName)}' declares {numValues} values for a "
+                + $"{rowCount}-row group (a struct field must be one value per row).");
+        }
     }
 
     // Builds an optional struct's per-row null mask from its fields' definition-level streams, validating that
@@ -364,55 +530,91 @@ internal static class NestedParquetColumnReader
         ParquetRowGroupReader rowGroup,
         PqListField fileList,
         ArrayType requested,
-        int rowCount,
+        int ownerCells,
         string columnName,
         NestedDecodeBudget budget,
         IReadOnlyDictionary<int, DataField>? byFieldId,
         NestedInteriorIds? interiorIds,
+        int depth,
+        int parentMaxRep,
+        int parentMaxDef,
         CancellationToken cancellationToken)
     {
-        // Charge the list's OWN per-row structural arrays against the shared row-group budget before its element
-        // leaf is read. The reconstruction builds a transient offsets int[rows+1] + nulls bool[rows], THEN
-        // ListColumnVector COPIES the offsets (NestedValidity.CopyValidatedOffsets) and builds a validity bitmap
-        // — transient + final coexist at the copy, so charge 2*(int+bool) = ~10 bytes/row (the complete per-row
-        // structural set; the element child is charged separately). Structure + child stay cumulatively bounded.
-        budget.ChargeStructural(rowCount, 2 * (sizeof(int) + sizeof(bool)), $"array column '{columnName}'");
+        // Charge the list's OWN per-owner structural arrays against the shared row-group budget before its
+        // element leaf is read. The reconstruction builds a transient offsets int[owners+1] + nulls bool[owners],
+        // THEN ListColumnVector COPIES the offsets (NestedValidity.CopyValidatedOffsets) and builds a validity
+        // bitmap — transient + final coexist at the copy, so charge 2*(int+bool) = ~10 bytes/owner (the complete
+        // per-owner structural set; the element child is charged separately). Structure + child stay bounded.
+        budget.ChargeStructural(ownerCells, 2 * (sizeof(int) + sizeof(bool)), $"array column '{columnName}'");
 
+        int listMaxDef = fileList.MaxDefinitionLevel;
+        int listMaxRep = fileList.MaxRepetitionLevel;
         string elementContext = $"array column '{columnName}' element";
 
-        // #839: in id mode (non-null byFieldId + interiorIds.ElementId) bind the element leaf by its nested.ids
-        // field_id within the container's own interior (identity-selection + containment); name/none mode binds
-        // the element positionally (fileList.Item).
+        int[]? def;
+        int[]? rep;
+        int numValues;
+        ColumnVector elements;
+        if (requested.ElementType is ArrayType or MapType or StructType)
+        {
+            // A nested list element (585a): reconstruct THIS level's offsets/nulls from the element subtree's
+            // DRIVING leaf (first leaf under fileList.Item), then recurse into the element type. The driving
+            // leaf's raw (def, rep) fully describe this repeated level's structure (design §2.2 DecodeList).
+            DataField drivingLeaf = FirstDataField(fileList.Item);
+            DataType deepScalar = FirstScalarType(requested.ElementType);
+            (_, def, rep, numValues) = await ReadScalarLeafAsync(
+                rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+            EnsureRepeatedSlotFloor(numValues, ownerCells, columnName, "element");
+
+            var nestedOffsets = new int[checked(ownerCells + 1)];
+            var nestedNulls = new bool[ownerCells];
+            int elemCount = BuildRepeatedStructure(
+                def, rep, numValues, listMaxDef, listMaxRep, parentMaxDef, parentMaxRep, ownerCells,
+                nestedOffsets, nestedNulls, columnName);
+
+            elements = await DecodeNode(
+                rowGroup, fileList.Item, requested.ElementType, elemCount, elementContext, budget, byFieldId: null,
+                interiorIds: null, depth + 1, listMaxRep, listMaxDef, cancellationToken).ConfigureAwait(false);
+
+            if (elemCount != elements.Length)
+            {
+                throw DeltaStorageException.CorruptData(
+                    $"Array column '{columnName}' reassembled {elemCount} element slot(s) but the element child has "
+                    + $"{elements.Length}.");
+            }
+
+            return new ListColumnVector(requested, elements, nestedOffsets.AsSpan(), nestedNulls.AsSpan());
+        }
+
+        // A scalar list element. #839: in id mode (non-null byFieldId + interiorIds.ElementId) bind the element
+        // leaf by its nested.ids field_id within the container's own interior (identity-selection + containment);
+        // name/none mode binds the element positionally (fileList.Item). The interior is ALWAYS scalar in id
+        // mode (nested-within-nested id mode is rejected upstream), so this is the only id-mode element path —
+        // the recursive branch above is never entered when byFieldId/interiorIds are present.
         DataField elementLeaf = byFieldId is not null && interiorIds?.ElementId is long elementId
             ? ExpectScalarLeaf(
                 ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext),
-                requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, elementContext)
+                requested.ElementType, listMaxRep, listMaxDef, elementContext)
             : ExpectScalarLeaf(
-                fileList.Item, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
-                elementContext);
-        int listMaxDef = fileList.MaxDefinitionLevel;
+                fileList.Item, requested.ElementType, listMaxRep, listMaxDef, elementContext);
 
         // The element child collects one cell per PRESENT element slot (a real value OR a null element),
         // skipping the placeholder slots a null/empty list emits (definition level below the list's own level).
-        (MutableColumnVector elements, int[]? def, int[]? rep, int numValues) = await ReadScalarLeafAsync(
+        MutableColumnVector scalarElements;
+        (scalarElements, def, rep, numValues) = await ReadScalarLeafAsync(
             rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, budget, cancellationToken)
             .ConfigureAwait(false);
         RejectNullInRequiredNestedLeaf(def, elementLeaf, requested.ElementType, requested.ContainsNull);
+        elements = scalarElements;
 
-        // A1 (defense in depth): every top-level row emits at least one element-level slot (a real element, or
-        // a placeholder for a null/empty list), so the element leaf's declared value count is >= the row count.
-        // A smaller count cannot describe rowCount rows — reject BEFORE allocating the rowCount-scaled
-        // offsets/nulls (this also transitively bounds that allocation, since numValues is ceiling-bounded).
-        if (numValues < rowCount)
-        {
-            throw DeltaStorageException.CorruptData(
-                $"Array column '{columnName}' declares {numValues} element slot(s) for a {rowCount}-row group, "
-                + "but a repeated column emits at least one level slot per row.");
-        }
+        // A1 (defense in depth): every owner cell emits at least one element-level slot (a real element, or a
+        // placeholder for a null/empty list), so the element leaf's declared value count is >= the owner count.
+        EnsureRepeatedSlotFloor(numValues, ownerCells, columnName, "element");
 
-        var offsets = new int[checked(rowCount + 1)];
-        var nulls = new bool[rowCount];
-        int total = BuildRepeatedStructure(def, rep, numValues, listMaxDef, rowCount, offsets, nulls, columnName);
+        var offsets = new int[checked(ownerCells + 1)];
+        var nulls = new bool[ownerCells];
+        int total = BuildRepeatedStructure(
+            def, rep, numValues, listMaxDef, listMaxRep, parentMaxDef, parentMaxRep, ownerCells, offsets, nulls, columnName);
         if (total != elements.Length)
         {
             throw DeltaStorageException.CorruptData(
@@ -423,88 +625,150 @@ internal static class NestedParquetColumnReader
         return new ListColumnVector(requested, elements, offsets.AsSpan(), nulls.AsSpan());
     }
 
+    // A1 (defense in depth): a repeated column emits at least one level slot per owner cell (a real occurrence
+    // or a null/empty-container placeholder), so its driving leaf's declared value count is >= the owner count.
+    // Reject a smaller count BEFORE allocating the owner-scaled offsets/nulls (bounding that allocation, since
+    // numValues is ceiling-bounded).
+    private static void EnsureRepeatedSlotFloor(int numValues, int ownerCells, string columnName, string kind)
+    {
+        if (numValues < ownerCells)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"{(string.Equals(kind, "element", StringComparison.Ordinal) ? "Array" : "Map")} column '{columnName}' "
+                + $"declares {numValues} {kind} slot(s) for {ownerCells} owner cell(s), but a repeated column emits "
+                + "at least one level slot per owner cell.");
+        }
+    }
+
     // ----- map (3-level MAP) -----
 
     private static async ValueTask<ColumnVector> ReadMapAsync(
         ParquetRowGroupReader rowGroup,
         PqMapField fileMap,
         MapType requested,
-        int rowCount,
+        int ownerCells,
         string columnName,
         NestedDecodeBudget budget,
         IReadOnlyDictionary<int, DataField>? byFieldId,
         NestedInteriorIds? interiorIds,
+        int depth,
+        int parentMaxRep,
+        int parentMaxDef,
         CancellationToken cancellationToken)
     {
-        // Charge the map's OWN per-row structural arrays against the shared row-group budget before its
-        // key/value leaves are read. Like a list, the reconstruction builds a transient entry-offsets int[rows+1]
-        // + nulls bool[rows], THEN MapColumnVector COPIES the offsets and builds a validity bitmap — transient +
-        // final coexist, so charge 2*(int+bool) = ~10 bytes/row (the complete per-row structural set; both child
-        // leaves are charged separately). Structure + children stay cumulatively bounded.
-        budget.ChargeStructural(rowCount, 2 * (sizeof(int) + sizeof(bool)), $"map column '{columnName}'");
+        // Charge the map's OWN per-owner structural arrays against the shared row-group budget before its
+        // key/value leaves are read. Like a list, the reconstruction builds a transient entry-offsets
+        // int[owners+1] + nulls bool[owners], THEN MapColumnVector COPIES the offsets and builds a validity
+        // bitmap — transient + final coexist, so charge 2*(int+bool) = ~10 bytes/owner (both child leaves are
+        // charged separately). Structure + children stay cumulatively bounded.
+        budget.ChargeStructural(ownerCells, 2 * (sizeof(int) + sizeof(bool)), $"map column '{columnName}'");
 
+        // The map key/value transposition + canonical-name + required-key guards run at EVERY map node (§2.6).
+        EnsureCanonicalMapChildNames(fileMap, columnName);
         EnsureRequiredMapKey(fileMap, columnName);
-        string keyContext = $"map column '{columnName}' key";
-        string valueContext = $"map column '{columnName}' value";
+        int mapMaxDef = fileMap.MaxDefinitionLevel;
+        int mapMaxRep = fileMap.MaxRepetitionLevel;
+        bool nestedKey = requested.KeyType is ArrayType or MapType or StructType;
+        bool nestedValue = requested.ValueType is ArrayType or MapType or StructType;
 
-        // #839: in id mode bind the key/value leaves by their DISTINCT nested.ids field_ids within the
-        // container's own interior (identity-selection separates key from value, §2.5 step 3); name/none mode
-        // binds them positionally (fileMap.Key / fileMap.Value). Either way the id-/position-selected leaf is
-        // type/level-validated by ExpectScalarLeaf.
-        DataField keyLeaf;
-        DataField valueLeaf;
-        if (byFieldId is not null && interiorIds?.KeyId is long keyId && interiorIds.ValueId is long valueId)
+        // Keys drive the entry structure (the key subtree's driving leaf). A required key's max definition level
+        // equals the map's own level, so every referenced key slot carries a real value — keys are never null,
+        // matching MapType's structural invariant.
+        MutableColumnVector? scalarKeys;
+        int[]? keyDef;
+        int[]? keyRep;
+        int keyNumValues;
+        if (nestedKey)
         {
-            List<DataField> interiors = MapInteriorLeaves(fileMap);
-            keyLeaf = ExpectScalarLeaf(
-                ResolveInteriorLeafById(keyId, interiors, byFieldId, keyContext),
-                requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, keyContext);
-            valueLeaf = ExpectScalarLeaf(
-                ResolveInteriorLeafById(valueId, interiors, byFieldId, valueContext),
-                requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, valueContext);
+            DataField keyDriving = FirstDataField(fileMap.Key);
+            DataType keyDeep = FirstScalarType(requested.KeyType);
+            (_, keyDef, keyRep, keyNumValues) = await ReadScalarLeafAsync(
+                rowGroup, keyDriving, keyDeep, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+            scalarKeys = null;
         }
         else
         {
-            keyLeaf = ExpectScalarLeaf(
-                fileMap.Key, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, keyContext);
-            valueLeaf = ExpectScalarLeaf(
-                fileMap.Value, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, valueContext);
+            // #839: in id mode bind the key leaf by its nested.ids field_id within the container's own interior
+            // (identity-selection separates key from value, §2.5 step 3); name/none mode binds it positionally
+            // (fileMap.Key). Either way ExpectScalarLeaf type/level-validates the selected leaf. The interior is
+            // ALWAYS scalar in id mode (nested key/value id mode is rejected upstream), so this non-nested
+            // branch is the only id-mode key path.
+            string keyContext = $"map column '{columnName}' key";
+            DataField keyLeaf = byFieldId is not null && interiorIds?.KeyId is long keyId
+                ? ExpectScalarLeaf(
+                    ResolveInteriorLeafById(keyId, MapInteriorLeaves(fileMap), byFieldId, keyContext),
+                    requested.KeyType, mapMaxRep, mapMaxDef, keyContext)
+                : ExpectScalarLeaf(
+                    fileMap.Key, requested.KeyType, mapMaxRep, mapMaxDef, keyContext);
+            (scalarKeys, keyDef, keyRep, keyNumValues) = await ReadScalarLeafAsync(
+                rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, budget, cancellationToken).ConfigureAwait(false);
         }
 
-        int mapMaxDef = fileMap.MaxDefinitionLevel;
+        // The value subtree is parallel to the key subtree (same repeated key_value group), so their driving
+        // leaves share a repetition stream AND agree, slot-by-slot, on entry presence.
+        MutableColumnVector? scalarValues;
+        int[]? valueDef;
+        int[]? valueRep;
+        if (nestedValue)
+        {
+            DataField valueDriving = FirstDataField(fileMap.Value);
+            DataType valueDeep = FirstScalarType(requested.ValueType);
+            (_, valueDef, valueRep, _) = await ReadScalarLeafAsync(
+                rowGroup, valueDriving, valueDeep, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+            scalarValues = null;
+        }
+        else
+        {
+            // #839: in id mode bind the value leaf by its DISTINCT nested.ids field_id within the container's
+            // own interior; name/none mode binds it positionally (fileMap.Value). Interior is always scalar in
+            // id mode, so this non-nested branch is the only id-mode value path.
+            string valueContext = $"map column '{columnName}' value";
+            DataField valueLeaf = byFieldId is not null && interiorIds?.ValueId is long valueId
+                ? ExpectScalarLeaf(
+                    ResolveInteriorLeafById(valueId, MapInteriorLeaves(fileMap), byFieldId, valueContext),
+                    requested.ValueType, mapMaxRep, mapMaxDef, valueContext)
+                : ExpectScalarLeaf(
+                    fileMap.Value, requested.ValueType, mapMaxRep, mapMaxDef, valueContext);
+            (scalarValues, valueDef, valueRep, _) = await ReadScalarLeafAsync(
+                rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, cancellationToken).ConfigureAwait(false);
+            RejectNullInRequiredNestedLeaf(valueDef, valueLeaf, requested.ValueType, requested.ValueContainsNull);
+        }
 
-        // Keys drive the entry structure. A required key's max definition level equals the map's own level
-        // (enforced above), so every referenced key slot carries a real value — keys are never null, matching
-        // MapType's structural invariant.
-        (MutableColumnVector keys, int[]? keyDef, int[]? keyRep, int keyNumValues) = await ReadScalarLeafAsync(
-            rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, budget, cancellationToken)
-            .ConfigureAwait(false);
+        // F1/R6/R7: the KEY and VALUE cross-leaf parity checks compare the two leaves slot-for-slot, so they
+        // apply ONLY when key AND value are SCALAR siblings in the same key_value group (the single-level 3-level
+        // map contract — byte-preserved). When either side is NESTED, its driving leaf is DEEPER (carries extra
+        // repetition beyond the map's own level), so a raw slot-for-slot comparison is meaningless; the
+        // recursion's own owner-cell reconstruction (each nested child is decoded with ownerCells = entryCount
+        // and re-checks that count) supplies the structural cross-check instead.
+        if (!nestedKey && !nestedValue)
+        {
+            // F1: the value child is consumed positionally against the KEY-driven entry structure. A divergent
+            // per-entry distribution would silently mis-pair — reject any rep divergence BEFORE reconstructing.
+            ValidateParallelRepetition(keyRep, valueRep, columnName);
 
-        // The value child is parallel to the key child: driven by the SAME present floor, its own definition
-        // levels distinguish a present-but-null value from a real value. Capture the value repetition AND
-        // definition streams (F1 rep, R6 def): a well-formed 3-level map nests the key and value in the SAME
-        // repeated key_value group, so their repetition levels are identical AND they agree, slot-by-slot, on
-        // whether an entry is present.
-        (MutableColumnVector values, int[]? valueDef, int[]? valueRep, _) = await ReadScalarLeafAsync(
-            rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, cancellationToken)
-            .ConfigureAwait(false);
-        RejectNullInRequiredNestedLeaf(valueDef, valueLeaf, requested.ValueType, requested.ValueContainsNull);
+            // R6/R7: key and value leaves must agree, slot-by-slot, on entry presence at the map's own level.
+            ValidateParallelDefinition(keyDef, valueDef, mapMaxDef, columnName);
+        }
 
-        // F1: the value child is consumed positionally against the KEY-driven entry structure (offsets/nulls
-        // below come from the key leaf alone). If a crafted/corrupt file gave the value a divergent per-entry
-        // distribution — a different repetition stream at the SAME total count — the positional pairing would
-        // silently mis-assign values across rows/keys (a WRONG, not merely failed, read). Reject any rep
-        // divergence BEFORE reconstructing.
-        ValidateParallelRepetition(keyRep, valueRep, columnName);
+        // A1 (defense in depth): the key subtree drives the entry structure and emits at least one level slot
+        // per owner cell (a placeholder for a null/empty map).
+        EnsureRepeatedSlotFloor(keyNumValues, ownerCells, columnName, "entry");
 
-        // R6: the value's DEFINITION levels are the second half of the cross-leaf contract. The value child is
-        // front-filled from the slots where valueDef >= mapMaxDef and paired positionally against the entries
-        // the KEY structure marks present (keyDef >= mapMaxDef). A crafted stream where key and value disagree
-        // on entry presence at a slot — passing rep-parity and level-range — would mis-pair values across the
-        // map. Validate ENTRY-PRESENCE parity (not raw def equality: a present value legitimately has a HIGHER
-        // def than the required key, distinguishing null vs non-null above the map's own level). Only REP is
-        // shared identically; the value's own def still distinguishes null values during its leaf reconstruction.
-        ValidateParallelDefinition(keyDef, valueDef, mapMaxDef, columnName);
+        var offsets = new int[checked(ownerCells + 1)];
+        var nulls = new bool[ownerCells];
+        int entryCount = BuildRepeatedStructure(
+            keyDef, keyRep, keyNumValues, mapMaxDef, mapMaxRep, parentMaxDef, parentMaxRep, ownerCells, offsets, nulls, columnName);
+
+        ColumnVector keys = nestedKey
+            ? await DecodeNode(
+                rowGroup, fileMap.Key, requested.KeyType, entryCount, $"map column '{columnName}' key", budget,
+                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, cancellationToken).ConfigureAwait(false)
+            : scalarKeys!;
+        ColumnVector values = nestedValue
+            ? await DecodeNode(
+                rowGroup, fileMap.Value, requested.ValueType, entryCount, $"map column '{columnName}' value", budget,
+                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, cancellationToken).ConfigureAwait(false)
+            : scalarValues!;
 
         if (keys.Length != values.Length)
         {
@@ -513,44 +777,40 @@ internal static class NestedParquetColumnReader
                 + "map's key and value children must be parallel.");
         }
 
-        // A1 (defense in depth): the key leaf drives the entry structure and emits at least one level slot per
-        // row (a placeholder for a null/empty map), so its declared value count is >= the row count. Reject a
-        // smaller count BEFORE allocating the rowCount-scaled offsets/nulls (bounding that allocation, since
-        // keyNumValues is ceiling-bounded).
-        if (keyNumValues < rowCount)
+        if (entryCount != keys.Length)
         {
             throw DeltaStorageException.CorruptData(
-                $"Map column '{columnName}' declares {keyNumValues} entry slot(s) for a {rowCount}-row group, "
-                + "but a repeated column emits at least one level slot per row.");
-        }
-
-        var offsets = new int[checked(rowCount + 1)];
-        var nulls = new bool[rowCount];
-        int total = BuildRepeatedStructure(keyDef, keyRep, keyNumValues, mapMaxDef, rowCount, offsets, nulls, columnName);
-        if (total != keys.Length)
-        {
-            throw DeltaStorageException.CorruptData(
-                $"Map column '{columnName}' reassembled {total} entry slot(s) but the key child has {keys.Length}.");
+                $"Map column '{columnName}' reassembled {entryCount} entry slot(s) but the key child has {keys.Length}.");
         }
 
         return new MapColumnVector(requested, keys, values, offsets.AsSpan(), nulls.AsSpan());
     }
 
-    // Reconstructs the per-row offsets + null flags for a repeated column (list/map) from its driving leaf's
-    // definition + repetition levels, distinguishing null container / empty container / present container.
-    // Returns the total number of PRESENT child cells (== offsets[^1]), so the caller can cross-check the
-    // reassembled child length. A repetition level of 0 opens a new top-level row; a definition level at or
-    // above the container's own level counts a present child cell; one below the container-minus-one level
-    // (i.e., not even the empty-container placeholder) marks a NULL container. Internal so a direct unit test
-    // can pin the F2 state-transition guard with crafted def/rep streams that the released Parquet.Net write
-    // door (which derives definition levels from value nullability, never below the element's own null level)
-    // cannot author.
+    // Reconstructs the per-owner-cell offsets + null flags for ONE repeated level (list/map) from its driving
+    // leaf's definition + repetition levels, distinguishing null container / empty container / present
+    // container — at ARBITRARY depth (design §2.2, worked trace §2.4). Returns the total number of PRESENT
+    // child cells at THIS level (== offsets[^1]), so the caller can cross-check the reassembled child length.
+    //
+    // Level parameters:
+    //   thisMaxDef / thisMaxRep  — the repeated node's OWN Dremel levels (this level's container).
+    //   parentMaxDef / parentMaxRep — the IMMEDIATE parent container's levels (the owner-cell boundary).
+    //
+    // The generalization over the single-level (#571) reader: an owner cell opens at `rep <= parentMaxRep`
+    // (the parent's element/row boundary — NOT the hard-wired `rep == 0`), and a new occurrence at THIS level
+    // counts iff `rep <= thisMaxRep && def >= thisMaxDef`. Slots with `rep > thisMaxRep` belong to a DEEPER
+    // container (a child recursion consumes them) and are excluded from this level's count. For a top-level
+    // single repeated level (parentMaxRep = parentMaxDef = 0, thisMaxRep = 1) this reduces EXACTLY to the old
+    // `rep == 0` owner boundary + ungated `def >= thisMaxDef` element count — byte-identical, no #571 regression.
+    //
+    // Internal so a direct unit test can pin the F2 state-transition guard with crafted def/rep streams that
+    // the released Parquet.Net write door (which derives definition levels from value nullability, never below
+    // the element's own null level) cannot author.
     internal static int BuildRepeatedStructure(
-        int[]? def, int[]? rep, int numValues, int containerMaxDef, int rowCount, int[] offsets, bool[] nulls,
-        string columnName)
+        int[]? def, int[]? rep, int numValues, int thisMaxDef, int thisMaxRep, int parentMaxDef, int parentMaxRep,
+        int ownerCells, int[] offsets, bool[] nulls, string columnName)
     {
-        // A top-level repeated column always carries both level streams (its max repetition and definition
-        // levels are >= 1); their absence is a malformed footer.
+        // A repeated column always carries both level streams (its max repetition and definition levels are
+        // >= 1); their absence is a malformed footer.
         if (def is null || rep is null)
         {
             throw DeltaStorageException.CorruptData(
@@ -558,83 +818,155 @@ internal static class NestedParquetColumnReader
                 + "reconstruct its structure.");
         }
 
-        int emptyContainerDef = containerMaxDef - 1;
-        int row = -1;
+        // A container that is empty (not null) sits ONE level below its own present level: def == thisMaxDef-1
+        // is the empty-container marker; def < thisMaxDef-1 is a NULL container (or an ABSENT parent, handled by
+        // the owner-open gate below).
+        int emptyContainerDef = thisMaxDef - 1;
+        int owner = -1;
         int elements = 0;
-        bool rowComplete = false; // F2: the current row opened as an empty/null container -> no continuation
+        bool ownerComplete = false; // F2: the current owner opened as an empty/null container -> no continuation
         offsets[0] = 0;
         for (int i = 0; i < numValues; i++)
         {
             int d = def[i];
-            if (rep[i] == 0)
+            int r = rep[i];
+
+            if (r <= parentMaxRep)
             {
-                // A new top-level row: close the previous row's offset window, then open this row (assumed
-                // present until a below-empty definition level proves it null).
-                if (row >= 0)
+                // A parent-boundary slot: it opens the NEXT owner cell (a new parent element/entry/row). But
+                // the parent element itself may be ABSENT here (def < parentMaxDef) — a placeholder emitted by a
+                // null/empty grandparent container — in which case NO owner cell exists at this position and the
+                // slot is consumed without opening one (it belongs to the parent level's own bookkeeping).
+                if (i == 0 && r != 0)
                 {
-                    offsets[row + 1] = elements;
-                }
-
-                row++;
-                if (row >= rowCount)
-                {
-                    throw DeltaStorageException.CorruptData(
-                        $"Nested column '{columnName}' declares more rows than the row group's {rowCount}.");
-                }
-
-                nulls[row] = false;
-
-                // F2: an empty or null container occupies a SINGLE level slot with no element occurrence
-                // (definition level below the container's own level), so it admits no continuation.
-                rowComplete = d < containerMaxDef;
-            }
-            else
-            {
-                // A continuation slot (repetition level > 0) of the current row.
-                if (row < 0)
-                {
-                    // The first level slot must open a row (repetition level 0); a leading non-zero is corrupt.
+                    // The very first level slot must carry repetition level 0 (the record boundary); a leading
+                    // non-zero is corrupt.
                     throw DeltaStorageException.CorruptData(
                         $"Nested column '{columnName}' begins with a non-zero repetition level (corrupt levels).");
                 }
 
-                // F2 (crafted-Dremel): a continuation is legal only when the row is an active element-bearing
-                // container (its opening slot was an element) AND this slot is itself an element occurrence
-                // (definition level at/above the container's own level). Continuing a row whose container was
-                // empty/null — e.g. def=[1,2]/rep=[0,1], an empty-list marker then a continuation — or a
-                // placeholder masquerading as a continuation would otherwise reconstruct a PHANTOM element
-                // into an empty/null container. Fail closed rather than silently decode wrong-but-plausible data.
-                if (rowComplete || d < containerMaxDef)
+                if (d < parentMaxDef)
+                {
+                    // The parent element is absent at this slot (its own container is null/empty). No owner
+                    // cell opens here.
+                    continue;
+                }
+
+                // The parent element is present: open a new owner cell for it. Close the previous owner's
+                // window first.
+                if (owner >= 0)
+                {
+                    offsets[owner + 1] = elements;
+                }
+
+                owner++;
+                if (owner >= ownerCells)
                 {
                     throw DeltaStorageException.CorruptData(
-                        $"Nested column '{columnName}' continues row {row} (repetition level {rep[i]}) after an "
+                        $"Nested column '{columnName}' declares more owner cells than the expected {ownerCells}.");
+                }
+
+                // This owner's container: null if its def is below even the empty-container marker; empty if it
+                // sits exactly at the marker; present (element-bearing) at/above its own level.
+                nulls[owner] = d < emptyContainerDef;
+                ownerComplete = d < thisMaxDef;
+            }
+            else if (r <= thisMaxRep)
+            {
+                // A continuation of the CURRENT owner at THIS repeated level (a new occurrence in the same
+                // container). Legal only when the owner is an active element-bearing container AND this slot is
+                // itself an occurrence at/above this level's own definition. Continuing an empty/null container,
+                // or a placeholder masquerading as a continuation, would reconstruct a PHANTOM occurrence.
+                if (owner < 0)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{columnName}' begins with a non-zero repetition level (corrupt levels).");
+                }
+
+                if (ownerComplete || d < thisMaxDef)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{columnName}' continues owner cell {owner} (repetition level {r}) after an "
                         + $"empty/null-container marker (definition level {d}); an empty or null repeated "
                         + "container has no continuation.");
                 }
             }
+            // else: r > thisMaxRep — a continuation at a DEEPER repeated level. It belongs to a child container
+            // nested inside this level's current occurrence; the child recursion consumes it. Excluded from THIS
+            // level's owner boundaries AND occurrence count.
 
-            if (d >= containerMaxDef)
+            // Count an occurrence at THIS level: a slot at/above this level's own definition that is NOT the
+            // business of a deeper level (rep <= thisMaxRep). This is the corrected count (design §2.4): for
+            // array<array<int>> the OUTER level counts INNER-LIST occurrences (rep <= 1), NOT leaf values.
+            if (r <= thisMaxRep && d >= thisMaxDef)
             {
                 elements++;
             }
-            else if (d < emptyContainerDef)
-            {
-                nulls[row] = true;
-            }
         }
 
-        if (row >= 0)
+        if (owner >= 0)
         {
-            offsets[row + 1] = elements;
+            offsets[owner + 1] = elements;
         }
 
-        if (row + 1 != rowCount)
+        if (owner + 1 != ownerCells)
         {
             throw DeltaStorageException.CorruptData(
-                $"Nested column '{columnName}' reconstructed {row + 1} row(s) but the row group declares {rowCount}.");
+                $"Nested column '{columnName}' reconstructed {owner + 1} owner cell(s) but the parent declares {ownerCells}.");
         }
 
         return elements;
+    }
+
+    // Extracts a nested struct-child's per-owner-cell definition stream (clamped at the struct's own level) from
+    // its driving leaf's raw (def, rep). Used to feed the cross-field null-mask parity guard (BuildStructNullMask)
+    // for a struct child that is ITSELF nested (a list/map/struct with no scalar leaf of its own). Each owner
+    // cell's def is the opening slot's def clamped at structMaxDef: at/above => the struct is present at that
+    // owner; below => the struct is absent there. Owner cells open at the parent boundary (rep <= parentMaxRep &&
+    // def >= parentMaxDef), matching BuildRepeatedStructure's owner discipline. A driving leaf with no repeated
+    // ancestor carries a null rep (max repetition 0) — every slot is then an owner (repetition level 0); a fully
+    // required path carries a null def — every slot is then present at its own max.
+    private static int[] ExtractOwnerCellDefs(
+        int[]? def, int[]? rep, int numValues, int structMaxDef, int parentMaxDef, int parentMaxRep,
+        int ownerCells, string columnName)
+    {
+        var owned = new int[ownerCells];
+        int owner = -1;
+        for (int i = 0; i < numValues; i++)
+        {
+            int r = rep is null ? 0 : rep[i];
+            int d = def is null ? structMaxDef : def[i];
+            if (r <= parentMaxRep)
+            {
+                if (i == 0 && r != 0)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{columnName}' begins with a non-zero repetition level (corrupt levels).");
+                }
+
+                if (d < parentMaxDef)
+                {
+                    continue; // parent element absent — no owner cell here
+                }
+
+                owner++;
+                if (owner >= ownerCells)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{columnName}' declares more owner cells than the expected {ownerCells}.");
+                }
+
+                owned[owner] = Math.Min(d, structMaxDef);
+            }
+        }
+
+        if (owner + 1 != ownerCells)
+        {
+            throw DeltaStorageException.CorruptData(
+                $"Nested column '{columnName}' reconstructed {owner + 1} owner cell(s) but the parent declares {ownerCells}.");
+        }
+
+        return owned;
     }
 
     // ----- leaf decode (raw Dremel -> child vector) -----
@@ -1147,7 +1479,10 @@ internal static class NestedParquetColumnReader
     // Resolves a struct child in NAME/none mode: matches the requested (physical) child by name against the
     // file struct's fields, DUPLICATE-INTOLERANTLY (#676) — two file fields sharing the requested name is an
     // ambiguous/foreign shape and fails closed rather than resolving to the first by luck.
-    private static DataField ResolveStructField(PqStructField fileStruct, StructField requested, string columnName)
+    // Resolves a struct child to its RAW file Field (NAME mode) — duplicate-intolerant, missing-intolerant —
+    // WITHOUT collapsing it to a scalar leaf. A scalar child then routes to ExpectScalarLeaf; a nested child
+    // recurses through DecodeNode/ValidateNode. This is the name-mode sibling of ResolveStructFieldById.
+    private static Field ResolveStructChildNode(PqStructField fileStruct, StructField requested, string columnName)
     {
         Field? match = null;
         foreach (Field candidate in fileStruct.Fields)
@@ -1171,9 +1506,65 @@ internal static class NestedParquetColumnReader
                 $"Struct column '{columnName}' is missing requested field '{DiagnosticText.Sanitize(requested.Name)}' in the file.");
         }
 
-        return ExpectScalarLeaf(
-            match, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
-            $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'");
+        return match;
+    }
+
+    // The DRIVING leaf of a (possibly nested) file node: the first scalar DataField reachable along the
+    // document-order first-child path (list -> Item, map -> Key, struct -> Fields[0], DataField -> itself).
+    // Its raw (def, rep) streams fully describe every repeated level between this node and the leaf, so an
+    // intermediate container reads them to reconstruct its OWN structure without materializing the child.
+    private static DataField FirstDataField(Field node)
+    {
+        while (true)
+        {
+            switch (node)
+            {
+                case DataField dataField:
+                    return dataField;
+                case PqListField list:
+                    node = list.Item;
+                    break;
+                case PqMapField map:
+                    node = map.Key;
+                    break;
+                case PqStructField structField when structField.Fields.Count > 0:
+                    node = structField.Fields[0];
+                    break;
+                default:
+                    throw DeltaStorageException.CorruptData(
+                        "A nested file column has no reachable scalar leaf to drive its structure "
+                        + "(a zero-field struct or an empty container in the footer).");
+            }
+        }
+    }
+
+    // The scalar leaf type along the requested type's first-child path — the parallel of FirstDataField on the
+    // REQUESTED side (array -> ElementType, map -> KeyType, struct -> field[0], scalar -> itself). ValidateShape
+    // guarantees this path corresponds slot-for-slot to FirstDataField's, so the driving leaf reads back as this
+    // scalar type. Used only to satisfy ReadScalarLeafAsync's physical dispatch when reading a driving leaf
+    // whose materialized child is DISCARDED (only its levels are consumed).
+    private static DataType FirstScalarType(DataType type)
+    {
+        while (true)
+        {
+            switch (type)
+            {
+                case ArrayType array:
+                    type = array.ElementType;
+                    break;
+                case MapType map:
+                    type = map.KeyType;
+                    break;
+                case StructType structType when structType.Count > 0:
+                    type = structType[0].DataType;
+                    break;
+                case ArrayType or MapType or StructType:
+                    throw DeltaStorageException.CorruptData(
+                        "A nested requested type has no reachable scalar leaf to drive its structure.");
+                default:
+                    return type;
+            }
+        }
     }
 
     // Resolves a struct child in ID mode (#676 §2.5): binds by the child's delta.columnMapping.id within the

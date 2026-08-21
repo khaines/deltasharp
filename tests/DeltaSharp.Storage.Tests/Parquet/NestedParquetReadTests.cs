@@ -127,6 +127,164 @@ public sealed class NestedParquetReadTests
         public List<Inner>? Items { get; set; }
     }
 
+    private sealed class ArrayOfArrayRow
+    {
+        public int Id { get; set; }
+
+        public List<List<int?>?>? Outer { get; set; }
+    }
+
+    private sealed class SoA
+    {
+        public List<int?>? Xs { get; set; }
+    }
+
+    private sealed class SoARow
+    {
+        public int Id { get; set; }
+
+        public SoA? S { get; set; }
+    }
+
+    private sealed class Mid
+    {
+        public Inner? Deep { get; set; }
+    }
+
+    private sealed class SoSRow
+    {
+        public int Id { get; set; }
+
+        public Mid? M { get; set; }
+    }
+
+    private sealed class MapOfStructRow
+    {
+        public int Id { get; set; }
+
+        public Dictionary<string, Inner?>? M { get; set; }
+    }
+
+    private sealed class MapOfMapRow
+    {
+        public int Id { get; set; }
+
+        public Dictionary<string, Dictionary<string, int?>?>? M { get; set; }
+    }
+
+    private sealed class ArrayOfMapRow
+    {
+        public int Id { get; set; }
+
+        public List<Dictionary<string, int?>?>? Arr { get; set; }
+    }
+
+    private sealed class MapOfArrayRow
+    {
+        public int Id { get; set; }
+
+        public Dictionary<string, List<int?>?>? M { get; set; }
+    }
+
+    private sealed class StructWithArray
+    {
+        public List<int?>? Xs { get; set; }
+    }
+
+    private sealed class ArrayOfStructOfArrayRow
+    {
+        public int Id { get; set; }
+
+        public List<StructWithArray>? Arr { get; set; }
+    }
+
+    // array<struct<long,double,bool>>: exercises MULTIPLE distinct scalar physical leaf types at depth 2 under
+    // a repeated ancestor (the "all-scalar-leaves-at-depth" §3.1 cell).
+    private sealed class ArrayOfWideRow
+    {
+        public int Id { get; set; }
+
+        public List<Wide>? Arr { get; set; }
+    }
+
+    private sealed class StructWithMap
+    {
+        public Dictionary<string, int?>? M { get; set; }
+    }
+
+    private sealed class MapOfStructOfMapRow
+    {
+        public int Id { get; set; }
+
+        public Dictionary<string, StructWithMap?>? M { get; set; }
+    }
+
+    // Recursive canonical description of a nested cell — values AND null-structure. null cell => "null";
+    // list => "[e0,e1,...]"; map => "{k0=v0,...}" (entries sorted by rendered key so ordering is not asserted);
+    // struct => "(Name=..,Name=..)"; scalar => its literal. Used by the 585a round-trip cells to assert an
+    // EXACT value+structure identity across arbitrary depth.
+    private static string Describe(ColumnVector v, int index)
+    {
+        if (v.IsNull(index))
+        {
+            return "null";
+        }
+
+        switch (v)
+        {
+            case ListColumnVector list:
+                {
+                    (int start, int len) = list.RawElementSpan(index);
+                    var parts = new List<string>(len);
+                    for (int j = 0; j < len; j++)
+                    {
+                        parts.Add(Describe(list.Elements, start + j));
+                    }
+
+                    return "[" + string.Join(",", parts) + "]";
+                }
+
+            case MapColumnVector map:
+                {
+                    (int start, int len) = map.RawEntrySpan(index);
+                    ColumnVector keys = map.Keys;
+                    ColumnVector values = map.Values;
+                    var parts = new List<string>(len);
+                    for (int j = 0; j < len; j++)
+                    {
+                        parts.Add(Describe(keys, start + j) + "=" + Describe(values, start + j));
+                    }
+
+                    parts.Sort(StringComparer.Ordinal);
+                    return "{" + string.Join(",", parts) + "}";
+                }
+
+            case StructColumnVector st:
+                {
+                    var structType = (StructType)st.Type;
+                    var parts = new List<string>(st.FieldCount);
+                    for (int f = 0; f < st.FieldCount; f++)
+                    {
+                        parts.Add(structType[f].Name + "=" + Describe(st.Child(f), index));
+                    }
+
+                    return "(" + string.Join(",", parts) + ")";
+                }
+
+            default:
+                return v.Type switch
+                {
+                    IntegerType => v.GetValue<int>(index).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    LongType => v.GetValue<long>(index).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    StringType => Utf8(v, index),
+                    BooleanType => v.GetValue<bool>(index) ? "true" : "false",
+                    DoubleType => v.GetValue<double>(index).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    FloatType => v.GetValue<float>(index).ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    _ => "<" + v.Type.SimpleString + ">",
+                };
+        }
+    }
+
     // All-nullable struct fields, so a PRESENT struct can have every field null — distinct from a NULL struct.
     private sealed class AllNullableInner
     {
@@ -1296,19 +1454,16 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
-    public async Task ArrayOfStruct_FailsClosed_UnsupportedFeature()
+    public async Task ArrayOfStructVoidLeaf_FailsClosed_UnsupportedFeature()
     {
-        // A nested type within a nested type (array-of-struct) is out of scope for #571: it must be rejected
-        // deterministically before any decode, never read partially.
-        //
-        // The element's field name is deliberately hostile. This pins ParquetTypeMapping.EnsureScalarReadable
-        // (the guard that actually fires for this shape — NestedParquetColumnReader.ExpectScalarLeaf's
-        // identical guard sits behind it as defense-in-depth and is unreachable from here): inside it the type
-        // is statically Array/Map/Struct, so SimpleString would recursively embed every nested field name
-        // verbatim. Only the bounded KIND may be echoed.
+        // 585a lifts the nested-within-nested READ reject for DECODABLE shapes (array<struct<int>> now round
+        // trips), but an UNSUPPORTED scalar leaf at ANY depth still fails closed: array<struct<void>> has a
+        // NullType leaf with no Parquet physical representation. The reject must be deterministic (before any
+        // decode) and BOUNDED — the leaf's hostile struct-field name is sanitized (control chars stripped) and
+        // only the leaf KIND is rendered, never a recursive SimpleString of the foreign field names.
         const string hostileFieldName = "n\r\n[CRITICAL] forged";
         StructType element =
-            DataTypes.CreateStructType(new[] { DataTypes.CreateStructField(hostileFieldName, DataTypes.IntegerType) });
+            DataTypes.CreateStructType(new[] { DataTypes.CreateStructField(hostileFieldName, DataTypes.NullType) });
         var requested = new StructType(new[]
         {
             new StructField("X", DataTypes.CreateArrayType(element), nullable: true),
@@ -1318,7 +1473,7 @@ public sealed class NestedParquetReadTests
         DeltaStorageException error =
             await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
-        Assert.Contains("nested type within a nested type ('struct')", error.Message, StringComparison.Ordinal);
+        Assert.Contains("no supported scalar Parquet read mapping", error.Message, StringComparison.Ordinal);
         Assert.DoesNotContain(hostileFieldName, error.Message, StringComparison.Ordinal);
         Assert.DoesNotContain('\r', error.Message);
         Assert.DoesNotContain('\n', error.Message);
@@ -1585,7 +1740,8 @@ public sealed class NestedParquetReadTests
         // whose container is empty has NO element occurrence and must never be continued.
         DeltaStorageException emptyThenContinue = Assert.Throws<DeltaStorageException>(() =>
             NestedParquetColumnReader.BuildRepeatedStructure(
-                def: new[] { 1, 2 }, rep: new[] { 0, 1 }, numValues: 2, containerMaxDef: 2, rowCount: 1,
+                def: new[] { 1, 2 }, rep: new[] { 0, 1 }, numValues: 2, thisMaxDef: 2, thisMaxRep: 1,
+                parentMaxDef: 0, parentMaxRep: 0, ownerCells: 1,
                 offsets: new int[2], nulls: new bool[1], columnName: "col"));
         Assert.Equal(StorageErrorKind.CorruptData, emptyThenContinue.Kind);
         Assert.Contains("has no continuation", emptyThenContinue.Message, StringComparison.Ordinal);
@@ -1594,14 +1750,16 @@ public sealed class NestedParquetReadTests
         // containerMaxDef) — a continuation must be a real element occurrence, not an empty/null marker.
         DeltaStorageException continuationIsMarker = Assert.Throws<DeltaStorageException>(() =>
             NestedParquetColumnReader.BuildRepeatedStructure(
-                def: new[] { 3, 1 }, rep: new[] { 0, 1 }, numValues: 2, containerMaxDef: 2, rowCount: 1,
+                def: new[] { 3, 1 }, rep: new[] { 0, 1 }, numValues: 2, thisMaxDef: 2, thisMaxRep: 1,
+                parentMaxDef: 0, parentMaxRep: 0, ownerCells: 1,
                 offsets: new int[2], nulls: new bool[1], columnName: "col"));
         Assert.Equal(StorageErrorKind.CorruptData, continuationIsMarker.Kind);
 
         // A leading non-zero repetition level cannot open a row.
         DeltaStorageException leadingRep = Assert.Throws<DeltaStorageException>(() =>
             NestedParquetColumnReader.BuildRepeatedStructure(
-                def: new[] { 3 }, rep: new[] { 1 }, numValues: 1, containerMaxDef: 2, rowCount: 1,
+                def: new[] { 3 }, rep: new[] { 1 }, numValues: 1, thisMaxDef: 2, thisMaxRep: 1,
+                parentMaxDef: 0, parentMaxRep: 0, ownerCells: 1,
                 offsets: new int[2], nulls: new bool[1], columnName: "col"));
         Assert.Equal(StorageErrorKind.CorruptData, leadingRep.Kind);
     }
@@ -1638,7 +1796,8 @@ public sealed class NestedParquetReadTests
         var offsets = new int[rowCount + 1];
         var nulls = new bool[rowCount];
         int total = NestedParquetColumnReader.BuildRepeatedStructure(
-            def, rep, def.Length, containerMaxDef: 2, rowCount, offsets, nulls, "col");
+            def, rep, def.Length, thisMaxDef: 2, thisMaxRep: 1, parentMaxDef: 0, parentMaxRep: 0, ownerCells: rowCount,
+            offsets, nulls, "col");
         Assert.Equal(expectedOffsets, offsets);
         Assert.Equal(expectedNulls, nulls);
         Assert.Equal(expectedOffsets[^1], total);
@@ -1954,6 +2113,544 @@ public sealed class NestedParquetReadTests
         Assert.False(s.IsNull(1));
         Assert.Equal(10, s.Child("A").GetValue<int>(0));
         Assert.Equal(20, s.Child("A").GetValue<int>(1));
+    }
+
+    // ---- §3.1 585a round-trip cells: arbitrary-depth nested DECODE (value + null-structure identity) --------
+    //
+    // Harness (stated per the design): each cell WRITES a REAL depth-2+ Parquet file via ParquetSerializer
+    // (the production serializer, which emits correct rep/def level streams for the nested-within-nested
+    // shape), then READS it back through the production ParquetFileReader.ReadAsync -> NestedParquetColumnReader
+    // decode (a REAL decode: ColumnVector reconstruction, not a footer/schema-only probe). Describe() renders
+    // each reconstructed cell's EXACT value AND null-structure across arbitrary depth, so the assert pins the
+    // full grouping (inner-list boundaries, map entries, struct fields, three-way null/empty/present).
+
+    [Fact]
+    public async Task ArrayOfStruct_Depth2_RoundTrips()
+    {
+        // §3.1 cell 1 (array-of-struct): null outer list, empty outer list, and a populated list of structs
+        // (one with a null string leaf) all reconstruct with per-element struct grouping intact.
+        string[] got = await RoundTripDescribe(
+            new List<NestedListRow>
+            {
+                new() { Id = 0, Items = null },
+                new() { Id = 1, Items = new List<Inner>() },
+                new() { Id = 2, Items = new List<Inner> { new() { A = 1, B = "x" }, new() { A = 2, B = null } } },
+            },
+            "Items",
+            DataTypes.CreateArrayType(
+                DataTypes.CreateStructType(new[]
+                {
+                    DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+                    DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+                }),
+                containsNull: true));
+
+        Assert.Equal(new[] { "null", "[]", "[(A=1,B=x),(A=2,B=null)]" }, got);
+    }
+
+    [Fact]
+    public async Task StructOfArray_Depth2_RoundTrips()
+    {
+        // §3.1 cell 2 (struct-of-array): the struct is transparent to repetition, so its inner list field
+        // reconstructs the three-way null-list / empty-list / present-list distinction PER present struct,
+        // and a null struct yields a null cell (no phantom inner list).
+        string[] got = await RoundTripDescribe(
+            new List<SoARow>
+            {
+                new() { Id = 0, S = null },
+                new() { Id = 1, S = new SoA { Xs = null } },
+                new() { Id = 2, S = new SoA { Xs = new List<int?>() } },
+                new() { Id = 3, S = new SoA { Xs = new List<int?> { 5, 6 } } },
+            },
+            "S",
+            DataTypes.CreateStructType(new[]
+            {
+                DataTypes.CreateStructField(
+                    "Xs", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+            }));
+
+        Assert.Equal(new[] { "null", "(Xs=null)", "(Xs=[])", "(Xs=[5,6])" }, got);
+    }
+
+    [Fact]
+    public async Task StructOfStruct_Depth2_RoundTrips()
+    {
+        // §3.1 cell 3 (struct-of-struct): a null outer struct, a present outer struct wrapping a null inner
+        // struct, and a fully-present nested struct all reconstruct distinctly (the null-struct-of-null-struct
+        // adjacency must not collapse).
+        string[] got = await RoundTripDescribe(
+            new List<SoSRow>
+            {
+                new() { Id = 0, M = null },
+                new() { Id = 1, M = new Mid { Deep = null } },
+                new() { Id = 2, M = new Mid { Deep = new Inner { A = 7, B = "z" } } },
+            },
+            "M",
+            DataTypes.CreateStructType(new[]
+            {
+                DataTypes.CreateStructField(
+                    "Deep",
+                    DataTypes.CreateStructType(new[]
+                    {
+                        DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+                        DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+                    }),
+                    nullable: true),
+            }));
+
+        Assert.Equal(new[] { "null", "(Deep=null)", "(Deep=(A=7,B=z))" }, got);
+    }
+
+    [Fact]
+    public async Task MapOfStruct_Depth2_RoundTrips()
+    {
+        // §3.1 cell 4 (map-of-struct): null map, empty map, and a single-entry map whose value is a struct.
+        string[] got = await RoundTripDescribe(
+            new List<MapOfStructRow>
+            {
+                new() { Id = 0, M = null },
+                new() { Id = 1, M = new Dictionary<string, Inner?>(StringComparer.Ordinal) },
+                new()
+                {
+                    Id = 2,
+                    M = new Dictionary<string, Inner?>(StringComparer.Ordinal) { ["k"] = new Inner { A = 3, B = "y" } },
+                },
+            },
+            "M",
+            DataTypes.CreateMapType(
+                DataTypes.StringType,
+                DataTypes.CreateStructType(new[]
+                {
+                    DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+                    DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+                }),
+                valueContainsNull: true));
+
+        Assert.Equal(new[] { "null", "{}", "{k=(A=3,B=y)}" }, got);
+    }
+
+    [Fact]
+    public async Task ArrayOfArray_Depth2_OuterOffsetsCountInnerLists_NotLeaves()
+    {
+        // §3.1 cell 5 (array-of-array) — THE bug the BuildRepeatedStructure rewrite fixes. The OUTER offsets
+        // must count inner-LIST occurrences, NOT flattened leaf values. For rows [null, [], [[],[]], [[10,20],
+        // [30]]] the design §2.4 trace requires OUTER offsets [0,0,0,2,4] (inner-list counts) and INNER offsets
+        // [0,0,0,2,3] (leaf counts). The pre-fix top-level-hardwired reader produced OUTER [0,0,0,2,5] (leaf
+        // counts) — flattening the two-level grouping. This cell asserts the reconstructed grouping directly.
+        var rows = new List<ArrayOfArrayRow>
+        {
+            new() { Id = 0, Outer = null },
+            new() { Id = 1, Outer = new List<List<int?>?>() },
+            new() { Id = 2, Outer = new List<List<int?>?> { new(), new() } },
+            new() { Id = 3, Outer = new List<List<int?>?> { new() { 10, 20 }, new() { 30 } } },
+        };
+
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+
+        // Reconstruct the OUTER offset array [0,0,0,2,4] from per-row inner-list counts (RawElementSpan length).
+        var outerOffsets = new int[batch.RowCount + 1];
+        for (int r = 0; r < batch.RowCount; r++)
+        {
+            (int _, int len) = outer.RawElementSpan(r);
+            outerOffsets[r + 1] = outerOffsets[r] + len;
+        }
+
+        Assert.Equal(new[] { 0, 0, 0, 2, 4 }, outerOffsets);
+
+        // And the INNER offset array [0,0,0,2,3] over those 4 inner lists (leaf counts).
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        var innerOffsets = new int[5];
+        for (int e = 0; e < 4; e++)
+        {
+            (int _, int len) = inner.RawElementSpan(e);
+            innerOffsets[e + 1] = innerOffsets[e] + len;
+        }
+
+        Assert.Equal(new[] { 0, 0, 0, 2, 3 }, innerOffsets);
+
+        // Full value+structure identity: null | [] | [[],[]] | [[10,20],[30]] (NOT a flattened [10,20,30]).
+        Assert.Equal("null", Describe(outer, 0));
+        Assert.Equal("[]", Describe(outer, 1));
+        Assert.Equal("[[],[]]", Describe(outer, 2));
+        Assert.Equal("[[10,20],[30]]", Describe(outer, 3));
+    }
+
+    [Fact]
+    public async Task MapOfMap_Depth2_RoundTrips()
+    {
+        // §3.1 cell 6 (map-of-map): null map, empty map, and a single outer entry whose value is itself a map.
+        string[] got = await RoundTripDescribe(
+            new List<MapOfMapRow>
+            {
+                new() { Id = 0, M = null },
+                new() { Id = 1, M = new Dictionary<string, Dictionary<string, int?>?>(StringComparer.Ordinal) },
+                new()
+                {
+                    Id = 2,
+                    M = new Dictionary<string, Dictionary<string, int?>?>(StringComparer.Ordinal)
+                    {
+                        ["a"] = new Dictionary<string, int?>(StringComparer.Ordinal) { ["p"] = 1 },
+                    },
+                },
+            },
+            "M",
+            DataTypes.CreateMapType(
+                DataTypes.StringType,
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: true),
+                valueContainsNull: true));
+
+        Assert.Equal(new[] { "null", "{}", "{a={p=1}}" }, got);
+    }
+
+    [Fact]
+    public async Task ArrayOfMap_Depth2_RoundTrips()
+    {
+        // §3.1 cell 7 (array-of-map): a list whose elements are maps (one populated, one empty).
+        string[] got = await RoundTripDescribe(
+            new List<ArrayOfMapRow>
+            {
+                new() { Id = 0, Arr = null },
+                new() { Id = 1, Arr = new List<Dictionary<string, int?>?>() },
+                new()
+                {
+                    Id = 2,
+                    Arr = new List<Dictionary<string, int?>?>
+                    {
+                        new(StringComparer.Ordinal) { ["p"] = 1 },
+                        new(StringComparer.Ordinal),
+                    },
+                },
+            },
+            "Arr",
+            DataTypes.CreateArrayType(
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: true),
+                containsNull: true));
+
+        Assert.Equal(new[] { "null", "[]", "[{p=1},{}]" }, got);
+    }
+
+    [Fact]
+    public async Task MapOfArray_Depth2_RoundTrips()
+    {
+        // §3.1 cell 8 (map-of-array): a map whose values are lists.
+        string[] got = await RoundTripDescribe(
+            new List<MapOfArrayRow>
+            {
+                new() { Id = 0, M = null },
+                new() { Id = 1, M = new Dictionary<string, List<int?>?>(StringComparer.Ordinal) },
+                new()
+                {
+                    Id = 2,
+                    M = new Dictionary<string, List<int?>?>(StringComparer.Ordinal) { ["k"] = new List<int?> { 9, 8 } },
+                },
+            },
+            "M",
+            DataTypes.CreateMapType(
+                DataTypes.StringType,
+                DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true),
+                valueContainsNull: true));
+
+        Assert.Equal(new[] { "null", "{}", "{k=[9,8]}" }, got);
+    }
+
+    [Fact]
+    public async Task ArrayOfStructOfArray_Depth3_RoundTrips()
+    {
+        // §3.1 cell 9 (depth-3, array<struct<array>>): three repeated/optional levels compose — the outer list
+        // groups structs, each struct is transparent to repetition, and each struct's inner list reconstructs
+        // its own leaf grouping (one populated, one empty).
+        string[] got = await RoundTripDescribe(
+            new List<ArrayOfStructOfArrayRow>
+            {
+                new() { Id = 0, Arr = null },
+                new()
+                {
+                    Id = 1,
+                    Arr = new List<StructWithArray>
+                    {
+                        new() { Xs = new List<int?> { 1, 2 } },
+                        new() { Xs = new List<int?>() },
+                    },
+                },
+            },
+            "Arr",
+            DataTypes.CreateArrayType(
+                DataTypes.CreateStructType(new[]
+                {
+                    DataTypes.CreateStructField(
+                        "Xs", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true),
+                }),
+                containsNull: true));
+
+        Assert.Equal(new[] { "null", "[(Xs=[1,2]),(Xs=[])]" }, got);
+    }
+
+    [Fact]
+    public async Task MapOfStructOfMap_Depth3_RoundTrips()
+    {
+        // §3.1 cell 10 (depth-3, map<struct<map>>): the outer map's value is a struct whose field is itself a
+        // map — three nested container levels reconstructed end-to-end.
+        string[] got = await RoundTripDescribe(
+            new List<MapOfStructOfMapRow>
+            {
+                new() { Id = 0, M = null },
+                new()
+                {
+                    Id = 1,
+                    M = new Dictionary<string, StructWithMap?>(StringComparer.Ordinal)
+                    {
+                        ["k"] = new StructWithMap
+                        {
+                            M = new Dictionary<string, int?>(StringComparer.Ordinal) { ["p"] = 4 },
+                        },
+                    },
+                },
+            },
+            "M",
+            DataTypes.CreateMapType(
+                DataTypes.StringType,
+                DataTypes.CreateStructType(new[]
+                {
+                    DataTypes.CreateStructField(
+                        "M",
+                        DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: true),
+                        nullable: true),
+                }),
+                valueContainsNull: true));
+
+        Assert.Equal(new[] { "null", "{k=(M={p=4})}" }, got);
+    }
+
+    [Fact]
+    public async Task AllScalarLeavesAtDepth_ArrayOfWideStruct_RoundTrips()
+    {
+        // §3.1 all-scalar-leaves-at-depth: an array<struct<long,double,bool>> exercises three DISTINCT scalar
+        // physical leaf types at depth 2 under a repeated ancestor (each leaf carries the ancestor's placeholder
+        // slots; each must decode with the correct per-element value).
+        var rows = new List<ArrayOfWideRow>
+        {
+            new() { Id = 0, Arr = null },
+            new()
+            {
+                Id = 1,
+                Arr = new List<Wide>
+                {
+                    new() { L = 100L, D = 1.5, Flag = true },
+                    new() { L = -7L, D = 2.5, Flag = false },
+                },
+            },
+        };
+
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateStructType(new[]
+                    {
+                        DataTypes.CreateStructField("L", DataTypes.LongType, nullable: false),
+                        DataTypes.CreateStructField("D", DataTypes.DoubleType, nullable: false),
+                        DataTypes.CreateStructField("Flag", DataTypes.BooleanType, nullable: false),
+                    }),
+                    containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        Assert.True(arr.IsNull(0));
+        Assert.Equal("[(L=100,D=1.5,Flag=true),(L=-7,D=2.5,Flag=false)]", Describe(arr, 1));
+    }
+
+    [Fact]
+    public void DecimalPrecision29_AtDepth_FailsClosed_UnsupportedFeature()
+    {
+        // §3.1 fail-closed: a decimal leaf with precision 29 ( > 28, outside decimal's unscaled range) at depth
+        // must fail closed at shape resolution, echoing the sanitized nested PATH — fail-closed parity holds at
+        // any depth (design §2.6). The file content is irrelevant: EnsureReadSupported rejects the requested
+        // type BEFORE any column read.
+        var requested = new StructField(
+            "Arr",
+            DataTypes.CreateArrayType(
+                DataTypes.CreateStructType(new[]
+                {
+                    DataTypes.CreateStructField("Dec", DataTypes.CreateDecimalType(29, 4), nullable: true),
+                }),
+                containsNull: true),
+            nullable: true);
+
+        DeltaStorageException error =
+            Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.EnsureReadSupported(requested));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+    }
+
+    [Fact]
+    public async Task NestedLeafWidening_AtDepth_StaysFailClosed_SchemaMismatch()
+    {
+        // §3.1 fail-closed (585b stays out of scope): requesting a nested int leaf as LONG is a WIDENING. 585a
+        // does NOT widen nested leaves (blocked on #546), so a physical mismatch at depth must fail closed with
+        // an EXACT-physical-type reject — not a silent int->long promotion. File is array<struct<A:int>>.
+        var rows = new List<NestedListRow>
+        {
+            new() { Id = 1, Items = new List<Inner> { new() { A = 1, B = "x" } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Items",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateStructType(new[]
+                    {
+                        DataTypes.CreateStructField("A", DataTypes.LongType, nullable: false), // WIDENING int->long
+                        DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+                    }),
+                    containsNull: true),
+                nullable: true),
+        });
+
+        DeltaStorageException error =
+            await Assert.ThrowsAsync<DeltaStorageException>(() => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    [Fact]
+    public void OverMaxNestedReadDepth_FailsClosed_UnsupportedFeature()
+    {
+        // §3.1 fail-closed (DoS bound, design §2.6): a requested schema nesting deeper than MaxNestedReadDepth
+        // (64) is rejected DETERMINISTICALLY at shape resolution — BEFORE any allocation/descent — as a typed
+        // UnsupportedFeature, never a StackOverflowException. 65 array levels put the leaf at depth 65 > 64.
+        DataType overDeep = DataTypes.IntegerType;
+        for (int i = 0; i < NestedParquetColumnReader.MaxNestedReadDepth + 1; i++)
+        {
+            overDeep = DataTypes.CreateArrayType(overDeep, containsNull: true);
+        }
+
+        var field = new StructField("Deep", overDeep, nullable: true);
+        DeltaStorageException error =
+            Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.EnsureReadSupported(field));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("nests deeper than the supported limit", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void AtMaxNestedReadDepth_ValidationAccepts()
+    {
+        // §3.1: a requested schema nesting EXACTLY to MaxNestedReadDepth (64) is accepted by shape resolution
+        // (the bound is inclusive). A real depth-64 round-trip is infeasible via the serializer, so this pins
+        // the at-bound acceptance at the validation door (the complement of the over-bound reject above).
+        DataType atBound = DataTypes.IntegerType;
+        for (int i = 0; i < NestedParquetColumnReader.MaxNestedReadDepth; i++)
+        {
+            atBound = DataTypes.CreateArrayType(atBound, containsNull: true);
+        }
+
+        // Must NOT throw.
+        ParquetTypeMapping.EnsureReadSupported(new StructField("Deep", atBound, nullable: true));
+    }
+
+    [Fact]
+    public void BuildRepeatedStructure_AtNestedInnerLevel_RejectsCorruption_CorruptData()
+    {
+        // §3.1 fail-closed (crafted def/rep corruption at depth 2): the rewritten BuildRepeatedStructure runs
+        // at a DEEP repeated level (parentMaxRep > 0). These crafted inner-list level streams — which no
+        // conforming writer can emit — must fail closed rather than reconstruct a phantom inner list. Levels
+        // model the INNER list of array<array<int>>: thisMaxRep=2, thisMaxDef=4, parentMaxRep=1, parentMaxDef=2
+        // (emptyContainerDef = thisMaxDef-1 = 3).
+
+        // (a) A leading THIS-LEVEL continuation (rep=2, > parentMaxRep) with no owner yet opened.
+        DeltaStorageException leading = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 4 }, rep: new[] { 2 }, numValues: 1, thisMaxDef: 4, thisMaxRep: 2,
+                parentMaxDef: 2, parentMaxRep: 1, ownerCells: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col.inner"));
+        Assert.Equal(StorageErrorKind.CorruptData, leading.Kind);
+
+        // (b) A NULL inner container (def=2 < emptyContainerDef 3) opened at the parent boundary, then a
+        // this-level continuation (rep=2) — a null/empty inner container has no element and cannot be continued.
+        DeltaStorageException continueAfterNull = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 2, 4 }, rep: new[] { 0, 2 }, numValues: 2, thisMaxDef: 4, thisMaxRep: 2,
+                parentMaxDef: 2, parentMaxRep: 1, ownerCells: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col.inner"));
+        Assert.Equal(StorageErrorKind.CorruptData, continueAfterNull.Kind);
+
+        // (c) More parent-boundary openings (rep=0, def>=parentMaxDef) than the owner count the parent decoded.
+        DeltaStorageException tooManyOwners = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 4, 4 }, rep: new[] { 0, 0 }, numValues: 2, thisMaxDef: 4, thisMaxRep: 2,
+                parentMaxDef: 2, parentMaxRep: 1, ownerCells: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col.inner"));
+        Assert.Equal(StorageErrorKind.CorruptData, tooManyOwners.Kind);
+    }
+
+    [Fact]
+    public void BuildRepeatedStructure_AtDepth3InnerLevel_RejectsLeadingContinuation_CorruptData()
+    {
+        // §3.1 fail-closed (crafted corruption at depth 3): the innermost list of array<array<array<int>>> has
+        // thisMaxRep=3, thisMaxDef=6, parentMaxRep=2, parentMaxDef=4. A leading this-level continuation (rep=3)
+        // with no owner opened is a structural contradiction and must fail closed at any depth.
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(() =>
+            NestedParquetColumnReader.BuildRepeatedStructure(
+                def: new[] { 6 }, rep: new[] { 3 }, numValues: 1, thisMaxDef: 6, thisMaxRep: 3,
+                parentMaxDef: 4, parentMaxRep: 2, ownerCells: 1,
+                offsets: new int[2], nulls: new bool[1], columnName: "col.inner3"));
+        Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
+    }
+
+    [Fact]
+    public void BuildRepeatedStructure_TopLevel_IsBytePreserved_NoRegression()
+    {
+        // §3.1 regression: the TOP repeated level (parentMaxRep=0, parentMaxDef=0, single repeated level)
+        // reduces byte-identically to the pre-585a `rep==0` owner boundary + ungated `d >= thisMaxDef` count
+        // — the rep<=thisMaxRep gate is vacuously true for a single repeated level (no #571 regression). Verify
+        // the exact §2.4 OUTER decode of [null, [], [[],[]], [[10,20],[30]]] at the outer level:
+        // outer offsets [0,0,0,2,4], nulls [true,false,false,false] (only the null OUTER list is null).
+        // Outer level: thisMaxRep=1, thisMaxDef=2 (null=0, empty=1, present-inner=2). The inner-list openers
+        // for row 3 are the two rep=1 continuations of the outer list; the third leaf (rep=2) belongs to the
+        // INNER level and is EXCLUDED here.
+        var offsets = new int[5];
+        var nulls = new bool[4];
+        int total = NestedParquetColumnReader.BuildRepeatedStructure(
+            def: new[] { 0, 1, 2, 2, 4, 4, 4 },
+            rep: new[] { 0, 0, 0, 1, 0, 1, 2 },
+            numValues: 7, thisMaxDef: 2, thisMaxRep: 1, parentMaxDef: 0, parentMaxRep: 0, ownerCells: 4,
+            offsets, nulls, "outer");
+
+        Assert.Equal(new[] { 0, 0, 0, 2, 4 }, offsets);
+        Assert.Equal(new[] { true, false, false, false }, nulls);
+        Assert.Equal(4, total);
+    }
+
+    // Round-trips a nested column through the production serializer + reader and renders each reconstructed
+    // cell with Describe (value + null-structure identity across arbitrary depth).
+    private static async Task<string[]> RoundTripDescribe<T>(IReadOnlyList<T> rows, string col, DataType colType)
+        where T : class, new()
+    {
+        byte[] bytes = await WriteAsync(rows);
+        var requested = new StructType(new[] { new StructField(col, colType, nullable: true) });
+        ColumnBatch batch = await ReadSingleAsync(bytes, requested);
+        ColumnVector v = batch.Column(col);
+        var result = new string[batch.RowCount];
+        for (int r = 0; r < batch.RowCount; r++)
+        {
+            result[r] = Describe(v, r);
+        }
+
+        return result;
     }
 
     private static async Task<byte[]> WriteAsync<T>(IReadOnlyList<T> rows)
