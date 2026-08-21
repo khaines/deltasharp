@@ -238,7 +238,7 @@ note `toName` appears multiple times in a rename message, so the amplification f
 | F6a | **Rename collides** with an existing sibling at the **same parent struct level** — **case-sensitive ordinal** (`schema.IndexOf(toName) >= 0`; `StructType.IndexOf` is ordinal, `StructType.cs:146`), with the **same-name carve-out** (renaming a field to its own `Name` under `StringComparison.Ordinal` is a **no-op**, not a collision — §2.6; matches the flat door `DeltaTableWriter.cs:711`) | rename | `InvalidOperationException` **at the door** | "a field named '…' already exists at this level" |
 | F6b | **Rename produces a case-insensitive sibling collision** (`struct<city,CITY>`) at the **same parent struct level** — there is **no inline OrdinalIgnoreCase check at the door**; enforced at **commit** by the recursive per-level `ColumnMapping.EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:1077`, throwing at `:1093`) invoked from `DeltaCommitter` (`DeltaCommitter.cs:377`) | rename | `DeltaProtocolException.Inconsistent` **at commit** | "Schema column '…' collides case-insensitively with '…'" (the committer's message, sanitized) |
 | F7 | **Target is a top-level partition column** (flat guard, retained) | drop | `InvalidOperationException` | existing partition-column message; **rename** updates `metaData.partitionColumns` for a top-level partition column (§2.6) |
-| F8 | **Path targets a nested child of a partition column** | both | `InvalidOperationException` | guard stated for completeness: partition columns cannot be nested struct children today (partition columns are scalar top-level), so a path of length > 1 can never hit a partition column; the guard rejects the impossible case defensively |
+| F8 | **Path targets a nested child of a partition column** | both | `InvalidOperationException` | guard stated for completeness: partition columns cannot be nested struct children today (partition columns are scalar top-level), so a path of length > 1 can never hit a partition column; the guard rejects the impossible case defensively — **no test (defensively unreachable, cf. F9)** |
 | F9 | **Ambiguity** (a segment matching two siblings) | both | cannot occur — the `StructType` ctor rejects duplicate **ordinal** names (`StructType.cs:98-105`, throwing **`SchemaValidationException`**, *not* `InvalidOperationException`); a case-insensitive sibling pair is caught by **F6b** on rename (at commit) and by the load gate `EnsureNoCaseInsensitiveDuplicateColumns` (`ColumnMapping.cs:1077`, via `ValidateColumnMappingSchema` `ColumnMapping.cs:414`) on read | typed (`SchemaValidationException`/`DeltaProtocolException.Inconsistent`), sanitized |
 | F10 | **Dependent CHECK** references the renamed/dropped nested field (§2.6) | both | `DeltaConstraintDependentColumnException` (`DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE`) | enforcer names the offending column + dependent CHECKs |
 
@@ -405,9 +405,13 @@ reproduction line) at the house-precedent **200** iterations.
 8. `NestedStructChildRename_SiblingsCarriedByReference_SpineRebuiltFresh` — `ReferenceEquals` identity: only
    the target field and its ancestor spine are new instances; untouched siblings are reference-identical.
 
-**Fail-closed matrix — vacuity-guarded (the #675 lesson applied).** Six cells — **F1** (empty path), **F2**
-(absent segment), **F3** (scalar intermediate), **F6a** (case-sensitive collision), **F7** and **F8**
-(partition) — all throw the **same** `InvalidOperationException`. Asserting only the exception **type** + "path
+**Fail-closed matrix — vacuity-guarded (the #675 lesson applied).** Five **constructible** cells — **F1**
+(empty path), **F2** (absent segment), **F3** (scalar intermediate), **F6a** (case-sensitive collision), and
+**F7** (top-level partition column) — all throw the **same** `InvalidOperationException`. (**F8** — a path into
+a *nested child of* a partition column — throws the same type but is **defensively unreachable** today, like
+**F9**: a partition column is a scalar top-level field, so a length > 1 path can never target one; F8 carries
+**no fixture and no test**, and is excluded from the isolation rules below.) Asserting only the exception
+**type** + "path
 sanitized" does **not** prove the **target** guard fired: an earlier door — e.g. F2 (absent-segment) or F5
 (`RequireNameMode`, which runs **first**) — could catch a mis-authored fixture and pass the assertion
 **vacuously**. Therefore **every shared-`InvalidOperationException` cell additionally asserts its DISTINCT §2.5
@@ -415,7 +419,8 @@ message SHAPE** (not merely the type), and each fixture is constructed so **only
 The **guard ordering inside each door** is fixed and load-bearing: **(1)** `RequireNameMode` (F5) runs
 **first** → **(2)** empty-path (F1) → **(3)** segment descent (F2 absent-segment → F3 scalar-intermediate → F4
 array/map-intermediate → F4b struct-within-struct) → **(4)** door-time sibling collision (F6a) and partition
-guards (F7/F8) → **(5)** commit-time case-insensitive collision (F6b) and dependent-CHECK (F10). Per-cell
+guards (F7/F8) → **(5)** commit-time case-insensitive collision (F6b) and dependent-CHECK (F10). (F8 in step
+(4) is defensively unreachable — see above.) Per-cell
 fixture construction that **isolates** each guard:
 
 - **F1 (empty path)** and **F3 (scalar intermediate)** fixtures are on a **name-mode** table, so F5
@@ -428,7 +433,8 @@ fixture construction that **isolates** each guard:
   #585").
 - **F6a (case-sensitive collision)** fixture uses a target whose last-segment `Name` **differs** from `toName`
   (else the same-name carve-out, §2.6, makes it a no-op) and a sibling that **ordinally equals** `toName`.
-- **F7 / F8 (partition)** fixtures are name-mode with the guard's exact precondition present.
+- **F7 (top-level partition column)** fixture is name-mode with the guard's exact precondition present (a
+  length-1 path targeting a partition column). **F8** has no fixture (defensively unreachable, see above).
 
 This is the **#675** vacuity lesson (a same-typed exception shared across cells makes type-only assertions
 vacuous) applied to this door.
@@ -599,7 +605,9 @@ operation is metadata-only.
 ## 7 · Observability
 
 - **Logging:** fail-closed rejections surface via the existing sanitized
-  `InvalidOperationException`/`DeltaConstraintDependentColumnException`/`DeltaStorageException` path; the
+  `InvalidOperationException`/`DeltaProtocolException`/`DeltaConstraintDependentColumnException`/`DeltaStorageException`
+  path (`DeltaProtocolException` carries the commit-time F6b case-insensitive collision and the load-time F4b
+  nested-within-nested reject — see §2.5); the
   message carries the sanitized nested path rendered in an **unambiguous, boundary-preserving** per-segment
   bracket-quote form — `["address"].["zip"]` (each segment individually `DiagnosticText.Sanitize`d **inside**
   its own `["…"]` bracket), **never** a boundary-collapsing dotted string. This is load-bearing because a
