@@ -225,7 +225,8 @@ internal class ParquetFileWriter
                         // the Dremel encoding, the level guard, and the required-lane checks.
                         await NestedColumnShredder.WriteColumnAsync(
                             rowGroup, fields[c], schema[c],
-                            BuildNestedSegments(selectedColumns, c, segments), written, cancellationToken)
+                            BuildNestedSegments(selectedColumns, c, segments), written,
+                            NestedLevelBufferBudgetBytes, cancellationToken)
                             .ConfigureAwait(false);
                         continue;
                     }
@@ -342,7 +343,7 @@ internal class ParquetFileWriter
                 {
                     await NestedColumnShredder.ValidateColumnAsync(
                         fields[c], schema[c], BuildNestedSegments(selectedColumns, c, segments), written,
-                        cancellationToken).ConfigureAwait(false);
+                        NestedLevelBufferBudgetBytes, cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -716,32 +717,54 @@ internal class ParquetFileWriter
         int size,
         CancellationToken cancellationToken)
     {
-        var values = new string?[size];
-        int idx = 0;
-        foreach (Segment segment in segments)
+        // #845 N5: stage the present values into ONE pooled UTF-16 scratch and hand ReadOnlyMemory<char>
+        // VIEWS into it, then write through the zero-alloc generic lane (as the other scalar arms do). The
+        // UTF-8 byte length is an exact upper bound on the transcoded char count, so the scratch is sized once
+        // and never grown mid-column — a re-rent would strand already-handed-out views. This eliminates the
+        // per-value Encoding.UTF8.GetString string allocation the old lane paid and plumbs the
+        // CancellationToken into the write. A string and its ReadOnlyMemory<char> encode identically in
+        // Parquet.Net 6.1.0 (the non-generic overload just does the same char-view conversion internally), so
+        // the emitted bytes and null handling are unchanged.
+        var values = new ReadOnlyMemory<char>?[size];
+        int budget = MeasurePresentPayloadBytes(nullable, field, selectedColumns, columnIndex, segments, cancellationToken);
+        char[] scratch = System.Buffers.ArrayPool<char>.Shared.Rent(Math.Max(budget, 1));
+        try
         {
-            ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
-            for (int j = 0; j < segment.Length; j++)
+            int idx = 0;
+            int position = 0;
+            foreach (Segment segment in segments)
             {
-                if ((idx & CancellationCheckMask) == 0)
+                ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+                for (int j = 0; j < segment.Length; j++)
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                }
+                    if ((idx & CancellationCheckMask) == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
 
-                int row = segment.Start + j;
-                if (vector.IsNull(row))
-                {
-                    EnsureNullable(nullable, field, row);
-                    values[idx++] = null;
-                }
-                else
-                {
-                    values[idx++] = System.Text.Encoding.UTF8.GetString(vector.GetBytes(row));
+                    int row = segment.Start + j;
+                    if (vector.IsNull(row))
+                    {
+                        // Nullability was already validated by MeasurePresentPayloadBytes, before any write.
+                        values[idx++] = null;
+                        continue;
+                    }
+
+                    ReadOnlySpan<byte> utf8 = vector.GetBytes(row);
+                    int written = System.Text.Encoding.UTF8.GetChars(utf8, scratch.AsSpan(position));
+                    values[idx++] = new ReadOnlyMemory<char>(scratch, position, written);
+                    position += written;
                 }
             }
-        }
 
-        await rowGroup.WriteAsync(field, (IReadOnlyCollection<string>)values!, null).ConfigureAwait(false);
+            await rowGroup.WriteAsync<ReadOnlyMemory<char>>(
+                field, new ReadOnlyMemory<ReadOnlyMemory<char>?>(values), null, null, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<char>.Shared.Return(scratch, clearArray: true);
+        }
     }
 
     private static async Task WriteBinaryAsync(
@@ -754,14 +777,72 @@ internal class ParquetFileWriter
         int size,
         CancellationToken cancellationToken)
     {
-        var values = new byte[]?[size];
+        // #845 N5: the string lane's ownership rules, minus the transcode — copy each present payload into ONE
+        // pooled byte scratch and hand ReadOnlyMemory<byte> VIEWS into it, then write through the zero-alloc
+        // generic lane. This drops the per-value GetBytes().ToArray() allocation and plumbs the
+        // CancellationToken. A byte[] and its ReadOnlyMemory<byte> encode identically in Parquet.Net 6.1.0.
+        var values = new ReadOnlyMemory<byte>?[size];
+        int budget = MeasurePresentPayloadBytes(nullable, field, selectedColumns, columnIndex, segments, cancellationToken);
+        byte[] scratch = System.Buffers.ArrayPool<byte>.Shared.Rent(Math.Max(budget, 1));
+        try
+        {
+            int idx = 0;
+            int position = 0;
+            foreach (Segment segment in segments)
+            {
+                ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
+                for (int j = 0; j < segment.Length; j++)
+                {
+                    if ((idx & CancellationCheckMask) == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                    }
+
+                    int row = segment.Start + j;
+                    if (vector.IsNull(row))
+                    {
+                        values[idx++] = null;
+                        continue;
+                    }
+
+                    ReadOnlySpan<byte> payload = vector.GetBytes(row);
+                    payload.CopyTo(scratch.AsSpan(position));
+                    values[idx++] = new ReadOnlyMemory<byte>(scratch, position, payload.Length);
+                    position += payload.Length;
+                }
+            }
+
+            await rowGroup.WriteAsync<ReadOnlyMemory<byte>>(
+                field, new ReadOnlyMemory<ReadOnlyMemory<byte>?>(values), null, null, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(scratch, clearArray: true);
+        }
+    }
+
+    // The §2.3b-style size pass for the scalar variable-width lanes: sums the PRESENT values' payload byte
+    // lengths (an exact upper bound on the UTF-16 char count the string lane transcodes into, and the exact
+    // byte count the binary lane copies) while validating that no null sits in a non-nullable column — before
+    // a single byte is written. A single row group whose payloads exceed 2 GiB cannot be staged in one
+    // contiguous scratch, which is a bounded UnsupportedFeature on the typed contract, never a raw overflow.
+    private static int MeasurePresentPayloadBytes(
+        bool nullable,
+        DataField field,
+        List<ColumnVector[]> selectedColumns,
+        int columnIndex,
+        List<Segment> segments,
+        CancellationToken cancellationToken)
+    {
+        long total = 0;
         int idx = 0;
         foreach (Segment segment in segments)
         {
             ColumnVector vector = selectedColumns[segment.Batch][columnIndex];
             for (int j = 0; j < segment.Length; j++)
             {
-                if ((idx & CancellationCheckMask) == 0)
+                if ((idx++ & CancellationCheckMask) == 0)
                 {
                     cancellationToken.ThrowIfCancellationRequested();
                 }
@@ -770,16 +851,18 @@ internal class ParquetFileWriter
                 if (vector.IsNull(row))
                 {
                     EnsureNullable(nullable, field, row);
-                    values[idx++] = null;
+                    continue;
                 }
-                else
-                {
-                    values[idx++] = vector.GetBytes(row).ToArray();
-                }
+
+                total += vector.GetBytes(row).Length;
             }
         }
 
-        await rowGroup.WriteAsync(field, (IReadOnlyCollection<byte[]>)values!, null).ConfigureAwait(false);
+        return total > int.MaxValue
+            ? throw DeltaStorageException.UnsupportedFeature(
+                $"Column '{DiagnosticText.Sanitize(field.Name)}': the variable-width column's payloads exceed "
+                + "the 2 GiB a single Parquet leaf write can stage in one buffer.")
+            : (int)total;
     }
 
     private static void EnsureNullable(bool nullable, DataField field, int row)

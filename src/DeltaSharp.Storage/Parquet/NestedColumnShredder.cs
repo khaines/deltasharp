@@ -52,18 +52,33 @@ internal static class NestedColumnShredder
     internal readonly record struct ColumnSegment(ColumnVector Vector, int Start, int Length);
 
     /// <summary>
-    /// The absolute int-domain backstop on a single leaf's level slots in one row group. Real writes never
-    /// approach it: <see cref="PlanRowCount"/> keeps every row group inside
-    /// <see cref="ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes"/> by SPLITTING, and this bound only
-    /// exists for callers that shred a hand-built segment list without planning first. It is deliberately a
-    /// RESOURCE bound, not a semantic one — §2.6 admits <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c>
-    /// unconditionally, so no fan-out width may narrow the acceptance set. It is denominated PER LANE, in that
-    /// lane's own per-slot cost, so the backstop admits the same transient BYTES for every shape (a map's four
-    /// concurrent level streams reach it at a quarter of a struct's slot count) instead of being four times
-    /// looser on the widest lane.
+    /// A fixed proxy, in bytes, for the per-value transient a VARIABLE-width leaf (<c>string</c>/<c>binary</c>)
+    /// holds concurrently: a 16-byte <see cref="ReadOnlyMemory{T}"/> descriptor in the element array PLUS a
+    /// ~16-byte payload in the transcode/copy scratch. The planner sizes a row group by slot COUNT and never
+    /// sees the data, so a fixed estimate is the only per-slot charge available; a stricter one only splits
+    /// value-heavy columns SOONER (safe) and is dwarfed by the default budget, so no legal single row is ever
+    /// rejected by it (Q2/§2.6).
     /// </summary>
-    internal static int MaxLeafSlotsPerRowGroup(int bytesPerSlot) => (int)Math.Min(
-        ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes / Math.Max(bytesPerSlot, sizeof(int)),
+    private const int VariableLeafValueBytesPerSlot = 32;
+
+    /// <summary>
+    /// The absolute int-domain backstop on a single leaf's level+value slots in one row group. Real writes
+    /// never approach it: <see cref="PlanRowCount"/> keeps every row group inside
+    /// <paramref name="budgetBytes"/> by SPLITTING, and this bound only exists for callers that shred a
+    /// hand-built segment list without planning first. It is deliberately a RESOURCE bound, not a semantic
+    /// one — §2.6 admits <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c> unconditionally, so no
+    /// fan-out width may narrow the acceptance set. It is denominated PER LANE, in that lane's own per-slot
+    /// cost, so the backstop admits the same transient BYTES for every shape instead of being looser on the
+    /// widest lane.
+    /// <para>It is derived from the caller's INSTANCE budget (threaded from
+    /// <see cref="ParquetFileWriter.NestedLevelBufferBudgetBytes"/>), not the
+    /// <see cref="ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes"/> const, so the "backstop &gt;= plan
+    /// ceiling" relation holds for ANY override — including one that RAISES the budget above the default — not
+    /// only for budgets &lt;= default.</para>
+    /// </summary>
+    internal static int MaxLeafSlotsPerRowGroup(long budgetBytes, int bytesPerSlot) => (int)Math.Clamp(
+        budgetBytes / Math.Max(bytesPerSlot, sizeof(int)),
+        1,
         int.MaxValue);
 
     /// <summary>
@@ -71,6 +86,11 @@ internal static class NestedColumnShredder
     /// <c>int</c> level streams the lane rents concurrently, times <c>sizeof(int)</c>. A map nests key and
     /// value in one repeated group and therefore holds four streams; an array holds definition + repetition;
     /// a struct holds one definition stream, reused across children (D2), at exactly one slot per row.
+    /// <para>This is the LEVEL-ONLY cost and is the ONLY cost the ACCEPTANCE/reject surfaces
+    /// (<see cref="PlanRowCount"/>'s single-row guard and <see cref="CheckSlotBound"/>) may use, so it
+    /// exactly preserves the §2.6 acceptance set: <c>array&lt;scalar&gt;</c>/<c>map&lt;scalar,scalar&gt;</c>
+    /// are admitted unconditionally and no fan-out VALUE width may narrow that set. The wider level+value
+    /// cost that governs SPLITTING lives in <see cref="RowGroupTransientBytesPerSlot"/>.</para>
     /// </summary>
     internal static int LevelBufferBytesPerSlot(DataType type) => type switch
     {
@@ -79,6 +99,64 @@ internal static class NestedColumnShredder
         StructType => sizeof(int),
         _ => 0,
     };
+
+    /// <summary>
+    /// The transient bytes ONE logical slot of <paramref name="type"/> costs across the WHOLE per-column
+    /// write — the <c>int</c> level streams the lane rents concurrently
+    /// (<see cref="LevelBufferBytesPerSlot"/>) PLUS the physical width of the leaf value(s) each slot stages
+    /// (#845 item 2). A map holds four level streams plus both leaf values; an array holds definition +
+    /// repetition plus its element value; a struct holds one definition stream, reused across children (D2),
+    /// at one slot per row, plus its children's values.
+    /// <para><b>SPLIT-ONLY — never a reject.</b> The leaf value array and the string/binary UTF-16/byte
+    /// scratch are CONCURRENT with the level buffers, so this folded cost is the true peak per-column
+    /// transient. It bounds how SMALL row groups are (the multi-row SPLIT decision in
+    /// <see cref="PlanRowCount"/>) so ONE budget (<see cref="ParquetFileWriter.NestedLevelBufferBudgetBytes"/>)
+    /// governs the whole per-column peak. It is DELIBERATELY NOT used for any reject surface, so it can never
+    /// narrow the §2.6 acceptance set — a row that fits the level budget is always writable, split as
+    /// finely as this folded budget requires.</para>
+    /// </summary>
+    internal static int RowGroupTransientBytesPerSlot(DataType type) => type switch
+    {
+        MapType map => LevelBufferBytesPerSlot(map) + LeafValueBytesPerSlot(map.KeyType) + LeafValueBytesPerSlot(map.ValueType),
+        ArrayType array => LevelBufferBytesPerSlot(array) + LeafValueBytesPerSlot(array.ElementType),
+        StructType structType => LevelBufferBytesPerSlot(structType) + StructValueBytesPerSlot(structType),
+        _ => 0,
+    };
+
+    // The physical width, in bytes, of ONE staged leaf value of a scalar leaf type — the size of the CLR
+    // element the value lane rents a T[] of (§2.3b): a fixed-width scalar stages its own CLR primitive; a
+    // variable-width leaf stages a ReadOnlyMemory<T> descriptor plus a scratch payload, for which
+    // VariableLeafValueBytesPerSlot is the fixed proxy. A non-scalar leaf cannot occur in single-level nested
+    // scope; it costs 0 here (the level backstop still bounds it).
+    private static int LeafValueBytesPerSlot(DataType leafType) => leafType switch
+    {
+        BooleanType => sizeof(bool),
+        ByteType => sizeof(byte),
+        ShortType => sizeof(short),
+        IntegerType => sizeof(int),
+        LongType => sizeof(long),
+        FloatType => sizeof(float),
+        DoubleType => sizeof(double),
+        DateType or TimestampType or TimestampNtzType => 8,   // staged as DateTime (8 bytes)
+        DecimalType => sizeof(decimal),
+        StringType or BinaryType => VariableLeafValueBytesPerSlot,
+        _ => 0,
+    };
+
+    // A struct emits ONE level slot per row but stages each child leaf's value in turn; the concurrent value
+    // transient is bounded by the SUM of its children's widths — a conservative over-estimate (the child
+    // lanes are written sequentially) that only ever splits sooner, never rejects legal data at the default
+    // budget.
+    private static int StructValueBytesPerSlot(StructType structType)
+    {
+        long total = 0;
+        for (int i = 0; i < structType.Count; i++)
+        {
+            total += LeafValueBytesPerSlot(structType[i].DataType);
+        }
+
+        return (int)Math.Min(total, int.MaxValue);
+    }
 
     /// <summary>
     /// §2.9.2 row-group PLANNING. Returns the largest number of LEADING logical rows of
@@ -98,18 +176,21 @@ internal static class NestedColumnShredder
         ArgumentNullException.ThrowIfNull(schemaField);
         ArgumentNullException.ThrowIfNull(segments);
 
-        int bytesPerSlot = LevelBufferBytesPerSlot(schemaField.DataType);
-        if (bytesPerSlot == 0 || rowCount <= 0)
+        int splitBytesPerSlot = RowGroupTransientBytesPerSlot(schemaField.DataType);
+        if (splitBytesPerSlot == 0 || rowCount <= 0)
         {
             return rowCount;
         }
 
         string label = DiagnosticText.Sanitize(schemaField.Name);
-        long maxSlots = Math.Max(budgetBytes / bytesPerSlot, 1);
+        long maxSplitSlots = Math.Max(budgetBytes / splitBytesPerSlot, 1);
+        int levelBytesPerSlot = LevelBufferBytesPerSlot(schemaField.DataType);
+        long maxLevelSlots = Math.Max(budgetBytes / levelBytesPerSlot, 1);
         if (schemaField.DataType is StructType)
         {
-            // Exactly one slot per row, so the plan is a pure division — no vector walk needed.
-            return (int)Math.Min(rowCount, maxSlots);
+            // Exactly one slot per row, so the plan is a pure division — no vector walk needed. A struct
+            // never rejects (its per-row slot count is fixed at 1), so it packs on the folded SPLIT budget.
+            return (int)Math.Min(rowCount, maxSplitSlots);
         }
 
         try
@@ -122,7 +203,11 @@ internal static class NestedColumnShredder
                 for (int j = 0; j < segment.Length && row < rowCount; j++, row++)
                 {
                     long rowSlots = RowSlots(schemaField.DataType, segment.Vector, segment.Start + j, label);
-                    if (rowSlots > maxSlots)
+
+                    // ACCEPTANCE (reject) is LEVEL-ONLY: a single row is only unwritable when its own level
+                    // buffers alone cannot fit any row group (nothing left to split). The folded value width
+                    // must NEVER reach this surface, or it would narrow the §2.6 acceptance set.
+                    if (rowSlots > maxLevelSlots)
                     {
                         throw DeltaStorageException.UnsupportedFeature(
                             $"Nested column '{label}': a single logical row contributes {rowSlots} Dremel level "
@@ -130,7 +215,10 @@ internal static class NestedColumnShredder
                             + "budget for one row group; the row group cannot be split any further.");
                     }
 
-                    if (slots + rowSlots > maxSlots)
+                    // SPLITTING packs on the tighter FOLDED budget, but always guarantees at least one row so
+                    // a row that passed the level reject is writable even if it alone exceeds the split budget:
+                    // row 0 is always packed (planned > 0 guard); subsequent rows split on the folded budget.
+                    if (planned > 0 && slots + rowSlots > maxSplitSlots)
                     {
                         return planned;
                     }
@@ -160,13 +248,19 @@ internal static class NestedColumnShredder
         {
             ListColumnVector list = ExpectListVector(vector, label);
             (_, int length) = list.RawElementSpan(row);
-            return list.IsNull(row) || length == 0 ? 1 : length;
+            return SlotsForRow(list.IsNull(row), length);
         }
 
         MapColumnVector map = ExpectMapVector(vector, label);
         (_, int entries) = map.RawEntrySpan(row);
-        return map.IsNull(row) || entries == 0 ? 1 : entries;
+        return SlotsForRow(map.IsNull(row), entries);
     }
+
+    // S4/D2 one-source-of-truth: the per-row level-slot rule shared by the PLANNER (RowSlots) and the SHREDDER
+    // (CountListSlots/CountMapSlots). A null or empty repeated container still occupies exactly ONE level slot
+    // (it emits a def/rep pair for the absence); otherwise it costs one slot per element/entry. Extracting it
+    // here means the two counting paths cannot drift and over/under-plan a row group.
+    private static int SlotsForRow(bool isNull, int length) => isNull || length == 0 ? 1 : length;
 
     /// <summary>
     /// Shreds <paramref name="schemaField"/>'s nested column over <paramref name="segments"/> and writes every
@@ -181,10 +275,11 @@ internal static class NestedColumnShredder
         StructField schemaField,
         IReadOnlyList<ColumnSegment> segments,
         int rowCount,
+        long budgetBytes,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(rowGroup);
-        return ShredAsync(rowGroup, field, schemaField, segments, rowCount, cancellationToken);
+        return ShredAsync(rowGroup, field, schemaField, segments, rowCount, budgetBytes, cancellationToken);
     }
 
     /// <summary>
@@ -200,8 +295,9 @@ internal static class NestedColumnShredder
         StructField schemaField,
         IReadOnlyList<ColumnSegment> segments,
         int rowCount,
+        long budgetBytes,
         CancellationToken cancellationToken) =>
-        ShredAsync(rowGroup: null, field, schemaField, segments, rowCount, cancellationToken);
+        ShredAsync(rowGroup: null, field, schemaField, segments, rowCount, budgetBytes, cancellationToken);
 
     private static async Task ShredAsync(
         ParquetRowGroupWriter? rowGroup,
@@ -209,6 +305,7 @@ internal static class NestedColumnShredder
         StructField schemaField,
         IReadOnlyList<ColumnSegment> segments,
         int rowCount,
+        long budgetBytes,
         CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(field);
@@ -220,15 +317,15 @@ internal static class NestedColumnShredder
             switch (schemaField.DataType)
             {
                 case StructType structType when field is PqStructField parquetStruct:
-                    await WriteStructAsync(rowGroup, parquetStruct, structType, segments, rowCount, label, cancellationToken)
+                    await WriteStructAsync(rowGroup, parquetStruct, structType, segments, rowCount, budgetBytes, label, cancellationToken)
                         .ConfigureAwait(false);
                     break;
                 case ArrayType arrayType when field is PqListField parquetList:
-                    await WriteListAsync(rowGroup, parquetList, arrayType, segments, rowCount, label, cancellationToken)
+                    await WriteListAsync(rowGroup, parquetList, arrayType, segments, rowCount, budgetBytes, label, cancellationToken)
                         .ConfigureAwait(false);
                     break;
                 case MapType mapType when field is PqMapField parquetMap:
-                    await WriteMapAsync(rowGroup, parquetMap, mapType, segments, rowCount, label, cancellationToken)
+                    await WriteMapAsync(rowGroup, parquetMap, mapType, segments, rowCount, budgetBytes, label, cancellationToken)
                         .ConfigureAwait(false);
                     break;
                 default:
@@ -275,6 +372,7 @@ internal static class NestedColumnShredder
         StructType structType,
         IReadOnlyList<ColumnSegment> segments,
         int rowCount,
+        long budgetBytes,
         string label,
         CancellationToken cancellationToken)
     {
@@ -284,7 +382,7 @@ internal static class NestedColumnShredder
         // segments the row group actually covers, never from `rowCount`. Comparing a `rowCount`-derived slice
         // length against `rowCount` is the tautology the council found; comparing this independently walked
         // total against it is a real invariant that a dropped/duplicated segment breaks.
-        int slots = TotalSegmentRows(segments, label, LevelBufferBytesPerSlot(structType));
+        int slots = TotalSegmentRows(segments, label, LevelBufferBytesPerSlot(structType), budgetBytes);
 
         // D2: the struct's own null mask, captured ONCE from the SOURCE vectors as a bitmap (one bit per
         // logical row, ~16 KiB for a full row group) instead of holding one rented int[rowGroupRows] per
@@ -465,6 +563,7 @@ internal static class NestedColumnShredder
         ArrayType arrayType,
         IReadOnlyList<ColumnSegment> segments,
         int rowCount,
+        long budgetBytes,
         string label,
         CancellationToken cancellationToken)
     {
@@ -474,7 +573,7 @@ internal static class NestedColumnShredder
         // S4/§2.3c N4-c: the container level is derived from the SCHEMA-ATTACHED leaf through the guard's own
         // helper, so encoder and guard share one source of truth.
         int containerMaxDef = NestedLevelGuard.ContainerMaxDefinitionLevel(leaf);
-        int slots = CountListSlots(segments, label, LevelBufferBytesPerSlot(arrayType));
+        int slots = CountListSlots(segments, label, LevelBufferBytesPerSlot(arrayType), budgetBytes);
 
         int[] def = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         int[] rep = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
@@ -574,6 +673,7 @@ internal static class NestedColumnShredder
         MapType mapType,
         IReadOnlyList<ColumnSegment> segments,
         int rowCount,
+        long budgetBytes,
         string label,
         CancellationToken cancellationToken)
     {
@@ -593,7 +693,7 @@ internal static class NestedColumnShredder
                 + $"value leaf reports {valueContainerMaxDef}; both share one repeated key_value group.");
         }
 
-        int slots = CountMapSlots(segments, label, LevelBufferBytesPerSlot(mapType));
+        int slots = CountMapSlots(segments, label, LevelBufferBytesPerSlot(mapType), budgetBytes);
 
         int[] keyDef = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
         int[] valueDef = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
@@ -722,7 +822,8 @@ internal static class NestedColumnShredder
 
     // ----- slot counting (raw offsets only — never Elements.Length, B-5) -----
 
-    private static int CountListSlots(IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot)
+    private static int CountListSlots(
+        IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot, long budgetBytes)
     {
         long slots = 0;
         foreach (ColumnSegment segment in segments)
@@ -732,14 +833,15 @@ internal static class NestedColumnShredder
             {
                 int row = segment.Start + j;
                 (_, int length) = vector.RawElementSpan(row);
-                slots = checked(slots + (vector.IsNull(row) || length == 0 ? 1 : length));
+                slots = checked(slots + SlotsForRow(vector.IsNull(row), length));
             }
         }
 
-        return CheckSlotBound(slots, label, bytesPerSlot);
+        return CheckSlotBound(slots, label, bytesPerSlot, budgetBytes);
     }
 
-    private static int CountMapSlots(IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot)
+    private static int CountMapSlots(
+        IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot, long budgetBytes)
     {
         long slots = 0;
         foreach (ColumnSegment segment in segments)
@@ -749,16 +851,16 @@ internal static class NestedColumnShredder
             {
                 int row = segment.Start + j;
                 (_, int length) = vector.RawEntrySpan(row);
-                slots = checked(slots + (vector.IsNull(row) || length == 0 ? 1 : length));
+                slots = checked(slots + SlotsForRow(vector.IsNull(row), length));
             }
         }
 
-        return CheckSlotBound(slots, label, bytesPerSlot);
+        return CheckSlotBound(slots, label, bytesPerSlot, budgetBytes);
     }
 
-    internal static int CheckSlotBound(long slots, string label, int bytesPerSlot)
+    internal static int CheckSlotBound(long slots, string label, int bytesPerSlot, long budgetBytes)
     {
-        int ceiling = MaxLeafSlotsPerRowGroup(bytesPerSlot);
+        int ceiling = MaxLeafSlotsPerRowGroup(budgetBytes, bytesPerSlot);
         if (slots > ceiling)
         {
             throw DeltaStorageException.UnsupportedFeature(
@@ -1392,7 +1494,8 @@ internal static class NestedColumnShredder
 
     // The logical row count the row group's segments describe, derived from the SEGMENTS — the independent
     // side of the struct lane's N4-a slot-count clause (B2).
-    private static int TotalSegmentRows(IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot)
+    private static int TotalSegmentRows(
+        IReadOnlyList<ColumnSegment> segments, string label, int bytesPerSlot, long budgetBytes)
     {
         long rows = 0;
         foreach (ColumnSegment segment in segments)
@@ -1400,7 +1503,7 @@ internal static class NestedColumnShredder
             rows = checked(rows + segment.Length);
         }
 
-        return CheckSlotBound(rows, label, bytesPerSlot);
+        return CheckSlotBound(rows, label, bytesPerSlot, budgetBytes);
     }
 
     // #730/S2, per NESTED leaf: the mapped Parquet leaf's repetition (OPTIONAL vs REQUIRED) must equal the

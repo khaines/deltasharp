@@ -95,15 +95,21 @@ public sealed class NestedShredderGuardWiringTests
         // stream keeps a green suite while every row group silently rents more than the budget it was planned
         // against. This binds the DECLARED cost to the rents the lanes actually issue, both read from source,
         // so drift is a test failure rather than an invisible over-rent.
+        //
+        // #845 item 1 also binds the CALL SITE: each lane must pass LevelBufferBytesPerSlot(<its OWN type>) into
+        // its slot-count helper. The table matching the rents is not enough — a lane could still pass a looser
+        // (wrong-type) bytesPerSlot into its helper and get a more permissive backstop than its own transient
+        // warrants. Only the planned path is exposed today, but an out-of-tree hand-built-segments caller is,
+        // so the coupling is pinned at the source.
         SyntaxNode shredder = Assert.Single(
             StorageSourceFiles(),
             t => Path.GetFileName(t.FilePath) == "NestedColumnShredder.cs").GetRoot();
 
-        var lanes = new (string Type, string Lane)[]
+        var lanes = new (string Type, string Lane, string SlotHelper, string TypeVar)[]
         {
-            ("MapType", "WriteMapAsync"),
-            ("ArrayType", "WriteListAsync"),
-            ("StructType", "WriteStructAsync"),
+            ("MapType", "WriteMapAsync", "CountMapSlots", "mapType"),
+            ("ArrayType", "WriteListAsync", "CountListSlots", "arrayType"),
+            ("StructType", "WriteStructAsync", "TotalSegmentRows", "structType"),
         };
 
         MethodDeclarationSyntax cost = Assert.Single(
@@ -112,7 +118,7 @@ public sealed class NestedShredderGuardWiringTests
         SwitchExpressionSyntax table = Assert.Single(
             cost.DescendantNodes().OfType<SwitchExpressionSyntax>());
 
-        foreach ((string type, string lane) in lanes)
+        foreach ((string type, string lane, string slotHelper, string typeVar) in lanes)
         {
             MethodDeclarationSyntax method = Assert.Single(
                 shredder.DescendantNodes().OfType<MethodDeclarationSyntax>(),
@@ -124,22 +130,99 @@ public sealed class NestedShredderGuardWiringTests
                     && i.Expression.ToString().Contains("ArrayPool<int>", StringComparison.Ordinal));
             Assert.True(rented > 0, $"'{lane}' rents no int level buffer, so the cost table cannot be bound.");
 
+            // Each arm binds its own type as a bare type pattern (`MapType => n * sizeof(int)`) — the LEVEL-ONLY
+            // cost, with no value-width fold (that lives in RowGroupTransientBytesPerSlot). At the SYNTAX layer
+            // a bare type name in an arm is a ConstantPattern wrapping an IdentifierName; match on that, then
+            // read the level-stream count from the `n * sizeof(int)` (or bare `sizeof(int)`) expression.
             SwitchExpressionArmSyntax arm = Assert.Single(
-                table.Arms, a => a.Pattern.ToString() == type);
+                table.Arms,
+                a => a.Pattern is ConstantPatternSyntax c
+                    && c.Expression is IdentifierNameSyntax id
+                    && id.Identifier.ValueText == type);
             Assert.Equal(rented, DeclaredIntStreams(arm.Expression, type));
+
+            // #845 item 1: the lane feeds LevelBufferBytesPerSlot(<its OWN type var>) into its slot-count helper.
+            InvocationExpressionSyntax slotCall = Assert.Single(
+                method.DescendantNodes().OfType<InvocationExpressionSyntax>(),
+                i => InvokedName(i.Expression) == slotHelper);
+            Assert.Contains(
+                slotCall.ArgumentList.Arguments,
+                a => a.Expression is InvocationExpressionSyntax inv
+                    && InvokedName(inv.Expression) == "LevelBufferBytesPerSlot"
+                    && inv.ArgumentList.Arguments.Count == 1
+                    && inv.ArgumentList.Arguments[0].Expression.ToString() == typeVar);
         }
     }
 
-    // `n * sizeof(int)` declares n concurrent level streams; a bare `sizeof(int)` declares one.
-    private static int DeclaredIntStreams(ExpressionSyntax expression, string type) => expression switch
+    // `n * sizeof(int)` declares n concurrent level streams; a bare `sizeof(int)` declares one. Each arm is
+    // now the LEVEL-ONLY cost (no value-width fold — that moved to RowGroupTransientBytesPerSlot, #845 item 2),
+    // so the whole arm expression is exactly the `n * sizeof(int)` (or bare `sizeof(int)`) level-stream count.
+    private static int DeclaredIntStreams(ExpressionSyntax expression, string type)
     {
-        BinaryExpressionSyntax b when b.IsKind(SyntaxKind.MultiplyExpression)
-            && b.Left is LiteralExpressionSyntax literal => (int)literal.Token.Value!,
-        SizeOfExpressionSyntax => 1,
-        _ => throw new InvalidOperationException(
+        if (expression is BinaryExpressionSyntax b && b.IsKind(SyntaxKind.MultiplyExpression)
+            && b.Left is LiteralExpressionSyntax literal
+            && b.Right is SizeOfExpressionSyntax)
+        {
+            return (int)literal.Token.Value!;
+        }
+
+        if (expression is SizeOfExpressionSyntax)
+        {
+            return 1;
+        }
+
+        throw new InvalidOperationException(
             $"LevelBufferBytesPerSlot's '{type}' arm is not expressed as a count of int level streams: "
-            + expression.ToString()),
-    };
+            + expression.ToString());
+    }
+
+    [Fact]
+    public void ScalarStringAndBinaryWrite_UseTheZeroAllocGenericLane_AndPlumbCancellation()
+    {
+        // #845 item 5 (design §2.3b N5). The scalar string/binary lanes were migrated OFF the per-value
+        // Encoding.UTF8.GetString + non-generic string WriteAsync (which allocated one string per value and
+        // dropped the CancellationToken) ONTO the zero-alloc generic ReadOnlyMemory<T> lane the other scalar
+        // arms use. Pin BOTH halves at the source so neither can regress: no lane may reintroduce the per-value
+        // GetString allocation, and each must thread the token into the write. A string and its
+        // ReadOnlyMemory<char> encode identically in Parquet.Net 6.1.0, so byte output is unchanged (covered
+        // behaviorally by the round-trip suite).
+        SyntaxNode writer = Assert.Single(
+            StorageSourceFiles(),
+            t => Path.GetFileName(t.FilePath) == "ParquetFileWriter.cs").GetRoot();
+
+        var lanes = new (string Method, string Element)[]
+        {
+            ("WriteStringAsync", "ReadOnlyMemory<char>"),
+            ("WriteBinaryAsync", "ReadOnlyMemory<byte>"),
+        };
+
+        foreach ((string methodName, string element) in lanes)
+        {
+            MethodDeclarationSyntax method = Assert.Single(
+                writer.DescendantNodes().OfType<MethodDeclarationSyntax>(),
+                m => m.Identifier.ValueText == methodName);
+
+            // No per-value string allocation may creep back in.
+            Assert.DoesNotContain(
+                method.DescendantNodes().OfType<InvocationExpressionSyntax>(),
+                i => InvokedName(i.Expression) == "GetString");
+
+            InvocationExpressionSyntax write = Assert.Single(
+                method.DescendantNodes().OfType<InvocationExpressionSyntax>(),
+                i => InvokedName(i.Expression) == "WriteAsync");
+
+            // The write goes through the generic zero-alloc lane: WriteAsync<ReadOnlyMemory<char|byte>>(…).
+            GenericNameSyntax generic = Assert.IsType<GenericNameSyntax>(
+                ((MemberAccessExpressionSyntax)write.Expression).Name);
+            Assert.Equal(
+                element, Assert.Single(generic.TypeArgumentList.Arguments).ToString());
+
+            // The CancellationToken is plumbed into the write.
+            Assert.Contains(
+                write.ArgumentList.Arguments,
+                a => a.Expression.ToString() == "cancellationToken");
+        }
+    }
 
     [Fact]
     public void RowGroupSegmentFaultSeam_IsATestOnlyOverride_NoProductionTypeCanPerturbSegments()
