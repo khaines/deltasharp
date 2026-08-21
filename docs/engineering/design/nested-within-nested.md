@@ -68,7 +68,15 @@ arbitrary depth: `ListColumnVector.Elements`, `MapColumnVector.Keys`/`Values`, a
 `StructColumnVector`, a struct child may be a `ListColumnVector`, and so on (the ctors validate only the
 child *type* against the declared element/field type and the length invariants — §2.7). The decode side reads
 raw Dremel levels (`ParquetRowGroupReader.ReadRawAsync<T>`), which already carry the **full** ancestor path
-of every leaf. So 585a is a generalization of the existing reassembly, not a new substrate.
+of every leaf. So 585a is a generalization of the existing **substrate** (vectors + raw-level reads), not a
+new substrate — but note this is not "unchanged code" throughout: the struct/leaf-guard half
+(`BuildStructNullMask`, `ValidateLeafStructuralLevels`) genuinely generalizes verbatim (already parameterized
+by `structMaxDef`/`containerMaxDef`), whereas the **repeated-container offset/null reconstruction**
+(`BuildRepeatedStructure`) is a real algorithm rewrite for any shape with ≥ 2 repeated ancestors
+(`array<array>`, `map<map>`, `array<map>`, `map<array>`, …): its owner-cell boundary and element-count logic
+are hard-wired to the top repeated level and mis-decode nested repeated levels (§2.2 `DecodeList`). The effort
+and risk framing (§8) reflects that: 585a is a targeted rewrite of the repeated-container counter, not a pure
+parameter-threading generalization.
 
 **Why 585b is blocked.** 585b extends #546's per-leaf widening + `fieldPath` emission (`DeltaSchemaEnforcer`,
 `TypeWidening`) to depth &gt; 1. #546 is the increment that (a) threads `allowWidenApply` through the
@@ -102,11 +110,15 @@ leaf's full ancestor path:
 
 Parquet.Net 6.1.0 exposes, on **every** `Field` node (not only leaves), its own `MaxRepetitionLevel` and
 `MaxDefinitionLevel`. The single-level reader already reads these off the container node
-(`fileList.MaxRepetitionLevel`, `fileStruct.MaxDefinitionLevel`, …) and off each leaf. **This is the pivot
-that makes 585a a recursion rather than a rewrite:** the per-node max levels are exactly the thresholds the
-reassembly needs at *any* depth, so a recursive walk can key each container's reconstruction off *that
-container node's own* `MaxRepetitionLevel`/`MaxDefinitionLevel` instead of the hard-wired `0`/`1` the
-single-level callers pass today.
+(`fileList.MaxRepetitionLevel`, `fileStruct.MaxDefinitionLevel`, …) and off each leaf. **These per-node max
+levels are the thresholds the reassembly needs at *any* depth**, so a recursive walk keys each container's
+reconstruction off *that container node's own* `MaxRepetitionLevel`/`MaxDefinitionLevel` (and its parent's
+`MaxRepetitionLevel`) instead of the hard-wired `0`/`1` the single-level callers pass today. **This makes the
+struct-side and leaf-guard reconstruction a clean recursion.** It does **not**, however, make the
+repeated-container offset/null counting a pure recursion: `BuildRepeatedStructure`'s owner-cell boundary and
+element counting are hard-wired to the top repeated level and must be **rewritten** to thread `parentMaxRep`
+and gate the element count on `rep <= thisMaxRep` (§2.2 `DecodeList`). Reading the per-node levels off the
+footer is necessary but not sufficient — the counting logic itself changes for ≥ 2 repeated ancestors.
 
 ### 2.2 585a — recursive decode (`DecodeContainer`)
 
@@ -146,27 +158,71 @@ count). This is exactly the length contract the #570 ctors enforce (§2.7).
 - `listMaxDef = fileList.MaxDefinitionLevel`, `listMaxRep = fileList.MaxRepetitionLevel` (its **own** levels;
   `=1`/`=2`/… by depth). `emptyContainerDef = listMaxDef − 1`.
 - Choose the element subtree's **driving leaf** (first leaf under `fileList.Item`), read its `(def, rep)`
-  streams, and run `BuildRepeatedStructure(def, rep, numValues, listMaxDef, ownerCells, offsets, nulls, …)`
-  (`:511`). **`BuildRepeatedStructure` is already parameterized by `containerMaxDef` and `rowCount`
-  (=`ownerCells`)**; the only generalization is that a `rep[i]` continuation is legal at this level when
-  `rep[i] == listMaxRep` (a same-level occurrence) — a `rep > listMaxRep` opens a *deeper* list and is a
-  descendant's business, a `rep < listMaxRep` closes back to an ancestor. The reconstruction yields
-  `elemCount` present element slots and the row null/empty flags.
-- **Recurse into the element type** with `ownerCells = elemCount`:
+  streams, and reconstruct this level's per-owner-cell offsets/nulls. **The single-level
+  `BuildRepeatedStructure` (`:511`) DOES NOT generalize unchanged to a repeated container nested inside
+  another repeated container** (`array<array>`, `map<map>`, `array<map>`, `map<array>`, or any array/map
+  whose element/key/value is itself repeated — i.e. **≥ 2 repeated ancestors**). Two hard-wired assumptions
+  in the released method are correct only at the top repeated level and are **wrong** at any nested repeated
+  level (verified against `NestedParquetColumnReader.cs`):
+  1. **Owner-cell boundary is hard-wired `if (rep[i] == 0)` (`:532`).** A new owner cell (parent row/element)
+     at a nested level opens at `rep[i] <= parentMaxRep`, **not** `== 0` (`parentMaxRep = 0` only at the top).
+     For `array<array<int>>` the inner list's owner cells are the outer list's *elements* (`parentMaxRep = 1`),
+     so the inner reconstruction must open a new owner at `rep <= 1`. With the `rep == 0` boundary the inner
+     walk folds all inner data into owner-row 0's continuation, and the terminal `if (row + 1 != rowCount)`
+     check (`:594`) then throws `CorruptData` on **valid** depth-2 data.
+  2. **Element counting is `if (d >= containerMaxDef) { elements++; }` (`:582`) with NO rep gate.** A present
+     element at *this* level opens only when `rep[i] <= thisMaxRep` (a same-level-or-shallower occurrence);
+     a slot with `rep[i] > thisMaxRep` is the business of a **deeper** repeated container and must be
+     EXCLUDED from this level's count. For the outer level of `array<array<int>>` the ungated `d >= containerMaxDef`
+     counts every present inner **leaf**, not each inner-**list** occurrence, so the outer offsets are wrong
+     (they measure total inner leaves, not inner-list count).
+- **Corrected reconstruction (a real algorithm change, not a re-parameterization).** Reconstruct this level
+  keyed on the container node's own `(thisMaxRep = listMaxRep, thisElemDef = listMaxDef, emptyContainerDef =
+  listMaxDef − 1)` **and its parent's** `parentMaxRep`:
+  - **Owner-cell boundary:** a new owner cell opens at `rep[i] <= parentMaxRep` (top level `parentMaxRep = 0`
+    ⇒ identical to today's `rep == 0`; depth-preserving by construction).
+  - **Element occurrence at this level:** count `elements++` iff `rep[i] <= thisMaxRep && d >= thisElemDef`.
+    Slots with `rep[i] > thisMaxRep` are skipped here (counted by the child recursion); slots with
+    `d < thisElemDef` are the null/empty markers (three-way threshold below).
+  - **Continuation legality (F2 guard, generalized):** a slot with `parentMaxRep < rep[i] <= thisMaxRep`
+    continues *this* level's current owner cell (legal only when that cell opened as an element-bearing,
+    non-empty/non-null container); a slot with `rep[i] > thisMaxRep` continues a *deeper* level and is not
+    this level's concern; a slot with `rep[i] <= parentMaxRep` closes back to an ancestor. The empty/null
+    phantom-continuation reject (`:570-579`) generalizes to this `(parentMaxRep, thisMaxRep)` window.
+  This requires a **new signature** threading `parentMaxRep`/`thisMaxRep` (e.g.
+  `BuildRepeatedStructure(def, rep, numValues, thisElemDef, thisMaxRep, parentMaxRep, ownerCells, offsets,
+  nulls, …)`), or replacement by the single-pass emitter below — it is **not** callable unchanged.
+- **Preferred: single-pass all-levels reconstruction (resolves Finding 4).** Rather than re-scan the driving
+  leaf once per repeated level (the released per-level design is O(depth × numValues)), collect the ordered
+  chain of repeated ancestors `R_1 … R_k` (outermost→innermost, each with its own
+  `(repLevel_j, defLevel_j)` off the footer node) and emit **every** level's offsets/nulls in **one** walk of
+  the driving leaf. For each slot `i` with `(d = def[i], r = rep[i])`, level `R_j` opens a new element iff
+  `r <= repLevel_j`, and that element is **present** (contributes a child cell to `R_j`'s parent) iff
+  additionally `d >= defLevel_j`; `d == defLevel_j − 1` is an empty container, `d < defLevel_j − 1` a null
+  container (evaluated within the enclosing present-parent window). This yields all `k` offset arrays in
+  O(numValues) and is the recommended shape for the rewrite.
+- **Recurse into the element type** with `ownerCells = elemCount` (this level's present-element count):
   `elements = DecodeNode(fileList.Item, requested.ElementType, elemCount, depth+1)`. For
   `array<scalar>` this is the base leaf case (byte-identical to today); for `array<struct>` /
-  `array<array>` / `array<map>` it descends.
-- Assemble `new ListColumnVector(requested, elements, offsets, nulls)`; the ctor cross-checks
-  `elements.Length == offsets[^1]` (`CopyValidatedOffsets`), preserving the existing count reconciliation.
+  `array<array>` / `array<map>` it descends, passing this list's `listMaxRep` down as the child's
+  `parentMaxRep`.
+- Assemble `new ListColumnVector(requested, elements, offsets, nulls)`; the ctor validates
+  `offsets[^1] <= elements.Length` (`NestedValidity.CopyValidatedOffsets` — a dangling element tail is
+  *allowed*, not required to be exact), so 585a keeps its own explicit `total == elements.Length` count
+  reconciliation (mirroring the single-level `total != elements.Length` reject) rather than relying on the
+  ctor for equality.
 
 **`DecodeMap`** (generalizes `ReadMapAsync`, `:414`):
 - `mapMaxDef = fileMap.MaxDefinitionLevel`. **The map key/value transposition + canonical-name guards run
   at every level** (§2.6): `EnsureCanonicalMapChildNames(fileMap, …)` (`:1098`) and
   `EnsureRequiredMapKey(fileMap, …)` (`:1077`) are called on **this** map node before its children are read.
-- The **key** subtree's driving leaf drives the entry structure (`BuildRepeatedStructure` at `mapMaxDef`);
+- The **key** subtree's driving leaf drives the entry structure via the **corrected** reconstruction above
+  (the `map<map>` / `map<array>` / `array<map>` cases carry ≥ 2 repeated ancestors, so the same
+  `parentMaxRep`/`thisMaxRep` threading — or the single-pass emitter — is required; the released
+  `BuildRepeatedStructure` mis-decodes an inner map exactly as it mis-decodes an inner list);
   the **value** subtree's driving leaf is checked for rep parity (`ValidateParallelRepetition`, `:838`) and
-  entry-presence def parity (`ValidateParallelDefinition`, `:894`) against the key structure — unchanged,
-  but now keyed off the map node's own `mapMaxDef`.
+  entry-presence def parity (`ValidateParallelDefinition`, `:894`) against the key structure — those parity
+  guards are unchanged, but now keyed off the map node's own `mapMaxDef`/`mapMaxRep` and its `parentMaxRep`.
 - **Recurse into both child types** with `ownerCells = entryCount`:
   `keys = DecodeNode(fileMap.Key, requested.KeyType, entryCount, depth+1)`,
   `values = DecodeNode(fileMap.Value, requested.ValueType, entryCount, depth+1)`. A `map<*,struct>` /
@@ -236,12 +292,18 @@ instead:
 | `ReadStructAsync` / `ReadListAsync` / `ReadMapAsync` | `:238/:360/:414` | replace the per-child `ExpectScalarLeaf`/`ReadScalarLeafAsync` calls with `DecodeNode` at `depth+1`; key reconstruction off the **node's own** `MaxDef`/`MaxRep`; choose a per-subtree driving leaf |
 | `ExpectScalarLeaf` → `ExpectChild` | `:1217` | scalar requested → unchanged `ExpectScalarLeaf`; nested requested → recurse into `ValidateShape`; the current nested-requested reject becomes the recursion entry, not a throw |
 | `ValidateLeafStructuralLevels` | `:1274` | **unchanged code**, called with the immediate parent's `MaxRep`/`MaxDef` (already parameterized) — generalizes to any depth |
-| `BuildStructNullMask` / `BuildRepeatedStructure` | `:298/:511` | **unchanged code** (already parameterized by `structMaxDef` / `containerMaxDef` + `rowCount`), called at each level with that level's thresholds; `BuildRepeatedStructure` continuation legality generalizes to `rep == containerMaxRep` |
+| `BuildStructNullMask` | `:298` | **unchanged code** (already parameterized by `structMaxDef`), called at each level with that level's threshold |
+| `BuildRepeatedStructure` → single-pass repeated-level emitter | `:511` | **REWRITE (not unchanged)** for ≥ 2 repeated ancestors: owner-cell boundary generalizes from `rep == 0` (`:532`) to `rep <= parentMaxRep`; element count gains a `rep <= thisMaxRep` gate (`:582` currently ungated); new signature threads `parentMaxRep`/`thisMaxRep`, or replace with the single-pass all-levels emitter (§2.2). Top-level (`parentMaxRep = 0`, single repeated level) behavior is preserved byte-for-byte |
 | `EnsureCanonicalMapChildNames` / `EnsureRequiredMapKey` | `:1098/:1077` | **unchanged code**, invoked on **every** map node (recursively), not only a top-level map |
 | `NestedDecodeBudget` | `NestedParquetColumnReader.cs` | charge each level's transient structural arrays (offsets/nulls) as the recursion descends — the cumulative-bound property already holds per node; recursion sums naturally |
 | `CollectLeafFields` | `:169` | already recurses the three shapes; extend to recurse nested-within-nested so the eager-decode ceiling still sums every descendant leaf's declared footprint before any allocation |
 
-### 2.4 Data flow — decode `array<struct<a:int,b:string>>` (585a)
+### 2.4 Data flow — decode `array<struct<a:int,b:string>>` and `array<array<int>>` (585a)
+
+The `array<struct<…>>` sequence below has only **one** repeated ancestor (the outer list); the struct is not
+repeated, so it does **not** exercise the ≥ 2-repeated-ancestor path where the released
+`BuildRepeatedStructure` mis-decodes. It is retained as the struct-recursion illustration; the
+`array<array<int>>` level-stream trace that follows is the **defect-exercising** case.
 
 ```mermaid
 sequenceDiagram
@@ -253,12 +315,75 @@ sequenceDiagram
   V->>V: array arm -> element is struct -> RECURSE ValidateShape(struct, elementNode, maxRep=1, maxDef=listMaxDef+1)
   V->>V: struct arm -> a:int, b:string -> ExpectScalarLeaf each (exact type + level guard)
   R->>D: DecodeNode(list, array<struct<...>>, ownerCells=rowCount, depth=0)
-  D->>D: DecodeList: BuildRepeatedStructure over key/element driving-leaf def/rep at listMaxDef -> offsets, nulls, elemCount
+  D->>D: DecodeList: reconstruct outer offsets/nulls at (thisMaxRep=1, parentMaxRep=0, listMaxDef) -> offsets, nulls, elemCount
   D->>D: RECURSE DecodeNode(elementNode, struct<a,b>, ownerCells=elemCount, depth=1)
   D->>D: DecodeStruct: read leaf a (int) + leaf b (string) as elemCount cells; BuildStructNullMask at structMaxDef
   D->>Vec: StructColumnVector(elemCount) -> ListColumnVector(rowCount, elements=struct, offsets, nulls)
   D-->>R: ListColumnVector<StructColumnVector<int,string>>
 ```
+
+**Worked level-stream trace — `array<array<int>>` (the rep≥2 case the struct example masks).** With the
+Parquet 3-level LIST encoding, the optional/repeated ancestors from root to leaf are: outer group (opt),
+outer `list` (rep), inner element group (opt), inner `list` (rep), leaf element (opt) — so the leaf's
+`MaxDefinitionLevel = 5` and `MaxRepetitionLevel = 2`. The **outer** list node has `MaxRepetitionLevel = 1`,
+`MaxDefinitionLevel = 2`; the **inner** list node has `MaxRepetitionLevel = 2`, `MaxDefinitionLevel = 4`.
+Definition-level meanings: `d=0` outer null, `d=1` outer empty, `d=2` outer present + inner **null**,
+`d=3` inner **empty**, `d=4` inner present + leaf slot but **value null**, `d=5` leaf value present. Consider
+**4 rows** exercising the full four-way null taxonomy:
+
+| row | logical value | classification |
+|---|---|---|
+| 0 | `null` (outer list absent) | **null outer** |
+| 1 | `[]` (outer list present, empty) | **empty outer** |
+| 2 | `[null, []]` (outer present; first inner = null, second inner = empty) | **outer-of-null/empty-inner** |
+| 3 | `[[7, null], [9]]` (all present, an inner element null) | **present** |
+
+The driving leaf emits one `(rep, def)` slot per null/empty container placeholder and one per present leaf
+cell:
+
+```
+slot: r  d   meaning
+row0: 0  0   outer NULL             (r<=parentMaxRep=0 opens owner 0; d<1 => outer null)
+row1: 0  1   outer EMPTY            (opens owner 1; d==1 => outer present-but-empty, 0 inner lists)
+row2: 0  2   inner #0 = NULL        (opens owner 2; d==2 => outer present, inner list #0 null)
+      1  3   inner #1 = EMPTY       (r==1<=outerMaxRep, new outer element; d==3 => inner empty)
+row3: 0  5   leaf 7                 (opens owner 3; outer present, inner #0 present, leaf value present)
+      2  4   leaf NULL              (r==2 => deeper repeat: same inner #0, next leaf slot; d==4 => value null)
+      1  5   leaf 9                 (r==1 => new outer element: inner #1; leaf value present)
+```
+
+**Outer level (`thisMaxRep = 1`, `parentMaxRep = 0`, `thisElemDef = 2`).** Owner cells open at `r <= 0`
+(rows 0–3). An outer **element** (one inner-list occurrence) is counted iff `r <= 1 && d >= 2`:
+- row0: no slot with `d ≥ 2` → 0 elements; owner-open `d = 0 < 1` ⇒ **null outer**.
+- row1: owner-open `d = 1` ⇒ **empty outer**, 0 elements.
+- row2: slots `(0,2)` and `(1,3)` both satisfy `r ≤ 1 && d ≥ 2` → **2** inner-list elements.
+- row3: slots `(0,5)` and `(1,5)` satisfy `r ≤ 1 && d ≥ 2`; slot `(2,4)` has `r = 2 > 1` and is **excluded**
+  (it is the inner level's business) → **2** inner-list elements.
+
+So `outer offsets = [0, 0, 0, 2, 4]` — the outer boundaries count **inner-list occurrences**, not leaf cells,
+and `elemCount = 4` present inner lists total. **Contrast the released code:** its ungated
+`if (d >= containerMaxDef) elements++` at `containerMaxDef = 2` counts *every* slot with `d ≥ 2` — row2's 2
+plus row3's `(0,5)`,`(2,4)`,`(1,5)` = **3** — giving `outer offsets = [0,0,0,2,5]` and `elemCount = 5`. It
+then recurses expecting **5** inner-list owner cells when there are only **4**, and the count reconciliation
+throws `CorruptData` on valid depth-2 data (or, absent that guard, mis-assigns leaves across inner lists).
+
+**Inner level (`thisMaxRep = 2`, `parentMaxRep = 1`, `thisElemDef = 4`), over `ownerCells = 4` inner lists.**
+Owner (inner-list) boundaries now open at `r <= 1` (**not** `r == 0` — the released `:532` boundary folds
+everything into inner-list 0 and then throws `CorruptData` at `:594` because `row+1 (=1) != rowCount (=4)` on
+valid data). A leaf **slot** is counted iff `r <= 2 && d >= 4`; the leaf's own `d` (5 vs 4) then distinguishes
+value-present vs value-null within a present slot:
+- inner list #0 (row2, slot `(0,2)`): owner-open `d = 2 < 3` ⇒ **null inner**, 0 leaf slots.
+- inner list #1 (row2, slot `(1,3)`): owner-open `d = 3 == thisElemDef − 1` ⇒ **empty inner**, 0 leaf slots.
+- inner list #2 (row3, slots `(0,5)`,`(2,4)`): both `r ≤ 2 && d ≥ 4` ⇒ **2** leaf slots; `(2,4)` `d = 4` is a
+  **null value**, `(0,5)` `d = 5` present → values `[7, null]`.
+- inner list #3 (row3, slot `(1,5)`): 1 leaf slot, value `9`.
+
+So `inner offsets = [0, 0, 0, 2, 3]`, `inner nulls = [null, —, —, —]` (list #0 null, #1 empty), and the leaf
+vector is `[7, null, 9]` with a per-leaf null mask marking index 1. The **four-way** distinction — null outer
+(row0) / empty outer (row1) / outer-of-null-or-empty-inner (row2) / fully present with a null inner element
+(row3) — is reconstructed exactly, and **only** the corrected `(parentMaxRep, thisMaxRep, thisElemDef)`
+-parameterized (or single-pass) reconstruction yields it; the released `BuildRepeatedStructure` fails at
+both levels.
 
 ### 2.5 585b — depth&gt;1 widening (SPEC ONLY; deferred until #546 merges)
 
@@ -322,13 +447,25 @@ only); it is 585b's scope and stays fail-closed until #546 + 585b land.
 
 **Recursion-depth bound (DoS guard).** The recursion walks two attacker-influenced trees — the requested type
 (from the log `metaData.schemaString`) and the file field tree (from the footer). Both are already
-depth-bounded upstream (`SchemaJson.MaxDepth = 64` JSON containers ≈ 21 struct levels on log parse;
-`MaxFooterFieldIdMapDepth = 100` on the footer id map), but the **decode recursion itself** must carry its
-own explicit bound so a maliciously deep schema cannot exhaust the stack or drive a pathological allocation
-fan-out. 585a introduces `MaxNestedReadDepth` (proposed **32** — comfortably above every realistic Spark
-schema, well below the upstream caps so it never rejects a schema those caps admit; final value in §9-D3).
-The bound is checked at `DecodeNode`/`ValidateShape` entry **before** any per-level allocation or descent, so
-a schema deeper than the bound fails closed `UnsupportedFeature` (a deterministic, typed rejection — never a
+depth-bounded upstream, and DeltaSharp's **write** path is capped too. The verified caps are:
+
+| Cap | Value | Source | What it bounds |
+|---|---|---|---|
+| `SchemaJson.MaxDepth` | **64** JSON containers | `SchemaJson.cs:50` | log-parse of `metaData.schemaString`; a struct costs 3 JSON containers ⇒ ~**21 struct levels**, array/map cost 1 each ⇒ ~**64 array/map levels** |
+| `ParquetTypeMapping.MaxFooterTypeDepth` | **64** type levels | `ParquetTypeMapping.cs:765` | footer type-tree walk on **read** (mirrors the write cap) |
+| `DeltaWriteSchemaEligibility.MaxDepth` | **64** type levels | `DeltaWriteSchemaEligibility.cs:60` | **write** eligibility — the deepest schema DeltaSharp will commit |
+
+The **decode recursion itself** must carry its own explicit bound so a maliciously deep schema cannot exhaust
+the stack or drive a pathological allocation fan-out. 585a introduces `MaxNestedReadDepth`, set to **64**
+(= the write cap `MaxFooterTypeDepth` / `DeltaWriteSchemaEligibility.MaxDepth`). **The read cap MUST be ≥ the
+write cap:** a smaller read cap (e.g. the earlier proposal of 32) would create a **read-after-write parity
+gap** — a schema DeltaSharp itself wrote at depth 33–64 would then be **rejected on read** — and, because 32
+sits *below* the ~64 array/map levels `SchemaJson`/`MaxFooterTypeDepth` admit, it would be the **first-firing**
+gate for array/map chains rather than a never-over-rejecting backstop. At **64** the read cap never
+over-rejects a schema the write/log/footer caps admit; it fires only on schemas already at/over those caps
+(and only, in practice, on struct-heavy trees `SchemaJson` would itself have rejected at ~21 levels). The
+bound is checked at `DecodeNode`/`ValidateShape` entry **before** any per-level allocation or descent, so a
+schema deeper than the bound fails closed `UnsupportedFeature` (a deterministic, typed rejection — never a
 `StackOverflowException`, which would bypass the fail-closed contract). Because the requested type is walked
 in validation *before* decode, an over-deep schema is rejected at shape resolution, before a single data page
 is read.
@@ -358,24 +495,28 @@ enforce exactly the invariants the recursion produces:
   every child `Length == parent.Length` (`StructColumnVector.cs:85-127`). A child may be a
   `ListColumnVector`/`MapColumnVector`/`StructColumnVector`.
 - `ListColumnVector(type, elements, offsets, nulls)` — validates `elements.Type.Equals(type.ElementType)`
-  and `offsets` monotone with `offsets[^1] == elements.Length` (`ListColumnVector.cs:80-99`,
-  `CopyValidatedOffsets`). `elements` may be nested.
+  and `offsets` monotone (non-negative, non-decreasing) with `offsets[^1] <= elements.Length`
+  (`ListColumnVector.cs:93` → `NestedValidity.CopyValidatedOffsets`, which throws only when
+  `offsets[^1] > childLength` — a **dangling element tail is allowed**, equality is not required). `elements`
+  may be nested.
 - `MapColumnVector(type, keys, values, offsets, nulls)` — validates key/value types and parallel lengths
   (`MapColumnVector.cs:87+`). `keys`/`values` may be nested.
 
 So `array<struct<…>>` → `ListColumnVector` whose `elements` is a `StructColumnVector`;
 `map<string, array<long>>` → `MapColumnVector` whose `values` is a `ListColumnVector`; etc. The recursion's
-per-node length contract (§2.2) is precisely each ctor's length invariant, so a decode that satisfies the
-recursion satisfies the vector ctors by construction (and a residual mismatch fails closed on the ctor's own
-`ArgumentException`, which 585a wraps into a typed `DeltaStorageException.CorruptData` at the count
-reconciliation, mirroring the single-level `total != elements.Length` check).
+per-node length contract (§2.2) is at least as strict as each ctor's length invariant (the list ctor bounds
+`offsets[^1] <= elements.Length`, so 585a enforces its **own** explicit `total == elements.Length` equality
+reconciliation — mirroring the single-level `total != elements.Length` reject — rather than relying on the
+ctor's weaker `<=` bound). A residual mismatch therefore fails closed as a typed
+`DeltaStorageException.CorruptData` at the 585a count reconciliation (the ctor's own `ArgumentException`
+remains a defense-in-depth backstop for the monotonicity/over-length cases).
 
 ### 2.8 Dependencies
 
 | Dependency | State | Role |
 |---|---|---|
 | #570 nested `ColumnVector`s (`Struct`/`List`/`Map`) | **CLOSED / merged** | recursion target — already represents arbitrary depth (§2.7) |
-| #571/#584 single-level nested decode | **CLOSED / merged (PR #584)** | the reassembly 585a generalizes (`BuildRepeatedStructure`, `BuildStructNullMask`, level guards already parameterized) |
+| #571/#584 single-level nested decode | **CLOSED / merged (PR #584)** | the reassembly 585a generalizes: `BuildStructNullMask` + the leaf structural-level guards are already parameterized and reused verbatim; the repeated-container counter (`BuildRepeatedStructure`) is **rewritten** for ≥ 2 repeated ancestors (§2.2) |
 | #834/#842 single-level nested **write** | **merged (PR #842)** | writes depth-1 nested; **does not write depth-2**, so depth-2+ round-trip fixtures need a synthesized-footer harness (§3) |
 | #546 nested widening (depth ≤ 1) | **OPEN** | **585b's blocking dependency** — the `allowWidenApply` + `fieldPath` machinery 585b extends |
 | #535 type-widening read-promotion | **CLOSED** | the `IsSanctionedWidening` allowlist + decimal-fit guard 585b reuses unchanged |
@@ -420,7 +561,10 @@ from disjoint value domains so a positional mis-bind cannot pass on equal values
 4. `MapOfStruct_RoundTrips` — `map<string, struct<a:int,b:long>>`: null map / empty map / entry with a null
    value-struct / present value-struct with a null field.
 5. `ArrayOfArray_RoundTrips` — `array<array<int>>`: null outer / empty outer / outer with null inner / inner
-   with null element (four-way null distinction across two repeated levels).
+   with null element (four-way null distinction across two repeated levels). **Explicitly asserts the outer
+   offsets count inner-**list** occurrences, not inner leaf cells** (the §2.4 trace: `outer offsets =
+   [0,0,0,2,4]`, not `[0,0,0,2,5]`) — the cell that fails against the released `BuildRepeatedStructure` and
+   passes only under the corrected `(parentMaxRep, thisMaxRep, thisElemDef)` reconstruction.
 6. `MapOfMap_RoundTrips` — `map<string, map<string,long>>`: recursive canonical `key`/`value` names on both
    map levels; entry with a null inner-map value.
 7. `ArrayOfMap_RoundTrips` / `MapOfArray_RoundTrips` — mixed repeated nesting.
@@ -445,10 +589,10 @@ from disjoint value domains so a positional mis-bind cannot pass on equal values
 | 15 | `MapWithNullableKey_AtDepth2_FailsClosed` | `SchemaMismatch` |
 | 16 | `InnerMapKeyValueTransposed_WitnessDisjoint_FailsClosed` (`map<string, map<long,long>>`, required value, children swapped) | `SchemaMismatch` |
 | 17 | `NestedLeaf_PhysicalTypeMismatch_AtDepth2_FailsClosed` (file leaf `int`, requested `string`) | `SchemaMismatch` |
-| 18 | `CraftedDefStream_StructNullParityViolation_AtDepth2_FailsClosed` (a deep struct child claims present under a null parent) | `CorruptData` |
-| 19 | `CraftedRepStream_PhantomInnerElement_FailsClosed` (`array<array<int>>`, continuation after an empty inner list) | `CorruptData` |
-| 20 | `CraftedLeafLevels_OverNestedDescendant_FailsClosed` (`ValidateLeafStructuralLevels` at depth 2/3) | `CorruptData` |
-| 21 | `SchemaDeeperThanMaxNestedReadDepth_FailsClosed` (a synthesized `array<array<…>>` chain past the bound) | `UnsupportedFeature`, **rejected at shape resolution before any page read** |
+| 18 | `CraftedDefStream_StructNullParityViolation_AtDepth2_FailsClosed` (a deep struct child claims present under a null parent) | `CorruptData` — **detected by no other oracle** (no released writer authors this def stream; the round-trip cells 1–10 cannot reach it — only the crafted `internal` `BuildStructNullMask` fixture exercises it) |
+| 19 | `CraftedRepStream_PhantomInnerElement_FailsClosed` (`array<array<int>>`, continuation after an empty inner list) | `CorruptData` — **detected by no other oracle** (crafted `internal` repeated-level fixture only; released writers never emit a continuation past an empty-container marker) |
+| 20 | `CraftedLeafLevels_OverNestedDescendant_FailsClosed` (`ValidateLeafStructuralLevels` at depth 2/3) | `CorruptData` — **detected by no other oracle** (crafted footer with descendant leaf max-levels inconsistent with its navigated position; unreachable via the write door) |
+| 21 | `SchemaDeeperThanMaxNestedReadDepth_FailsClosed` (a synthesized `array<array<…>>` chain past depth 64) | `UnsupportedFeature`, **rejected at shape resolution before any page read** |
 | 22 | `NestedWidening_AtDepth2_StaysFailClosed_Under585a` (`array<struct<x:int>>` file, `array<struct<x:long>>` requested) | `SchemaMismatch` — pins that widening is **not** enabled by 585a (585b's scope) |
 
 **Regression / parity**
@@ -456,6 +600,12 @@ from disjoint value domains so a positional mis-bind cannot pass on equal values
     pre-585a (the recursion's base case == the old single-level path).
 24. `EagerDecodeCeiling_SumsAllDescendantLeaves` — a deep/wide footer is bounded before allocation
     (`CollectLeafFields` recursion).
+25. `SchemaAtMaxNestedReadDepth_RoundTrips_Success` — the **at-bound (or bound−1) SUCCESS** companion to
+    cell 21: a legitimate nested chain synthesized at depth == `MaxNestedReadDepth` (= 64, the max writable
+    depth) **decodes successfully** (round-trips value + null structure), pinning that the depth cap does
+    **not** over-reject a schema the write/log/footer caps admit (§2.6 read-after-write parity). Guards
+    against a regression that lowers the read cap below the write cap and silently over-rejects deep
+    writable schemas.
 
 ### 3.2 · 585b — depth&gt;1 widening (SPECIFIED, PENDING #546)
 
@@ -478,6 +628,12 @@ from disjoint value domains so a positional mis-bind cannot pass on equal values
 - **Workload:** per-column recursive decode of the requested nested tree — O(total leaf cells + total
   structural slots), the same asymptotic cost as single-level nesting; the recursion adds one stack frame per
   container node (≤ `MaxNestedReadDepth`), not per row.
+- **Single-pass reconstruction (Columnar).** A naïve per-level reconstruction re-scans each repeated
+  container's driving leaf once per repeated ancestor — **O(depth × numValues)** over the level streams. The
+  design instead prescribes the **single-pass all-levels emitter** (§2.2 `DecodeList`): one walk of the
+  driving leaf emits every repeated level's offsets/nulls (level `R_j` opens at `rep <= repLevel_j`, present
+  at `def >= defLevel_j`), restoring **O(numValues)** level processing. This simultaneously fixes the
+  repeated-within-repeated counting defect (Finding 1) and removes the per-level re-scan cost.
 - **Targets:** depth-2 decode within the single-level decode noise floor per equivalent cell count; zero extra
   allocation per data row beyond the per-level structural arrays (offsets/nulls) the #570 vectors already
   require. Driving-leaf selection is O(children) per container, off the already-open footer.
@@ -506,7 +662,9 @@ from disjoint value domains so a positional mis-bind cannot pass on equal values
 - **Recursion-depth DoS bound (`MaxNestedReadDepth`, §2.6):** a maliciously deep nested schema fails closed
   `UnsupportedFeature` at shape resolution, **before** any allocation, page read, or deep recursion — never a
   `StackOverflowException` (which would bypass the `DeltaStorageException` fail-closed contract). The bound is
-  ≤ the upstream `SchemaJson`/footer depth caps, so it rejects only schemas that are already pathological.
+  set to **64 = the write cap** (`MaxFooterTypeDepth` / `DeltaWriteSchemaEligibility.MaxDepth`) so it is
+  **≥ every write/log/footer cap** and never over-rejects a schema DeltaSharp can write/admit (no
+  read-after-write parity gap); it fires only on schemas already at/over those caps (§2.6).
 - **Fail-closed over fallback:** an exact physical-type match at every nested leaf under 585a (no
   promotion — promotion is 585b, gated by the unchanged allowlist); a crafted level stream that is
   self-consistent at one level but violates a deeper invariant fails closed `CorruptData` at that level.
@@ -573,7 +731,17 @@ mapping of nested-within-nested (`nested.ids`, array/map id mode) stays out of s
 **Risk register:**
 - (a) recursive mis-decode at depth → **wrong data** — mitigated by per-level structural guards run at every
   level (§2.6) + §3.1 crafted-stream cells (18–20) + the depth-2/3 round-trips (1–9).
-- (b) deep-schema DoS → stack/alloc exhaustion — `MaxNestedReadDepth` bound + eager-decode ceiling + §3.1-21.
+- (a′) **repeated-within-repeated counting rewrite** → the repeated-container reconstruction is a **real
+  algorithm change** (owner boundary `rep <= parentMaxRep`, element count gated `rep <= thisMaxRep`), **not**
+  reusable-unchanged code, for `array<array>`/`map<map>`/`array<map>`/`map<array>` and any ≥ 2-repeated-ancestor
+  shape (§2.2). Highest-effort/-risk item in 585a. Mitigated by the §2.4 worked-trace assertions (cell 5
+  pins outer offsets = inner-list counts, not leaf counts), the depth-3 round-trips (8–9), and the
+  single-level byte-identical regression (23) that pins the top-level (`parentMaxRep = 0`) path unchanged.
+- (b) deep-schema DoS → stack/alloc exhaustion — `MaxNestedReadDepth` (= 64, the write cap) bound +
+  eager-decode ceiling + §3.1-21.
+- (b′) **read-after-write parity gap** → a read cap below the write cap over-rejects a schema DeltaSharp
+  wrote — prevented by fixing `MaxNestedReadDepth = 64 ≥ MaxFooterTypeDepth`/`DeltaWriteSchemaEligibility.MaxDepth`
+  (§2.6, D3); §3.1-25 at-bound SUCCESS cell guards against a regression.
 - (c) recursive map transposition → key/value swap at a nested map — recursive canonical-name guard + §3.1-16.
 - (d) accidental widening under 585a → silent promotion at a nested leaf — 585a keeps exact match; §3.1-22
   pins it fail-closed until 585b.
@@ -593,13 +761,28 @@ single-level byte-identical regression (§3.1-23) green.
    #546 merges)**. 585a covers scope items 1/3/4; 585b covers item 2.
 2. **Recursion structure — RESOLVED: `DecodeNode` recursion (§2.2).** A single recursive dispatcher keys each
    container's reconstruction off **that container node's own** `MaxRepetitionLevel`/`MaxDefinitionLevel`
-   (Parquet.Net exposes them on every node), reusing the already-parameterized `BuildRepeatedStructure` /
-   `BuildStructNullMask` / `ValidateLeafStructuralLevels`. Driving-leaf per repeated subtree; cross-leaf
-   structural agreement validated at each level.
-3. **Recursion-depth bound value — OPEN (D3).** `MaxNestedReadDepth` proposed **32** (above every realistic
-   Spark schema, below `SchemaJson.MaxDepth ≈ 21 struct levels` / footer cap 100). Final value pending a
-   check against the deepest legitimate Spark-authored schema in the interop corpus; the mechanism (fail
-   closed `UnsupportedFeature` at entry, before allocation) is fixed.
+   (Parquet.Net exposes them on every node). `BuildStructNullMask` / `ValidateLeafStructuralLevels` are
+   reused already-parameterized; **the repeated-container offset/null counter is REWRITTEN** — the released
+   `BuildRepeatedStructure`'s hard-wired `rep == 0` owner boundary (`:532`) and ungated `d >= containerMaxDef`
+   element count (`:582`) mis-decode any shape with ≥ 2 repeated ancestors (`array<array>`, `map<map>`,
+   `array<map>`, `map<array>`, …). The rewrite threads `parentMaxRep`/`thisMaxRep` (owner boundary
+   `rep <= parentMaxRep`; element count gated `rep <= thisMaxRep && d >= thisElemDef`) — preferably as a
+   single-pass all-levels emitter (§2.2, also resolves the Columnar per-level re-scan cost). Driving-leaf per
+   repeated subtree; cross-leaf structural agreement validated at each level. This is a substantive algorithm
+   change, **not** "unchanged code."
+3. **Recursion-depth bound value — RESOLVED (D3): `MaxNestedReadDepth = 64` (= the write cap).** The verified
+   upstream caps (§2.6/§5) are: the **write** caps `ParquetTypeMapping.MaxFooterTypeDepth = 64`
+   (`ParquetTypeMapping.cs:765`) and `DeltaWriteSchemaEligibility.MaxDepth = 64`
+   (`DeltaWriteSchemaEligibility.cs:60`); and the log-parse serialization cap `SchemaJson.MaxDepth = 64` JSON
+   containers (`SchemaJson.cs:50`) which admits ~21 struct levels (3 JSON containers/struct) but ~64
+   array/map levels (1 container each). The read cap **must be ≥ the write cap** so a schema DeltaSharp can
+   write/admit never over-rejects on read (no read-after-write parity gap). The earlier proposal of **32**
+   was **wrong**: 32 < 64 write cap ⇒ a DeltaSharp-written depth-33–64 array/map schema would be rejected on
+   read, and 32 is *below* the ~64 array/map levels `SchemaJson` admits so it would be the first-firing gate
+   for array/map chains (not a never-firing backstop). Setting it to 64 makes it a true backstop that fires
+   only on schemas already at/over the write/log caps. Mechanism unchanged: fail closed typed
+   `UnsupportedFeature` checked at `DecodeNode`/`ValidateShape` entry before any allocation/descent — never a
+   `StackOverflowException`.
 4. **585b `fieldPath` chain — RESOLVED (spec, §2.5): `element`/`key`/`value` tokens joined by `.`**, struct
    children excluded (they carry their own `StructField` `typeChanges`), oldest-first — per Delta PROTOCOL.md
    "Type Change Metadata". Implementation deferred to 585b (post-#546).
