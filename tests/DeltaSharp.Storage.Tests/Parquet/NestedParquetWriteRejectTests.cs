@@ -453,7 +453,9 @@ public sealed class NestedParquetWriteRejectTests
         // times what the struct lane may.
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
             () => NestedColumnShredder.CheckSlotBound(
-                NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot) + 1L, "a", bytesPerSlot));
+                NestedColumnShredder.MaxLeafSlotsPerRowGroup(
+                    ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes, bytesPerSlot) + 1L,
+                "a", bytesPerSlot, ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
         Assert.Contains("Dremel level slot(s)", error.Message, StringComparison.Ordinal);
@@ -466,9 +468,12 @@ public sealed class NestedParquetWriteRejectTests
     public void SlotBound_AcceptsTheBoundExactly(int bytesPerSlot) =>
         // Non-vacuity: the ceiling is inclusive, so a leaf sitting exactly on it is legal.
         Assert.Equal(
-            NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot),
+            NestedColumnShredder.MaxLeafSlotsPerRowGroup(
+                ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes, bytesPerSlot),
             NestedColumnShredder.CheckSlotBound(
-                NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot), "a", bytesPerSlot));
+                NestedColumnShredder.MaxLeafSlotsPerRowGroup(
+                    ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes, bytesPerSlot),
+                "a", bytesPerSlot, ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes));
 
     [Fact]
     public void SlotBound_IsTheSameByteFootprintForEveryLane() =>
@@ -478,7 +483,34 @@ public sealed class NestedParquetWriteRejectTests
             new[] { 4, 8, 16 },
             bytesPerSlot => Assert.Equal(
                 ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes,
-                (long)NestedColumnShredder.MaxLeafSlotsPerRowGroup(bytesPerSlot) * bytesPerSlot));
+                (long)NestedColumnShredder.MaxLeafSlotsPerRowGroup(
+                    ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes, bytesPerSlot) * bytesPerSlot));
+
+    [Theory]
+    [InlineData(4)]
+    [InlineData(8)]
+    [InlineData(16)]
+    public void SlotBound_TracksTheInstanceBudget_NotTheDefaultConst(int bytesPerSlot)
+    {
+        // #845 item 4: the backstop is derived from the caller's INSTANCE budget (threaded from
+        // ParquetFileWriter.NestedLevelBufferBudgetBytes), not the DefaultNestedLevelBufferBudgetBytes const,
+        // so the "backstop >= plan ceiling" relation holds for ANY override — including one that RAISES the
+        // budget above the default. A backstop pinned to the const would be LOWER than a raised-budget plan
+        // ceiling and reject a validly-planned row group. Doubling the budget must double the ceiling.
+        long doubled = ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes * 2;
+        Assert.Equal(
+            2L * NestedColumnShredder.MaxLeafSlotsPerRowGroup(
+                ParquetFileWriter.DefaultNestedLevelBufferBudgetBytes, bytesPerSlot),
+            NestedColumnShredder.MaxLeafSlotsPerRowGroup(doubled, bytesPerSlot));
+
+        // And a leaf sitting exactly on the raised ceiling is accepted (the plan ceiling for the raised budget
+        // never exceeds the backstop for the same budget).
+        Assert.Equal(
+            NestedColumnShredder.MaxLeafSlotsPerRowGroup(doubled, bytesPerSlot),
+            NestedColumnShredder.CheckSlotBound(
+                NestedColumnShredder.MaxLeafSlotsPerRowGroup(doubled, bytesPerSlot),
+                "a", bytesPerSlot, doubled));
+    }
 
     private static void AssertRejected(Action act, string expectedFragment)
     {

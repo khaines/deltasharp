@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using DeltaSharp.Engine.Columnar;
@@ -104,16 +105,25 @@ public sealed class NestedParquetRowGroupPlanningTests
     [InlineData("map")]
     public async Task AWideColumn_SplitsIntoMoreRowGroups_RatherThanFailingClosed(string shape)
     {
-        // The budget admits 8 array slots (8 bytes/slot: definition + repetition) or 4 map slots
-        // (16 bytes/slot: key/value definition + key/value repetition). Each row carries 4 elements/entries,
-        // so a row group holds 2 array rows or 1 map row — the file must simply grow more row groups.
+        // The folded per-slot cost (level streams + leaf value width, #845 item 2) drives the split: a row
+        // group holds floor(maxSlots / fanOut) rows, so the value-heavier MAP lane (a 32-byte string key on top
+        // of four level ints ⇒ 52 bytes/slot) splits into MORE, smaller row groups than the ARRAY lane
+        // (12 bytes/slot) at the same budget. Deriving the expectation from the PRODUCTION per-slot cost keeps
+        // this cell honest across a cost change while still asserting the END-TO-END split really happens.
         const int rows = 6;
-        (StructType schema, ColumnBatch batch, int expectedGroups) = shape == "array"
-            ? (ArraySchema, WideArrayBatch(rows, fanOut: 4), 3)
-            : (MapSchema, WideMapBatch(rows, fanOut: 4), 6);
+        const int fanOut = 4;
+        const long budget = 256;
+        (StructType schema, ColumnBatch batch) = shape == "array"
+            ? (ArraySchema, WideArrayBatch(rows, fanOut))
+            : (MapSchema, WideMapBatch(rows, fanOut));
+
+        int perSlot = NestedColumnShredder.LevelBufferBytesPerSlot(schema[0].DataType);
+        long maxSlots = Math.Max(budget / perSlot, 1);
+        int rowsPerGroup = Math.Max((int)(maxSlots / fanOut), 1);
+        int expectedGroups = (rows + rowsPerGroup - 1) / rowsPerGroup;
 
         using var output = new MemoryStream();
-        await new BudgetedParquetFileWriter(64)
+        await new BudgetedParquetFileWriter(budget)
             .WriteAsync(output, schema, new[] { batch }, CancellationToken.None);
 
         output.Position = 0;
@@ -121,6 +131,7 @@ public sealed class NestedParquetRowGroupPlanningTests
             await global::Parquet.ParquetReader.CreateAsync(output, null, true, CancellationToken.None))
         {
             Assert.Equal(expectedGroups, reader.RowGroupCount);
+            Assert.True(expectedGroups > 1, "the budget must split this column for the cell to be non-vacuous");
         }
 
         // Non-vacuity: the same data at the DEFAULT budget is one row group, so the split is the budget's
@@ -177,7 +188,112 @@ public sealed class NestedParquetRowGroupPlanningTests
     }
 
     [Fact]
-    public async Task EveryNestedColumn_IsBudgetBounded_EvenAfterAnEarlierOneHasPlannedDownToOneRow()
+    public async Task AValueHeavyArrayColumn_SplitsTighterThanAFixedWidthOne_UnderTheFoldedBudget()
+    {
+        // #845 item 2: folding the leaf value width into the per-slot cost makes ONE budget govern the whole
+        // per-column transient. A wide array<string> stages a 32-byte value proxy per element on top of the two
+        // level ints, so it costs far more per slot than array<int> — and at the SAME budget/fanOut/rows the
+        // writer answers by emitting MORE, smaller row groups for the value-heavy column. That boundary shift is
+        // exactly the tightening the fold buys; this cell pins it end to end and binds it to the production cost.
+        const int rows = 8;
+        const int fanOut = 4;
+        const long budget = 256;
+
+        StructType stringSchema = DataTypes.CreateStructType(new[]
+        {
+            new StructField("a", DataTypes.CreateArrayType(DataTypes.StringType), nullable: true),
+        });
+
+        // The value fold is real: array<string> costs strictly more per slot than array<int>.
+        Assert.True(
+            NestedColumnShredder.LevelBufferBytesPerSlot(stringSchema[0].DataType)
+                > NestedColumnShredder.LevelBufferBytesPerSlot(ArraySchema[0].DataType),
+            "the folded per-slot cost must charge the string leaf's value width");
+
+        ColumnBatch stringBatch = WideStringArrayBatch(stringSchema, rows, fanOut);
+        ColumnBatch intBatch = WideArrayBatch(rows, fanOut);
+
+        int stringGroups = await CountRowGroupsAsync(budget, stringSchema, stringBatch);
+        int intGroups = await CountRowGroupsAsync(budget, ArraySchema, intBatch);
+
+        Assert.True(
+            stringGroups > intGroups,
+            $"array<string> ({stringGroups} row groups) must split tighter than array<int> ({intGroups}) at "
+            + $"the same budget once the value width is folded in");
+
+        // And the value-heavy column still round-trips every element across the tighter split.
+        byte[] bytes;
+        using (var output = new MemoryStream())
+        {
+            await new BudgetedParquetFileWriter(budget)
+                .WriteAsync(output, stringSchema, new[] { stringBatch }, CancellationToken.None);
+            bytes = output.ToArray();
+        }
+
+        int observed = 0;
+        await foreach (ColumnBatch group in ReadAsync(bytes, stringSchema))
+        {
+            var list = (ListColumnVector)group.Column(0);
+            for (int i = 0; i < list.Length; i++)
+            {
+                ColumnVector row = list.ElementsAt(i);
+                Assert.Equal(fanOut, row.Length);
+                for (int e = 0; e < fanOut; e++)
+                {
+                    Assert.Equal(
+                        $"s{observed + i}_{e}",
+                        Encoding.UTF8.GetString(row.GetBytes(e)));
+                }
+            }
+
+            observed += list.Length;
+        }
+
+        Assert.Equal(rows, observed);
+    }
+
+    private static async Task<int> CountRowGroupsAsync(long budget, StructType schema, ColumnBatch batch)
+    {
+        // DeltaSharp's reader yields one ColumnBatch per row group, so the yielded count is the emitted
+        // row-group count — the boundary the fold moves.
+        byte[] bytes;
+        using (var output = new MemoryStream())
+        {
+            await new BudgetedParquetFileWriter(budget)
+                .WriteAsync(output, schema, new[] { batch }, CancellationToken.None);
+            bytes = output.ToArray();
+        }
+
+        int groups = 0;
+        await foreach (ColumnBatch _ in ReadAsync(bytes, schema))
+        {
+            groups++;
+        }
+
+        return groups;
+    }
+
+    private static ColumnBatch WideStringArrayBatch(StructType schema, int rows, int fanOut)
+    {
+        var type = (ArrayType)schema[0].DataType;
+        MutableColumnVector elements = ColumnVectors.Create(DataTypes.StringType, rows * fanOut);
+        var offsets = new int[rows + 1];
+        for (int r = 0; r < rows; r++)
+        {
+            offsets[r] = r * fanOut;
+            for (int e = 0; e < fanOut; e++)
+            {
+                elements.AppendBytes(Encoding.UTF8.GetBytes($"s{r}_{e}"));
+            }
+        }
+
+        offsets[rows] = rows * fanOut;
+        var vector = new ListColumnVector(type, elements, offsets, new bool[rows]);
+        return new ManagedColumnBatch(schema, new ColumnVector[] { vector }, rows);
+    }
+
+    [Fact]
+    public async Task EveryNestedColumn_IsBudgetBounded()
     {
         // Q2: the planner must probe EVERY nested column. A narrow column that plans down to a single row must
         // not short-circuit the probe of a later, far wider one — an unprobed column skips both its budget
@@ -195,12 +311,13 @@ public sealed class NestedParquetRowGroupPlanningTests
         ColumnVector wide = WideArrayBatch(rows, fanOut: 64).Column(0);
         var batch = new ManagedColumnBatch(schema, new[] { (ColumnVector)narrow, wide }, rows);
 
-        // 64 bytes admits ONE map row (16 bytes/slot x 4 entries), so the map drives the plan to a single row
-        // first. The array's 64 elements/row cost 512 bytes even at one row, so it must still be seen — and at
-        // one row it is unsplittable, which is the only genuine reject.
+        // 256 bytes admits ONE map row (52 bytes/slot x 4 entries = 208 <= 256; 2 rows = 416 > 256), so the map
+        // drives the plan to a single row first. The array's 64 elements/row cost 768 bytes (12 bytes/slot x 64)
+        // even at one row, so it must still be seen — and at one row it is unsplittable, which is the only
+        // genuine reject.
         using var output = new MemoryStream();
         DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
-            () => new BudgetedParquetFileWriter(64)
+            () => new BudgetedParquetFileWriter(256)
                 .WriteAsync(output, schema, new[] { batch }, CancellationToken.None));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
@@ -237,16 +354,25 @@ public sealed class NestedParquetRowGroupPlanningTests
     }
 
     [Fact]
-    public void PlanRowCount_ChargesAMapFourLevelStreamsAndAnArrayTwo()
+    public void PlanRowCount_ChargesLevelStreamsPlusLeafValueWidthPerSlot()
     {
-        // The byte cost is the number of int level streams the lane rents CONCURRENTLY. Getting this wrong is
-        // how a "resource" bound silently becomes a semantic one. These returns are bound to the rents the
-        // lanes ACTUALLY issue by the source invariant in
-        // DeltaSharp.Core.Tests.WriteDoor.NestedShredderGuardWiringTests, so this cell is not self-referential.
-        Assert.Equal(4 * sizeof(int), NestedColumnShredder.LevelBufferBytesPerSlot(MapSchema[0].DataType));
-        Assert.Equal(2 * sizeof(int), NestedColumnShredder.LevelBufferBytesPerSlot(ArraySchema[0].DataType));
+        // The per-slot cost is the number of int level streams the lane rents CONCURRENTLY (bound to the rents
+        // the lanes ACTUALLY issue by the source invariant in
+        // DeltaSharp.Core.Tests.WriteDoor.NestedShredderGuardWiringTests, so the level portion is not
+        // self-referential) PLUS the physical width of the leaf value(s) each slot stages (#845 item 2). Getting
+        // the level portion wrong silently turns a "resource" bound into a semantic one; OMITTING the value
+        // portion lets array<string>/array<decimal> rent ~2-3x the named budget, which the fold closes so ONE
+        // budget governs the whole per-column transient. The string leaf's 32-byte per-slot proxy is
+        // NestedColumnShredder.VariableLeafValueBytesPerSlot (a 16-byte ReadOnlyMemory descriptor + a 16-byte
+        // payload estimate).
         Assert.Equal(
-            sizeof(int),
+            (4 * sizeof(int)) + 32 + sizeof(int),   // key/value def+rep + string key (32) + int value (4)
+            NestedColumnShredder.LevelBufferBytesPerSlot(MapSchema[0].DataType));
+        Assert.Equal(
+            (2 * sizeof(int)) + sizeof(int),        // element def+rep + int element (4)
+            NestedColumnShredder.LevelBufferBytesPerSlot(ArraySchema[0].DataType));
+        Assert.Equal(
+            sizeof(int) + sizeof(int),              // one def stream (reused across children) + int child (4)
             NestedColumnShredder.LevelBufferBytesPerSlot(
                 DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.IntegerType, nullable: true) })));
         Assert.Equal(0, NestedColumnShredder.LevelBufferBytesPerSlot(DataTypes.IntegerType));
