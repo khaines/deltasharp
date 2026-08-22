@@ -491,16 +491,12 @@ public sealed class NestedColumnMappingTamperFuzzTests
     }
 
     // =========================================================================================
-    // §3.32 · Metadata-only nested rename/drop is DEFERRED to #840 (honor the deferral)
+    // §3.32 · Metadata-only nested rename/drop — IMPLEMENTED by #840
     // =========================================================================================
-
-    [Fact(Skip = "AC-rename/drop for nested struct children is deferred to #840 (design §3.32/§9); "
-        + "this PR intentionally does not implement a passing nested rename/drop.")]
-    public void NestedChildRenameOrDrop_MetadataOnly_NoRewrite_DeferredTo840()
-    {
-        // Placeholder: the eventual §3.32 conjunctive assertion (exactly one metaData action + zero add/remove
-        // ∧ per-file byte-identity ∧ maxColumnId unchanged ∧ post-read under new name) belongs to #840.
-    }
+    // The §3.32 conjunctive no-rewrite assertion (exactly one metaData action + zero add/remove ∧ per-file
+    // byte-identity ∧ maxColumnId unchanged ∧ post-read under the new name) is reproduced verbatim as §3.1 in
+    // NestedRenameDropTests (#840) — the segment-array rename/drop door. The deferral placeholder that stood
+    // here has been discharged.
 
     // =========================================================================================
     // §3.33 · Seeded property harness (house convention — fixed 200 iterations, TestSeed, repro line)
