@@ -423,14 +423,14 @@ internal static class ParquetTypeMapping
     /// Validates that a requested read column is a shape the <see cref="ParquetFileReader"/> can decode,
     /// throwing <see cref="StorageErrorKind.UnsupportedFeature"/> otherwise — BEFORE any row group is
     /// decoded, so an unsupported projection fails deterministically without materializing a partial batch.
-    /// Beyond the scalar mappings <see cref="CreateScalarField"/> accepts, the reader also decodes the three
-    /// single-level nested shapes (#571): a <b>struct of scalars</b>, an <b>array of a scalar</b>, and a
-    /// <b>map of scalar→scalar</b>. Any nested type nested WITHIN one of those (array-of-struct, struct-of-
-    /// list, map-of-map, …) is deliberately <b>not</b> in this increment and fails closed here rather than
-    /// producing a partial/wrong read — Spark-parity fail-closed behavior. This does not widen the
-    /// <b>writer</b>'s scope: the write door (<see cref="CreateField"/>) accepts exactly these three shapes
-    /// (design §2.9), and <see cref="CreateScalarField"/> — the entry point used here — still rejects every
-    /// nested type.
+    /// Beyond the scalar mappings <see cref="CreateScalarField"/> accepts, the reader decodes arbitrary-depth
+    /// nested shapes (585a): <b>struct</b>/<b>array</b>/<b>map</b> trees of the supported scalars, nested to
+    /// any finite depth up to <see cref="NestedParquetColumnReader.MaxNestedReadDepth"/>. What STILL fails
+    /// closed here (fail-closed parity, design §2.6): an unsupported scalar leaf at any depth (<c>void</c>,
+    /// <c>decimal</c> precision &gt; 28, or an unmapped physical type), a zero-field struct at any depth, and
+    /// a schema nesting deeper than the recursion-depth bound. This does not widen the <b>writer</b>'s scope:
+    /// the write door (<see cref="CreateField"/>) still rejects nested-within-nested (585a is a READ-side
+    /// increment).
     /// </summary>
     /// <exception cref="DeltaStorageException">The requested column's type (or a nested leaf type) has no
     /// supported Parquet read mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
@@ -439,29 +439,11 @@ internal static class ParquetTypeMapping
         ArgumentNullException.ThrowIfNull(field);
         switch (field.DataType)
         {
-            case ArrayType array:
-                EnsureScalarReadable(array.ElementType, $"array column '{DiagnosticText.Sanitize(field.Name)}' element");
-                break;
-            case MapType map:
-                EnsureScalarReadable(map.KeyType, $"map column '{DiagnosticText.Sanitize(field.Name)}' key");
-                EnsureScalarReadable(map.ValueType, $"map column '{DiagnosticText.Sanitize(field.Name)}' value");
-                break;
-            case StructType structType:
-                if (structType.Count == 0)
-                {
-                    // A zero-field struct has no leaf to drive the row count, so it would reconstruct a
-                    // length-0 vector for a non-empty row group and trip a raw ArgumentException in the batch
-                    // ctor — fail closed on the DeltaStorageException contract instead (parity with the prior
-                    // CreateField reject of all nested types).
-                    throw DeltaStorageException.UnsupportedFeature(
-                        $"Parquet read for struct column '{DiagnosticText.Sanitize(field.Name)}': a zero-field struct is not supported.");
-                }
-
-                foreach (StructField nested in structType)
-                {
-                    EnsureScalarReadable(nested.DataType, $"struct column '{DiagnosticText.Sanitize(field.Name)}' field '{DiagnosticText.Sanitize(nested.Name)}'");
-                }
-
+            case ArrayType or MapType or StructType:
+                // 585a: recurse the requested container's element/key/value/field validation to arbitrary
+                // depth, guarded by the recursion-depth bound (checked BEFORE any descent — a maliciously deep
+                // schema is rejected at shape resolution, before a single data page is read).
+                EnsureNestedReadable(field.DataType, $"read column '{DiagnosticText.Sanitize(field.Name)}'", depth: 0);
                 break;
             default:
                 // Scalar (or unsupported scalar/void/decimal>28): the exact same validation the write path
@@ -475,25 +457,75 @@ internal static class ParquetTypeMapping
         }
     }
 
-    // A requested nested LEAF type (array element, map key/value, or struct field) must itself be a supported
-    // SCALAR — a nested-within-nested leaf fails closed (#571 scopes only single-level nesting). Reuses
-    // CreateScalarField's scalar validation (rejecting void and decimal precision > 28) so the read path accepts
-    // exactly the scalars the write path can round-trip.
-    private static void EnsureScalarReadable(DataType type, string context)
+    // 585a — recursively validates that a requested nested type (and every descendant leaf) is a shape the
+    // reader can decode, echoing the sanitized nested PATH (`context`) that identifies the offending level.
+    // Every scalar LEAF (at any depth) still goes through CreateScalarField's unchanged allowlist (void /
+    // decimal>28 / unmapped fail closed); a zero-field struct at any depth still fails closed; and a schema
+    // deeper than MaxNestedReadDepth fails closed BEFORE descent (DoS bound, design §2.6). Nested-leaf
+    // WIDENING stays out of scope (585b): this is a shape/mappability probe only.
+    private static void EnsureNestedReadable(DataType type, string context, int depth)
     {
-        if (type is ArrayType or MapType or StructType)
+        if (depth > NestedParquetColumnReader.MaxNestedReadDepth)
         {
-            // #683/#686: inside this guard `type` is Array/Map/Struct, so `SimpleString` would recursively
-            // embed every nested field NAME verbatim and unbounded. Echo the bounded KIND instead; `context`
-            // already carries the (sanitized) column label that identifies WHICH column is at fault.
+            // Checked BEFORE any recursion so an over-deep requested schema is rejected deterministically at
+            // shape resolution, never a StackOverflowException. `context` is already sanitized.
             throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet read for {context}: a nested type within a nested type ('{type.TypeName}') is "
-                + "not supported.");
+                $"Parquet read for {context}: the requested type nests deeper than the supported limit of "
+                + $"{NestedParquetColumnReader.MaxNestedReadDepth} levels.");
         }
 
-        // honorReferenceNullability: false — a discarded probe of the LEAF type's mappability; the
-        // returned field's repetition is never observed.
-        _ = CreateScalarField(new StructField("_leaf", type, nullable: true), honorReferenceNullability: false);
+        switch (type)
+        {
+            case ArrayType array:
+                EnsureNestedReadable(array.ElementType, $"array column '{context}' element", depth + 1);
+                break;
+            case MapType map:
+                EnsureNestedReadable(map.KeyType, $"map column '{context}' key", depth + 1);
+                EnsureNestedReadable(map.ValueType, $"map column '{context}' value", depth + 1);
+                break;
+            case StructType structType:
+                if (structType.Count == 0)
+                {
+                    // A zero-field struct has no leaf to drive the row count, so it would reconstruct a
+                    // length-0 vector for a non-empty row group — fail closed on the DeltaStorageException
+                    // contract (applied recursively at every depth).
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet read for struct column '{context}': a zero-field struct is not supported.");
+                }
+
+                foreach (StructField nested in structType)
+                {
+                    EnsureNestedReadable(
+                        nested.DataType, $"struct column '{context}' field '{DiagnosticText.Sanitize(nested.Name)}'", depth + 1);
+                }
+
+                break;
+            default:
+                EnsureScalarLeafReadable(type, context);
+                break;
+        }
+    }
+
+    // A nested LEAF type (array element, map key/value, or struct field, at any depth) must be a supported
+    // SCALAR. Reuses CreateScalarField's scalar validation (rejecting void and decimal precision > 28) so the
+    // read path accepts exactly the scalars the write path can round-trip. On rejection the message echoes the
+    // sanitized nested `context` (never the leaf's raw foreign type via SimpleString) — bounded, #683/#686.
+    private static void EnsureScalarLeafReadable(DataType type, string context)
+    {
+        try
+        {
+            // honorReferenceNullability: false — a discarded probe of the LEAF type's mappability; the
+            // returned field's repetition is never observed.
+            _ = CreateScalarField(new StructField("_leaf", type, nullable: true), honorReferenceNullability: false);
+        }
+        catch (DeltaStorageException)
+        {
+            // Re-raise with the nested PATH context (CreateScalarField's own message names only the throwaway
+            // "_leaf" probe). DescribeType renders the bounded atomic kind, never a recursive SimpleString.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet read for {context}: the leaf type '{DiagnosticText.DescribeType(type)}' has no supported "
+                + "scalar Parquet read mapping.");
+        }
     }
 
     /// <summary>

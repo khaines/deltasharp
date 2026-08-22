@@ -293,20 +293,23 @@ public sealed class ParquetMessageHygieneTests
     // ---- #686 item 2: DataType.SimpleString is NOT a bounded type name ----
 
     [Fact]
-    public void EnsureScalarReadable_NestedWithinNested_EchoesBoundedKindNotRecursiveSimpleString()
+    public void EnsureReadSupported_NestedWithinNestedUnsupportedLeaf_EchoesBoundedKindNotRecursiveSimpleString()
     {
-        // StructType.SimpleString appends each field's Name VERBATIM and recurses, so echoing it is
-        // simultaneously a raw-name echo AND an unbounded aggregate. A 5,000-field struct previously rendered
-        // a ~124,000-char message carrying every field name raw. The message must instead carry the bounded
-        // KIND ("struct") — the sanitized column label already identifies WHICH column is at fault.
+        // 585a lifts the nested-within-nested READ reject for DECODABLE shapes, so the SimpleString hazard is
+        // no longer reached by rendering the whole struct — the validator DESCENDS field-by-field and can only
+        // ever render ONE offending leaf's bounded kind + its sanitized path. To keep the hazard live, the
+        // element struct carries an UNSUPPORTED void leaf as its LAST field (still fails closed): a recursive
+        // SimpleString render would embed all 5,000 poisoned SIBLING names, so its absence is the assertion.
         var fields = new StructField[5_000];
-        for (int i = 0; i < fields.Length; i++)
+        for (int i = 0; i < fields.Length - 1; i++)
         {
             fields[i] = new StructField(
                 string.Create(CultureInfo.InvariantCulture, $"f{i}{FullInjectionCorpus}"),
                 DataTypes.IntegerType,
                 nullable: true);
         }
+
+        fields[^1] = new StructField("leaf", DataTypes.NullType, nullable: true);
 
         ArrayType nestedWithinNested = DataTypes.CreateArrayType(new StructType(fields), containsNull: true);
 
@@ -315,7 +318,8 @@ public sealed class ParquetMessageHygieneTests
                 new StructField("c", nestedWithinNested, nullable: true)));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
-        Assert.Contains("'struct'", error.Message, StringComparison.Ordinal);
+        Assert.Contains("no supported scalar Parquet read mapping", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(FullInjectionCorpus, error.Message, StringComparison.Ordinal);
         Assert.True(
             error.Message.Length < 400,
             string.Create(CultureInfo.InvariantCulture, $"message was {error.Message.Length} chars: unbounded"));

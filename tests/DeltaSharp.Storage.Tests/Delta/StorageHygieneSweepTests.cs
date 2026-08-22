@@ -467,10 +467,11 @@ public sealed class StorageHygieneSweepTests
     public void Door_ParquetTypeMapping_UnsupportedNestedRead(string poison)
     {
         string p = Payload(poison);
-        // A nested type whose SimpleString would recursively embed every field name verbatim: the guard must
-        // echo the bounded KIND plus the sanitized column label, never SimpleString.
+        // 585a lifts the wholesale nested-within-nested READ reject; a nested type whose SimpleString would
+        // recursively embed every field name verbatim is still rejected when a LEAF is unsupported (void). The
+        // guard must echo the bounded KIND plus the sanitized column label, never SimpleString.
         var nested = new MapType(DataTypes.StringType, new StructType(
-            [new StructField(p, DataTypes.LongType, nullable: true)]), valueContainsNull: true);
+            [new StructField(p, DataTypes.NullType, nullable: true)]), valueContainsNull: true);
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
             () => ParquetTypeMapping.EnsureReadSupported(new StructField(p, nested, nullable: true)));
@@ -575,8 +576,10 @@ public sealed class StorageHygieneSweepTests
     public void Door_ParquetTypeMapping_ArrayElementUnsupported(string poison)
     {
         string p = Payload(poison);
+        // 585a: nested element is decodable, so an UNSUPPORTED leaf (void) at depth drives the reject; the
+        // echoed path still names the offending "array column" level.
         var arrayOfNested = new ArrayType(
-            new MapType(DataTypes.StringType, DataTypes.StringType, valueContainsNull: true), containsNull: true);
+            new MapType(DataTypes.StringType, DataTypes.NullType, valueContainsNull: true), containsNull: true);
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
             () => ParquetTypeMapping.EnsureReadSupported(new StructField(p, arrayOfNested, nullable: true)));
@@ -590,8 +593,10 @@ public sealed class StorageHygieneSweepTests
     public void Door_ParquetTypeMapping_MapKeyUnsupported(string poison)
     {
         string p = Payload(poison);
+        // 585a: nested key is decodable, so an UNSUPPORTED leaf (void) inside the key subtree drives the
+        // reject; the echoed path still names the offending "map column" level.
         var mapWithNestedKey = new MapType(
-            new ArrayType(DataTypes.StringType, containsNull: true), DataTypes.StringType, valueContainsNull: true);
+            new ArrayType(DataTypes.NullType, containsNull: true), DataTypes.StringType, valueContainsNull: true);
 
         DeltaStorageException ex = Assert.ThrowsAny<DeltaStorageException>(
             () => ParquetTypeMapping.EnsureReadSupported(new StructField(p, mapWithNestedKey, nullable: true)));
@@ -618,13 +623,14 @@ public sealed class StorageHygieneSweepTests
     public void Door_ParquetTypeMapping_StructFieldUnsupported(string poison)
     {
         // BOTH echoed tokens carry the payload — the column name and the nested FIELD name — so a revert of
-        // either sanitizer on that line reddens this door.
+        // either sanitizer on that line reddens this door. 585a: the nested struct field is decodable, so an
+        // UNSUPPORTED leaf (void) at depth drives the reject; the echoed path still names "struct column".
         string p = Payload(poison);
         var structOfNested = new StructType(
         [
             new StructField(
                 p + "-field",
-                new MapType(DataTypes.StringType, DataTypes.StringType, valueContainsNull: true),
+                new MapType(DataTypes.StringType, DataTypes.NullType, valueContainsNull: true),
                 nullable: true),
         ]);
 
@@ -1598,15 +1604,17 @@ public sealed class StorageHygieneSweepTests
         Assert.DoesNotContain("is not supported", shape.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(shape.Message, p);
 
-        // …and a nested leaf inside a nested request is rejected by the nested-within-nested arm (pinned by
-        // Door_NestedRead_NestedWithinNested) rather than by the physical-type comparison, which is why the
-        // latter's requested-type render can only ever see a scalar.
+        // …and a nested leaf inside a nested request now DESCENDS (585a lifts the nested-within-nested read
+        // reject): the physical-type comparison still never sees a nested requested type because the descent's
+        // container-kind guard intercepts first — here the requested struct field 'f' is matched against a
+        // scalar file leaf, yielding a bounded "not a struct" schema-mismatch (the poison sits on the
+        // never-reached grandchildren, so it is not echoed).
         DeltaStorageException leaf = Assert.ThrowsAny<DeltaStorageException>(
             () => NestedParquetColumnReader.ValidateShape(
                 new global::Parquet.Schema.StructField("c", new global::Parquet.Schema.DataField<int?>("f")),
                 new StructType([new StructField("f", nested, nullable: true)]),
                 "c"));
-        Assert.Contains("a nested type within a nested type", leaf.Message, StringComparison.Ordinal);
+        Assert.Contains("the file column is not a struct", leaf.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("does not match the requested", leaf.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(leaf.Message, p);
 
@@ -1744,23 +1752,25 @@ public sealed class StorageHygieneSweepTests
         AssertNeutralizedAndBounded(mismatch.Message, p);
     }
 
-    // The nested-within-nested arm, which its own production comment calls defense-in-depth "unreachable from
-    // the read path today". It is NOT unreachable at the method boundary — ValidateShape is the reader's
-    // public shape entry point and hands the requested element type straight to it — so it is pinned here
-    // rather than declared dead; the upstream guard that makes it unreachable END TO END is itself pinned by
-    // Door_ParquetTypeMapping_ArrayElementUnsupported.
+    // 585a: nested-within-nested READ is now decodable, so ValidateShape DESCENDS into the element subtree
+    // rather than rejecting it wholesale. This door now pins that the descent's per-node schema/shape guards
+    // still neutralize a FILE-derived/requested poison at depth: a nested list element whose requested struct
+    // field is absent from the (matching-shape) file struct yields a bounded, neutralized schema-mismatch that
+    // echoes the requested field name — the same message-hygiene contract, now enforced one level deeper.
     [Theory]
     [MemberData(nameof(Poisons))]
     public void Door_NestedRead_NestedWithinNested(string poison)
     {
         string p = Payload(poison);
-        var fileList = new global::Parquet.Schema.ListField("col", new global::Parquet.Schema.DataField<int?>("element"));
+        var fileList = new global::Parquet.Schema.ListField(
+            "col",
+            new global::Parquet.Schema.StructField("element", new global::Parquet.Schema.DataField<int?>("x")));
 
         DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
             () => NestedParquetColumnReader.ValidateShape(
                 fileList, new ArrayType(PoisonedStructOf(p), containsNull: true), "col"));
 
-        Assert.Contains("a nested type within a nested type", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("is missing requested field", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
     }
 
