@@ -554,7 +554,7 @@ public sealed class DeltaWriteTarget : IDisposable
         RejectUnenforceableCreate(logicalSchema, batches);
 
         (StructType mappedSchema, long maxColumnId) =
-            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource);
+            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource, ColumnMappingMode.Id);
 
         // Route the staging into PHYSICAL name space (as name mode) but PRESERVE the per-field id metadata on
         // the physical schema — ToPhysicalSchema(mappedSchema, Id) keeps delta.columnMapping.id so the Parquet
@@ -679,7 +679,7 @@ public sealed class DeltaWriteTarget : IDisposable
         RejectUnenforceableCreate(logicalSchema, batches);
 
         (StructType mappedSchema, long maxColumnId) =
-            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource);
+            ColumnMapping.AssignFreshMapping(logicalSchema, physicalNameSource, ColumnMappingMode.Id);
 
         StructType physicalSchema = ColumnMapping.ToPhysicalSchema(mappedSchema, ColumnMappingMode.Id);
         IReadOnlyList<string> physicalPartitions =

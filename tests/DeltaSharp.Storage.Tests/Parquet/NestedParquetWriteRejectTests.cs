@@ -99,13 +99,13 @@ public sealed class NestedParquetWriteRejectTests
     }
 
     [Fact]
-    public void CreateField_RejectsNestedArrayColumnCarryingAColumnMappingId_DeferredTo839()
+    public void CreateField_RejectsIdModeArrayColumnWithoutNestedIds_UnstampedInteriorUnreadable()
     {
-        // §2.5/#839: an ARRAY (or map) column carrying delta.columnMapping.id under id mode is rejected at the
-        // write door — its interior (element/key/value) is not a StructField and carries no representable
-        // field_id, so id-mode nested array/map column mapping is deferred to #839. (A struct<scalar> container
-        // carrying ids DOES write — its scalar children stamp their own field_id; see the sibling positive
-        // test below.)
+        // #839: an ARRAY (or map) column carrying delta.columnMapping.id under id mode is now SUPPORTED — but
+        // ONLY when it also carries a delta.columnMapping.nested.ids assigning the interior element/key/value
+        // field_id. Without a nested.ids there is no representable interior field_id to stamp, so the write door
+        // fails closed rather than emit an unstamped, unreadable interior leaf. (The positive path — id +
+        // nested.ids present — is pinned by ArrayMapIdModeNestedIdsWriteDoorTests.)
         var metadata = FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
         {
             ["delta.columnMapping.id"] = MetadataValue.Long(7),
@@ -116,7 +116,7 @@ public sealed class NestedParquetWriteRejectTests
             () => ParquetTypeMapping.CreateField(field, honorReferenceNullability: true));
 
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
-        Assert.Contains("#839", error.Message, StringComparison.Ordinal);
+        Assert.Contains("unstamped interior leaf would be unreadable", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]

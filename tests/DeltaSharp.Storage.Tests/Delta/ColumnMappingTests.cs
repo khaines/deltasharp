@@ -1245,12 +1245,12 @@ public sealed class ColumnMappingTests : IDisposable
         Assert.DoesNotContain(3, ids.Values);
     }
 
-    // #676/#839: a single-level struct<scalars> top-level column now COMMITS + reads under id mode
-    // (containment-scoped). An ARRAY/MAP top-level column under id mode remains out of scope: AssignFreshMapping
-    // mints the mapping (it is mode-independent), but the commit's ValidateColumnMappingSchema gate fails closed
-    // naming #839 — so the id-mode CREATE fails at commit rather than bricking as a permanently-unreadable table.
+    // #676/#839: a single-level struct<scalars> top-level column commits + reads under id mode
+    // (containment-scoped). Since #839 an ARRAY/MAP top-level column under id mode is ALSO in scope:
+    // CreateIdMappedTableAsync mints the container + interior nested.ids and the commit's
+    // ValidateColumnMappingSchema gate now ACCEPTS it — the id-mode CREATE succeeds.
     [Fact]
-    public async Task IdMode_Create_NestedArrayColumn_FailsClosed_839()
+    public async Task IdMode_Create_NestedArrayColumn_Succeeds_839()
     {
         var nested = new StructType(new[]
         {
@@ -1260,14 +1260,12 @@ public sealed class ColumnMappingTests : IDisposable
 
         using DeltaWriteTarget target = DeltaWriteTarget.ForLocalPath(
             _root, new FixedTimeProvider(DateTimeOffset.UnixEpoch), FileNames());
-        DeltaProtocolException ex = await Assert.ThrowsAsync<DeltaProtocolException>(() => target.CreateIdMappedTableAsync(
-            nested, Array.Empty<string>(), Array.Empty<ColumnBatch>(), new SeededPhysicalNameSource(Seed)));
-        Assert.Contains("#839", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("id mode", ex.Message, StringComparison.OrdinalIgnoreCase);
+        await target.CreateIdMappedTableAsync(
+            nested, Array.Empty<string>(), Array.Empty<ColumnBatch>(), new SeededPhysicalNameSource(Seed));
 
-        // The table was NOT created (fail-closed leaves no _delta_log).
+        // The table WAS created (the id-mode array/map mapping validated at commit).
         using var backend = new LocalFileSystemBackend(_root);
-        Assert.Null(await new DeltaLog(backend).GetLatestCommitVersionAsync(CancellationToken.None));
+        Assert.Equal(0L, await new DeltaLog(backend).GetLatestCommitVersionAsync(CancellationToken.None));
     }
 
     // RT-9 (council nice-to-have): the fresh-create door is create-ONLY. Enabling id-mode column mapping on an

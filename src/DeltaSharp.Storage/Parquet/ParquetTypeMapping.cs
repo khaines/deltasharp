@@ -100,18 +100,14 @@ internal static class ParquetTypeMapping
     {
         string label = DiagnosticText.Sanitize(field.Name);
 
-        // #676: column-mapping id mode is supported for a STRUCT container (its scalar children each carry a
-        // delta.columnMapping.id that is stamped as the leaf field_id below; the struct GROUP node carries no
-        // field_id — Parquet.Net has no public setter for one, and the container binds by physical name).
-        // array/map under id mode is deferred to #839 and rejected fail-closed here as defense-in-depth
-        // (ValidateColumnMappingSchema is the primary gate, at commit and load).
+        // #676/#839: column-mapping id mode is supported for a STRUCT container (its scalar children each
+        // carry a delta.columnMapping.id stamped as the leaf field_id below) AND — since #839 — for an
+        // array<scalar>/map<scalar,scalar> container whose interior element/key/value field_id comes from the
+        // container field's delta.columnMapping.nested.ids. The container GROUP node still carries no field_id
+        // (Parquet.Net 6.1.0 has no public group-node field_id setter, so the container binds by physical
+        // name); only the interior LEAF field_id is stamped. A nested-within-nested interior is rejected first
+        // (below / CreateNestedLeaf).
         bool idMode = ColumnMapping.TryGetId(field, out _);
-        if (idMode && field.DataType is ArrayType or MapType)
-        {
-            throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet mapping for nested column '{label}': column-mapping id mode for an "
-                + $"{field.DataType.TypeName} column is deferred to #839.");
-        }
 
         // §2.4a — Field.IsNullable has no public setter in Parquet.Net 6.1.0, so a nested container is always
         // OPTIONAL on the wire. Emitting a declared-REQUIRED container as OPTIONAL is exactly the footer↔log
@@ -130,14 +126,22 @@ internal static class ParquetTypeMapping
             switch (field.DataType)
             {
                 case ArrayType array:
-                    return new PqListField(
-                        field.Name,
-                        CreateNestedLeaf(array.ElementType, array.ContainsNull, "element", $"array column '{label}' element", honorReferenceNullability));
+                    {
+                        long? elementId = ResolveArrayElementId(field, idMode, label);
+                        return new PqListField(
+                            field.Name,
+                            CreateNestedLeaf(array.ElementType, array.ContainsNull, "element", $"array column '{label}' element", honorReferenceNullability, elementId));
+                    }
+
                 case MapType map:
-                    return new PqMapField(
-                        field.Name,
-                        CreateNestedLeaf(map.KeyType, nullable: false, "key", $"map column '{label}' key", honorReferenceNullability),
-                        CreateNestedLeaf(map.ValueType, map.ValueContainsNull, "value", $"map column '{label}' value", honorReferenceNullability));
+                    {
+                        (long? keyId, long? valueId) = ResolveMapInteriorIds(field, idMode, label);
+                        return new PqMapField(
+                            field.Name,
+                            CreateNestedLeaf(map.KeyType, nullable: false, "key", $"map column '{label}' key", honorReferenceNullability, keyId),
+                            CreateNestedLeaf(map.ValueType, map.ValueContainsNull, "value", $"map column '{label}' value", honorReferenceNullability, valueId));
+                    }
+
                 case StructType structType:
                     if (structType.Count == 0)
                     {
@@ -220,11 +224,13 @@ internal static class ParquetTypeMapping
     }
 
     // Builds one nested LEAF field (an array element, a map key/value). A nested child that
-    // is itself nested is the #585 boundary and fails closed here — before any bytes. The leaf carries NO
-    // field_id (design §2.5/F9 / C1): array/map interiors are not StructFields, so the synthesized StructField
-    // below has no column-mapping metadata and CreateScalarField's stamp is structurally unreachable for it.
+    // is itself nested is the #585 boundary and fails closed here — before any bytes. In name/none mode the
+    // leaf carries NO field_id (design §2.5/F9 / C1): array/map interiors are not StructFields. In id mode
+    // (#839) the interior <paramref name="fieldId"/> — derived from the container's delta.columnMapping.nested.ids
+    // — is stamped onto the LEAF (range-guarded [1, int.MaxValue]) so an id-mode reader binds the interior by
+    // field_id within the container subtree.
     private static DataField CreateNestedLeaf(
-        DataType type, bool nullable, string name, string context, bool honorReferenceNullability)
+        DataType type, bool nullable, string name, string context, bool honorReferenceNullability, long? fieldId)
     {
         if (type is ArrayType or MapType or StructType)
         {
@@ -236,9 +242,10 @@ internal static class ParquetTypeMapping
                 + "supported (deferred, #585).");
         }
 
+        DataField leaf;
         try
         {
-            return CreateScalarField(new StructField(name, type, nullable), honorReferenceNullability);
+            leaf = CreateScalarField(new StructField(name, type, nullable), honorReferenceNullability);
         }
         catch (DeltaStorageException ex)
         {
@@ -252,6 +259,66 @@ internal static class ParquetTypeMapping
                 + "supported Parquet mapping.",
                 ex);
         }
+
+        if (fieldId is long id)
+        {
+            // Write-door assertion: every id-mode interior leaf MUST be stamped + range-guarded — an unstamped
+            // interior leaf commits a permanently-unreadable file (design §2.4). The synthesized StructField
+            // above carries no id metadata, so CreateScalarField never stamped it; stamp the nested.ids-derived
+            // interior field_id here under the same [1, int.MaxValue] range guard.
+            if (id is <= 0 or > int.MaxValue)
+            {
+                throw DeltaStorageException.UnsupportedFeature(
+                    $"Parquet mapping for {context}: the nested.ids interior field_id ({id}) is outside the Parquet "
+                    + "field_id range [1, int.MaxValue].");
+            }
+
+            leaf.FieldId = (int)id;
+        }
+
+        return leaf;
+    }
+
+    // #839 write door: resolves the array<scalar> interior element field_id from the container field's
+    // delta.columnMapping.nested.ids (keyed by <physicalName>.element). In id mode a missing/malformed interior
+    // id fails closed — an unstamped interior leaf would commit a permanently-unreadable file. Name/none mode
+    // stamps no interior field_id (returns null).
+    private static long? ResolveArrayElementId(StructField field, bool idMode, string label)
+    {
+        if (!idMode)
+        {
+            return null;
+        }
+
+        if (!ColumnMapping.TryGetArrayElementId(field, field.Name, out long elementId))
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for array column '{label}': an id-mode array has no "
+                + "'delta.columnMapping.nested.ids' element id to stamp as its interior Parquet field_id; an "
+                + "unstamped interior leaf would be unreadable.");
+        }
+
+        return elementId;
+    }
+
+    // #839 write door: resolves the map<scalar,scalar> interior key/value field_ids from the container field's
+    // delta.columnMapping.nested.ids (keyed by <physicalName>.key / .value). See ResolveArrayElementId.
+    private static (long? KeyId, long? ValueId) ResolveMapInteriorIds(StructField field, bool idMode, string label)
+    {
+        if (!idMode)
+        {
+            return (null, null);
+        }
+
+        if (!ColumnMapping.TryGetMapKeyValueIds(field, field.Name, out long keyId, out long valueId))
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for map column '{label}': an id-mode map has no "
+                + "'delta.columnMapping.nested.ids' key/value ids to stamp as its interior Parquet field_ids; an "
+                + "unstamped interior leaf would be unreadable.");
+        }
+
+        return (keyId, valueId);
     }
 
     /// <summary>

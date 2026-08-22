@@ -203,6 +203,7 @@ internal static class NestedParquetColumnReader
         string columnName,
         NestedDecodeBudget budget,
         IReadOnlyDictionary<int, DataField>? byFieldId,
+        NestedInteriorIds? interiorIds,
         CancellationToken cancellationToken)
     {
         // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
@@ -214,15 +215,17 @@ internal static class NestedParquetColumnReader
         return requestedType switch
         {
             // #676: a non-null byFieldId routes struct-child binding through the id-keyed containment path
-            // (id mode); array/map under id mode are rejected upstream (#839), so they never reach here.
+            // (id mode). #839: an id-mode array/map (non-null byFieldId + interiorIds) routes the interior
+            // element/key/value leaf binding through the same containment/identity-selection path; name/none
+            // mode (null interiorIds) binds the interior positionally.
             StructType structType => await ReadStructAsync(
                 rowGroup, ExpectStruct(fileField, columnName), structType, rowCount, columnName, budget, byFieldId, cancellationToken)
                 .ConfigureAwait(false),
             ArrayType arrayType => await ReadListAsync(
-                rowGroup, ExpectList(fileField, columnName), arrayType, rowCount, columnName, budget, cancellationToken)
+                rowGroup, ExpectList(fileField, columnName), arrayType, rowCount, columnName, budget, byFieldId, interiorIds, cancellationToken)
                 .ConfigureAwait(false),
             MapType mapType => await ReadMapAsync(
-                rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, budget, cancellationToken)
+                rowGroup, ExpectMap(fileField, columnName), mapType, rowCount, columnName, budget, byFieldId, interiorIds, cancellationToken)
                 .ConfigureAwait(false),
             _ => throw DeltaStorageException.UnsupportedFeature(
                 // #705 predicate: struct/array/map are the three explicit switch arms above, so this `_` arm
@@ -364,6 +367,8 @@ internal static class NestedParquetColumnReader
         int rowCount,
         string columnName,
         NestedDecodeBudget budget,
+        IReadOnlyDictionary<int, DataField>? byFieldId,
+        NestedInteriorIds? interiorIds,
         CancellationToken cancellationToken)
     {
         // Charge the list's OWN per-row structural arrays against the shared row-group budget before its element
@@ -373,9 +378,18 @@ internal static class NestedParquetColumnReader
         // structural set; the element child is charged separately). Structure + child stay cumulatively bounded.
         budget.ChargeStructural(rowCount, 2 * (sizeof(int) + sizeof(bool)), $"array column '{columnName}'");
 
-        DataField elementLeaf = ExpectScalarLeaf(
-            fileList.Item, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
-            $"array column '{columnName}' element");
+        string elementContext = $"array column '{columnName}' element";
+
+        // #839: in id mode (non-null byFieldId + interiorIds.ElementId) bind the element leaf by its nested.ids
+        // field_id within the container's own interior (identity-selection + containment); name/none mode binds
+        // the element positionally (fileList.Item).
+        DataField elementLeaf = byFieldId is not null && interiorIds?.ElementId is long elementId
+            ? ExpectScalarLeaf(
+                ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext),
+                requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, elementContext)
+            : ExpectScalarLeaf(
+                fileList.Item, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
+                elementContext);
         int listMaxDef = fileList.MaxDefinitionLevel;
 
         // The element child collects one cell per PRESENT element slot (a real value OR a null element),
@@ -418,6 +432,8 @@ internal static class NestedParquetColumnReader
         int rowCount,
         string columnName,
         NestedDecodeBudget budget,
+        IReadOnlyDictionary<int, DataField>? byFieldId,
+        NestedInteriorIds? interiorIds,
         CancellationToken cancellationToken)
     {
         // Charge the map's OWN per-row structural arrays against the shared row-group budget before its
@@ -428,12 +444,33 @@ internal static class NestedParquetColumnReader
         budget.ChargeStructural(rowCount, 2 * (sizeof(int) + sizeof(bool)), $"map column '{columnName}'");
 
         EnsureRequiredMapKey(fileMap, columnName);
-        DataField keyLeaf = ExpectScalarLeaf(
-            fileMap.Key, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-            $"map column '{columnName}' key");
-        DataField valueLeaf = ExpectScalarLeaf(
-            fileMap.Value, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-            $"map column '{columnName}' value");
+        string keyContext = $"map column '{columnName}' key";
+        string valueContext = $"map column '{columnName}' value";
+
+        // #839: in id mode bind the key/value leaves by their DISTINCT nested.ids field_ids within the
+        // container's own interior (identity-selection separates key from value, §2.5 step 3); name/none mode
+        // binds them positionally (fileMap.Key / fileMap.Value). Either way the id-/position-selected leaf is
+        // type/level-validated by ExpectScalarLeaf.
+        DataField keyLeaf;
+        DataField valueLeaf;
+        if (byFieldId is not null && interiorIds?.KeyId is long keyId && interiorIds.ValueId is long valueId)
+        {
+            List<DataField> interiors = MapInteriorLeaves(fileMap);
+            keyLeaf = ExpectScalarLeaf(
+                ResolveInteriorLeafById(keyId, interiors, byFieldId, keyContext),
+                requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, keyContext);
+            valueLeaf = ExpectScalarLeaf(
+                ResolveInteriorLeafById(valueId, interiors, byFieldId, valueContext),
+                requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, valueContext);
+        }
+        else
+        {
+            keyLeaf = ExpectScalarLeaf(
+                fileMap.Key, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, keyContext);
+            valueLeaf = ExpectScalarLeaf(
+                fileMap.Value, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, valueContext);
+        }
+
         int mapMaxDef = fileMap.MaxDefinitionLevel;
 
         // Keys drive the entry structure. A required key's max definition level equals the map's own level
@@ -1212,6 +1249,135 @@ internal static class NestedParquetColumnReader
         {
             _ = ResolveStructFieldById(container, child, byFieldId, columnName);
         }
+    }
+
+    // The interior element/key/value field_ids parsed from a container field's delta.columnMapping.nested.ids
+    // (#839, design §2.5). Carried from ResolveFileFields (validation) through to the decode (ReadListAsync/
+    // ReadMapAsync) so the interior leaf is bound by id — never positionally.
+    internal sealed class NestedInteriorIds
+    {
+        private NestedInteriorIds(long? elementId, long? keyId, long? valueId)
+        {
+            ElementId = elementId;
+            KeyId = keyId;
+            ValueId = valueId;
+        }
+
+        internal long? ElementId { get; }
+
+        internal long? KeyId { get; }
+
+        internal long? ValueId { get; }
+
+        internal static NestedInteriorIds ForArray(long elementId) => new(elementId, null, null);
+
+        internal static NestedInteriorIds ForMap(long keyId, long valueId) => new(null, keyId, valueId);
+    }
+
+    // Collects the interior LEAF DataField(s) that are the container group's OWN direct children — the array
+    // element (a list's Item) or the map key/value. A container whose interior is itself nested (Item/Key/Value
+    // is not a DataField) contributes no interior leaf, so an id lookup fails closed by containment (that shape
+    // is nested-within-nested #585 and rejected upstream).
+    private static List<DataField> ListInteriorLeaves(PqListField fileList)
+    {
+        var leaves = new List<DataField>(1);
+        if (fileList.Item is DataField item)
+        {
+            leaves.Add(item);
+        }
+
+        return leaves;
+    }
+
+    private static List<DataField> MapInteriorLeaves(PqMapField fileMap)
+    {
+        var leaves = new List<DataField>(2);
+        if (fileMap.Key is DataField key)
+        {
+            leaves.Add(key);
+        }
+
+        if (fileMap.Value is DataField value)
+        {
+            leaves.Add(value);
+        }
+
+        return leaves;
+    }
+
+    // Resolves an id-mode array/map interior leaf by its nested.ids field_id within the container's OWN
+    // interior leaves (#839, design §2.5 step 2). The id is looked up in the path-keyed footer field-id map
+    // (#829); the resolved leaf MUST be one of <paramref name="containerInteriorLeaves"/> (full-path
+    // direct-child membership — the #676 containment check one level down) so a forged footer that stamps the
+    // id on a top-level / sibling-container leaf fails closed rather than mis-attributing a column. Never binds
+    // positionally.
+    private static DataField ResolveInteriorLeafById(
+        long interiorId, List<DataField> containerInteriorLeaves,
+        IReadOnlyDictionary<int, DataField> byFieldId, string context)
+    {
+        if (interiorId is < 1 or > int.MaxValue || !byFieldId.TryGetValue((int)interiorId, out DataField? leaf))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Parquet nested read for {context}: its '{ColumnMapping.NestedIdsKey}' interior id is absent from the "
+                + "file footer field ids; the id-mode read fails closed (no positional fallback).");
+        }
+
+        var leafKey = ParquetFileReader.PhysicalPathKey.From(leaf.Path);
+        foreach (DataField interior in containerInteriorLeaves)
+        {
+            if (ParquetFileReader.PhysicalPathKey.From(interior.Path).Equals(leafKey))
+            {
+                return leaf;
+            }
+        }
+
+        throw DeltaStorageException.SchemaMismatch(
+            $"Parquet nested read for {context}: its '{ColumnMapping.NestedIdsKey}' interior id resolves to a footer leaf "
+            + "outside the resolved container's own interior; the id-mode read fails closed to avoid cross-column mis-attribution.");
+    }
+
+    // Validates an id-mode array<scalar> container against its requested type WITHOUT reading a data page
+    // (#839): the element leaf is bound by its nested.ids field_id within the container's own interior, then
+    // type/level-validated (ExpectScalarLeaf). Never positional.
+    public static void ValidateArrayShapeById(
+        Field container, ArrayType requested, long elementId,
+        IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
+    {
+        columnName = DiagnosticText.Sanitize(columnName);
+        PqListField fileList = container as PqListField
+            ?? throw DeltaStorageException.SchemaMismatch(
+                $"Column '{columnName}': its container physical name resolves to a non-list file column; the id-mode "
+                + "nested read fails closed.");
+        string context = $"array column '{columnName}' element";
+        DataField elementLeaf = ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, context);
+        _ = ExpectScalarLeaf(
+            elementLeaf, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, context);
+    }
+
+    // Validates an id-mode map<scalar,scalar> container against its requested type WITHOUT reading a data page
+    // (#839): the key/value leaves are bound by their distinct nested.ids field_ids within the container's own
+    // interior, then type/level-validated. The canonical key/value name guard is kept as defense-in-depth
+    // (§2.4). Never positional.
+    public static void ValidateMapShapeById(
+        Field container, MapType requested, long keyId, long valueId,
+        IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
+    {
+        columnName = DiagnosticText.Sanitize(columnName);
+        PqMapField fileMap = container as PqMapField
+            ?? throw DeltaStorageException.SchemaMismatch(
+                $"Column '{columnName}': its container physical name resolves to a non-map file column; the id-mode "
+                + "nested read fails closed.");
+        EnsureCanonicalMapChildNames(fileMap, columnName);
+        EnsureRequiredMapKey(fileMap, columnName);
+        List<DataField> interiors = MapInteriorLeaves(fileMap);
+        DataField keyLeaf = ResolveInteriorLeafById(keyId, interiors, byFieldId, $"map column '{columnName}' key");
+        DataField valueLeaf = ResolveInteriorLeafById(valueId, interiors, byFieldId, $"map column '{columnName}' value");
+        _ = ExpectScalarLeaf(
+            keyLeaf, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
+            $"map column '{columnName}' key");
+        _ = ExpectScalarLeaf(
+            valueLeaf, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
+            $"map column '{columnName}' value");
     }
 
     private static DataField ExpectScalarLeaf(

@@ -1169,7 +1169,7 @@ internal sealed class DeltaTableWriter
         // physical name; partition columns stay physical-keyed.
         (StructType mappedEvolvedSchema, ImmutableSortedDictionary<string, string> evolvedConfiguration) =
             ColumnMapping.EvolveNameModeMapping(
-                mergedSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource);
+                mergedSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource, mode);
 
         // #702: gate the mapped evolved schema before it becomes a schemaString (same door as the none-mode
         // LogicalEvolution branch above — column mapping changes a column's NAME, never its eligibility).
@@ -1431,7 +1431,7 @@ internal sealed class DeltaTableWriter
             // field_id in id mode.
             (StructType mappedNewSchema, ImmutableSortedDictionary<string, string> newConfiguration) =
                 ColumnMapping.EvolveNameModeMapping(
-                    writeSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource);
+                    writeSchema, readSnapshot.Schema, readSnapshot.Metadata.Configuration, _nameSource, mode);
             stagingSchema = ColumnMapping.MapWriteSchemaToPhysical(writeSchema, mappedNewSchema, mode);
             stagingPartitions =
                 ColumnMapping.PhysicalPartitionColumns(mappedNewSchema, partitionColumns, mode).ToImmutableArray();

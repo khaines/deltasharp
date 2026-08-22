@@ -254,6 +254,7 @@ public sealed class ParquetMessageHygieneTests
                 columnName: FullInjectionCorpus,
                 new NestedParquetColumnReader.NestedDecodeBudget(50_000_000),
                 byFieldId: null,
+                interiorIds: null,
                 CancellationToken.None));
 
         Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
@@ -281,6 +282,7 @@ public sealed class ParquetMessageHygieneTests
                 columnName: new string('y', 100_000),
                 new NestedParquetColumnReader.NestedDecodeBudget(50_000_000),
                 byFieldId: null,
+                interiorIds: null,
                 CancellationToken.None));
 
         Assert.True(
