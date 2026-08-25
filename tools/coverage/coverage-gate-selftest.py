@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -39,6 +40,7 @@ from importlib import util as _importlib_util
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _GATE = os.path.join(_HERE, "coverage-gate.py")
+_DETECT = os.path.join(_HERE, "detect-collect-abort.sh")
 _EXPECTED = ["DeltaSharp.Abstractions", "DeltaSharp.Core", "DeltaSharp.Engine", "DeltaSharp.Executor"]
 
 # Load the gate module (hyphenated filename) so the sentinel filename is referenced from the SAME
@@ -247,19 +249,129 @@ class CoverageGateSelfTest(unittest.TestCase):
         self.assertEqual(code, 3, out)
         self.assertNotIn("below threshold", out.lower())
 
+    def test_abort_sentinel_precedes_missing_assembly_fail_closed(self):
+        # A crashed host frequently DROPS an entire assembly's report, which presents as the
+        # fail-closed "missing expected assembly" shape (exit 2), not merely low coverage. The
+        # sentinel check must precede THAT path too, so a crash is reported as indeterminate
+        # (exit 3 / re-run) rather than misattributed to a provenance failure. Reports omit
+        # DeltaSharp.Executor AND the sentinel is present -> exit 3 must win.
+        code, out = self._run(
+            packages=[(n, 890, 1000) for n in _EXPECTED if n != "DeltaSharp.Executor"],
+            raw_files={_ABORT_SENTINEL: "aborted on all 3 attempts"},
+        )
+        self.assertEqual(code, 3, out)
+        self.assertIn("indeterminate", out.lower())
+
     def test_workflow_writes_the_sentinel_the_gate_reads(self):
         # The gate reads _ABORT_SENTINEL and the CI collect step WRITES it; a self-test cannot see
         # the YAML, so without this the two literals could drift and silently disable the #858 fix
-        # (the gate would never fire). Pin the coupling: ci.yml must write `TestResults/<sentinel>`.
+        # (the gate would never fire). Pin the coupling to the EXACT redirection token: an ANCHORED
+        # match, not a bare substring — a substring `assertIn("TestResults/.collect-aborted")` is
+        # satisfied by a suffix-appending rename (`.collect-aborted.txt`, `.collect-aborted-v2`)
+        # that the gate's exact-path os.path.exists would then MISS, silently disabling the fix while
+        # the test stayed green (a round-2 mutation proved this bypass).
+        ci_yml = os.path.join(_HERE, "..", "..", ".github", "workflows", "ci.yml")
+        with open(ci_yml, encoding="utf-8") as handle:
+            workflow = handle.read()
+        self.assertRegex(
+            workflow,
+            rf">[ \t]+TestResults/{re.escape(_ABORT_SENTINEL)}(?:\s|$)",
+            f"ci.yml must write the same sentinel the gate reads ({_ABORT_SENTINEL!r}) as an exact "
+            "redirection target; a rename on either side (including a suffix append) silently "
+            "disables the #858 coverage-abort resilience.",
+        )
+
+    def test_ci_yml_delegates_classification_to_the_single_source_script(self):
+        # The retry loop must delegate the abort/normal decision to detect-collect-abort.sh (the ONE
+        # testable place the crash signature lives). If a future edit re-inlines a `grep` in the YAML,
+        # the anchored-marker + exit-code hardening (round-2) silently disappears with no red test.
         ci_yml = os.path.join(_HERE, "..", "..", ".github", "workflows", "ci.yml")
         with open(ci_yml, encoding="utf-8") as handle:
             workflow = handle.read()
         self.assertIn(
-            f"TestResults/{_ABORT_SENTINEL}",
+            "tools/coverage/detect-collect-abort.sh",
             workflow,
-            f"ci.yml must write the same sentinel the gate reads ({_ABORT_SENTINEL!r}); a rename on "
-            "either side silently disables the #858 coverage-abort resilience.",
+            "ci.yml must classify collection aborts via detect-collect-abort.sh (single source of the "
+            "crash signature); an inline grep would drift from the tested classifier.",
         )
+
+
+class DetectCollectAbortSelfTest(unittest.TestCase):
+    """Unit-tests for detect-collect-abort.sh — the crash classifier the collect retry loop keys off.
+
+    Exit 0 = ABORT (retry / write sentinel); exit 1 = NOT an abort (let the gate read the reports).
+    This is the semantic heart of #858 and the most drift-prone piece, so it is pinned directly with
+    canned (exit_code, log) pairs rather than left unverified inline in YAML.
+    """
+
+    def _classify(self, code, log_text=""):
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write(log_text)
+            log_path = fh.name
+        try:
+            proc = subprocess.run(
+                ["bash", _DETECT, str(code), log_path],
+                capture_output=True,
+                text=True,
+            )
+            return proc.returncode, proc.stdout + proc.stderr
+        finally:
+            os.unlink(log_path)
+
+    def test_clean_run_is_never_an_abort_even_if_log_mentions_aborted(self):
+        # exit 0 short-circuits: a PASSING test that logs the word "aborted" must not trip the retry
+        # path (round-2 false-positive concern). Not an abort -> exit 1.
+        code, out = self._classify(0, "The active test run was aborted (this is just test output)\n")
+        self.assertEqual(code, 1, out)
+
+    def test_ordinary_failure_with_complete_report_is_not_an_abort(self):
+        # A plain test failure (exit 1, coverlet wrote complete reports, no crash banner) must be
+        # gated normally, never retried/laundered -> exit 1.
+        code, out = self._classify(1, "Failed!  - Failed:  3, Passed: 200, Skipped: 0\n")
+        self.assertEqual(code, 1, out)
+
+    def test_failure_mentioning_marker_mid_line_is_not_an_abort(self):
+        # Anchoring: a failing assertion whose message merely CONTAINS a crash phrase mid-line must
+        # not be misclassified as a host crash (else a real regression is laundered to indeterminate).
+        code, out = self._classify(
+            1, "  Assert.Equal() Failure: expected 'the active test run was aborted' banner\n"
+        )
+        self.assertEqual(code, 1, out)
+
+    def test_host_crash_banner_at_line_start_is_an_abort(self):
+        code, out = self._classify(
+            1, "The active test run was aborted. Reason: Test host process crashed : Boom\n"
+        )
+        self.assertEqual(code, 0, out)
+
+    def test_error_prefixed_crash_banner_is_an_abort(self):
+        # dotnet often prefixes the crash line with `Error: `.
+        code, out = self._classify(1, "Error: Test host process crashed\n")
+        self.assertEqual(code, 0, out)
+
+    def test_signal_death_without_banner_is_an_abort_sigkill(self):
+        # A SILENT crash (OOM SIGKILL -> 137) truncates the report with NO banner; the prior
+        # marker-only classifier missed this and #858 recurred. Signal death (>128) -> abort.
+        code, out = self._classify(137, "")
+        self.assertEqual(code, 0, out)
+
+    def test_signal_death_without_banner_is_an_abort_sigsegv(self):
+        code, out = self._classify(139, "some partial output before segfault\n")
+        self.assertEqual(code, 0, out)
+
+    def test_non_signal_failure_with_missing_log_is_not_an_abort(self):
+        # Defensive: a non-signal non-zero exit with no readable log is treated as a normal failure
+        # (fail-closed toward gating the reports), not a spurious abort.
+        proc = subprocess.run(
+            ["bash", _DETECT, "1", os.path.join(tempfile.gettempdir(), "no-such-log-" + uuid.uuid4().hex)],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+
+    def test_bad_arity_errors_out(self):
+        proc = subprocess.run(["bash", _DETECT, "1"], capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
 
 
 if __name__ == "__main__":

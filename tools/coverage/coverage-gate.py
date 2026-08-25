@@ -279,7 +279,13 @@ def main(argv=None) -> int:
                 # written by the collect step, but a PR test runs before it and could plant arbitrary
                 # bytes; never echo them unbounded into a `::error::` annotation (log-injection D-i-D).
                 raw = handle.read(256)
-            detail = re.sub(r"[\r\n]+", " ", raw).replace("::", ":").strip()
+            # Collapse newlines to spaces so attacker bytes can never START a new line (GHA parses
+            # workflow commands only at line start), THEN collapse any run of 2+ colons to one. The
+            # colon collapse must be a single regex pass over ALL runs, not str.replace("::", ":"):
+            # replace() is non-idempotent (":::: " -> "::"), leaving a live `::` token the round-2
+            # red-team showed could still forge a `::error::`/`::set-output::` workflow command.
+            detail = re.sub(r"[\r\n]+", " ", raw)
+            detail = re.sub(r":{2,}", ":", detail).strip()
         except OSError:
             pass
         _log(

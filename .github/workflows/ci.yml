@@ -134,6 +134,9 @@ jobs:
       - name: Collect coverage (measurement only)
         continue-on-error: true
         env:
+          # Bounded retry count for an instrumentation-aborted collect. `set -u` below makes this a
+          # HARD requirement: if this env is ever removed, the step fails fast at first reference
+          # rather than silently defaulting — keep them together on any refactor.
           COLLECT_MAX_ATTEMPTS: "3"
         run: |
           # GitHub Actions runs `run:` steps with `bash --noprofile --norc -eo pipefail {0}`, i.e.
@@ -154,10 +157,16 @@ jobs:
               --collect:"XPlat Code Coverage" \
               --settings coverlet.runsettings \
               --results-directory TestResults 2>&1 | tee "${log}"
+            # dotnet's own exit code (NOT tee's) — a signal death (128+N) is a silent crash with no
+            # banner, so the classifier needs it as well as the log. PIPESTATUS[0] is why we run under
+            # bash (not sh) here.
+            dotnet_rc=${PIPESTATUS[0]}
             echo "::endgroup::"
             # An ABORTED run (test host crashed) — NOT an ordinary test failure — is the only thing
             # we retry. coverlet writes complete reports on a plain test failure, so those break out.
-            if grep -qiE "the active test run was aborted|test host process crashed|test run aborted" "${log}"; then
+            # The crash signature lives in ONE testable place (detect-collect-abort.sh), keyed on the
+            # exit code AND an anchored banner so a passing/failing test cannot spoof it from its log.
+            if bash tools/coverage/detect-collect-abort.sh "${dotnet_rc}" "${log}"; then
               if [ "${attempt}" -lt "${COLLECT_MAX_ATTEMPTS}" ]; then
                 echo "::warning::coverage collect attempt ${attempt} ABORTED (test host crashed under instrumentation); retrying"
                 attempt=$((attempt + 1))
