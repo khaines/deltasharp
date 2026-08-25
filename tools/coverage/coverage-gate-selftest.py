@@ -249,6 +249,25 @@ class CoverageGateSelfTest(unittest.TestCase):
         self.assertEqual(code, 3, out)
         self.assertNotIn("below threshold", out.lower())
 
+    def test_abort_sentinel_detail_is_injection_sanitized(self):
+        # HIGH (round-2/3 red-team + quality): the sentinel body is attacker-influenceable (a PR test
+        # runs before the collect step), and the gate echoes a bounded slice into a ::error:: line. A
+        # NON-idempotent collapse (str.replace("::",":")) leaves a live "::" token from a "::::"-run,
+        # forging a workflow command; and an un-stripped newline could START a new GHA-parsed command
+        # line. Pin the idempotent single-pass re.sub(r":{2,}",":") + newline collapse: the echoed
+        # Detail must contain NO "::" run and NO newline. Reverting the gate to str.replace keeps every
+        # OTHER test green, so without this the HIGH fix could silently regress.
+        payload = "a:::::error::title=x::pwn\r\nsecond::set-output::name=y"
+        code, out = self._run(
+            packages=[(n, 890, 1000) for n in _EXPECTED],
+            raw_files={_ABORT_SENTINEL: payload},
+        )
+        self.assertEqual(code, 3, out)
+        err_line = next((ln for ln in out.splitlines() if "Detail:" in ln), None)
+        self.assertIsNotNone(err_line, out)
+        detail = err_line.split("Detail:", 1)[1]
+        self.assertNotIn("::", detail, f"non-idempotent sanitize leaked a live '::' token: {detail!r}")
+
     def test_abort_sentinel_precedes_missing_assembly_fail_closed(self):
         # A crashed host frequently DROPS an entire assembly's report, which presents as the
         # fail-closed "missing expected assembly" shape (exit 2), not merely low coverage. The
@@ -344,6 +363,25 @@ class DetectCollectAbortSelfTest(unittest.TestCase):
         )
         self.assertEqual(code, 0, out)
 
+    def test_test_run_aborted_banner_is_an_abort(self):
+        # Pin the 'test run aborted' alternative (a surviving mutant in round 3: removing it turned no
+        # test red). Every listed banner phrase must have exactly one positive test so the alternation
+        # cannot silently shrink and reintroduce #858 for a host that emits only this wording.
+        code, out = self._classify(1, "Test Run Aborted.\n")
+        self.assertEqual(code, 0, out)
+
+    def test_aborting_the_test_run_banner_is_an_abort(self):
+        # Pin the 'aborting( the)? test run' alternative (also a round-3 surviving mutant).
+        code, out = self._classify(1, "Aborting the test run.\n")
+        self.assertEqual(code, 0, out)
+
+    def test_non_crash_line_starting_with_aborted_word_is_not_an_abort(self):
+        # Negative fixture guarding against a future over-broadening of the alternation to a bare
+        # 'aborted' term: a legitimate non-crash line that merely STARTS with "Aborted" must stay a
+        # normal failure (exit 1), never a spurious abort.
+        code, out = self._classify(1, "Aborted run summary: 0 crashes, 3 assertion failures\n")
+        self.assertEqual(code, 1, out)
+
     def test_error_prefixed_crash_banner_is_an_abort(self):
         # dotnet often prefixes the crash line with `Error: `.
         code, out = self._classify(1, "Error: Test host process crashed\n")
@@ -359,6 +397,36 @@ class DetectCollectAbortSelfTest(unittest.TestCase):
         code, out = self._classify(139, "some partial output before segfault\n")
         self.assertEqual(code, 0, out)
 
+    def test_signal_boundary_128_is_not_an_abort(self):
+        # The signal branch is `code > 128`. 128 itself is NOT a signal death; with no banner it must
+        # stay a normal failure. Pins the boundary against an off-by-one refactor to `>= 128`.
+        code, out = self._classify(128, "ordinary failure output\n")
+        self.assertEqual(code, 1, out)
+
+    def test_signal_boundary_129_is_an_abort(self):
+        # 129 (SIGHUP) is the first signal-death code above the boundary -> abort even with no banner.
+        code, out = self._classify(129, "")
+        self.assertEqual(code, 0, out)
+
+    def test_non_numeric_exit_code_degrades_fail_closed(self):
+        # dotnet_rc always arrives numeric (PIPESTATUS[0]); defensively a malformed value must degrade
+        # to banner-only classification (non-abort here), never crash the classifier under `set -u`.
+        code, out = self._classify("nan", "ordinary failure output\n")
+        self.assertEqual(code, 1, out)
+        # ...and a real anchored banner with a garbage code is still an abort (fail-closed toward retry).
+        code, out = self._classify("nan", "Test host process crashed\n")
+        self.assertEqual(code, 0, out)
+        # The numeric guard's job is to suppress the `[: integer expression expected` stderr a raw
+        # `[ nan -eq 0 ]` would emit; assert stderr is clean so removing the guard turns this red.
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as fh:
+            fh.write("ordinary failure output\n")
+            log_path = fh.name
+        try:
+            proc = subprocess.run(["bash", _DETECT, "nan", log_path], capture_output=True, text=True)
+        finally:
+            os.unlink(log_path)
+        self.assertEqual(proc.stderr, "", f"non-numeric code must not emit stderr noise: {proc.stderr!r}")
+
     def test_non_signal_failure_with_missing_log_is_not_an_abort(self):
         # Defensive: a non-signal non-zero exit with no readable log is treated as a normal failure
         # (fail-closed toward gating the reports), not a spurious abort.
@@ -370,8 +438,12 @@ class DetectCollectAbortSelfTest(unittest.TestCase):
         self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
 
     def test_bad_arity_errors_out(self):
-        proc = subprocess.run(["bash", _DETECT, "1"], capture_output=True, text=True)
-        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        # The arity guard must reject 0, 1, and 3 args (only <code> <log> is valid) with exit 2, so a
+        # miswired caller fails loudly rather than silently mis-parsing. Exit 2 is non-abort to the
+        # caller (the `if` in ci.yml treats only exit 0 as abort), so this is also fail-closed.
+        for args in ([], ["1"], ["1", "a.log", "extra"]):
+            proc = subprocess.run(["bash", _DETECT, *args], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 2, f"args={args}: {proc.stdout + proc.stderr}")
 
 
 if __name__ == "__main__":

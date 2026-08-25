@@ -25,6 +25,12 @@ fi
 code="$1"
 log="$2"
 
+# dotnet's exit code always arrives numeric (the caller passes PIPESTATUS[0]); guard defensively so a
+# malformed/empty value degrades to fail-closed banner-only classification (code=1 is non-zero and
+# non-signal) instead of erroring `[: integer expression expected` under `set -u`. The self-comparison
+# is a numeric test that fails (stderr suppressed) unless "$code" is an integer.
+[ "$code" -eq "$code" ] 2>/dev/null || code=1
+
 # A clean run (exit 0) is NEVER an abort, regardless of anything a passing test printed to the log.
 # This short-circuit is what stops a passing test that merely logs the word "aborted" from tripping
 # the retry path (the round-2 red-team / SRE / security false-positive concern).
@@ -33,9 +39,11 @@ if [ "$code" -eq 0 ]; then
 fi
 
 # Killed by a signal: a shell reports 128+N for signal N. SIGABRT(134), SIGKILL(137 — e.g. an OOM
-# kill), SIGSEGV(139), SIGBUS(138) all truncate the report set with NO "aborted" banner in the log.
-# The prior marker-only classifier missed these SILENT crashes and the #858 bug recurred; treat any
-# signal death as an abort so the sentinel/indeterminate path engages.
+# kill), SIGSEGV(139), SIGBUS(138), SIGTERM(143 — runner-initiated kill) all truncate the report set
+# with NO "aborted" banner in the log. The prior marker-only classifier missed these SILENT crashes
+# and the #858 bug recurred; treat any signal death as an abort so the sentinel/indeterminate path
+# engages. (Known non-signal gap: GNU `timeout(1)` reports 124 on a kill, which is NOT >128 — if a
+# `timeout` wrapper is ever added around `dotnet test`, add 124 here and a matching self-test row.)
 if [ "$code" -gt 128 ]; then
   exit 0
 fi
@@ -45,6 +53,13 @@ fi
 # Anchoring is what distinguishes a genuine host-crash announcement from an ordinary failing test that
 # happens to print one of these phrases mid-message: an ordinary test failure writes COMPLETE reports,
 # so it must fall through to exit 1 and be gated normally (never laundered into an indeterminate).
+#
+# INHERENT, ACCEPTED LIMITATION (round-2/3 red-team): a *failing* test (exit 1) that deliberately
+# prints one of these banners AT LINE START is classified as an abort and, after the bounded retries,
+# reported as indeterminate (gate exit 3). This is fail-CLOSED — exit 3 still blocks the merge, it can
+# never launder a real failure into a PASS — and it is not fully avoidable: a real host crash under
+# `dotnet test` frequently exits 1 with exactly this banner (the documented #858 trigger), so dropping
+# the exit-1 banner path to reject the spoof would reintroduce the very false-negative #858 fixes.
 if [ ! -f "$log" ]; then
   exit 1
 fi
