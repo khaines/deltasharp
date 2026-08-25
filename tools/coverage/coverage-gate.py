@@ -275,7 +275,11 @@ def main(argv=None) -> int:
         detail = ""
         try:
             with open(sentinel, encoding="utf-8") as handle:
-                detail = handle.read().strip()
+                # Bounded read + strip control chars / GHA workflow-command markers: the sentinel is
+                # written by the collect step, but a PR test runs before it and could plant arbitrary
+                # bytes; never echo them unbounded into a `::error::` annotation (log-injection D-i-D).
+                raw = handle.read(256)
+            detail = re.sub(r"[\r\n]+", " ", raw).replace("::", ":").strip()
         except OSError:
             pass
         _log(

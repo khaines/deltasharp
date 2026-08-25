@@ -35,10 +35,19 @@ import sys
 import tempfile
 import unittest
 import uuid
+from importlib import util as _importlib_util
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _GATE = os.path.join(_HERE, "coverage-gate.py")
 _EXPECTED = ["DeltaSharp.Abstractions", "DeltaSharp.Core", "DeltaSharp.Engine", "DeltaSharp.Executor"]
+
+# Load the gate module (hyphenated filename) so the sentinel filename is referenced from the SAME
+# constant the gate uses — the self-test must not duplicate the literal (a drift would silently
+# disable the #858 fix on the gate side without a red test).
+_spec = _importlib_util.spec_from_file_location("_coverage_gate", _GATE)
+_gate_mod = _importlib_util.module_from_spec(_spec)
+_spec.loader.exec_module(_gate_mod)
+_ABORT_SENTINEL = _gate_mod._ABORT_SENTINEL
 
 
 def _report_xml(packages) -> str:
@@ -222,7 +231,7 @@ class CoverageGateSelfTest(unittest.TestCase):
         # truncated, so no verdict may be gated on them.
         code, out = self._run(
             packages=[(n, 890, 1000) for n in _EXPECTED],
-            raw_files={".collect-aborted": "aborted on all 3 attempts"},
+            raw_files={_ABORT_SENTINEL: "aborted on all 3 attempts"},
         )
         self.assertEqual(code, 3, out)
         self.assertIn("indeterminate", out.lower())
@@ -233,10 +242,24 @@ class CoverageGateSelfTest(unittest.TestCase):
         # so an instrumentation crash is never mistaken for a real coverage regression.
         code, out = self._run(
             packages=[(n, 280, 1000) for n in _EXPECTED],  # ~28% — the observed truncated value
-            raw_files={".collect-aborted": "aborted on all 3 attempts"},
+            raw_files={_ABORT_SENTINEL: "aborted on all 3 attempts"},
         )
         self.assertEqual(code, 3, out)
         self.assertNotIn("below threshold", out.lower())
+
+    def test_workflow_writes_the_sentinel_the_gate_reads(self):
+        # The gate reads _ABORT_SENTINEL and the CI collect step WRITES it; a self-test cannot see
+        # the YAML, so without this the two literals could drift and silently disable the #858 fix
+        # (the gate would never fire). Pin the coupling: ci.yml must write `TestResults/<sentinel>`.
+        ci_yml = os.path.join(_HERE, "..", "..", ".github", "workflows", "ci.yml")
+        with open(ci_yml, encoding="utf-8") as handle:
+            workflow = handle.read()
+        self.assertIn(
+            f"TestResults/{_ABORT_SENTINEL}",
+            workflow,
+            f"ci.yml must write the same sentinel the gate reads ({_ABORT_SENTINEL!r}); a rename on "
+            "either side silently disables the #858 coverage-abort resilience.",
+        )
 
 
 if __name__ == "__main__":
