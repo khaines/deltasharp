@@ -70,7 +70,11 @@ Usage
 
 Exit codes: 0 = at/above threshold, 1 = below threshold, 2 = usage/data error
 (unreadable/malformed/empty reports; an empty/absent or src-drifted expectedAssemblies allowlist;
-or a missing expected / unexpected extra production assembly in the merged report set).
+or a missing expected / unexpected extra production assembly in the merged report set),
+3 = instrumented run indeterminate (#858) — the collect step wrote an abort sentinel because the
+instrumented test host CRASHED (not merely a test failing), which truncates a report and would make
+the merged percentage a MISLEADING low number. The gate refuses to gate on that partial data and
+exits DISTINCTLY (re-run the job) rather than reporting a phantom coverage regression.
 """
 
 from __future__ import annotations
@@ -91,6 +95,13 @@ def _log(msg: str = "") -> None:
 
 def _gha() -> bool:
     return os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
+
+
+# The collect step (ci.yml) writes this sentinel into --results-dir when the instrumented test run
+# ABORTED (test host crashed) on every attempt, after its bounded retries. Its presence means the
+# reports under --results-dir are TRUNCATED and the merged percentage is not trustworthy (#858), so
+# the gate exits 3 (indeterminate) instead of emitting a misleading below-threshold FAIL.
+_ABORT_SENTINEL = ".collect-aborted"
 
 
 # Repo root relative to this script (tools/coverage/coverage-gate.py -> repo root), so the src/ drift
@@ -254,6 +265,27 @@ def main(argv=None) -> int:
     )
     parser.add_argument("--summary-out", default=None)
     args = parser.parse_args(argv)
+
+    # #858: a truncated report set from an instrumentation-induced test-host CRASH must NOT be
+    # gated as a real coverage number (it presents as a phantom low-coverage regression). The
+    # collect step writes an abort sentinel when its bounded retries were all aborted; if present,
+    # fail DISTINCTLY (exit 3, "indeterminate — re-run") BEFORE reading any partial report.
+    sentinel = os.path.join(args.results_dir, _ABORT_SENTINEL)
+    if os.path.exists(sentinel):
+        detail = ""
+        try:
+            with open(sentinel, encoding="utf-8") as handle:
+                detail = handle.read().strip()
+        except OSError:
+            pass
+        _log(
+            "::error::coverage indeterminate — the instrumented test run aborted (test host crashed) "
+            "on every attempt, so the coverage reports are truncated and the merged percentage would "
+            "be a MISLEADING low number. Re-run the job (this is an instrumentation flake, not a "
+            "coverage regression)."
+            + (f" Detail: {detail}" if detail else "")
+        )
+        return 3
 
     # Always read the config for the provenance allowlist (expectedAssemblies); a
     # --threshold override only substitutes the numeric floor for local dry runs.

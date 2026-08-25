@@ -216,6 +216,28 @@ class CoverageGateSelfTest(unittest.TestCase):
         code, out = self._run(packages=[])
         self.assertEqual(code, 2, out)
 
+    def test_abort_sentinel_returns_indeterminate_over_passing_set(self):
+        # #858: an abort sentinel (instrumented test host crashed on every attempt) makes the
+        # gate exit 3 (indeterminate) even over an otherwise-PASSING report set — the reports are
+        # truncated, so no verdict may be gated on them.
+        code, out = self._run(
+            packages=[(n, 890, 1000) for n in _EXPECTED],
+            raw_files={".collect-aborted": "aborted on all 3 attempts"},
+        )
+        self.assertEqual(code, 3, out)
+        self.assertIn("indeterminate", out.lower())
+
+    def test_abort_sentinel_precedes_truncated_low_coverage(self):
+        # The crux: a truncated report set would otherwise read as a phantom low-coverage FAIL
+        # (exit 1). With the sentinel present the gate must exit 3 (indeterminate / re-run), NOT 1,
+        # so an instrumentation crash is never mistaken for a real coverage regression.
+        code, out = self._run(
+            packages=[(n, 280, 1000) for n in _EXPECTED],  # ~28% — the observed truncated value
+            raw_files={".collect-aborted": "aborted on all 3 attempts"},
+        )
+        self.assertEqual(code, 3, out)
+        self.assertNotIn("below threshold", out.lower())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
