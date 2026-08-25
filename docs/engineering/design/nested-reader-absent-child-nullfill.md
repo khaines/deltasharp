@@ -83,10 +83,14 @@ a higher-layer schema-evolution question), and an absent **whole top-level neste
 
 ### 2.1 Where the change lands
 
-The entire behavior change is contained in one method's child-resolution step —
-`NestedParquetColumnReader.ReadStructAsync` (`NestedParquetColumnReader.cs:334`–`:460`) — plus a small,
-non-throwing variant of its resolver. Nothing above the struct boundary changes: the top-level scalar/nested
-resolution (`ParquetFileReader.ResolveFileFields`), the row-group decode driver, `DeltaReadSource`, and the
+The behavior change is contained in `NestedParquetColumnReader`: the decode-path child-resolution step in
+`ReadStructAsync` (`NestedParquetColumnReader.cs:334`–`:460`), a small non-throwing variant of its resolver,
+and the parallel **pre-decode** shape-validation step in `ValidateNode` (reached from
+`ParquetFileReader` via `ValidateShape` before any row group is decoded). `ValidateNode` calls the *same*
+resolver, so it is updated in lockstep: a **required** absent child fails closed there fast (before decode);
+a **nullable** absent child has nothing in the file to validate, so validation is deferred to the decode-path
+null-fill. Nothing above the struct boundary changes: the top-level scalar/nested resolution
+(`ParquetFileReader.ResolveFileFields`), the row-group decode driver, `DeltaReadSource`, and the
 projection/deletion-vector layers are all untouched. This is a **read-path relaxation** — a case that used to
 `throw` now returns data.
 
@@ -101,7 +105,7 @@ graph TD
   RESOLVE -- "ABSENT physical name" --> NULLABLE{"field.Nullable?"}
   NULLABLE -- "no (required)" --> FAILREQ["FAIL-CLOSED: ColumnNotPresentInFile / SchemaMismatch (§9 Q3)"]
   NULLABLE -- "yes (nullable)" --> SYNTH["NULL-FILL (the new path)"]
-  SYNTH --> V["children[i] = SynthesizeAllNull(field.DataType, rowCount)\n(ColumnVectors.Create + rowCount×AppendNull — scalar OR nested subtree)"]
+  SYNTH --> V["children[i] = SynthesizeAbsentChild(field.DataType, rowCount)\nscalar/array/map: ColumnVectors.Create + rowCount×AppendNull;\nstruct: immutable ctor with recursively all-null children"]
   SYNTH --> D["fieldDefs[i] = StructPresenceDefs (clamped at structMaxDef)\nfrom the file struct's own driving leaf — see §2.4"]
   SYNTH --> B["budget.ChargeStructural for the O(rows) all-null vector"]
   V --> MASK["BuildStructNullMask(fieldDefs, structMaxDef, rowCount) — parity guard SATISFIED"]
@@ -119,7 +123,8 @@ graph TD
 | `BuildStructNullMask` | `NestedParquetColumnReader.cs:467` | cross-field null-mask parity guard | **unchanged code**; consumes the synthesized `fieldDefs[i]` (§2.4) |
 | `ExtractOwnerCellDefs` | `NestedParquetColumnReader.cs:929` | owner-cell def extraction (clamped at `structMaxDef`) under a repeated ancestor | **reused** to derive `StructPresenceDefs` |
 | `NestedDecodeBudget` | `NestedParquetColumnReader.cs:1321` | shared row-group eager-decode ceiling | **reused** — the synthesized all-null vector is charged O(rows) |
-| `ColumnVectors.Create` | `ColumnVectors.cs:26` | build an empty mutable vector for any `DataType` (scalar + nested) | **reused** — `+ rowCount×AppendNull()` = all-null child |
+| `ColumnVectors.Create` | `ColumnVectors.cs:26` | build an empty mutable vector for any `DataType` (scalar + nested) | **reused** — `+ rowCount×AppendNull()` = all-null scalar/array/map child; a struct child uses the immutable `StructColumnVector` ctor with recursively all-null children (§2.5) |
+| `ValidateNode` (via `ValidateShape`) | `NestedParquetColumnReader.cs` | pre-decode shape validation; calls the same resolver | **modified** — a required absent child fails closed fast (before decode); a nullable absent child is deferred to the decode-path null-fill |
 
 ### 2.2 The invariant this design must not violate
 
@@ -251,11 +256,16 @@ return v;
 - **Scalar child** (`long`, `string`, `decimal`, …) → an all-null fixed/variable-width vector — the direct
   analogue of the flat path's `for (…) vector.AppendNull();` (`ParquetFileReader.cs:2064`).
 - **Nested child** (`struct` / `array` / `map`, now decodable via 585a's recursive `DecodeNode`). An absent
-  physical column means the **entire subtree** is absent, so **every** cell is null. `ColumnVectors.Create`
-  recurses to build a `StructColumnVector`/`ListColumnVector`/`MapColumnVector`, and `AppendNull()` commits a
-  null row at the top of the subtree (`StructColumnVector.AppendNull` → `CommitRow(isNull:true)`,
-  `StructColumnVector.cs:321`) — no interior leaves are touched or read. This is the correct all-null
-  representation for a null struct/list/map cell; the interior children of an all-null nested vector need no
+  physical column means the **entire subtree** is absent, so **every** cell is null, and **no interior leaf is
+  touched or read**. An **array**/**map** builds directly through `ColumnVectors.Create` + `rowCount`×
+  `AppendNull()`: a null list/map has no elements/entries, so `AppendNull` commits a null cell with no interior
+  values. A **struct**, however, cannot be committed via a standalone `AppendNull()` — `StructColumnVector`
+  requires every field child already populated (each struct row carries one cell per child, even a null-struct
+  row: `StructColumnVector.AppendNull` throws on length-0 children). So a struct is built via its **immutable
+  constructor with recursively all-null children** (`BuildAllNullSubtree`): each child lane is itself an
+  all-null subtree, and a `bool[rowCount]` all-true null mask marks every owner cell null. This still reads no
+  file leaf and stays O(rows) per level (the recursion is over the *declared* subtree shape, bounded by
+  `MaxNestedReadDepth`, not over any file data). The interior children of an all-null nested vector need no
   values because every owner cell is null.
 
 Crucially, a **nested absent child never recurses into `DecodeNode`/`ReadScalarLeafAsync`** for its interior —

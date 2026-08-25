@@ -152,10 +152,26 @@ internal static class NestedParquetColumnReader
 
                 foreach (StructField field in structType)
                 {
-                    Field childNode = ResolveStructChildNode(fileStruct, field, context);
+                    string childLabel = $"struct column '{context}' field '{DiagnosticText.Sanitize(field.Name)}'";
+                    if (!TryResolveStructChildNode(fileStruct, field, context, out Field? childNode))
+                    {
+                        // ABSENT physical name (#857). A REQUIRED absent child cannot be null-filled — fail
+                        // closed here (fast, before any decode; mirrors the flat gate), the same
+                        // ColumnNotPresentInFile the decode path would raise (§9 Q3). A NULLABLE absent child
+                        // is null-filled at decode (ReadStructAsync), so there is nothing in the file to
+                        // validate — defer. A DUPLICATE already threw inside the resolver; a PRESENT child
+                        // still validates its shape below (AC3), so absence is never conflated with mismatch.
+                        if (!field.Nullable)
+                        {
+                            throw DeltaStorageException.ColumnNotPresentInFile(childLabel);
+                        }
+
+                        continue;
+                    }
+
                     ValidateChild(
-                        childNode, field.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
-                        $"struct column '{context}' field '{DiagnosticText.Sanitize(field.Name)}'", depth + 1);
+                        childNode!, field.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
+                        childLabel, depth + 1);
                 }
 
                 break;
@@ -365,7 +381,11 @@ internal static class NestedParquetColumnReader
         // one-per-row path (presentFloor 0, raw def) — byte-identical, no #571 regression.
         bool underRepeatedAncestor = structMaxRep > 0;
         var children = new ColumnVector[requested.Count];
-        int[]?[] fieldDefs = new int[requested.Count][]; // each field's definition-level stream (null if required)
+        // Each field's definition-level stream. It is `null` for a required field (no null mask). For a
+        // synthesized ABSENT child (null-filled, #857) it is `null` under a REQUIRED struct (required-field
+        // semantics) or a `StructPresenceDefs` clone under a NULLABLE struct (so the cross-field parity guard's
+        // INV-PARITY holds against every present sibling).
+        int[]?[] fieldDefs = new int[requested.Count][];
         for (int i = 0; i < requested.Count; i++)
         {
             StructField field = requested[i];
@@ -386,8 +406,39 @@ internal static class NestedParquetColumnReader
                 continue;
             }
 
-            Field childNode = ResolveStructChildNode(fileStruct, field, columnName);
             string childContext = $"struct column '{columnName}' field '{DiagnosticText.Sanitize(field.Name)}'";
+            if (!TryResolveStructChildNode(fileStruct, field, columnName, out Field? resolvedChild))
+            {
+                // ABSENT physical name (#857, §2.3): a drop-then-re-add mints a FRESH physicalName, so a data
+                // file written before the re-add carries NO physical column for the re-added child — genuinely
+                // absent, exactly as an additively-added top-level column is absent from an older, narrower
+                // file. Reached ONLY when the physical name is absent (a PRESENT-but-mismatched child routed
+                // through the resolver as `true` and fails closed below on type/shape — absence and mismatch
+                // are never conflated, AC3); a DUPLICATE physical name already threw inside the resolver.
+                if (!field.Nullable)
+                {
+                    // §9 Q3: a REQUIRED absent child cannot be null-filled (a required lane cannot carry the
+                    // null the older rows would need) — fail closed, mirroring the flat gate
+                    // (nullFillMissingColumns && requestedField.Nullable) at ParquetFileReader. (Defense in
+                    // depth: ValidateShape's ValidateNode already fails this case closed with the SAME
+                    // ColumnNotPresentInFile before decode; this keeps the decode path fail-closed even if
+                    // reached without the up-front shape validation.)
+                    throw DeltaStorageException.ColumnNotPresentInFile(childContext);
+                }
+
+                // NULLABLE + absent → NULL-FILL (§2.4/§2.5): an all-null child vector for the FULL requested
+                // type (scalar OR nested subtree) plus a synthesized per-owner-cell presence stream clamped at
+                // structMaxDef so BuildStructNullMask's parity guard is satisfied (INV-PARITY).
+                children[i] = SynthesizeAbsentChild(field.DataType, rowCount, budget, childContext);
+                fieldDefs[i] = await StructPresenceDefs(
+                    rowGroup, fileStruct, structMaxDef, parentMaxDef, parentMaxRep, rowCount, budget, childContext,
+                    cancellationToken).ConfigureAwait(false);
+                continue;
+            }
+
+            // PRESENT: unchanged routing — a scalar leaf or a 585a nested recurse. A type/shape disagreement
+            // here still fails closed (SchemaMismatch, AC3), never null-fills.
+            Field childNode = resolvedChild!;
 
             if (field.DataType is ArrayType or MapType or StructType)
             {
@@ -505,7 +556,9 @@ internal static class NestedParquetColumnReader
                 {
                     // A field inside a nullable struct always carries a definition stream (its max def >=
                     // structMaxDef >= 1); a null stream would need a max def of 0, impossible under an optional
-                    // parent — so there is nothing to cross-check.
+                    // parent — so there is nothing to cross-check. (A synthesized ABSENT child, #857, likewise
+                    // carries a StructPresenceDefs clone under a nullable struct; it is `null` only under a
+                    // REQUIRED struct, where structMaxDef == 0 and this guard has already early-returned above.)
                     continue;
                 }
 
@@ -1476,13 +1529,17 @@ internal static class NestedParquetColumnReader
         }
     }
 
-    // Resolves a struct child in NAME/none mode: matches the requested (physical) child by name against the
-    // file struct's fields, DUPLICATE-INTOLERANTLY (#676) — two file fields sharing the requested name is an
-    // ambiguous/foreign shape and fails closed rather than resolving to the first by luck.
-    // Resolves a struct child to its RAW file Field (NAME mode) — duplicate-intolerant, missing-intolerant —
-    // WITHOUT collapsing it to a scalar leaf. A scalar child then routes to ExpectScalarLeaf; a nested child
-    // recurses through DecodeNode/ValidateNode. This is the name-mode sibling of ResolveStructFieldById.
-    private static Field ResolveStructChildNode(PqStructField fileStruct, StructField requested, string columnName)
+    // Resolves a struct child to its RAW file Field (NAME/none mode) — DUPLICATE-intolerant, non-throwing on
+    // ABSENCE — WITHOUT collapsing it to a scalar leaf. A scalar child then routes to ExpectScalarLeaf; a
+    // nested child recurses through DecodeNode/ValidateNode. This is the name-mode sibling of
+    // ResolveStructFieldById. Three outcomes (#857 §2.3):
+    //   • EXACTLY ONE file field with the requested physical name → `childNode = match; return true` (present).
+    //   • MORE THAN ONE → still THROWS SchemaMismatch (an ambiguous/foreign shape; a DUPLICATE is NOT absence
+    //     and must never be treated as one — the duplicate-child guard stays intact inside the resolver).
+    //   • NONE → `childNode = null; return false` (genuinely ABSENT — the CALLER decides null-fill vs
+    //     fail-closed, so absence is never conflated with a present-but-mismatched child).
+    private static bool TryResolveStructChildNode(
+        PqStructField fileStruct, StructField requested, string columnName, out Field? childNode)
     {
         Field? match = null;
         foreach (Field candidate in fileStruct.Fields)
@@ -1500,14 +1557,142 @@ internal static class NestedParquetColumnReader
             }
         }
 
-        if (match is null)
+        childNode = match;
+        return match is not null;
+    }
+
+    // §2.4 (#857): synthesizes an ABSENT nullable struct child's per-owner-cell definition stream so the
+    // cross-field null-mask parity guard (BuildStructNullMask) sees the SAME struct presence the present
+    // siblings report (INV-PARITY). Struct presence is a property of the STRUCT, not of any one child, so it
+    // is read from the file struct's OWN driving leaf (FirstDataField) — PROJECTION-INDEPENDENT: correct even
+    // when the absent child is the ONLY projected field (there is then no requested sibling to drive the
+    // mask). The clone is clamped at structMaxDef by the SAME ExtractOwnerCellDefs a present sibling under a
+    // repeated ancestor uses; for a TOP-LEVEL struct (parentMaxRep == 0) that call reduces to
+    // min(def[r], structMaxDef) per owner cell (and additionally reconciles a repeated FIRST-child driving
+    // leaf and the owner-cell count), so parity holds by construction in BOTH null-mask paths. A REQUIRED
+    // struct (structMaxDef == 0) has no null mask — BuildStructNullMask early-returns — so `null` is returned
+    // (required-field semantics) and NO extra leaf is read. The one driving-leaf read is charged against the
+    // shared budget by the existing ReadScalarLeafAsync path.
+    private static async ValueTask<int[]?> StructPresenceDefs(
+        ParquetRowGroupReader rowGroup,
+        PqStructField fileStruct,
+        int structMaxDef,
+        int parentMaxDef,
+        int parentMaxRep,
+        int rowCount,
+        NestedDecodeBudget budget,
+        string context,
+        CancellationToken cancellationToken)
+    {
+        if (structMaxDef == 0)
         {
-            throw DeltaStorageException.SchemaMismatch(
-                $"Struct column '{columnName}' is missing requested field '{DiagnosticText.Sanitize(requested.Name)}' in the file.");
+            // A REQUIRED struct: no null mask exists (every owner cell is present); required-field semantics.
+            return null;
         }
 
-        return match;
+        // FirstDataField throws CorruptData for a zero-leaf struct; a struct PRESENT in the file always has
+        // >= 1 physical leaf, so this only fires on a corrupt/empty footer — fail-closed, correct.
+        DataField driving = FirstDataField(fileStruct);
+
+        // The driving leaf's DeltaSharp scalar type is derived from its OWN physical type (we discard its
+        // values and consume only its Dremel levels), so the physical read dispatch is exact.
+        DataType drivingScalar = ParquetTypeMapping.ToDataType(driving);
+        (_, int[]? def, int[]? rep, int numValues) = await ReadScalarLeafAsync(
+            rowGroup, driving, drivingScalar, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+
+        return ExtractOwnerCellDefs(
+            def, rep, numValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, context);
     }
+
+    // §2.5/§2.6 (#857): builds an all-null child vector for an ABSENT nullable struct child of ANY requested
+    // type — scalar OR nested (struct/array/map, now decodable via 585a's recursive DecodeNode). An absent
+    // physical column means the ENTIRE subtree is absent, so EVERY cell is null and NO interior physical leaf
+    // is read (it NEVER recurses into DecodeNode/ReadScalarLeafAsync), keeping a deeply nested absent subtree
+    // O(rows), not O(rows x subtree-leaves). The vector is charged against the shared NestedDecodeBudget
+    // consistent with ChargeStructural so a wide absent-child projection cannot escape the row-group decode
+    // ceiling (§2.6, §6 DoS).
+    private static ColumnVector SynthesizeAbsentChild(
+        DataType type, int rowCount, NestedDecodeBudget budget, string context)
+    {
+        // Conservative O(rows) charge (§2.6, Q6): the value lanes the factory allocates (up to rowCount slots)
+        // plus a per-cell validity byte, summed over the requested subtree (bounded by MaxNestedReadDepth).
+        // No per-VALUE payload term — every cell is null, so nothing is materialized beyond the lanes.
+        budget.ChargeStructural(rowCount, AbsentCellWidth(type), context);
+        return BuildAllNullSubtree(type, rowCount);
+    }
+
+    // Materializes an all-null vector for the requested subtree WITHOUT charging (the parent SynthesizeAbsent
+    // child charges the whole subtree once). A STRUCT is built via its immutable constructor with recursively
+    // all-null children: a struct's own AppendNull requires EVERY field child already populated (each struct
+    // row carries one cell per child, even a null-struct row), so it cannot be committed standalone — this is
+    // the one shape whose null-fill must recurse into its children's LANES (still no file leaf read, still
+    // O(rows) per level). A scalar/array/map builds directly through the factory + AppendNull: a null
+    // list/map has no elements/entries and a null scalar needs no value, so AppendNull commits a null cell
+    // with no interior values.
+    private static ColumnVector BuildAllNullSubtree(DataType type, int rowCount)
+    {
+        if (type is StructType structType)
+        {
+            var children = new ColumnVector[structType.Count];
+            for (int i = 0; i < structType.Count; i++)
+            {
+                children[i] = BuildAllNullSubtree(structType[i].DataType, rowCount);
+            }
+
+            var nulls = new bool[rowCount];
+            Array.Fill(nulls, true);
+            return new StructColumnVector(structType, children, nulls);
+        }
+
+        MutableColumnVector vector = ColumnVectors.Create(type, Math.Max(rowCount, 1));
+        for (int r = 0; r < rowCount; r++)
+        {
+            vector.AppendNull();
+        }
+
+        return vector;
+    }
+
+    // The conservative per-owner-cell byte width of an all-null subtree (§2.6): a scalar contributes its value
+    // lane's element width (the offset/length HANDLE for variable-width string/binary, since an all-null
+    // vector holds no payload) plus one validity byte; a container adds one validity byte + one offset int for
+    // its OWN level plus its children's widths. Summed over the subtree (depth-bounded by MaxNestedReadDepth),
+    // it is an upper bound on the transient the synthesized vector allocates.
+    private static long AbsentCellWidth(DataType type)
+    {
+        switch (type)
+        {
+            case StructType structType:
+                long structWidth = 1; // this struct's own validity byte
+                foreach (StructField child in structType)
+                {
+                    structWidth += AbsentCellWidth(child.DataType);
+                }
+
+                return structWidth;
+            case ArrayType arrayType:
+                return 1 + sizeof(int) + AbsentCellWidth(arrayType.ElementType);
+            case MapType mapType:
+                return 1 + sizeof(int) + AbsentCellWidth(mapType.KeyType) + AbsentCellWidth(mapType.ValueType);
+            default:
+                return ScalarLaneWidth(type) + 1;
+        }
+    }
+
+    // The value-lane element width a scalar MutableColumnVector allocates per cell (mirrors ColumnVectors.
+    // Create's backing storage). Variable-width string/binary carries only the per-value offset/length HANDLE
+    // here — an all-null vector stores no payload bytes.
+    private static long ScalarLaneWidth(DataType type) => type switch
+    {
+        BooleanType or ByteType => 1,
+        ShortType => sizeof(short),
+        IntegerType or DateType or FloatType => sizeof(int),
+        LongType or TimestampType or TimestampNtzType or DoubleType => sizeof(long),
+        DecimalType { IsCompact: true } => sizeof(long),
+        DecimalType => 16, // Int128 lane
+        StringType or BinaryType => 2 * sizeof(int), // offset + length handle (no payload — all null)
+        _ => sizeof(long), // conservative default
+    };
 
     // The DRIVING leaf of a (possibly nested) file node: the first scalar DataField reachable along the
     // document-order first-child path (list -> Item, map -> Key, struct -> Fields[0], DataField -> itself).

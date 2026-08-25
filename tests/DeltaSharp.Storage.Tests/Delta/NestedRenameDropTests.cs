@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Security.Cryptography;
 using System.Text;
@@ -289,14 +290,173 @@ public sealed class NestedRenameDropTests : IDisposable
         // Fresh identity: different physicalName + different id + strictly greater maxColumnId. Because the
         // re-added child's physicalName DIVERGES from the dropped child's, NO byte of the old v0 data file maps
         // to the re-added logical name — the dropped column's stale data can never surface under it (the
-        // soundness anchor; a read null-fill of a newly-added NESTED child is a separate #676 reader concern,
-        // so this is asserted at the metadata level rather than via a read-through).
+        // soundness anchor).
         Assert.NotEqual(zipPhysicalV0, ColumnMapping.PhysicalName(zipV2, ColumnMappingMode.Name));
         Assert.Equal(reAddedPhysical, ColumnMapping.PhysicalName(zipV2, ColumnMappingMode.Name));
         Assert.True(ColumnMapping.TryGetId(zipV2, out long zipIdV2));
         Assert.NotEqual(zipIdV0, zipIdV2);
         long maxV2 = long.Parse(v2.Metadata.Configuration[ColumnMapping.MaxColumnIdKey], CultureInfo.InvariantCulture);
         Assert.True(maxV2 > maxV0, $"maxColumnId must strictly increase: {maxV0} -> {maxV2}");
+
+        // AC4 (#857): the #840 §3.4 deferral is now CLOSED — read the OLD v0 data file through the v2 schema
+        // and assert the re-added address.zip reads NULL for the old rows. Its NEW physicalName
+        // ('col-readded-zip') is absent from the old file (whose zip was written under the DROPPED physical
+        // name), so the nested reader null-fills it (drop-then-re-add read-back), while the surviving
+        // address.city still reads its real values — the metadata-level identity assertion plus a real
+        // read-through, no longer deferred.
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var readAddr = (StructColumnVector)read.Column(1);
+        Assert.False(readAddr.IsNull(0));
+        Assert.False(readAddr.IsNull(1));
+        Assert.Equal("seattle", Encoding.UTF8.GetString(readAddr.Child(0).GetBytes(0)));  // city index 0
+        Assert.Equal("portland", Encoding.UTF8.GetString(readAddr.Child(0).GetBytes(1)));
+        Assert.True(readAddr.Child(1).IsNull(0)); // zip index 1 → NULL (re-added physical name absent)
+        Assert.True(readAddr.Child(1).IsNull(1));
+    }
+
+    // ================================================================ §3.2 — AC2 drop→re-add data read-back
+
+    [Fact]
+    public async Task NestedStructChildDrop_ThenReAdd_OldFileRows_ReadBackNull_NewRows_ReadValues()
+    {
+        // The end-to-end #840 §3.4 scenario as a REAL read (AC2): (v0) write struct<city, zip> with real zip
+        // values; (v1) drop address.zip; (v2) re-add address.zip (fresh id + physicalName) as a metadata-only
+        // commit; (v3) append a NEW data file that physically carries the re-added zip's new physical name with
+        // values. Reading the v3 table: rows from the OLD (v0) file read address.zip as NULL (its new physical
+        // name is absent → null-fill), while rows from the NEW file read the NEW values — the pre/post split.
+        StructType schema = AddressSchema();
+        await WriteNestedNameMappedAsync(schema, AddressBatch(schema));
+
+        Snapshot v0 = await LoadSnapshotAsync();
+        string cityPhysical = ColumnMapping.PhysicalName(ChildField(v0.Schema, "address", "city"), ColumnMappingMode.Name);
+        long maxV0 = long.Parse(v0.Metadata.Configuration[ColumnMapping.MaxColumnIdKey], CultureInfo.InvariantCulture);
+
+        // Drop address.zip (v1).
+        using (var backend = new LocalFileSystemBackend(_root))
+        {
+            await new DeltaTableWriter(backend).DropColumnAsync(new[] { "address", "zip" });
+        }
+
+        Snapshot v1 = await LoadSnapshotAsync();
+
+        // Re-add a NEW address.zip (same logical name) with a FRESH id + physicalName (v2, metadata-only).
+        long reAddedId = maxV0 + 1;
+        const string reAddedPhysical = "col-readded-zip";
+        var addrV1 = (StructType)v1.Schema["address"].DataType;
+        var reAddedZip = new StructField(
+            "zip",
+            DataTypes.LongType,
+            nullable: true,
+            FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(reAddedId)),
+                new KeyValuePair<string, MetadataValue>(ColumnMapping.PhysicalNameKey, MetadataValue.String(reAddedPhysical)),
+            }));
+        var addrV2 = new StructType(addrV1.Concat(new[] { reAddedZip }));
+        var schemaV2 = new StructType(v1.Schema.Select(f =>
+            f.Name == "address" ? new StructField("address", addrV2, f.Nullable, f.Metadata) : f));
+        await AppendMetadataOnlyCommitAsync(
+            2,
+            DeltaSchemaJson.ToJson(schemaV2),
+            ("delta.columnMapping.mode", "name"),
+            ("delta.columnMapping.maxColumnId", reAddedId.ToString(CultureInfo.InvariantCulture)));
+
+        Snapshot v2 = await LoadSnapshotAsync();
+
+        // (v3) Append a NEW data file that physically carries the re-added zip under its NEW physical name.
+        string[] physicalNames = ColumnMappingProjection.ResolvePhysicalNames(v2.Schema, ColumnMappingMode.Name);
+        StructType physicalSchema = ColumnMappingProjection.BuildDataSchema(
+            v2.Schema, physicalNames, ImmutableArray<string>.Empty);
+        Assert.Equal(reAddedPhysical, ((StructType)physicalSchema[1].DataType)[1].Name); // sanity: zip → new phys
+        Assert.Equal(cityPhysical, ((StructType)physicalSchema[1].DataType)[0].Name);    // city keeps v0 phys
+
+        ColumnBatch newBatch = NewFileBatch(physicalSchema);
+        byte[] newParquet = await ParquetTestHelpers.WriteToBytesAsync(physicalSchema, new[] { newBatch });
+        const string newRelative = "part-00001.parquet";
+        using (var backend = new LocalFileSystemBackend(_root))
+        {
+            await backend.PutIfAbsentAsync(newRelative, newParquet, CancellationToken.None);
+            byte[] commit = Encoding.UTF8.GetBytes(
+                $"{{\"add\":{{\"path\":\"{newRelative}\",\"partitionValues\":{{}},"
+                + $"\"size\":{newParquet.Length},\"modificationTime\":0,\"dataChange\":true}}}}\n");
+            await backend.PutIfAbsentAsync("_delta_log/00000000000000000003.json", commit, CancellationToken.None);
+        }
+
+        // Read the v3 table: two active files (old v0, new v3). Assert the pre/post split on address.zip.
+        var addressByFile = new List<StructColumnVector>();
+        var cityByFile = new List<string>();
+        var zipNullByFile = new List<bool>();
+        foreach (ColumnBatch batch in await ReadAllBatchesAsync())
+        {
+            var addr = (StructColumnVector)batch.Column(1);
+            for (int r = 0; r < addr.Length; r++)
+            {
+                addressByFile.Add(addr);
+                cityByFile.Add(addr.Child(0).IsNull(r) ? "<null>" : Encoding.UTF8.GetString(addr.Child(0).GetBytes(r)));
+                zipNullByFile.Add(addr.Child(1).IsNull(r));
+            }
+        }
+
+        // Old (v0) rows: seattle/portland with zip NULL (re-added physical name absent → null-fill).
+        // New (v3) row: denver with zip 90003 (present under the new physical name).
+        Assert.Contains("seattle", cityByFile);
+        Assert.Contains("portland", cityByFile);
+        Assert.Contains("denver", cityByFile);
+
+        // Every city that is an old-file row (seattle/portland) read zip NULL; denver read a real zip value.
+        for (int i = 0; i < cityByFile.Count; i++)
+        {
+            if (cityByFile[i] is "seattle" or "portland")
+            {
+                Assert.True(zipNullByFile[i], $"old-file row '{cityByFile[i]}' must read zip NULL");
+            }
+            else if (cityByFile[i] == "denver")
+            {
+                Assert.False(zipNullByFile[i], "new-file row 'denver' must read the new zip value");
+            }
+        }
+
+        // Confirm the new-file denver row carries the actual re-added value 90003.
+        bool sawDenverValue = false;
+        foreach (ColumnBatch batch in await ReadAllBatchesAsync())
+        {
+            var addr = (StructColumnVector)batch.Column(1);
+            for (int r = 0; r < addr.Length; r++)
+            {
+                if (!addr.Child(0).IsNull(r) && Encoding.UTF8.GetString(addr.Child(0).GetBytes(r)) == "denver")
+                {
+                    Assert.False(addr.Child(1).IsNull(r));
+                    Assert.Equal(90003L, addr.Child(1).GetValue<long>(r));
+                    sawDenverValue = true;
+                }
+            }
+        }
+
+        Assert.True(sawDenverValue, "expected to observe the new-file denver row's zip value");
+    }
+
+    // A one-row new-file batch (id=3, address={city='denver', zip=90003}) under the PHYSICAL schema.
+    private static ManagedColumnBatch NewFileBatch(StructType physicalSchema)
+    {
+        var addrType = (StructType)physicalSchema[1].DataType;
+        var city = Str(new[] { "denver" });
+        var zip = Long(new long?[] { 90003L });
+        var address = new StructColumnVector(addrType, new ColumnVector[] { city, zip }, new[] { false });
+        return new ManagedColumnBatch(
+            physicalSchema, new ColumnVector[] { Long(new long?[] { 3L }), address }, 1);
+    }
+
+    private async Task<IReadOnlyList<ColumnBatch>> ReadAllBatchesAsync()
+    {
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(_root);
+        DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
+        var batches = new List<ColumnBatch>();
+        foreach (ColumnBatch b in await source.ReadBatchesAsync(info.Version))
+        {
+            batches.Add(b);
+        }
+
+        return batches;
     }
 
     // ================================================================ §3.6/3.7/3.8 — segment-array addressing
