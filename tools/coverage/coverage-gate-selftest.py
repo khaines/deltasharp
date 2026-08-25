@@ -254,19 +254,35 @@ class CoverageGateSelfTest(unittest.TestCase):
         # runs before the collect step), and the gate echoes a bounded slice into a ::error:: line. A
         # NON-idempotent collapse (str.replace("::",":")) leaves a live "::" token from a "::::"-run,
         # forging a workflow command; and an un-stripped newline could START a new GHA-parsed command
-        # line. Pin the idempotent single-pass re.sub(r":{2,}",":") + newline collapse: the echoed
-        # Detail must contain NO "::" run and NO newline. Reverting the gate to str.replace keeps every
-        # OTHER test green, so without this the HIGH fix could silently regress.
+        # line. Pin BOTH halves (idempotent single-pass re.sub(r":{2,}",":") AND newline->space
+        # collapse) by asserting the echoed detail equals the exact fully-sanitized form, contiguously
+        # (a surviving "::" OR an un-collapsed newline both break the contiguous match). Reverting
+        # either sanitize pass leaves every OTHER test green, so without this the HIGH fix could
+        # silently regress.
         payload = "a:::::error::title=x::pwn\r\nsecond::set-output::name=y"
+        expected_detail = "a:error:title=x:pwn second:set-output:name=y"  # \r\n->space, then :{2,}->:
         code, out = self._run(
             packages=[(n, 890, 1000) for n in _EXPECTED],
             raw_files={_ABORT_SENTINEL: payload},
         )
         self.assertEqual(code, 3, out)
+        # The whole sanitized detail must appear on ONE line, contiguously — not split across lines by
+        # a leaked newline, and with no surviving "::" run.
+        self.assertIn(
+            f"Detail: {expected_detail}",
+            out,
+            f"sanitizer regressed (surviving '::' or un-collapsed newline); got: {out!r}",
+        )
         err_line = next((ln for ln in out.splitlines() if "Detail:" in ln), None)
         self.assertIsNotNone(err_line, out)
-        detail = err_line.split("Detail:", 1)[1]
+        detail = err_line.split("Detail:", 1)[1].strip()
         self.assertNotIn("::", detail, f"non-idempotent sanitize leaked a live '::' token: {detail!r}")
+        # The mutant that drops the newline collapse splits the payload across log lines: assert the
+        # second half never becomes its own line (which would be GHA-parseable).
+        self.assertFalse(
+            any(ln.strip().startswith("second:") for ln in out.splitlines()),
+            f"newline collapse regressed — attacker bytes started a new log line: {out!r}",
+        )
 
     def test_abort_sentinel_precedes_missing_assembly_fail_closed(self):
         # A crashed host frequently DROPS an entire assembly's report, which presents as the
