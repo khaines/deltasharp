@@ -330,6 +330,19 @@ The reference could not test depth ≥ 2 **read** (585a did not exist). #546 mus
   depth-composed, not a plain bool. (Pairs with the write-side AC7.)
 - **Depth ≤ 1 unaffected regression:** the 585a recursive-decode tests for `array<struct<…>>` etc. must still
   pass byte-identically with the gate **closed** (default), proving #546 adds no decode regression.
+- **Decimal grow-only nested read promote:** a physical `decimal(p,s)` element/field read into a requested
+  wider `decimal(p′,s′)` (grow-only) must rescale losslessly and preserve nulls — the one `ReadPromotedLeafAsync`
+  arm the reference exercised only via the flat/cross-family paths (added in R2: `…DecimalGrowOnly…Promotes`).
+
+**Decode-gate depth component — documented defense-in-depth (no independent test).** The read gate is enforced
+at **two** points: the up-front `ValidateChild` gate (`allow && depth <= 1`) *and* the decode-time gate
+(`allow && depth == 0`, per struct/list/map). `ValidateShape` runs **before** decode and already rejects a
+depth ≥ 2 promotable-but-narrow leaf (`SchemaMismatch`), so the decode-time `depth == 0` component is
+**unreachable via the public read path by construction** — dropping it survives the full suite (confirmed by the
+RFL-864 R1 Quality seat and independently by the red-team). It is retained as a **deliberate defense-in-depth
+invariant** (self-consistent decode if a future refactor moves/bypasses up-front validation) and is documented
+as such in-code at each decode gate, rather than pinned by a contrived test for provably-unreachable code. The
+*load-bearing* validate gate is pinned by the depth ≥ 2 fail-closed test above.
 
 ---
 

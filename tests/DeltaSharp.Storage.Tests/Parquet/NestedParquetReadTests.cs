@@ -358,6 +358,20 @@ public sealed class NestedParquetReadTests
         public DateInner? S { get; set; }
     }
 
+    // A struct physically carrying a narrow decimal(9,2) leaf — to widen to decimal(18,6) on read (grow-only).
+    private sealed class DecNarrowInner
+    {
+        [ParquetDecimal(9, 2)]
+        public decimal Dec { get; set; }
+    }
+
+    private sealed class DecNarrowRow
+    {
+        public int Id { get; set; }
+
+        public DecNarrowInner? S { get; set; }
+    }
+
     [Fact]
     public async Task Struct_ReadsFields_WithNullFieldAndNullStructRow()
     {
@@ -2907,6 +2921,35 @@ public sealed class NestedParquetReadTests
         Assert.Equal(5.00m, ParquetTypeMapping.ReadDecimal(e0, wide, 0));
         Assert.True(e0.IsNull(1));
         Assert.Equal(-3.00m, ParquetTypeMapping.ReadDecimal(e0, wide, 2));
+    }
+
+    [Fact]
+    public async Task Struct_FieldWidening_DecimalGrowOnly_WhenEnabled_Promotes()
+    {
+        // The one ReadPromotedLeafAsync arm the reference exercised only via the flat/cross-family paths
+        // (R2 Columnar F1 / Quality F3): a physical decimal(9,2) struct field read into a requested wider
+        // decimal(18,6) — grow-only (scale 2→6, integer digits p−s 7→12 both grow), so IsSanctionedWidening
+        // admits it and AppendDecimal rescales losslessly. Null struct row preserves a null field cell.
+        var rows = new List<DecNarrowRow>
+        {
+            new() { Id = 1, S = new DecNarrowInner { Dec = 12.34m } },
+            new() { Id = 2, S = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var wide = DataTypes.CreateDecimalType(18, 6);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "S",
+                new StructType(new[] { new StructField("Dec", wide, nullable: false) }),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        Assert.Equal(12.34m, ParquetTypeMapping.ReadDecimal(s.Child("Dec"), wide, 0));
+        Assert.True(s.IsNull(1)); // null struct row → field cell null, preserved through the promoted schema
     }
 
     [Fact]

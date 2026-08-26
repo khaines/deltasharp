@@ -114,6 +114,12 @@ internal static class NestedParquetColumnReader
     /// (<see cref="StorageErrorKind.SchemaMismatch"/>), a leaf type is unsupported or the schema nests deeper
     /// than <see cref="MaxNestedReadDepth"/> (<see cref="StorageErrorKind.UnsupportedFeature"/>), or a crafted
     /// footer declares structurally-inconsistent levels (<see cref="StorageErrorKind.CorruptData"/>).</exception>
+    /// <remarks>
+    /// Invoked only on the NAME/none-mode branch (id-mode columns route to the separate
+    /// <c>Validate*ShapeById</c> helpers, which hardcode <c>promoteLeaf: false</c>), so the
+    /// <paramref name="allowTypeWideningPromotion"/> gate composed here is never applied to an id-mode leaf
+    /// (#546 §2.4 / §9 O1).
+    /// </remarks>
     public static void ValidateShape(
         Field fileField, DataType requestedType, string columnName, bool allowTypeWideningPromotion)
     {
@@ -506,7 +512,13 @@ internal static class NestedParquetColumnReader
             // a TOP-LEVEL struct (depth == 0) sits at container depth 1 (promotable); a struct nested inside
             // another container is decoded at depth ≥ 1, so its scalar fields sit at depth ≥ 2 and stay
             // exact-match (fail-closed) — the decode-path mirror of ValidateChild's `depth <= 1` (design §2.4).
-            bool promoteLeaf = allowTypeWideningPromotion && depth == 0;
+            // DEFENSE-IN-DEPTH INVARIANT: ValidateShape/ValidateChild runs BEFORE decode and already rejects a
+            // depth ≥ 2 promotable-but-narrow leaf, so this decode-time `depth == 0` component is not reachable
+            // via the public read path (ParquetFileReader.ReadAsync) — it has no independent killing test by
+            // construction and exists only to keep the decode self-consistent if a future refactor were to move
+            // or bypass the up-front validation (design §2.4 / §3.3, RFL-864 R1 Quality F1). `byFieldId is null`
+            // for symmetry with the list/map sites (id-mode never promotes; the id-mode branch already `continue`d).
+            bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
             DataField scalarLeaf = ExpectScalarLeaf(
                 childNode, field.DataType, structMaxRep, structMaxDef, childContext, promoteLeaf);
             int scalarPresentFloor = underRepeatedAncestor ? parentMaxDef : 0;
@@ -699,6 +711,8 @@ internal static class NestedParquetColumnReader
         // (depth == 0) sits at container depth 1 (promotable); an array nested inside another container is
         // decoded at depth ≥ 1, so its scalar element sits at depth ≥ 2 and stays exact-match — the decode-path
         // mirror of ValidateChild's `depth <= 1` (design §2.4). Id-mode leaves keep promoteLeaf false (§9 O1).
+        // DEFENSE-IN-DEPTH: shadowed by the up-front ValidateChild gate (no independent public-API test by
+        // construction) — see the struct site above / design §3.3 (RFL-864 R1 Quality F1).
         bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
         DataField elementLeaf = byFieldId is not null && interiorIds?.ElementId is long elementId
             ? ExpectScalarLeaf(
@@ -785,6 +799,8 @@ internal static class NestedParquetColumnReader
         // (depth == 0) sits at container depth 1 (promotable); a map nested inside another container is decoded
         // at depth ≥ 1, so its scalar key/value sits at depth ≥ 2 and stays exact-match — the decode-path
         // mirror of ValidateChild's `depth <= 1` (design §2.4). Id-mode leaves keep promoteLeaf false (§9 O1).
+        // DEFENSE-IN-DEPTH: shadowed by the up-front ValidateChild gate (no independent public-API test by
+        // construction) — see the struct site / design §3.3 (RFL-864 R1 Quality F1).
         bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
 
         // Keys drive the entry structure (the key subtree's driving leaf). A required key's max definition level
