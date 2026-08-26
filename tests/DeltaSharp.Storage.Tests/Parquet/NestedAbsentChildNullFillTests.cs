@@ -488,6 +488,56 @@ public sealed class NestedAbsentChildNullFillTests
         }
     }
 
+    // ---- §3.6b · repeated-ancestor parity: a NULL struct owner cell must report ABSENT (R2 Quality F1) ----
+
+    [Fact]
+    public void ExtractOwnerCellDefs_NullStructOwnerCell_UnderRepeatedAncestor_ReportsAbsent()
+    {
+        // The presence stream that StructPresenceDefs clones for an absent child is produced by
+        // ExtractOwnerCellDefs. Under a repeated ancestor (parentMaxRep > 0), a list element whose STRUCT is
+        // null (present list element, null struct: parentMaxDef <= d < structMaxDef) MUST report def <
+        // structMaxDef so BuildStructNullMask marks that owner cell null — matching a present sibling. A
+        // regression that over-reports presence (clamping to structMaxDef unconditionally under a repeated
+        // ancestor) would disagree with a present sibling's real def and trip the parity guard on valid data.
+        // Levels for list<struct<...>>: parentMaxRep=1 (list), parentMaxDef=1 (list element present),
+        // structMaxDef=2 (struct present). One row, one list of TWO elements: [present struct, null struct].
+        const int structMaxDef = 2;
+        const int parentMaxDef = 1;
+        const int parentMaxRep = 1;
+        int[] def = { 2, 1 }; // elem 0: struct present (d=2); elem 1: element present but struct null (d=1)
+        int[] rep = { 0, 1 }; // elem 0 opens the row/list; elem 1 continues the same list
+
+        int[] owned = NestedParquetColumnReader.ExtractOwnerCellDefs(
+            def, rep, numValues: 2, structMaxDef, parentMaxDef, parentMaxRep, ownerCells: 2, "col");
+
+        Assert.Equal(2, owned[0]);                 // present struct owner cell
+        Assert.True(owned[1] < structMaxDef);      // NULL struct owner cell — reported absent (kills the over-report mutant)
+        Assert.Equal(1, owned[1]);                 // exactly the clamped list-element def, not structMaxDef
+    }
+
+    // ---- §3.6c · empty row group (rowCount == 0) — null-fill composes without throwing (R2 F2/F3) --------
+
+    [Fact]
+    public async Task NestedAbsentChild_EmptyRowGroup_NullFillComposesWithoutThrowing()
+    {
+        // An absent nullable child over a ZERO-row file. SynthesizeAbsentChild uses Math.Max(rowCount,1) for
+        // capacity and a 0-iteration append loop; StructPresenceDefs / BuildStructNullMask see rowCount == 0.
+        // The read must complete without throwing; any produced batch exposes the absent child at length 0.
+        byte[] bytes = await WriteAsync(new List<OnlyARow>());
+
+        using var stream = new MemoryStream(bytes, writable: false);
+        var reader = new ParquetFileReader();
+        StructType requested = RequestStructAB(bNullable: true);
+        await foreach (ColumnBatch batch in reader.ReadAsync(
+            stream, requested, keepRowGroup: null, nullFillMissingColumns: false,
+            allowTypeWideningPromotion: false, resolveByFieldId: false, CancellationToken.None))
+        {
+            var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+            ColumnVector b = s.Child("B");
+            Assert.Equal(batch.RowCount, b.Length);
+        }
+    }
+
     // ---- harness --------------------------------------------------------------------------------------
 
     private static StructType RequestStructAB(bool bNullable) => new(new[]

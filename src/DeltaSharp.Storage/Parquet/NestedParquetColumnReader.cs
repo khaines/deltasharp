@@ -386,6 +386,13 @@ internal static class NestedParquetColumnReader
         // semantics) or a `StructPresenceDefs` clone under a NULLABLE struct (so the cross-field parity guard's
         // INV-PARITY holds against every present sibling).
         int[]?[] fieldDefs = new int[requested.Count][];
+        // #857 (Storage F1 / red-team): the struct's presence stream is a property of the STRUCT, not of any
+        // one absent child, so it is computed AT MOST ONCE per ReadStructAsync and shared by every absent
+        // child — otherwise N absent children would each re-decode AND re-CHARGE the same driving leaf N times,
+        // which both wastes I/O and can spuriously exhaust the shared decode budget for a wide drop-then-re-add
+        // projection (failing valid data closed). The shared array is read-only to BuildStructNullMask.
+        int[]? absentPresenceDefs = null;
+        bool absentPresenceComputed = false;
         for (int i = 0; i < requested.Count; i++)
         {
             StructField field = requested[i];
@@ -428,11 +435,18 @@ internal static class NestedParquetColumnReader
 
                 // NULLABLE + absent → NULL-FILL (§2.4/§2.5): an all-null child vector for the FULL requested
                 // type (scalar OR nested subtree) plus a synthesized per-owner-cell presence stream clamped at
-                // structMaxDef so BuildStructNullMask's parity guard is satisfied (INV-PARITY).
-                children[i] = SynthesizeAbsentChild(field.DataType, rowCount, budget, childContext);
-                fieldDefs[i] = await StructPresenceDefs(
-                    rowGroup, fileStruct, structMaxDef, parentMaxDef, parentMaxRep, rowCount, budget, childContext,
-                    cancellationToken).ConfigureAwait(false);
+                // structMaxDef so BuildStructNullMask's parity guard is satisfied (INV-PARITY). The presence
+                // stream is computed once (memoized) and shared across all absent children of this struct.
+                children[i] = SynthesizeAbsentChild(field.DataType, rowCount, budget, childContext, depth + 1);
+                if (!absentPresenceComputed)
+                {
+                    absentPresenceDefs = await StructPresenceDefs(
+                        rowGroup, fileStruct, structMaxDef, parentMaxDef, parentMaxRep, rowCount, budget,
+                        childContext, cancellationToken).ConfigureAwait(false);
+                    absentPresenceComputed = true;
+                }
+
+                fieldDefs[i] = absentPresenceDefs;
                 continue;
             }
 
@@ -979,7 +993,10 @@ internal static class NestedParquetColumnReader
     // def >= parentMaxDef), matching BuildRepeatedStructure's owner discipline. A driving leaf with no repeated
     // ancestor carries a null rep (max repetition 0) — every slot is then an owner (repetition level 0); a fully
     // required path carries a null def — every slot is then present at its own max.
-    private static int[] ExtractOwnerCellDefs(
+    // internal (not private) so the parity-under-repeated-ancestor clamp is directly unit-testable (#857 R2,
+    // Quality F1): a null struct owner cell under a repeated ancestor must report def < structMaxDef, not be
+    // over-reported as present.
+    internal static int[] ExtractOwnerCellDefs(
         int[]? def, int[]? rep, int numValues, int structMaxDef, int parentMaxDef, int parentMaxRep,
         int ownerCells, string columnName)
     {
@@ -1612,31 +1629,40 @@ internal static class NestedParquetColumnReader
     // consistent with ChargeStructural so a wide absent-child projection cannot escape the row-group decode
     // ceiling (§2.6, §6 DoS).
     private static ColumnVector SynthesizeAbsentChild(
-        DataType type, int rowCount, NestedDecodeBudget budget, string context)
+        DataType type, int rowCount, NestedDecodeBudget budget, string context, int depth)
     {
         // Conservative O(rows) charge (§2.6, Q6): the value lanes the factory allocates (up to rowCount slots)
         // plus a per-cell validity byte, summed over the requested subtree (bounded by MaxNestedReadDepth).
         // No per-VALUE payload term — every cell is null, so nothing is materialized beyond the lanes.
-        budget.ChargeStructural(rowCount, AbsentCellWidth(type), context);
-        return BuildAllNullSubtree(type, rowCount);
+        budget.ChargeStructural(rowCount, AbsentCellWidth(type, depth), context);
+        return BuildAllNullSubtree(type, rowCount, depth);
     }
 
     // Materializes an all-null vector for the requested subtree WITHOUT charging (the parent SynthesizeAbsent
     // child charges the whole subtree once). A STRUCT is built via its immutable constructor with recursively
     // all-null children: a struct's own AppendNull requires EVERY field child already populated (each struct
     // row carries one cell per child, even a null-struct row), so it cannot be committed standalone — this is
-    // the one shape whose null-fill must recurse into its children's LANES (still no file leaf read, still
-    // O(rows) per level). A scalar/array/map builds directly through the factory + AppendNull: a null
-    // list/map has no elements/entries and a null scalar needs no value, so AppendNull commits a null cell
-    // with no interior values.
-    private static ColumnVector BuildAllNullSubtree(DataType type, int rowCount)
+    // the one shape whose null-fill must recurse into its children's LANES (still no file leaf read: the
+    // recursion is over the DECLARED subtree shape only). No interior physical leaf is read at any level, so
+    // the FILE-READ cost stays O(rows); the transient ALLOCATION is O(rows × subtree-width), charged in full
+    // by AbsentCellWidth. The requested subtree depth is bounded by MaxNestedReadDepth (fail-closed past it),
+    // matching the sibling DecodeNode/ValidateNode guards, so a programmatically-constructed deep type cannot
+    // recurse unbounded into a StackOverflow.
+    private static ColumnVector BuildAllNullSubtree(DataType type, int rowCount, int depth)
     {
+        if (depth > MaxNestedReadDepth)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Nested column exceeds the maximum supported nesting depth of {MaxNestedReadDepth} levels "
+                + "while null-filling an absent nested child.");
+        }
+
         if (type is StructType structType)
         {
             var children = new ColumnVector[structType.Count];
             for (int i = 0; i < structType.Count; i++)
             {
-                children[i] = BuildAllNullSubtree(structType[i].DataType, rowCount);
+                children[i] = BuildAllNullSubtree(structType[i].DataType, rowCount, depth + 1);
             }
 
             var nulls = new bool[rowCount];
@@ -1654,34 +1680,46 @@ internal static class NestedParquetColumnReader
     }
 
     // The conservative per-owner-cell byte width of an all-null subtree (§2.6): a scalar contributes its value
-    // lane's element width (the offset/length HANDLE for variable-width string/binary, since an all-null
-    // vector holds no payload) plus one validity byte; a container adds one validity byte + one offset int for
-    // its OWN level plus its children's widths. Summed over the subtree (depth-bounded by MaxNestedReadDepth),
-    // it is an upper bound on the transient the synthesized vector allocates.
-    private static long AbsentCellWidth(DataType type)
+    // lane's element width (for a variable-width string/binary, the speculative data lane AND the offset lane
+    // the backing store allocates up-front — see ScalarLaneWidth) plus one validity byte; a container adds one
+    // validity byte + one offset int for its OWN level plus its children's widths. Summed over the subtree
+    // (depth-bounded by MaxNestedReadDepth, fail-closed past it), it is an UPPER BOUND on the transient the
+    // synthesized vector allocates — so a wide/deep absent projection cannot escape the row-group decode
+    // ceiling by being under-charged.
+    private static long AbsentCellWidth(DataType type, int depth)
     {
+        if (depth > MaxNestedReadDepth)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Nested column exceeds the maximum supported nesting depth of {MaxNestedReadDepth} levels "
+                + "while sizing an absent nested child.");
+        }
+
         switch (type)
         {
             case StructType structType:
                 long structWidth = 1; // this struct's own validity byte
                 foreach (StructField child in structType)
                 {
-                    structWidth += AbsentCellWidth(child.DataType);
+                    structWidth += AbsentCellWidth(child.DataType, depth + 1);
                 }
 
                 return structWidth;
             case ArrayType arrayType:
-                return 1 + sizeof(int) + AbsentCellWidth(arrayType.ElementType);
+                return 1 + sizeof(int) + AbsentCellWidth(arrayType.ElementType, depth + 1);
             case MapType mapType:
-                return 1 + sizeof(int) + AbsentCellWidth(mapType.KeyType) + AbsentCellWidth(mapType.ValueType);
+                return 1 + sizeof(int)
+                    + AbsentCellWidth(mapType.KeyType, depth + 1) + AbsentCellWidth(mapType.ValueType, depth + 1);
             default:
                 return ScalarLaneWidth(type) + 1;
         }
     }
 
     // The value-lane element width a scalar MutableColumnVector allocates per cell (mirrors ColumnVectors.
-    // Create's backing storage). Variable-width string/binary carries only the per-value offset/length HANDLE
-    // here — an all-null vector stores no payload bytes.
+    // Create's backing storage). For a variable-width string/binary vector the managed backing store
+    // speculatively allocates BOTH a data lane (8 bytes/cell) AND an offset lane (sizeof(int)/cell) up-front,
+    // even though an all-null vector writes no payload — so both are counted here to keep AbsentCellWidth a
+    // true upper bound on the transient (Columnar F1).
     private static long ScalarLaneWidth(DataType type) => type switch
     {
         BooleanType or ByteType => 1,
@@ -1690,7 +1728,7 @@ internal static class NestedParquetColumnReader
         LongType or TimestampType or TimestampNtzType or DoubleType => sizeof(long),
         DecimalType { IsCompact: true } => sizeof(long),
         DecimalType => 16, // Int128 lane
-        StringType or BinaryType => 2 * sizeof(int), // offset + length handle (no payload — all null)
+        StringType or BinaryType => 8 + sizeof(int), // speculative data lane (8/cell) + offset lane (no payload — all null)
         _ => sizeof(long), // conservative default
     };
 

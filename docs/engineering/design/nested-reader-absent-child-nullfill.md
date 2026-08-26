@@ -269,9 +269,19 @@ return v;
   values because every owner cell is null.
 
 Crucially, a **nested absent child never recurses into `DecodeNode`/`ReadScalarLeafAsync`** for its interior —
-there is no physical column to decode — so it neither reads nor charges any file leaf beyond the single
-`StructPresenceDefs` driving leaf (§2.4). This is what keeps a deeply nested absent subtree O(rows), not
-O(rows × subtree-leaves).
+there is no physical column to decode — so it neither reads nor charges any file **leaf** beyond the single
+`StructPresenceDefs` driving leaf (§2.4). The *file-read* cost is therefore **O(rows)** (independent of the
+absent subtree's leaf count); the transient **allocation** is O(rows × subtree-width) — the immutable
+`StructColumnVector` ctor requires every declared child lane populated at `Length == rowCount` — and is
+charged in full (§2.6). `BuildAllNullSubtree`/`AbsentCellWidth` recurse over the **declared** subtree shape and
+fail closed (`UnsupportedFeature`) past `MaxNestedReadDepth`, matching the sibling `DecodeNode`/`ValidateNode`
+guards, so a programmatically-constructed deep requested type cannot recurse unbounded into a `StackOverflow`.
+
+**Presence-stream memoization.** The struct's presence pattern is a property of the **struct**, not of any one
+absent child, so `StructPresenceDefs` is computed **at most once per `ReadStructAsync`** and the resulting
+(read-only) stream is shared by every absent child of that struct. Without this, a wide drop-then-re-add (N
+absent children in one struct) would re-decode **and re-charge the budget for** the same driving leaf N times —
+which both wastes I/O and can spuriously exhaust the shared decode ceiling, failing *valid* data closed.
 
 ### 2.6 Budget charging for the synthesized vector
 
@@ -279,18 +289,22 @@ The synthesized vector is transient reconstruction state and MUST be charged aga
 `NestedDecodeBudget` ceiling like every other nested allocation, so a projection of many wide absent children
 cannot escape the ceiling. The design charges O(rows) per synthesized child:
 
-- **Scalar absent child:** `budget.ChargeStructural(rowCount, perCellBytes, ctx)` where `perCellBytes` bounds
-  the all-null slot (the value lane's element width + one validity byte; for variable-width string/binary the
-  element width is the offset/length handle since no payload bytes exist).
+- **Scalar absent child:** `budget.ChargeStructural(rowCount, perCellBytes, ctx)` where `perCellBytes` is an
+  **upper bound** on the all-null slot: the value lane's element width + one validity byte. For a variable-width
+  string/binary the managed backing store speculatively allocates BOTH a data lane (8 bytes/cell) AND an offset
+  lane (`sizeof(int)`/cell) up-front even though an all-null vector writes no payload, so **both** lanes are
+  counted (`ScalarLaneWidth` returns `8 + sizeof(int)` for string/binary) — otherwise the ceiling would be
+  under-charged for a wide absent string projection.
 - **Nested absent child:** charge the per-row null-mask/validity width **summed over the requested subtree**
   (each `Struct`/`List`/`Map` level contributes its own per-row validity slot; a `List`/`Map` adds a per-row
-  offset). The subtree depth is bounded by `MaxNestedReadDepth = 64` (`NestedParquetColumnReader.cs:97`), so
-  the charge is O(rows × depth) = O(rows) with a small constant. Because every interior cell is null, **no**
-  per-value payload term is charged (there are no values) — unlike a present leaf's `Charge`
-  (`NestedParquetColumnReader.cs:1338`), which folds in the decoded payload.
+  offset). The subtree depth is bounded by `MaxNestedReadDepth = 64` (`NestedParquetColumnReader.cs:97`) — and
+  `AbsentCellWidth` **enforces** it (fail-closed `UnsupportedFeature` past the bound), not merely relies on the
+  upstream schema-parse cap — so the charge is O(rows × depth) = O(rows) with a small constant. Because every
+  interior cell is null, **no** per-value payload term is charged.
 
 The `StructPresenceDefs` driving-leaf read is charged by the existing `ReadScalarLeafAsync` path (it is a
-normal present leaf). No new uncharged allocation is introduced.
+normal present leaf), and — per the memoization above — **once** per struct regardless of how many children are
+absent. No new uncharged allocation is introduced.
 
 ---
 
@@ -376,6 +390,18 @@ fail-closed case asserts the **exact exception kind** (`SchemaMismatch` / `Colum
     absent, `structMaxRep > 0`). **Assert:** the synthesized `StructPresenceDefs` is built via
     `ExtractOwnerCellDefs` (clamped at `structMaxDef`), one cell per present owner element; `b` reads null per
     element; the parity guard holds; owner-cell counts reconcile.
+13b. `ExtractOwnerCellDefs_NullStructOwnerCell_UnderRepeatedAncestor_ReportsAbsent` — the parity crux under a
+    repeated ancestor: a present list element whose **struct is null** (`parentMaxDef ≤ d < structMaxDef`) must
+    report `def < structMaxDef` so `BuildStructNullMask` marks that owner cell null, byte-identically to a
+    present sibling. **Assert:** the clamp preserves the null-struct owner cell as absent (kills a regression
+    that over-reports presence under a repeated ancestor). A direct unit test of `ExtractOwnerCellDefs`.
+13c. `NestedAbsentChild_EmptyRowGroup_NullFillComposesWithoutThrowing` — a zero-row file
+    (`rowCount == 0`): `SynthesizeAbsentChild`'s `Math.Max(rowCount, 1)` capacity + 0-iteration append loop and
+    the length-0 `StructColumnVector` composition must not throw; any produced batch exposes the absent child at
+    length 0.
+13d. `NestedAbsentChild_Budget_ChargedAndBounded` — a wide projection of many absent children; a crafted tiny
+    ceiling fails closed (`CorruptData`) while the default ceiling admits it. Also exercises presence-stream
+    memoization (the driving leaf is charged once, not once per absent child).
 14. `NestedAbsentChild_Budget_ChargedAndBounded` — a wide projection of many absent children over a large row
     group. **Assert:** each synthesized vector is charged O(rows) against `NestedDecodeBudget`; a crafted
     row-count/ceiling that would overflow fails closed with `CorruptData` (ceiling breach), never OOMs; a normal
@@ -528,16 +554,18 @@ resurface**.
    Extending top-level nested null-fill (build an all-null nested container from the requested type) is a
    natural but **separate** increment; flag as a follow-up if a top-level nested column is ever dropped→re-added
    and read. This design does not change that site.
-5. **OPEN — reuse a present sibling's stream vs. always read the file-struct driving leaf.** §2.4 mandates the
-   driving-leaf read for correctness (projection-independence). Whether to **also** short-circuit to a present
-   requested sibling's already-clamped stream when one is projected (saving one leaf read) is a micro-optimization
-   left to implementation; it must not change semantics and must fall back to the driving-leaf read when no
-   present sibling is projected. Recommend implementing the driving-leaf read first (correct, simple) and adding
-   the reuse only if a benchmark shows the extra read matters.
-6. **OPEN — nested absent child budget granularity.** §2.6 charges O(rows × subtree-depth) for a nested absent
-   child. Whether to charge the exact per-level validity/offset widths or a single conservative `perRowBytes ×
-   depth` upper bound is an implementation choice; either is O(rows) and fails closed on breach. Recommend the
-   conservative upper bound to match `ChargeStructural`'s existing style.
+5. **RESOLVED (R2) — reuse across absent children via memoization.** §2.4 mandates the driving-leaf read for
+   correctness (projection-independence). The implementation computes `StructPresenceDefs` **once per
+   `ReadStructAsync`** and shares the (read-only) stream across every absent child of the struct, so a wide
+   drop-then-re-add does not re-decode or re-charge the same driving leaf N times (which could otherwise
+   spuriously exhaust the decode budget and fail valid data closed). Reuse of a *present projected sibling's*
+   already-clamped stream remains an optional further micro-optimization, not required for correctness.
+6. **RESOLVED (R2) — nested absent child budget granularity.** §2.6 charges a conservative per-cell **upper
+   bound** summed over the requested subtree (`AbsentCellWidth`), including — for variable-width string/binary —
+   BOTH the speculative data lane and the offset lane the backing store allocates up-front, so the ceiling is
+   never under-charged. `AbsentCellWidth`/`BuildAllNullSubtree` **enforce** `MaxNestedReadDepth` (fail-closed
+   `UnsupportedFeature` past the bound), matching the sibling `DecodeNode`/`ValidateNode` guards rather than
+   relying solely on the upstream schema-parse cap.
 
 ---
 
