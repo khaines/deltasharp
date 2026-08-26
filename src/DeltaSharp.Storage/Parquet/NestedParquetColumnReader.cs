@@ -96,33 +96,41 @@ internal static class NestedParquetColumnReader
     /// </summary>
     internal const int MaxNestedReadDepth = 64;
 
+    // Micros in one UTC day — the scale factor for the date → timestamp_ntz per-leaf promotion (#546),
+    // mirroring ParquetFileReader.MicrosPerDay for the flat path.
+    private const long MicrosPerDay = 86_400L * 1_000_000L;
+
     /// <summary>
     /// Structurally validates that <paramref name="fileField"/> matches the requested nested
     /// <paramref name="requestedType"/> to ARBITRARY DEPTH (585a): the correct container kind at every level,
-    /// every requested leaf present with an EXACT physical-type match (no widening for nested leaves — that is
-    /// 585b), and every per-level structural guard (canonical/required map key, leaf structural-level
-    /// consistency) applied recursively — WITHOUT reading any data page, so a schema disagreement fails before
-    /// any batch is yielded (mirrors the flat path's up-front validation).
+    /// every requested leaf present with an EXACT physical-type match OR — when
+    /// <paramref name="allowTypeWideningPromotion"/> is set AND the leaf sits at container depth ≤ 1 — a
+    /// Delta-sanctioned NARROWER widening the read path promotes per leaf (#546), and every per-level
+    /// structural guard (canonical/required map key, leaf structural-level consistency) applied recursively —
+    /// WITHOUT reading any data page, so a schema disagreement fails before any batch is yielded (mirrors the
+    /// flat path's up-front validation).
     /// </summary>
     /// <exception cref="DeltaStorageException">The shapes disagree
     /// (<see cref="StorageErrorKind.SchemaMismatch"/>), a leaf type is unsupported or the schema nests deeper
     /// than <see cref="MaxNestedReadDepth"/> (<see cref="StorageErrorKind.UnsupportedFeature"/>), or a crafted
     /// footer declares structurally-inconsistent levels (<see cref="StorageErrorKind.CorruptData"/>).</exception>
-    public static void ValidateShape(Field fileField, DataType requestedType, string columnName)
+    public static void ValidateShape(
+        Field fileField, DataType requestedType, string columnName, bool allowTypeWideningPromotion)
     {
         // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
         // into every message this reader raises, including the recursive sub-labels built from it. Sanitize it
         // ONCE at the entry point (control-char strip + length cap) so a crafted/foreign schema name cannot
         // inject line breaks into a structured-log sink or render unbounded.
         columnName = DiagnosticText.Sanitize(columnName);
-        ValidateNode(fileField, requestedType, columnName, depth: 0);
+        ValidateNode(fileField, requestedType, columnName, depth: 0, allowTypeWideningPromotion);
     }
 
     // 585a — recursive shape/level validator. Keys each container's leaf-structural-level guards off THAT
     // container node's own MaxRepetitionLevel/MaxDefinitionLevel, so it generalizes the single-level guards to
     // any depth; a scalar leaf routes to ExpectScalarLeaf (exact physical type + level guard), a nested child
     // recurses. The map-transposition + canonical-name + required-key guards run at EVERY map node.
-    private static void ValidateNode(Field fileField, DataType requestedType, string context, int depth)
+    private static void ValidateNode(
+        Field fileField, DataType requestedType, string context, int depth, bool allowTypeWideningPromotion)
     {
         if (depth > MaxNestedReadDepth)
         {
@@ -171,7 +179,7 @@ internal static class NestedParquetColumnReader
 
                     ValidateChild(
                         childNode!, field.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
-                        childLabel, depth + 1);
+                        childLabel, depth + 1, allowTypeWideningPromotion);
                 }
 
                 break;
@@ -184,7 +192,7 @@ internal static class NestedParquetColumnReader
 
                 ValidateChild(
                     fileList.Item, arrayType.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel,
-                    $"array column '{context}' element", depth + 1);
+                    $"array column '{context}' element", depth + 1, allowTypeWideningPromotion);
                 break;
             case MapType mapType:
                 if (fileField is not PqMapField fileMap)
@@ -200,10 +208,10 @@ internal static class NestedParquetColumnReader
                 EnsureRequiredMapKey(fileMap, context);
                 ValidateChild(
                     fileMap.Key, mapType.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-                    $"map column '{context}' key", depth + 1);
+                    $"map column '{context}' key", depth + 1, allowTypeWideningPromotion);
                 ValidateChild(
                     fileMap.Value, mapType.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-                    $"map column '{context}' value", depth + 1);
+                    $"map column '{context}' value", depth + 1, allowTypeWideningPromotion);
                 break;
             default:
                 // #705 predicate: struct/array/map are handled by the cases above, so this arm fires only for
@@ -219,16 +227,22 @@ internal static class NestedParquetColumnReader
     // a scalar child routes to the exact-physical-type + structural-level leaf guard; a nested child recurses
     // (guarded by MaxNestedReadDepth at ValidateNode entry). `parentMaxRep`/`parentMaxDef` are the IMMEDIATE
     // parent container node's own levels — the thresholds the leaf structural-level guard needs at any depth.
+    // `depth` is THIS child's own container depth (its parent's depth + 1), so the #546 promotion gate for a
+    // scalar leaf is `allowTypeWideningPromotion && depth <= 1` — a leaf directly under one top-level container
+    // (the exact shapes #571's reader promotes); a deeper (nested-within-nested) leaf keeps the exact-match
+    // requirement (fail-closed), composing the read gate with 585a's recursive descent (design §2.4).
     private static void ValidateChild(
-        Field fileChild, DataType requested, int parentMaxRep, int parentMaxDef, string context, int depth)
+        Field fileChild, DataType requested, int parentMaxRep, int parentMaxDef, string context, int depth,
+        bool allowTypeWideningPromotion)
     {
         if (requested is ArrayType or MapType or StructType)
         {
-            ValidateNode(fileChild, requested, context, depth);
+            ValidateNode(fileChild, requested, context, depth, allowTypeWideningPromotion);
         }
         else
         {
-            _ = ExpectScalarLeaf(fileChild, requested, parentMaxRep, parentMaxDef, context);
+            bool promoteLeaf = allowTypeWideningPromotion && depth <= 1;
+            _ = ExpectScalarLeaf(fileChild, requested, parentMaxRep, parentMaxDef, context, promoteLeaf);
         }
     }
 
@@ -273,6 +287,7 @@ internal static class NestedParquetColumnReader
         NestedDecodeBudget budget,
         IReadOnlyDictionary<int, DataField>? byFieldId,
         NestedInteriorIds? interiorIds,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         // #683 message hygiene: `columnName` is a pure DIAGNOSTIC LABEL (never a lookup key) that is echoed
@@ -285,7 +300,8 @@ internal static class NestedParquetColumnReader
         // present), ownerCells = rowCount, depth = 0.
         return await DecodeNode(
             rowGroup, fileField, requestedType, rowCount, columnName, budget, byFieldId, interiorIds,
-            depth: 0, parentMaxRep: 0, parentMaxDef: 0, cancellationToken).ConfigureAwait(false);
+            depth: 0, parentMaxRep: 0, parentMaxDef: 0, allowTypeWideningPromotion, cancellationToken)
+            .ConfigureAwait(false);
     }
 
     // 585a — the recursive shredder-inverse. Dispatches on the requested type, reconstructing an arbitrary-depth
@@ -307,6 +323,7 @@ internal static class NestedParquetColumnReader
         int depth,
         int parentMaxRep,
         int parentMaxDef,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         if (depth > MaxNestedReadDepth)
@@ -330,13 +347,15 @@ internal static class NestedParquetColumnReader
             // id mode is rejected upstream), so it never recurses.
             StructType structType => await ReadStructAsync(
                 rowGroup, ExpectStruct(fileField, columnName), structType, ownerCells, columnName, budget, byFieldId,
-                depth, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false),
+                depth, parentMaxRep, parentMaxDef, allowTypeWideningPromotion, cancellationToken).ConfigureAwait(false),
             ArrayType arrayType => await ReadListAsync(
                 rowGroup, ExpectList(fileField, columnName), arrayType, ownerCells, columnName, budget,
-                byFieldId, interiorIds, depth, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false),
+                byFieldId, interiorIds, depth, parentMaxRep, parentMaxDef, allowTypeWideningPromotion,
+                cancellationToken).ConfigureAwait(false),
             MapType mapType => await ReadMapAsync(
                 rowGroup, ExpectMap(fileField, columnName), mapType, ownerCells, columnName, budget,
-                byFieldId, interiorIds, depth, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false),
+                byFieldId, interiorIds, depth, parentMaxRep, parentMaxDef, allowTypeWideningPromotion,
+                cancellationToken).ConfigureAwait(false),
             _ => throw DeltaStorageException.UnsupportedFeature(
                 // #705 predicate: struct/array/map are the three explicit switch arms above, so this `_` arm
                 // fires only for a SCALAR requestedType at a container position. DescribeType bounds it.
@@ -358,6 +377,7 @@ internal static class NestedParquetColumnReader
         int depth,
         int parentMaxRep,
         int parentMaxDef,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         int rowCount = ownerCells;
@@ -404,8 +424,11 @@ internal static class NestedParquetColumnReader
             if (byFieldId is not null)
             {
                 DataField leaf = ResolveStructFieldById(fileStruct, field, byFieldId, columnName);
+                // Id-mode nested widening is out of scope (#676/#839, design §9 O1): keep the exact-match
+                // requirement — promoteLeaf is never set on an id-mode leaf.
                 (MutableColumnVector child, int[]? def, _, int numValues) = await ReadScalarLeafAsync(
-                    rowGroup, leaf, field.DataType, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                    rowGroup, leaf, field.DataType, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                    .ConfigureAwait(false);
                 RejectNullInRequiredNestedLeaf(def, leaf, field.DataType, field.Nullable);
                 EnsureStructFieldRowCount(numValues, rowCount, columnName, field.Name);
                 children[i] = child;
@@ -461,8 +484,11 @@ internal static class NestedParquetColumnReader
                 // presence — feed that to the cross-field null-mask parity guard.
                 DataField drivingLeaf = FirstDataField(childNode);
                 DataType deepScalar = FirstScalarType(field.DataType);
+                // The driving leaf is read only for its def/rep structure (the child vector is discarded), and
+                // it is deeper than depth ≤ 1 — never promote it.
                 (_, int[]? drivingDef, int[]? drivingRep, int drivingNumValues) = await ReadScalarLeafAsync(
-                    rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                    rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                    .ConfigureAwait(false);
                 fieldDefs[i] = ExtractOwnerCellDefs(
                     drivingDef, drivingRep, drivingNumValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, childContext);
 
@@ -471,16 +497,22 @@ internal static class NestedParquetColumnReader
                 // struct's parentMaxRep/parentMaxDef UNCHANGED — NOT structMaxRep/structMaxDef.
                 children[i] = await DecodeNode(
                     rowGroup, childNode, field.DataType, rowCount, childContext, budget, byFieldId: null,
-                    interiorIds: null, depth + 1, parentMaxRep, parentMaxDef, cancellationToken).ConfigureAwait(false);
+                    interiorIds: null, depth + 1, parentMaxRep, parentMaxDef, allowTypeWideningPromotion,
+                    cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            // A scalar struct field.
+            // A scalar struct field. The #546 promotion gate composes 585a's container depth: a scalar child of
+            // a TOP-LEVEL struct (depth == 0) sits at container depth 1 (promotable); a struct nested inside
+            // another container is decoded at depth ≥ 1, so its scalar fields sit at depth ≥ 2 and stay
+            // exact-match (fail-closed) — the decode-path mirror of ValidateChild's `depth <= 1` (design §2.4).
+            bool promoteLeaf = allowTypeWideningPromotion && depth == 0;
             DataField scalarLeaf = ExpectScalarLeaf(
-                childNode, field.DataType, structMaxRep, structMaxDef, childContext);
+                childNode, field.DataType, structMaxRep, structMaxDef, childContext, promoteLeaf);
             int scalarPresentFloor = underRepeatedAncestor ? parentMaxDef : 0;
             (MutableColumnVector scalarChild, int[]? scalarDef, int[]? scalarRep, int scalarNumValues) = await ReadScalarLeafAsync(
-                rowGroup, scalarLeaf, field.DataType, scalarPresentFloor, budget, cancellationToken).ConfigureAwait(false);
+                rowGroup, scalarLeaf, field.DataType, scalarPresentFloor, budget, promoteLeaf, cancellationToken)
+                .ConfigureAwait(false);
             RejectNullInRequiredNestedLeaf(scalarDef, scalarLeaf, field.DataType, field.Nullable);
 
             if (underRepeatedAncestor)
@@ -605,6 +637,7 @@ internal static class NestedParquetColumnReader
         int depth,
         int parentMaxRep,
         int parentMaxDef,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         // Charge the list's OWN per-owner structural arrays against the shared row-group budget before its
@@ -629,8 +662,10 @@ internal static class NestedParquetColumnReader
             // leaf's raw (def, rep) fully describe this repeated level's structure (design §2.2 DecodeList).
             DataField drivingLeaf = FirstDataField(fileList.Item);
             DataType deepScalar = FirstScalarType(requested.ElementType);
+            // Driving leaf read for structure only (child vector discarded), and it is deeper than depth ≤ 1.
             (_, def, rep, numValues) = await ReadScalarLeafAsync(
-                rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                .ConfigureAwait(false);
             EnsureRepeatedSlotFloor(numValues, ownerCells, columnName, "element");
 
             var nestedOffsets = new int[checked(ownerCells + 1)];
@@ -641,7 +676,8 @@ internal static class NestedParquetColumnReader
 
             elements = await DecodeNode(
                 rowGroup, fileList.Item, requested.ElementType, elemCount, elementContext, budget, byFieldId: null,
-                interiorIds: null, depth + 1, listMaxRep, listMaxDef, cancellationToken).ConfigureAwait(false);
+                interiorIds: null, depth + 1, listMaxRep, listMaxDef, allowTypeWideningPromotion, cancellationToken)
+                .ConfigureAwait(false);
 
             if (elemCount != elements.Length)
             {
@@ -658,19 +694,25 @@ internal static class NestedParquetColumnReader
         // name/none mode binds the element positionally (fileList.Item). The interior is ALWAYS scalar in id
         // mode (nested-within-nested id mode is rejected upstream), so this is the only id-mode element path —
         // the recursive branch above is never entered when byFieldId/interiorIds are present.
+        //
+        // The #546 promotion gate composes 585a's container depth: a scalar element of a TOP-LEVEL array
+        // (depth == 0) sits at container depth 1 (promotable); an array nested inside another container is
+        // decoded at depth ≥ 1, so its scalar element sits at depth ≥ 2 and stays exact-match — the decode-path
+        // mirror of ValidateChild's `depth <= 1` (design §2.4). Id-mode leaves keep promoteLeaf false (§9 O1).
+        bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
         DataField elementLeaf = byFieldId is not null && interiorIds?.ElementId is long elementId
             ? ExpectScalarLeaf(
                 ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext),
-                requested.ElementType, listMaxRep, listMaxDef, elementContext)
+                requested.ElementType, listMaxRep, listMaxDef, elementContext, promoteLeaf: false)
             : ExpectScalarLeaf(
-                fileList.Item, requested.ElementType, listMaxRep, listMaxDef, elementContext);
+                fileList.Item, requested.ElementType, listMaxRep, listMaxDef, elementContext, promoteLeaf);
 
         // The element child collects one cell per PRESENT element slot (a real value OR a null element),
         // skipping the placeholder slots a null/empty list emits (definition level below the list's own level).
         MutableColumnVector scalarElements;
         (scalarElements, def, rep, numValues) = await ReadScalarLeafAsync(
-            rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, budget, cancellationToken)
-            .ConfigureAwait(false);
+            rowGroup, elementLeaf, requested.ElementType, presentFloor: listMaxDef, budget, promoteLeaf,
+            cancellationToken).ConfigureAwait(false);
         RejectNullInRequiredNestedLeaf(def, elementLeaf, requested.ElementType, requested.ContainsNull);
         elements = scalarElements;
 
@@ -721,6 +763,7 @@ internal static class NestedParquetColumnReader
         int depth,
         int parentMaxRep,
         int parentMaxDef,
+        bool allowTypeWideningPromotion,
         CancellationToken cancellationToken)
     {
         // Charge the map's OWN per-owner structural arrays against the shared row-group budget before its
@@ -738,6 +781,12 @@ internal static class NestedParquetColumnReader
         bool nestedKey = requested.KeyType is ArrayType or MapType or StructType;
         bool nestedValue = requested.ValueType is ArrayType or MapType or StructType;
 
+        // The #546 promotion gate composes 585a's container depth: a scalar key/value of a TOP-LEVEL map
+        // (depth == 0) sits at container depth 1 (promotable); a map nested inside another container is decoded
+        // at depth ≥ 1, so its scalar key/value sits at depth ≥ 2 and stays exact-match — the decode-path
+        // mirror of ValidateChild's `depth <= 1` (design §2.4). Id-mode leaves keep promoteLeaf false (§9 O1).
+        bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
+
         // Keys drive the entry structure (the key subtree's driving leaf). A required key's max definition level
         // equals the map's own level, so every referenced key slot carries a real value — keys are never null,
         // matching MapType's structural invariant.
@@ -749,8 +798,10 @@ internal static class NestedParquetColumnReader
         {
             DataField keyDriving = FirstDataField(fileMap.Key);
             DataType keyDeep = FirstScalarType(requested.KeyType);
+            // Driving leaf read for structure only (child vector discarded), deeper than depth ≤ 1.
             (_, keyDef, keyRep, keyNumValues) = await ReadScalarLeafAsync(
-                rowGroup, keyDriving, keyDeep, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                rowGroup, keyDriving, keyDeep, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                .ConfigureAwait(false);
             scalarKeys = null;
         }
         else
@@ -764,11 +815,12 @@ internal static class NestedParquetColumnReader
             DataField keyLeaf = byFieldId is not null && interiorIds?.KeyId is long keyId
                 ? ExpectScalarLeaf(
                     ResolveInteriorLeafById(keyId, MapInteriorLeaves(fileMap), byFieldId, keyContext),
-                    requested.KeyType, mapMaxRep, mapMaxDef, keyContext)
+                    requested.KeyType, mapMaxRep, mapMaxDef, keyContext, promoteLeaf: false)
                 : ExpectScalarLeaf(
-                    fileMap.Key, requested.KeyType, mapMaxRep, mapMaxDef, keyContext);
+                    fileMap.Key, requested.KeyType, mapMaxRep, mapMaxDef, keyContext, promoteLeaf);
             (scalarKeys, keyDef, keyRep, keyNumValues) = await ReadScalarLeafAsync(
-                rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, budget, cancellationToken).ConfigureAwait(false);
+                rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, budget, promoteLeaf, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         // The value subtree is parallel to the key subtree (same repeated key_value group), so their driving
@@ -781,7 +833,8 @@ internal static class NestedParquetColumnReader
             DataField valueDriving = FirstDataField(fileMap.Value);
             DataType valueDeep = FirstScalarType(requested.ValueType);
             (_, valueDef, valueRep, _) = await ReadScalarLeafAsync(
-                rowGroup, valueDriving, valueDeep, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+                rowGroup, valueDriving, valueDeep, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                .ConfigureAwait(false);
             scalarValues = null;
         }
         else
@@ -793,11 +846,12 @@ internal static class NestedParquetColumnReader
             DataField valueLeaf = byFieldId is not null && interiorIds?.ValueId is long valueId
                 ? ExpectScalarLeaf(
                     ResolveInteriorLeafById(valueId, MapInteriorLeaves(fileMap), byFieldId, valueContext),
-                    requested.ValueType, mapMaxRep, mapMaxDef, valueContext)
+                    requested.ValueType, mapMaxRep, mapMaxDef, valueContext, promoteLeaf: false)
                 : ExpectScalarLeaf(
-                    fileMap.Value, requested.ValueType, mapMaxRep, mapMaxDef, valueContext);
+                    fileMap.Value, requested.ValueType, mapMaxRep, mapMaxDef, valueContext, promoteLeaf);
             (scalarValues, valueDef, valueRep, _) = await ReadScalarLeafAsync(
-                rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, cancellationToken).ConfigureAwait(false);
+                rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, promoteLeaf,
+                cancellationToken).ConfigureAwait(false);
             RejectNullInRequiredNestedLeaf(valueDef, valueLeaf, requested.ValueType, requested.ValueContainsNull);
         }
 
@@ -829,12 +883,14 @@ internal static class NestedParquetColumnReader
         ColumnVector keys = nestedKey
             ? await DecodeNode(
                 rowGroup, fileMap.Key, requested.KeyType, entryCount, $"map column '{columnName}' key", budget,
-                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, cancellationToken).ConfigureAwait(false)
+                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, allowTypeWideningPromotion,
+                cancellationToken).ConfigureAwait(false)
             : scalarKeys!;
         ColumnVector values = nestedValue
             ? await DecodeNode(
                 rowGroup, fileMap.Value, requested.ValueType, entryCount, $"map column '{columnName}' value", budget,
-                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, cancellationToken).ConfigureAwait(false)
+                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, allowTypeWideningPromotion,
+                cancellationToken).ConfigureAwait(false)
             : scalarValues!;
 
         if (keys.Length != values.Length)
@@ -1044,15 +1100,34 @@ internal static class NestedParquetColumnReader
     // Reads one scalar leaf's packed values + definition/repetition levels and materializes the child cells,
     // returning the child plus the raw level streams for the caller's structural pass. Dispatches the physical
     // read type T and the value->lane conversion per requested scalar type (mirroring the flat reader's
-    // ReadColumnAsync, minus widening — nested leaves require an EXACT physical match).
+    // ReadColumnAsync). When <paramref name="promoteLeaf"/> is set and the leaf's PHYSICAL type is a NARROWER
+    // Delta-sanctioned widening of the requested scalar, reads the narrow values and PROMOTES each into the
+    // requested (wide) lane — the exact per-leaf type widening of #546 (the scalar promotion the flat path
+    // applies in ReadPromotedColumnAsync, now per nested leaf, gated by the container-depth-composed leaf gate).
     private static ValueTask<(MutableColumnVector Child, int[]? Def, int[]? Rep, int NumValues)> ReadScalarLeafAsync(
         ParquetRowGroupReader rowGroup,
         DataField leaf,
         DataType scalarType,
         int presentFloor,
         NestedDecodeBudget budget,
+        bool promoteLeaf,
         CancellationToken cancellationToken)
     {
+        // Per-leaf type-widening promotion (#546). The same allowlist the flat path uses
+        // (TypeWidening.IsSanctionedWidening, including the integral→decimal fit guard), gated identically by
+        // the caller's depth-composed promoteLeaf. ValidateLeafPhysicalType (up-front) already proved the pair
+        // is a sanctioned widening; this re-check disambiguates a same-physical pair whose logical types differ
+        // but is NOT a widening (a native micros leaf read as timestamp_ntz has physical timestamp ≠ requested
+        // timestamp_ntz yet takes the identity micros read, not promotion — #533).
+        if (promoteLeaf
+            && ParquetTypeMapping.TryToDataType(leaf, out DataType? physicalType)
+            && !physicalType.Equals(scalarType)
+            && TypeWidening.IsSanctionedWidening(physicalType, scalarType))
+        {
+            return ReadPromotedLeafAsync(
+                rowGroup, leaf, physicalType, scalarType, presentFloor, budget, cancellationToken);
+        }
+
         switch (scalarType)
         {
             case BooleanType:
@@ -1108,6 +1183,114 @@ internal static class NestedParquetColumnReader
                 // DescribeType bounds either — a raw SimpleString would recurse for the non-atomic case.
                 throw DeltaStorageException.UnsupportedFeature(
                     $"Parquet nested read for leaf type '{DiagnosticText.DescribeType(scalarType)}' is not supported.");
+        }
+    }
+
+    // Reads a nested leaf's NARROW physical values and promotes each into the requested WIDE lane (#546) — the
+    // per-leaf mirror of ParquetFileReader.ReadPromotedColumnAsync. The dispatch is by (physical, requested);
+    // ValidateLeafPhysicalType already proved the pair is a sanctioned widening, so every arm is a lossless
+    // promotion: an integral sign-extend (byte/short/int → wider integral), float→double, a grow-only decimal
+    // rescale, a cross-family integral→double / integral→decimal (#535), or date→timestamp_ntz (#533). The
+    // child vector ReadLeafAsync allocates is the REQUESTED (wide) type, so every converting append targets the
+    // requested storage width. The decimal/integral→decimal arms capture the requested decimal + hoisted scale
+    // factors (as the exact-match decimal case above already does); the rest are non-capturing.
+    private static ValueTask<(MutableColumnVector Child, int[]? Def, int[]? Rep, int NumValues)> ReadPromotedLeafAsync(
+        ParquetRowGroupReader rowGroup,
+        DataField leaf,
+        DataType physicalType,
+        DataType requestedScalar,
+        int presentFloor,
+        NestedDecodeBudget budget,
+        CancellationToken cancellationToken)
+    {
+        if (requestedScalar is DecimalType requestedDecimal)
+        {
+            ParquetTypeMapping.DecimalScaleFactors factors = ParquetTypeMapping.DecimalScaleFactors.For(requestedDecimal);
+
+            // decimal(p,s) → decimal(p',s') grow-only: read at the file's scale, rescale into the requested lane.
+            if (physicalType is DecimalType)
+            {
+                return ReadLeafAsync<decimal>(rowGroup, leaf, requestedDecimal, presentFloor, budget,
+                    (v, x) => ParquetTypeMapping.AppendDecimal(v, requestedDecimal, x, factors), cancellationToken);
+            }
+
+            // Cross-family integral → decimal (#535): read the narrow integral and widen into the decimal lane.
+            // ValidateLeafPhysicalType proved the decimal holds the full integral range (its integer-digit
+            // capacity p − s ≥ the source's Parquet-physical digits), so AppendDecimal never truncates.
+            return physicalType switch
+            {
+                ByteType => ReadLeafAsync<sbyte>(rowGroup, leaf, requestedDecimal, presentFloor, budget,
+                    (v, x) => ParquetTypeMapping.AppendDecimal(v, requestedDecimal, x, factors), cancellationToken),
+                ShortType => ReadLeafAsync<short>(rowGroup, leaf, requestedDecimal, presentFloor, budget,
+                    (v, x) => ParquetTypeMapping.AppendDecimal(v, requestedDecimal, x, factors), cancellationToken),
+                IntegerType => ReadLeafAsync<int>(rowGroup, leaf, requestedDecimal, presentFloor, budget,
+                    (v, x) => ParquetTypeMapping.AppendDecimal(v, requestedDecimal, x, factors), cancellationToken),
+                _ => ReadLeafAsync<long>(rowGroup, leaf, requestedDecimal, presentFloor, budget,
+                    (v, x) => ParquetTypeMapping.AppendDecimal(v, requestedDecimal, x, factors), cancellationToken),
+            };
+        }
+
+        if (requestedScalar is DoubleType)
+        {
+            // float → double, or cross-family byte/short/int → double (#535). long → double is lossy and NOT
+            // sanctioned, so the physical is never long here.
+            return physicalType switch
+            {
+                FloatType => ReadLeafAsync<float>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                    static (v, x) => v.AppendValue((double)x), cancellationToken),
+                ByteType => ReadLeafAsync<sbyte>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                    static (v, x) => v.AppendValue((double)x), cancellationToken),
+                ShortType => ReadLeafAsync<short>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                    static (v, x) => v.AppendValue((double)x), cancellationToken),
+                _ => ReadLeafAsync<int>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                    static (v, x) => v.AppendValue((double)x), cancellationToken),
+            };
+        }
+
+        if (requestedScalar is TimestampNtzType && physicalType is DateType)
+        {
+            // date → timestamp_ntz (#533): promote each epoch-day to epoch-micros at midnight of the date
+            // (days × MicrosPerDay, timezone-less — no session offset), mirroring the flat path. The multiply
+            // is `checked`: any epoch-day a Parquet DATE can materialize keeps the product ≪ long.MaxValue, so
+            // it never throws in practice but fails loud (→ CorruptData) rather than wrapping on a hostile value.
+            return ReadLeafAsync<DateTime>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                static (v, x) => v.AppendValue(checked((long)ParquetTypeMapping.DateTimeToEpochDay(x) * MicrosPerDay)),
+                cancellationToken);
+        }
+
+        // Integral widening: byte(sbyte) → short → int → long. The requested lane is the upcast target; the
+        // file's physical width is the read buffer's element type.
+        switch (requestedScalar)
+        {
+            case ShortType:
+                // Only byte → short reaches here (a sanctioned narrower integral).
+                return ReadLeafAsync<sbyte>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                    static (v, x) => v.AppendValue((short)x), cancellationToken);
+
+            case IntegerType:
+                return physicalType is ByteType
+                    ? ReadLeafAsync<sbyte>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                        static (v, x) => v.AppendValue((int)x), cancellationToken)
+                    : ReadLeafAsync<short>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                        static (v, x) => v.AppendValue((int)x), cancellationToken);
+
+            case LongType:
+                return physicalType switch
+                {
+                    ByteType => ReadLeafAsync<sbyte>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                        static (v, x) => v.AppendValue((long)x), cancellationToken),
+                    ShortType => ReadLeafAsync<short>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                        static (v, x) => v.AppendValue((long)x), cancellationToken),
+                    _ => ReadLeafAsync<int>(rowGroup, leaf, requestedScalar, presentFloor, budget,
+                        static (v, x) => v.AppendValue((long)x), cancellationToken),
+                };
+
+            default:
+                // Unreachable: ValidateLeafPhysicalType only admits the sanctioned widenings handled above.
+                throw DeltaStorageException.SchemaMismatch(
+                    $"Nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}': cannot promote physical type "
+                    + $"'{DiagnosticText.DescribeType(physicalType)}' to requested "
+                    + $"'{DiagnosticText.DescribeType(requestedScalar)}'.");
         }
     }
 
@@ -1612,10 +1795,12 @@ internal static class NestedParquetColumnReader
         DataField driving = FirstDataField(fileStruct);
 
         // The driving leaf's DeltaSharp scalar type is derived from its OWN physical type (we discard its
-        // values and consume only its Dremel levels), so the physical read dispatch is exact.
+        // values and consume only its Dremel levels), so the physical read dispatch is exact. It is read for
+        // structure only (values discarded), so it is NEVER promoted (#546): promoteLeaf: false.
         DataType drivingScalar = ParquetTypeMapping.ToDataType(driving);
         (_, int[]? def, int[]? rep, int numValues) = await ReadScalarLeafAsync(
-            rowGroup, driving, drivingScalar, presentFloor: 0, budget, cancellationToken).ConfigureAwait(false);
+            rowGroup, driving, drivingScalar, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+            .ConfigureAwait(false);
 
         return ExtractOwnerCellDefs(
             def, rep, numValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, context);
@@ -1824,7 +2009,7 @@ internal static class NestedParquetColumnReader
 
         return ExpectScalarLeaf(
             leaf, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
-            $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'");
+            $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'", promoteLeaf: false);
     }
 
     // True when <paramref name="leaf"/> is one of <paramref name="container"/>'s OWN direct leaf children,
@@ -1965,7 +2150,8 @@ internal static class NestedParquetColumnReader
         string context = $"array column '{columnName}' element";
         DataField elementLeaf = ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, context);
         _ = ExpectScalarLeaf(
-            elementLeaf, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, context);
+            elementLeaf, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, context,
+            promoteLeaf: false);
     }
 
     // Validates an id-mode map<scalar,scalar> container against its requested type WITHOUT reading a data page
@@ -1988,14 +2174,15 @@ internal static class NestedParquetColumnReader
         DataField valueLeaf = ResolveInteriorLeafById(valueId, interiors, byFieldId, $"map column '{columnName}' value");
         _ = ExpectScalarLeaf(
             keyLeaf, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-            $"map column '{columnName}' key");
+            $"map column '{columnName}' key", promoteLeaf: false);
         _ = ExpectScalarLeaf(
             valueLeaf, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-            $"map column '{columnName}' value");
+            $"map column '{columnName}' value", promoteLeaf: false);
     }
 
     private static DataField ExpectScalarLeaf(
-        Field fileField, DataType requestedScalar, int expectedMaxRepetition, int containerMaxDef, string context)
+        Field fileField, DataType requestedScalar, int expectedMaxRepetition, int containerMaxDef, string context,
+        bool promoteLeaf)
     {
         if (requestedScalar is ArrayType or MapType or StructType)
         {
@@ -2017,7 +2204,7 @@ internal static class NestedParquetColumnReader
                 $"Parquet nested read for {context}: the file column is itself nested, which is not supported.");
         }
 
-        ValidateLeafPhysicalType(leaf, requestedScalar, context);
+        ValidateLeafPhysicalType(leaf, requestedScalar, context, promoteLeaf);
         ValidateLeafStructuralLevels(leaf, expectedMaxRepetition, containerMaxDef, context);
         return leaf;
     }
@@ -2071,12 +2258,23 @@ internal static class NestedParquetColumnReader
         }
     }
 
-    // An EXACT physical-type match (no type widening for nested leaves — that is #546's scope). Mirrors the
-    // flat reader's ValidateFileField annotation checks (DATE vs micros TIMESTAMP, decimal precision/scale,
-    // timestamp lane passthrough) but skips nullability enforcement (nested value/element/field nullability is
-    // advisory per #570).
-    private static void ValidateLeafPhysicalType(DataField leaf, DataType requested, string context)
+    // An EXACT physical-type match, OR — when the promotion gate is open (#546, <paramref name="promoteLeaf"/>
+    // already composes the container depth ≤ 1 rule) — a NARROWER physical leaf that is a Delta-sanctioned
+    // widening of the requested scalar (the read path promotes each value into the wide lane; the
+    // integral→decimal fit guard is baked into TypeWidening.IsSanctionedWidening). Mirrors the flat reader's
+    // ValidateFileField promotion branch. When the gate is closed an exact match is still required
+    // (fail-closed). Skips nullability enforcement (nested value/element/field nullability is advisory per #570).
+    private static void ValidateLeafPhysicalType(
+        DataField leaf, DataType requested, string context, bool promoteLeaf)
     {
+        if (promoteLeaf
+            && ParquetTypeMapping.TryToDataType(leaf, out DataType? physicalType)
+            && !physicalType.Equals(requested)
+            && TypeWidening.IsSanctionedWidening(physicalType, requested))
+        {
+            return;
+        }
+
         bool matches = requested switch
         {
             BooleanType => leaf.ClrType == typeof(bool),

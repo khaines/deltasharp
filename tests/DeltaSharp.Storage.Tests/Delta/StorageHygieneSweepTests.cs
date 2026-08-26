@@ -1599,7 +1599,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaStorageException shape = Assert.ThrowsAny<DeltaStorageException>(
             () => NestedParquetColumnReader.ValidateShape(
-                new global::Parquet.Schema.DataField<int?>("x"), nested, "c"));
+                new global::Parquet.Schema.DataField<int?>("x"), nested, "c", allowTypeWideningPromotion: false));
         Assert.Contains("the file column is not a struct", shape.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("is not supported", shape.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(shape.Message, p);
@@ -1613,7 +1613,7 @@ public sealed class StorageHygieneSweepTests
             () => NestedParquetColumnReader.ValidateShape(
                 new global::Parquet.Schema.StructField("c", new global::Parquet.Schema.DataField<int?>("f")),
                 new StructType([new StructField("f", nested, nullable: true)]),
-                "c"));
+                "c", allowTypeWideningPromotion: false));
         Assert.Contains("the file column is not a struct", leaf.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("does not match the requested", leaf.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(leaf.Message, p);
@@ -1735,7 +1735,7 @@ public sealed class StorageHygieneSweepTests
             () => NestedParquetColumnReader.ValidateShape(
                 fileStruct,
                 new StructType([new StructField(p, DataTypes.IntegerType, nullable: false)]),
-                "col"));
+                "col", allowTypeWideningPromotion: false));
         // #857: an absent NULLABLE child now null-fills; an absent REQUIRED child still fails closed
         // (ColumnNotPresentInFile), and its message echoes the requested field name — the hygiene surface.
         Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, missing.Kind);
@@ -1750,7 +1750,7 @@ public sealed class StorageHygieneSweepTests
             () => NestedParquetColumnReader.ValidateShape(
                 poisonedFileStruct,
                 new StructType([new StructField(p, DataTypes.StringType, nullable: true)]),
-                "col"));
+                "col", allowTypeWideningPromotion: false));
         Assert.Contains("does not match the requested", mismatch.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(mismatch.Message, p);
     }
@@ -1776,7 +1776,7 @@ public sealed class StorageHygieneSweepTests
                 fileList,
                 new ArrayType(
                     new StructType([new StructField(p, DataTypes.IntegerType, nullable: false)]), containsNull: true),
-                "col"));
+                "col", allowTypeWideningPromotion: false));
 
         Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, ex.Kind);
         Assert.Contains("is not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);

@@ -88,6 +88,46 @@ public sealed class NestedParquetReadTests
         public Dictionary<string, string?>? Sm { get; set; }
     }
 
+    // ----- #546 nested type-widening promotion fixtures (narrow physical → wide requested) -----
+
+    private sealed class FloatListRow
+    {
+        public int Id { get; set; }
+
+        public List<float?>? Arr { get; set; }
+    }
+
+    private sealed class LongListRow
+    {
+        public int Id { get; set; }
+
+        public List<long?>? Arr { get; set; }
+    }
+
+    private sealed class IntKeyMapRow
+    {
+        public int Id { get; set; }
+
+        public Dictionary<int, string?>? M { get; set; }
+    }
+
+    // A DATE list element (DateOnly → Parquet DATE physical) for the #546 date→timestamp_ntz promotion (O2).
+    private sealed class DateListRow
+    {
+        public int Id { get; set; }
+
+        public List<DateOnly?>? Arr { get; set; }
+    }
+
+    // A TIMESTAMP list element (DateTime → Parquet micros TIMESTAMP) for the micros-identity (non-promotion)
+    // companion of the #546 date→timestamp_ntz promotion (O2).
+    private sealed class TimestampListRow
+    {
+        public int Id { get; set; }
+
+        public List<DateTime?>? Arr { get; set; }
+    }
+
     // BINARY leaves in all three nested positions (#832 M5b): the nested leaf physical-type check has a
     // dedicated BinaryType arm that no nested test exercised, so nested binary could have been broken (or the
     // arm deleted) without a single failure. Mirrors the string-leaf row shapes above.
@@ -2507,7 +2547,7 @@ public sealed class NestedParquetReadTests
             containsNull: true);
 
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
-            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "Arr"));
+            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "Arr", allowTypeWideningPromotion: false));
 
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
         Assert.Contains("not named the canonical", error.Message, StringComparison.Ordinal);
@@ -2541,7 +2581,7 @@ public sealed class NestedParquetReadTests
             containsNull: true);
 
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
-            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "Arr"));
+            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "Arr", allowTypeWideningPromotion: false));
 
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
         Assert.Contains("map key is nullable", error.Message, StringComparison.Ordinal);
@@ -2574,7 +2614,7 @@ public sealed class NestedParquetReadTests
             valueContainsNull: true);
 
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
-            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "M"));
+            () => NestedParquetColumnReader.ValidateShape(fileField, requested, "M", allowTypeWideningPromotion: false));
 
         Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
         Assert.Contains("not named the canonical", error.Message, StringComparison.Ordinal);
@@ -2759,6 +2799,435 @@ public sealed class NestedParquetReadTests
         return result;
     }
 
+    // ===== #546: per-leaf type-widening promotion on the nested read path =====================
+
+    [Fact]
+    public async Task Array_ElementWidening_IntToLong_WhenEnabled_Promotes_AndPreservesNulls()
+    {
+        // A pre-widening array<int> file read under a widened array<long> schema: each present element is
+        // promoted INT32 → INT64, and the null element / null list structure is preserved intact.
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?> { 10, 20 } },
+            new() { Id = 2, Arr = null },
+            new() { Id = 3, Arr = new List<int?> { int.MaxValue, null, int.MinValue } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(DataTypes.LongType, e0.Type);
+        Assert.Equal(10L, e0.GetValue<long>(0));
+        Assert.Equal(20L, e0.GetValue<long>(1));
+
+        Assert.True(arr.IsNull(1)); // null list preserved through promotion
+
+        ColumnVector e2 = arr.ElementsAt(2);
+        Assert.Equal(int.MaxValue, e2.GetValue<long>(0));
+        Assert.True(e2.IsNull(1)); // null element preserved
+        Assert.Equal(int.MinValue, e2.GetValue<long>(2));
+    }
+
+    [Fact]
+    public async Task Array_ElementWidening_IntToDouble_CrossFamily_WhenEnabled_Promotes()
+    {
+        // #535 cross-family int→double at a nested element position, gated identically to the scalar path.
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?> { 5, null, -3 } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.DoubleType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(DataTypes.DoubleType, e0.Type);
+        Assert.Equal(5.0, e0.GetValue<double>(0));
+        Assert.True(e0.IsNull(1));
+        Assert.Equal(-3.0, e0.GetValue<double>(2));
+    }
+
+    [Fact]
+    public async Task Array_ElementWidening_FloatToDouble_WhenEnabled_Promotes()
+    {
+        var rows = new List<FloatListRow>
+        {
+            new() { Id = 1, Arr = new List<float?> { 1.5f, null, -2.25f } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.DoubleType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(1.5, e0.GetValue<double>(0));
+        Assert.True(e0.IsNull(1));
+        Assert.Equal(-2.25, e0.GetValue<double>(2));
+    }
+
+    [Fact]
+    public async Task Array_ElementWidening_IntToDecimal_Fits_WhenEnabled_Promotes()
+    {
+        // #535 cross-family int→decimal(12,2): p−s = 10 ≥ 10 int-digit capacity, so the decimal holds the full
+        // INT32 range — the decimal-fit boundary the read path enforces via TypeWidening.IsSanctionedWidening.
+        var rows = new List<ListRow>
+        {
+            new() { Id = 1, Arr = new List<int?> { 5, null, -3 } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var wide = DataTypes.CreateDecimalType(12, 2);
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(wide, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(5.00m, ParquetTypeMapping.ReadDecimal(e0, wide, 0));
+        Assert.True(e0.IsNull(1));
+        Assert.Equal(-3.00m, ParquetTypeMapping.ReadDecimal(e0, wide, 2));
+    }
+
+    [Fact]
+    public async Task Array_ElementWidening_IntToDecimal_DoesNotFit_FailsClosed()
+    {
+        // Decimal-fit boundary: decimal(9,2) has p−s = 7 < 10 int digits, so it CANNOT hold the full INT32
+        // range — not a Delta-sanctioned widening, so the read fails closed even with the gate open (never a
+        // truncating promotion).
+        var rows = new List<ListRow> { new() { Id = 1, Arr = new List<int?> { 5 } } };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.CreateDecimalType(9, 2), containsNull: true),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Array_ElementWidening_WhenGateClosed_FailsClosed_NotSilentlyPromoted()
+    {
+        // Fail-closed parity: with the promotion gate CLOSED, a narrow array<int> file requested as
+        // array<long> is a physical mismatch — the same fail-closed behavior the scalar path has (#495).
+        var rows = new List<ListRow> { new() { Id = 1, Arr = new List<int?> { 10 } } };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.LongType), nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Array_ElementNarrowing_WhenEnabled_FailsClosed()
+    {
+        // Narrowing (long→int) is not a sanctioned widening: even with the gate open the read fails closed.
+        var rows = new List<LongListRow> { new() { Id = 1, Arr = new List<long?> { 10L } } };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.IntegerType), nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Array_ElementWidening_LongToDouble_IsLossy_FailsClosedEvenWithGate()
+    {
+        // long→double is LOSSY (not a Delta-sanctioned widening), so it is never promoted — fail-closed even
+        // with the gate open, matching the scalar path's exclusion of long→double.
+        var rows = new List<LongListRow> { new() { Id = 1, Arr = new List<long?> { 10L } } };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Arr", DataTypes.CreateArrayType(DataTypes.DoubleType), nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Map_ValueWidening_IntToLong_WhenEnabled_Promotes_AndPreservesNulls()
+    {
+        var rows = new List<MapRow>
+        {
+            new() { Id = 1, M = new Dictionary<string, int?>(StringComparer.Ordinal) { ["k1"] = 100, ["k2"] = null } },
+            new() { Id = 2, M = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType, valueContainsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var m = Assert.IsType<MapColumnVector>(batch.Column("M"));
+        Assert.Equal(2, m.EntryLength(0));
+        Assert.True(m.IsNull(1)); // null map preserved
+
+        ColumnVector keys = m.KeysAt(0);
+        ColumnVector vals = m.ValuesAt(0);
+        Assert.Equal(DataTypes.LongType, vals.Type);
+        var read = new Dictionary<string, long?>(StringComparer.Ordinal);
+        for (int i = 0; i < 2; i++)
+        {
+            read[Utf8(keys, i)] = vals.IsNull(i) ? null : vals.GetValue<long>(i);
+        }
+
+        Assert.Equal(100L, read["k1"]);
+        Assert.Null(read["k2"]); // null value preserved through promotion
+    }
+
+    [Fact]
+    public async Task Map_KeyWidening_IntToLong_WhenEnabled_Promotes()
+    {
+        var rows = new List<IntKeyMapRow>
+        {
+            new() { Id = 1, M = new Dictionary<int, string?> { [1] = "a", [2] = "b" } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(DataTypes.LongType, DataTypes.StringType, valueContainsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var m = Assert.IsType<MapColumnVector>(batch.Column("M"));
+        ColumnVector keys = m.KeysAt(0);
+        ColumnVector vals = m.ValuesAt(0);
+        Assert.Equal(DataTypes.LongType, keys.Type);
+        var read = new Dictionary<long, string?>();
+        for (int i = 0; i < m.EntryLength(0); i++)
+        {
+            read[keys.GetValue<long>(i)] = Utf8(vals, i);
+        }
+
+        Assert.Equal("a", read[1L]);
+        Assert.Equal("b", read[2L]);
+    }
+
+    [Fact]
+    public async Task Struct_FieldWidening_IntToLong_WhenEnabled_Promotes_AndPreservesNulls()
+    {
+        var rows = new List<StructRow>
+        {
+            new() { Id = 1, S = new Inner { A = 10, B = "x" } },
+            new() { Id = 2, S = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType structType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("Id", DataTypes.IntegerType, nullable: false),
+            new StructField("S", structType, nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        ColumnVector a = s.Child("A");
+        Assert.Equal(DataTypes.LongType, a.Type);
+        Assert.Equal(10L, a.GetValue<long>(0));
+        Assert.True(a.IsNull(1)); // null struct materializes null children, preserved through promotion
+    }
+
+    [Fact]
+    public async Task Struct_FieldWidening_WhenGateClosed_FailsClosed()
+    {
+        // Fail-closed parity for a struct field: with the gate closed, a narrow int field requested as long
+        // is a physical mismatch.
+        var rows = new List<StructRow> { new() { Id = 1, S = new Inner { A = 10, B = "x" } } };
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType structType = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("S", structType, nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSingleAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    // ----- #546 O3 (design §3.3): the depth-composed gate is NOT a plain bool -----
+
+    [Fact]
+    public async Task Array_OfStruct_InnerFieldWidening_AtDepth2_WhenEnabled_FailsClosed()
+    {
+        // O3 (design §3.3, required-for-merge): 585a can DECODE array<struct<a:int>>, but #546 only widens a
+        // scalar leaf at container depth ≤ 1. A leaf inside a nested-within-nested shape (array<struct<a:int>>,
+        // the struct field 'A' sits at depth 2) requested as array<struct<a:long>> must NOT be promoted even
+        // with the gate OPEN — it stays fail-closed (SchemaMismatch), proving `promoteLeaf` is composed with
+        // 585a's container depth, not a plain depth-agnostic bool. (Pairs with the write-side AC7.)
+        var rows = new List<NestedListRow>
+        {
+            new() { Id = 1, Items = new List<Inner> { new() { A = 10, B = "x" } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType innerLong = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.LongType, nullable: false),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("Items", DataTypes.CreateArrayType(innerLong, containsNull: true), nullable: true),
+        });
+
+        // Gate OPEN: the depth-2 leaf is still exact-match, so INT32 ≠ requested INT64 → SchemaMismatch.
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public async Task Array_OfStruct_ExactShape_WhenGateOpen_DecodesUnchanged()
+    {
+        // O3 companion (design §3.3, depth ≤ 1 unaffected): the 585a recursive decode of array<struct<…>> must
+        // still read byte-identically when the gate is OPEN but no leaf needs promotion (exact physical match),
+        // proving #546 adds no decode regression at depth ≥ 2.
+        var rows = new List<NestedListRow>
+        {
+            new() { Id = 1, Items = new List<Inner> { new() { A = 10, B = "x" }, new() { A = 20, B = "y" } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        StructType innerInt = DataTypes.CreateStructType(new[]
+        {
+            DataTypes.CreateStructField("A", DataTypes.IntegerType, nullable: false),
+            DataTypes.CreateStructField("B", DataTypes.StringType, nullable: true),
+        });
+        var requested = new StructType(new[]
+        {
+            new StructField("Items", DataTypes.CreateArrayType(innerInt, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Items"));
+        var s0 = Assert.IsType<StructColumnVector>(arr.ElementsAt(0));
+        ColumnVector a = s0.Child("A");
+        Assert.Equal(DataTypes.IntegerType, a.Type); // exact — never promoted
+        Assert.Equal(10, a.GetValue<int>(0));
+        Assert.Equal(20, a.GetValue<int>(1));
+    }
+
+    // ----- #546 O2 (design §3.3 / AC13): nested date→timestamp_ntz promote + micros/LTZ identity -----
+
+    [Fact]
+    public async Task Array_ElementWidening_DateToTimestampNtz_WhenEnabled_Promotes()
+    {
+        // O2/AC13: a nested DATE element promoted to timestamp_ntz (#533) — each epoch-day widens to
+        // epoch-micros at midnight of the date (days × 86_400_000_000), timezone-less, nulls preserved.
+        var d1 = new DateOnly(2021, 3, 15);
+        var d2 = new DateOnly(1970, 1, 1);
+        var rows = new List<DateListRow>
+        {
+            new() { Id = 1, Arr = new List<DateOnly?> { d1, null, d2 } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.TimestampNtzType, containsNull: true), nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(DataTypes.TimestampNtzType, e0.Type);
+
+        const long MicrosPerDay = 86_400L * 1_000_000L;
+        long epochDay1 = d1.DayNumber - new DateOnly(1970, 1, 1).DayNumber;
+        Assert.Equal(epochDay1 * MicrosPerDay, e0.GetValue<long>(0));
+        Assert.True(e0.IsNull(1)); // null element preserved through promotion
+        Assert.Equal(0L, e0.GetValue<long>(2)); // 1970-01-01 → 0 micros
+    }
+
+    [Fact]
+    public async Task Array_ElementTimestampNtz_NativeMicros_WhenEnabled_TakesIdentityRead_NotPromotion()
+    {
+        // O2/AC13 companion: a native micros/LTZ timestamp element requested as timestamp_ntz is NOT a
+        // sanctioned widening (IsSanctionedWidening(timestamp, timestamp_ntz) is false), so it takes the
+        // IDENTITY micros read, never a date→ntz promotion — matching the flat #533 behavior at a nested leaf.
+        var t1 = new DateTime(2021, 3, 15, 12, 30, 45, DateTimeKind.Utc);
+        var rows = new List<TimestampListRow>
+        {
+            new() { Id = 1, Arr = new List<DateTime?> { t1, null } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr", DataTypes.CreateArrayType(DataTypes.TimestampNtzType, containsNull: true), nullable: true),
+        });
+
+        // Gate open, but the physical timestamp lane already satisfies timestamp_ntz — identity micros read.
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(DataTypes.TimestampNtzType, e0.Type);
+        long expectedMicros = (t1.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerMicrosecond;
+        Assert.Equal(expectedMicros, e0.GetValue<long>(0));
+        Assert.True(e0.IsNull(1));
+    }
+
     private static async Task<byte[]> WriteAsync<T>(IReadOnlyList<T> rows)
         where T : class, new()
     {
@@ -2779,6 +3248,25 @@ public sealed class NestedParquetReadTests
 
     private static async Task<ColumnBatch> ReadSingleAsync(byte[] bytes, StructType requested) =>
         await ReadSingleAsync(new ParquetFileReader(), bytes, requested);
+
+    // Reads with the type-widening promotion gate OPEN (#546) — the read-side counterpart of a table whose
+    // protocol declares the `typeWidening` feature. A pre-widening (narrow) nested leaf is promoted per value
+    // into the requested wide lane.
+    private static async Task<ColumnBatch> ReadSinglePromotedAsync(byte[] bytes, StructType requested)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        ColumnBatch? only = null;
+        await foreach (ColumnBatch batch in new ParquetFileReader().ReadAsync(
+            stream, requested, null, nullFillMissingColumns: false, allowTypeWideningPromotion: true,
+            CancellationToken.None))
+        {
+            Assert.Null(only);
+            only = batch;
+        }
+
+        Assert.NotNull(only);
+        return only!;
+    }
 
     private static async Task<ColumnBatch> ReadSingleAsync(
         ParquetFileReader reader, byte[] bytes, StructType requested)

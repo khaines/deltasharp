@@ -1104,20 +1104,230 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
-    public void Reconcile_WideningInsideArrayElement_IsNotApplied_EvenWhenEnabled()
+    public void Reconcile_ArrayElementWidening_WhenEnabled_IsAppliedWithElementPath()
     {
-        // Applied widening is confined to a StructField's own scalar type; an array element widening is not
-        // applied (it would need a fieldPath in delta.typeChanges and the reader can't promote nested types).
+        // #546: a sanctioned widening of a TOP-LEVEL array<scalar> element (the shape #571's reader decodes)
+        // is APPLIED when the feature is enabled — the merged element type widens and a delta.typeChanges
+        // entry carrying fieldPath="element" is recorded on the enclosing field so pre-widening nested files
+        // are read-promoted.
         var tableArray = new ArrayType(DataTypes.IntegerType, containsNull: true);
         var writeArray = new ArrayType(DataTypes.LongType, containsNull: true);
         StructType table = Schema(Field("nums", tableArray, nullable: true));
         StructType write = Schema(Field("nums", writeArray, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["nums"];
+        ArrayType mergedArray = Assert.IsType<ArrayType>(field.DataType);
+        Assert.Equal(DataTypes.LongType, mergedArray.ElementType);
+        Assert.True(mergedArray.ContainsNull);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element");
+    }
+
+    [Fact]
+    public void Reconcile_MapValueWidening_WhenEnabled_IsAppliedWithValuePath()
+    {
+        // #546: a sanctioned widening of a TOP-LEVEL map value is APPLIED with fieldPath="value".
+        StructType table = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType), nullable: true));
+        StructType write = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["lookup"];
+        MapType mergedMap = Assert.IsType<MapType>(field.DataType);
+        Assert.IsType<StringType>(mergedMap.KeyType);
+        Assert.Equal(DataTypes.LongType, mergedMap.ValueType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "value");
+    }
+
+    [Fact]
+    public void Reconcile_MapKeyWidening_WhenEnabled_IsAppliedWithKeyPath()
+    {
+        // #546: a sanctioned widening of a TOP-LEVEL map key is APPLIED with fieldPath="key".
+        StructType table = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.StringType), nullable: true));
+        StructType write = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.LongType, DataTypes.StringType), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["lookup"];
+        MapType mergedMap = Assert.IsType<MapType>(field.DataType);
+        Assert.Equal(DataTypes.LongType, mergedMap.KeyType);
+        Assert.IsType<StringType>(mergedMap.ValueType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "key");
+    }
+
+    [Fact]
+    public void Reconcile_MapKeyAndValueWidening_WhenEnabled_RecordsBothPaths()
+    {
+        // #546: widening BOTH the key and the value of a top-level map records two delta.typeChanges entries
+        // on the enclosing field, each with its own fieldPath ("key" then "value", in merge order).
+        StructType table = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.ShortType), nullable: true));
+        StructType write = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.LongType, DataTypes.IntegerType), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["lookup"];
+        MapType mergedMap = Assert.IsType<MapType>(field.DataType);
+        Assert.Equal(DataTypes.LongType, mergedMap.KeyType);
+        Assert.Equal(DataTypes.IntegerType, mergedMap.ValueType);
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        Assert.Equal(2, entries!.Count);
+        AssertNestedTypeChangeEntry(entries[0], "integer", "long", "key");
+        AssertNestedTypeChangeEntry(entries[1], "short", "integer", "value");
+    }
+
+    [Fact]
+    public void Reconcile_StructFieldWidening_WhenEnabled_IsAppliedOnInnerField_NoFieldPath()
+    {
+        // #546: a sanctioned widening of a TOP-LEVEL struct<scalar> field (readable by #571) is APPLIED and
+        // recorded on the INNER StructField directly, with NO fieldPath (a struct field's change is carried
+        // on the field, per PROTOCOL.md "Type Change Metadata").
+        StructType tableInner = Schema(Field("zip", DataTypes.IntegerType, nullable: true));
+        StructType writeInner = Schema(Field("zip", DataTypes.LongType, nullable: true));
+        StructType table = Schema(Field("address", tableInner, nullable: true));
+        StructType write = Schema(Field("address", writeInner, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField addressField = merged!["address"];
+        StructType mergedInner = Assert.IsType<StructType>(addressField.DataType);
+        StructField zip = mergedInner["zip"];
+        Assert.Equal(DataTypes.LongType, zip.DataType);
+
+        // The change is on the inner `zip` field (no fieldPath), and the enclosing `address` field carries none.
+        AssertSingleTypeChange(zip.Metadata, "integer", "long");
+        Assert.False(addressField.Metadata.TryGetValue("delta.typeChanges", out _));
+    }
+
+    [Fact]
+    public void Reconcile_ArrayElementDecimalGrowOnlyWidening_WhenEnabled_IsAppliedWithElementPath()
+    {
+        // #546: a grow-only decimal widening of a top-level array element is applied with fieldPath="element".
+        DecimalType from = DataTypes.CreateDecimalType(10, 2);
+        DecimalType to = DataTypes.CreateDecimalType(12, 4);
+        StructType table = Schema(Field("amounts", DataTypes.CreateArrayType(from), nullable: true));
+        StructType write = Schema(Field("amounts", DataTypes.CreateArrayType(to), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["amounts"];
+        ArrayType mergedArray = Assert.IsType<ArrayType>(field.DataType);
+        Assert.Equal(to, mergedArray.ElementType);
+        AssertSingleNestedTypeChange(field.Metadata, from.TypeName, to.TypeName, "element");
+    }
+
+    [Fact]
+    public void Reconcile_ArrayElementWidening_PreservesPriorNestedTypeChangeHistory_OldestFirst()
+    {
+        // #546 + the full-history rule: an array element already widened once (short→int, recorded with
+        // fieldPath="element") widens again (int→long): the new entry appends after the prior one, oldest
+        // first, both carrying fieldPath="element".
+        FieldMetadata priorHistory = FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(
+                "delta.typeChanges",
+                MetadataValue.Array(new[]
+                {
+                    MetadataValue.Nested(FieldMetadata.FromEntries(new[]
+                    {
+                        new KeyValuePair<string, string>("fromType", "short"),
+                        new KeyValuePair<string, string>("toType", "integer"),
+                        new KeyValuePair<string, string>("fieldPath", "element"),
+                    })),
+                })),
+        });
+        StructType table = Schema(new StructField(
+            "nums", DataTypes.CreateArrayType(DataTypes.IntegerType), nullable: true, priorHistory));
+        StructType write = Schema(Field("nums", DataTypes.CreateArrayType(DataTypes.LongType), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["nums"];
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        Assert.Equal(2, entries!.Count);
+        AssertNestedTypeChangeEntry(entries[0], "short", "integer", "element");
+        AssertNestedTypeChangeEntry(entries[1], "integer", "long", "element");
+    }
+
+    [Fact]
+    public void Reconcile_ArrayElementCrossFamilyWidening_WhenEnabled_IsDeferred_NotApplied()
+    {
+        // #546 parity with the scalar path: a CROSS-FAMILY widening (#535: int→double) is read-promotable but
+        // NOT schema-evolution-eligible, so it is NOT auto-applied on append at a nested position either —
+        // rejected fail-closed as TypeWideningUnsupported, exactly like the scalar column path.
+        StructType table = Schema(Field("nums", DataTypes.CreateArrayType(DataTypes.IntegerType), nullable: true));
+        StructType write = Schema(Field("nums", DataTypes.CreateArrayType(DataTypes.DoubleType), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
                 table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("nums.element", ex.Path);
+    }
+
+    [Fact]
+    public void Reconcile_WideningInsideArrayOfStruct_IsNotApplied_EvenWhenEnabled()
+    {
+        // #546 boundary: a leaf nested WITHIN another nested type (array<struct<scalar>>) stays fail-closed
+        // even when the feature is enabled — #571's reader cannot promote a struct inside an array, so
+        // applying the widening would mint an unreadable table. Rejected as TypeWideningUnsupported, closing
+        // the pre-#546 latent gap where this widening was silently accepted but unreadable. (Tracked as a
+        // follow-up: widening inside nested-within-nested shapes.)
+        StructType tableElement = Schema(Field("zip", DataTypes.IntegerType, nullable: true));
+        StructType writeElement = Schema(Field("zip", DataTypes.LongType, nullable: true));
+        StructType table = Schema(
+            Field("items", DataTypes.CreateArrayType(tableElement), nullable: true));
+        StructType write = Schema(
+            Field("items", DataTypes.CreateArrayType(writeElement), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("items.element.zip", ex.Path);
+    }
+
+    [Fact]
+    public void Reconcile_WideningInsideMapValueStruct_IsNotApplied_EvenWhenEnabled()
+    {
+        // #546 boundary: a leaf nested within a map value struct (map<*, struct<scalar>>) stays fail-closed.
+        StructType tableValue = Schema(Field("zip", DataTypes.IntegerType, nullable: true));
+        StructType writeValue = Schema(Field("zip", DataTypes.LongType, nullable: true));
+        StructType table = Schema(Field(
+            "lookup", DataTypes.CreateMapType(DataTypes.StringType, tableValue), nullable: true));
+        StructType write = Schema(Field(
+            "lookup", DataTypes.CreateMapType(DataTypes.StringType, writeValue), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("lookup.value.zip", ex.Path);
     }
 
     private static void AssertSingleTypeChange(FieldMetadata metadata, string fromType, string toType)
@@ -1135,5 +1345,28 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.True(nested.TryGetString("toType", out string? actualTo));
         Assert.Equal(fromType, actualFrom);
         Assert.Equal(toType, actualTo);
+    }
+
+    // Asserts the field carries EXACTLY one delta.typeChanges entry: {fromType, toType, fieldPath} — a nested
+    // (array element / map key-value) widening recorded on the enclosing field with its Delta fieldPath (#546).
+    private static void AssertSingleNestedTypeChange(
+        FieldMetadata metadata, string fromType, string toType, string fieldPath)
+    {
+        Assert.True(metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        MetadataValue only = Assert.Single(entries!);
+        AssertNestedTypeChangeEntry(only, fromType, toType, fieldPath);
+    }
+
+    private static void AssertNestedTypeChangeEntry(
+        MetadataValue entry, string fromType, string toType, string fieldPath)
+    {
+        Assert.True(entry.TryGetNested(out FieldMetadata? nested));
+        Assert.True(nested!.TryGetString("fromType", out string? actualFrom));
+        Assert.True(nested.TryGetString("toType", out string? actualTo));
+        Assert.True(nested.TryGetString("fieldPath", out string? actualPath));
+        Assert.Equal(fromType, actualFrom);
+        Assert.Equal(toType, actualTo);
+        Assert.Equal(fieldPath, actualPath);
     }
 }
