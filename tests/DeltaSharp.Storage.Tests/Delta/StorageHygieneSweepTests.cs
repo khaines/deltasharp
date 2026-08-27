@@ -1734,9 +1734,12 @@ public sealed class StorageHygieneSweepTests
         DeltaStorageException missing = Assert.Throws<DeltaStorageException>(
             () => NestedParquetColumnReader.ValidateShape(
                 fileStruct,
-                new StructType([new StructField(p, DataTypes.IntegerType, nullable: true)]),
+                new StructType([new StructField(p, DataTypes.IntegerType, nullable: false)]),
                 "col"));
-        Assert.Contains("is missing requested field", missing.Message, StringComparison.Ordinal);
+        // #857: an absent NULLABLE child now null-fills; an absent REQUIRED child still fails closed
+        // (ColumnNotPresentInFile), and its message echoes the requested field name — the hygiene surface.
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, missing.Kind);
+        Assert.Contains("is not present in the Parquet file schema", missing.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(missing.Message, p);
 
         // Present in the file but of a different physical type: the same requested name is echoed through the
@@ -1754,9 +1757,11 @@ public sealed class StorageHygieneSweepTests
 
     // 585a: nested-within-nested READ is now decodable, so ValidateShape DESCENDS into the element subtree
     // rather than rejecting it wholesale. This door now pins that the descent's per-node schema/shape guards
-    // still neutralize a FILE-derived/requested poison at depth: a nested list element whose requested struct
-    // field is absent from the (matching-shape) file struct yields a bounded, neutralized schema-mismatch that
-    // echoes the requested field name — the same message-hygiene contract, now enforced one level deeper.
+    // still neutralize a FILE-derived/requested poison at depth: a nested list element whose requested REQUIRED
+    // struct field is absent from the (matching-shape) file struct yields a bounded, neutralized
+    // ColumnNotPresentInFile that echoes the requested field name (#857: a NULLABLE absent child would instead
+    // null-fill, so the poison is requested as a REQUIRED child to keep exercising the fail-closed echo) — the
+    // same message-hygiene contract, now enforced one level deeper.
     [Theory]
     [MemberData(nameof(Poisons))]
     public void Door_NestedRead_NestedWithinNested(string poison)
@@ -1768,9 +1773,13 @@ public sealed class StorageHygieneSweepTests
 
         DeltaStorageException ex = Assert.Throws<DeltaStorageException>(
             () => NestedParquetColumnReader.ValidateShape(
-                fileList, new ArrayType(PoisonedStructOf(p), containsNull: true), "col"));
+                fileList,
+                new ArrayType(
+                    new StructType([new StructField(p, DataTypes.IntegerType, nullable: false)]), containsNull: true),
+                "col"));
 
-        Assert.Contains("is missing requested field", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, ex.Kind);
+        Assert.Contains("is not present in the Parquet file schema", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
     }
 
