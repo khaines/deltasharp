@@ -35,6 +35,33 @@ public sealed class NestedParquetReadTests
         public Inner? S { get; set; }
     }
 
+    // A struct physically carrying ONLY an int `A` — requesting an extra child `B` makes B genuinely absent,
+    // so a single read can BOTH promote A (int->long, #546) and null-fill B (#857) — the merge interaction seam.
+    private sealed class InnerAOnly
+    {
+        public int A { get; set; }
+    }
+
+    private sealed class AOnlyRow
+    {
+        public int Id { get; set; }
+
+        public InnerAOnly? S { get; set; }
+    }
+
+    // array<struct<A:long>> physical — for the repeated-ancestor null-fill-with-gate-open variant.
+    private sealed class InnerALong
+    {
+        public long A { get; set; }
+    }
+
+    private sealed class AListRow
+    {
+        public int Id { get; set; }
+
+        public List<InnerALong>? Items { get; set; }
+    }
+
     private sealed class Wide
     {
         public long L { get; set; }
@@ -3121,6 +3148,124 @@ public sealed class NestedParquetReadTests
         Assert.Equal(DataTypes.LongType, a.Type);
         Assert.Equal(10L, a.GetValue<long>(0));
         Assert.True(a.IsNull(1)); // null struct materializes null children, preserved through promotion
+    }
+
+    // ---- #857 x #546 INTERACTION SEAM (RFL-864 merge round F1) ----------------------------------------
+    // The rebase of #546 (nested widening) onto #857 (absent-child null-fill) makes ONE ReadStructAsync pass
+    // capable of promoting a present child AND null-filling an absent sibling. These tests pin that seam.
+
+    [Fact]
+    public async Task Struct_PresentChildWidens_AndAbsentNullableChild_NullFills_WhenGateOpen()
+    {
+        // In ONE struct read with the gate OPEN: a PRESENT narrow child (A: int -> long) is PROMOTED while a
+        // genuinely-ABSENT nullable child (B) is NULL-FILLED, in the same struct. Both materialize at their
+        // requested wide/declared types, with a correct struct null mask on the null-struct row (INV-PARITY
+        // holds when a promoted present sibling coexists with a synthesized absent one).
+        var rows = new List<AOnlyRow>
+        {
+            new() { Id = 1, S = new InnerAOnly { A = 10 } },
+            new() { Id = 2, S = null },                    // null struct row (parity)
+            new() { Id = 3, S = new InnerAOnly { A = -7 } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Id", DataTypes.IntegerType, nullable: false),
+            new StructField(
+                "S",
+                new StructType(new[]
+                {
+                    new StructField("A", DataTypes.LongType, nullable: false),   // present -> widen int->long
+                    new StructField("B", DataTypes.LongType, nullable: true),    // absent  -> null-fill
+                }),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        ColumnVector a = s.Child("A");
+        ColumnVector b = s.Child("B");
+
+        Assert.Equal(DataTypes.LongType, a.Type);   // promoted lane
+        Assert.Equal(DataTypes.LongType, b.Type);   // null-filled at the declared wide type
+        Assert.Equal(10L, a.GetValue<long>(0));
+        Assert.True(s.IsNull(1));                    // null struct row
+        Assert.Equal(-7L, a.GetValue<long>(2));
+        Assert.True(b.IsNull(0));                    // B absent from the file -> null in every row
+        Assert.True(b.IsNull(1));
+        Assert.True(b.IsNull(2));
+    }
+
+    [Fact]
+    public async Task Struct_RequiredAbsentChild_WithPresentWiden_FailsClosed_WhenGateOpen()
+    {
+        // AC3 across the seam: even with a present widen-able child and the gate OPEN, a REQUIRED absent child
+        // fails closed (ColumnNotPresentInFile) — widening never conjures a required lane into existence.
+        var rows = new List<AOnlyRow> { new() { Id = 1, S = new InnerAOnly { A = 10 } } };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField("Id", DataTypes.IntegerType, nullable: false),
+            new StructField(
+                "S",
+                new StructType(new[]
+                {
+                    new StructField("A", DataTypes.LongType, nullable: false),   // present, widen-able
+                    new StructField("B", DataTypes.LongType, nullable: false),   // required + absent -> fail closed
+                }),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.ColumnNotPresentInFile, ex.Kind);
+    }
+
+    [Fact]
+    public async Task RepeatedAncestor_AbsentNullableChild_NullFills_WithGateOpen_ParityHolds()
+    {
+        // Under a repeated ancestor the struct fields sit at depth >= 2, so #546 widening is OFF there; but
+        // #857 null-fill of an absent nullable child must still work WITH the gate OPEN, and the presence
+        // parity (ExtractOwnerCellDefs-clamped) must hold. File array<struct<A:long>> (identity), requested
+        // array<struct<A:long, B:long?>>: A reads exact, B null-fills per element.
+        var rows = new List<AListRow>
+        {
+            new() { Id = 1, Items = new List<InnerALong> { new() { A = 100L }, new() { A = 200L } } },
+            new() { Id = 2, Items = new List<InnerALong>() }, // empty list
+            new() { Id = 3, Items = null },                   // null list
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Items",
+                new ArrayType(new StructType(new[]
+                {
+                    new StructField("A", DataTypes.LongType, nullable: true),
+                    new StructField("B", DataTypes.LongType, nullable: true), // absent -> null-fill (depth 2)
+                })),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var list = Assert.IsType<ListColumnVector>(batch.Column("Items"));
+        var elements = Assert.IsType<StructColumnVector>(list.Elements);
+        ColumnVector a = elements.Child("A");
+        ColumnVector b = elements.Child("B");
+
+        Assert.False(list.IsNull(0));
+        Assert.True(list.IsNull(2)); // null list
+        (int start0, int len0) = list.RawElementSpan(0);
+        Assert.Equal(2, len0);
+        Assert.Equal(100L, a.GetValue<long>(start0));
+        Assert.Equal(200L, a.GetValue<long>(start0 + 1));
+        for (int e = 0; e < b.Length; e++)
+        {
+            Assert.True(b.IsNull(e)); // B absent across the whole list -> all null
+        }
     }
 
     [Fact]

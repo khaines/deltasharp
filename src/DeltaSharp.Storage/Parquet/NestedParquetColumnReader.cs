@@ -1812,7 +1812,10 @@ internal static class NestedParquetColumnReader
 
         // The driving leaf's DeltaSharp scalar type is derived from its OWN physical type (we discard its
         // values and consume only its Dremel levels), so the physical read dispatch is exact. It is read for
-        // structure only (values discarded), so it is NEVER promoted (#546): promoteLeaf: false.
+        // structure only (values discarded), so it is NEVER promoted (#546): promoteLeaf: false. Note this is
+        // defensive symmetry, not load-bearing — because drivingScalar == the leaf's own physical type, the
+        // promotion predicate (!physicalType.Equals(scalarType) && IsSanctionedWidening) is structurally
+        // UNREACHABLE here regardless of the flag (RFL-864 merge round F3: flipping it is an equivalent mutant).
         DataType drivingScalar = ParquetTypeMapping.ToDataType(driving);
         (_, int[]? def, int[]? rep, int numValues) = await ReadScalarLeafAsync(
             rowGroup, driving, drivingScalar, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)

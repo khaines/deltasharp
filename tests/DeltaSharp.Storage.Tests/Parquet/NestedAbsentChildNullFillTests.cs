@@ -515,6 +515,28 @@ public sealed class NestedAbsentChildNullFillTests
         Assert.Equal(1, owned[1]);                 // exactly the clamped list-element def, not structMaxDef
     }
 
+    [Fact]
+    public void ExtractOwnerCellDefs_PresentFieldDefAboveStructDef_IsClampedToStructMaxDef()
+    {
+        // RFL-864 merge round F2: the {2,1} case above never drives d ABOVE structMaxDef, so a mutant that
+        // drops the `Math.Min(d, structMaxDef)` cap survives it. Here the driving leaf is an OPTIONAL field
+        // inside the struct, so a present-struct/present-field owner cell reports def = structMaxDef + 1 (=3).
+        // ExtractOwnerCellDefs must CLAMP it to structMaxDef (2) — the contract is "the struct's presence, not
+        // the leaf's own depth" — otherwise an absent child's synthesized presence would over-report the def
+        // relative to a present sibling clamped identically. Assert the clamp bites: owned[0] == structMaxDef,
+        // NOT structMaxDef + 1 (which the drop-clamp mutant would produce).
+        const int structMaxDef = 2;
+        const int parentMaxDef = 1;
+        const int parentMaxRep = 1;
+        int[] def = { 3 }; // one present list element, present struct, present optional field -> leaf def 3
+        int[] rep = { 0 };
+
+        int[] owned = NestedParquetColumnReader.ExtractOwnerCellDefs(
+            def, rep, numValues: 1, structMaxDef, parentMaxDef, parentMaxRep, ownerCells: 1, "col");
+
+        Assert.Equal(structMaxDef, owned[0]); // clamped to 2 (struct present), NOT the leaf's raw def 3
+    }
+
     // ---- §3.6c · empty row group (rowCount == 0) — null-fill composes without throwing (R2 F2/F3) --------
 
     [Fact]
