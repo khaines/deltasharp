@@ -36,14 +36,20 @@ namespace DeltaSharp.Storage.Tests.Reading;
 /// <item>AC1 — nested-mapped histories: <c>struct&lt;a,b&gt;</c> (name + id mode), <c>array&lt;string&gt;</c>
 /// and <c>map&lt;string,long&gt;</c> in BOTH name mode AND id mode (id-mode array/map now READS THROUGH the CDF
 /// door once #854 lifted the #839 fail-closed gate for a container carrying a valid
-/// <c>delta.columnMapping.nested.ids</c>). Append / overwrite / delete across versions; change-row value
-/// fidelity for the nested column (struct children / array elements / map entries — not just counts) AND
-/// reconciled OUTPUT SCHEMA physical↔logical fidelity for the nested leaves (name-mode <c>col-&lt;uuid&gt;</c>
-/// physical names; id-mode struct-child <c>field_id</c>s and array/map interior <c>nested.ids</c> ids).</item>
-/// <item>AC1b — nested type WIDENING across CDF versions (#546): a <c>struct&lt;a:int&gt;→struct&lt;a:long&gt;</c>
-/// widening under a typeWidening-enabled table READ-PROMOTES the pre-widening narrow file's nested leaves in
-/// NAME mode; in ID mode the same history fails CLOSED (a DELIBERATE non-promotion — #546 §9 O1 hardcodes
-/// <c>promoteLeaf: false</c> on the by-field-id resolution path — pinned as the current contract, see the
+/// <c>delta.columnMapping.nested.ids</c>). Append / overwrite / delete across versions (overwrite exercised for
+/// array AND map under id mode); change-row value fidelity for the nested column (struct children / array
+/// elements / map entries — not just counts), NULL-vs-EMPTY-vs-PRESENT container distinctness in BOTH name and
+/// id mode, AND reconciled OUTPUT SCHEMA physical↔logical fidelity for the nested leaves (name-mode
+/// <c>col-&lt;uuid&gt;</c> physical names; id-mode struct-child <c>field_id</c>s and array/map interior
+/// <c>nested.ids</c> ids, each validated in <c>[1, maxColumnId]</c>).</item>
+/// <item>AC1b — nested type WIDENING across CDF versions (#546): an <c>int→long</c> widening under a
+/// typeWidening-enabled table READ-PROMOTES the pre-widening narrow file's nested leaf in NAME mode for ALL
+/// THREE nested shapes — a <c>struct</c> child (<c>struct&lt;a:int&gt;→struct&lt;a:long&gt;</c>), an ARRAY
+/// element (<c>array&lt;int&gt;→array&lt;long&gt;</c>), and a MAP value
+/// (<c>map&lt;_,int&gt;→map&lt;_,long&gt;</c>; the map KEY is left unchanged, key widening being neither
+/// sanctioned nor typical) — with a post-widen value &gt; <c>int.MaxValue</c> proving genuine 64-bit width. In
+/// ID mode each of the three fails CLOSED (a DELIBERATE non-promotion — #546 §9 O1 hardcodes
+/// <c>promoteLeaf: false</c> on the by-field-id resolution path — pinned by SchemaMismatch reason, see the
 /// Finding on <see cref="ChangeFeedNestedColumnMappingTests.IdMode_NestedLeafWidening_AcrossCdfVersions_FailsClosed_546"/>).</item>
 /// <item>AC2 — nested-leaf CDF identity immutability across retained versions: a nested-child LOGICAL rename
 /// (id + physicalName preserved) reads through, and a nested-child metadata-only DROP reads through (the
@@ -231,8 +237,8 @@ public sealed class ChangeFeedNestedColumnMappingTests
     /// <c>delta.columnMapping.nested.ids</c> element <c>field_id</c> (#854 lifted the #839 fail-closed load-door
     /// gate for an id-mode array/map that carries a valid <c>nested.ids</c>). Asserts element value fidelity
     /// (order + empty-vs-present) across append/overwrite AND the end snapshot's container reconciles: its own
-    /// <c>delta.columnMapping.id</c> plus a <c>nested.ids</c> element id (the interior leaf field_id the read
-    /// resolves by), distinct and in <c>[1, maxColumnId]</c> — the id-mode physical↔logical witness for an
+    /// <c>delta.columnMapping.id</c> plus a <c>nested.ids</c> element id recorded in the END schema, distinct
+    /// from the container id and in <c>[1, maxColumnId]</c> — the id-mode physical↔logical witness for an
     /// array interior. The dual (this exact shape under NAME mode) is <see cref="NameMode_NestedArray_CdfHistory_ElementValueFidelity"/>.
     /// </summary>
     [Fact]
@@ -258,13 +264,16 @@ public sealed class ChangeFeedNestedColumnMappingTests
         StructField tags = FindField(schema, "tags");
         Assert.Equal(DataTypes.StringType, Assert.IsType<ArrayType>(tags.DataType).ElementType);
 
-        // Id-mode physical↔logical witness: the end snapshot's container carries its field_id AND a nested.ids
-        // element id (the interior element leaf's field_id the read resolved by) — distinct, positive.
+        // Id-mode physical↔logical witness: the end snapshot's container CARRIES its own field_id AND a
+        // nested.ids element id — the END schema records the interior element field_id, validated in
+        // [1, maxColumnId] and distinct from the container id. (This proves the reconciled schema surfaces the
+        // interior id; it does NOT attempt to discriminate by-id vs positional binding for a single fixed leaf.)
         StructType endSchema = await table.LoadEndSchemaAsync();
         StructField endTags = endSchema["tags"];
         Assert.True(ColumnMapping.TryGetId(endTags, out long containerId) && containerId > 0);
         Assert.True(
             ColumnMapping.TryGetArrayElementId(endTags, Physical(endTags), out long elementId) && elementId > 0);
+        Assert.True(elementId <= table.MaxColumnId);
         Assert.NotEqual(containerId, elementId);
     }
 
@@ -287,10 +296,13 @@ public sealed class ChangeFeedNestedColumnMappingTests
         NestedCdfTable.FileRef f1 = await table.AppendAsync(MapBatch(
             table, (1, new[] { ("w", 5001L), ("h", 5002L) }), (2, new[] { ("z", 5003L) })));
         AddInserts(model, 1, MapSig(1, ("w", 5001), ("h", 5002)), MapSig(2, ("z", 5003)));
-        await table.AppendAsync(MapBatch(table, (3, new[] { ("k", 5004L) })));
+        NestedCdfTable.FileRef f2 = await table.AppendAsync(MapBatch(table, (3, new[] { ("k", 5004L) })));
         AddInserts(model, 2, MapSig(3, ("k", 5004)));
-        await table.RemoveAsync(f1);
-        AddDeletes(model, 3, MapSig(1, ("w", 5001), ("h", 5002)), MapSig(2, ("z", 5003)));
+        // Overwrite (delete + insert in one commit) — symmetric with the id-mode ARRAY history's overwrite so a
+        // map's overwrite delete+insert change rows are exercised under id mode too.
+        await table.OverwriteAsync(MapBatch(table, (4, new[] { ("q", 5005L), ("r", 5006L) })), f1, f2);
+        AddDeletes(model, 3, MapSig(1, ("w", 5001), ("h", 5002)), MapSig(2, ("z", 5003)), MapSig(3, ("k", 5004)));
+        AddInserts(model, 3, MapSig(4, ("q", 5005), ("r", 5006)));
 
         (StructType schema, List<ActualChange> changes) =
             await table.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 3), DecodeMap);
@@ -301,14 +313,16 @@ public sealed class ChangeFeedNestedColumnMappingTests
         Assert.Equal(DataTypes.StringType, map.KeyType);
         Assert.Equal(DataTypes.LongType, map.ValueType);
 
-        // Id-mode physical↔logical witness: the container's own id + DISTINCT nested.ids key/value ids (the
-        // interior key/value leaf field_ids the read resolved by), all positive and mutually distinct.
+        // Id-mode physical↔logical witness: the END schema CARRIES the container's own id + DISTINCT nested.ids
+        // key/value ids, all validated in [1, maxColumnId] and mutually distinct. (This proves the reconciled
+        // schema surfaces the interior ids; it does NOT discriminate by-id vs positional binding.)
         StructType endSchema = await table.LoadEndSchemaAsync();
         StructField endProps = endSchema["props"];
         Assert.True(ColumnMapping.TryGetId(endProps, out long containerId) && containerId > 0);
         Assert.True(
             ColumnMapping.TryGetMapKeyValueIds(endProps, Physical(endProps), out long keyId, out long valueId));
         Assert.True(keyId > 0 && valueId > 0);
+        Assert.True(keyId <= table.MaxColumnId && valueId <= table.MaxColumnId);
         Assert.Equal(3, new[] { containerId, keyId, valueId }.Distinct().Count());
     }
 
@@ -392,25 +406,139 @@ public sealed class ChangeFeedNestedColumnMappingTests
         await table.AppendAsync(StructBatch(table, (3, 3_000_000_000L, 2003)));            // v3 wide long file
 
         // The read must fail closed: the v1 narrow (int) leaf resolved by field_id against the END (long) leaf
-        // is a physical-type disagreement, and id-mode leaves are never promoted (§9 O1). Pin the reason so a
-        // wrong-but-thrown typed error cannot masquerade as the deliberate non-promotion gate.
-        Exception? caught = null;
-        try
-        {
-            await table.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 3), DecodeStruct);
-        }
-        catch (Exception ex)
-        {
-            caught = ex;
-        }
+        // is a physical-type disagreement, and id-mode leaves are never promoted (§9 O1). The shared helper
+        // pins the SchemaMismatch + "does not match the requested" reason so a wrong-but-thrown typed error
+        // cannot masquerade as the deliberate non-promotion gate.
+        await AssertIdModeWideningFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(1, 3), DecodeStruct);
+    }
 
-        AssertTypedFailClosed(caught);
-        // The outer DeltaReadException classifies it as a SchemaMismatch storage fault; the inner
-        // DeltaStorageException carries the precise physical-type disagreement ("... does not match the
-        // requested ..."). Pin BOTH so a wrong-but-thrown typed error cannot masquerade as the §9 O1 gate.
-        Assert.Contains("SchemaMismatch", caught!.Message, StringComparison.Ordinal);
-        string reason = (caught.InnerException?.Message ?? string.Empty) + caught.Message;
-        Assert.Contains("does not match the requested", reason, StringComparison.Ordinal);
+    /// <summary>
+    /// NAME-mode ARRAY-ELEMENT type WIDENING across CDF versions (#546/#854 read-promotion). A typeWidening +
+    /// column-mapping table over <c>{id:long, tags:array&lt;int&gt;}</c> appends a NARROW <c>array&lt;int&gt;</c>
+    /// file, WIDENS the element leaf <c>int→long</c> (metadata-only; container id + physicalName preserved),
+    /// then appends a WIDE <c>array&lt;long&gt;</c> file carrying an element only representable as long
+    /// (&gt; <see cref="int.MaxValue"/>). The CDF read must reconcile to the END <c>array&lt;long&gt;</c> schema
+    /// AND READ-PROMOTE the pre-widening narrow file's ELEMENTS to long (NestedParquetColumnReader promotes the
+    /// element leaf at container depth ≤ 1 in name mode). The id-mode dual fails closed
+    /// (<see cref="IdMode_NestedArrayElementWidening_AcrossCdfVersions_FailsClosed_546"/>).
+    /// </summary>
+    [Fact]
+    public async Task NameMode_NestedArrayElementWidening_AcrossCdfVersions_ReadPromotesEarlierNarrowValues()
+    {
+        using NestedCdfTable table = NewWideningArrayTable(ColumnMappingMode.Name);
+        await table.CreateAsync();                                                         // v0 (narrow array<int>)
+        var model = new List<ExpectedChange>();
+
+        await table.AppendAsync(ArrayIntBatch(table, (1, new[] { 10, 11 }), (2, new[] { 12 })));  // v1 narrow
+        AddInserts(model, 1, LongArraySig(1, 10, 11), LongArraySig(2, 12));
+
+        // v2: metaData-only widen tags element int->long (container id + physicalName preserved). Zero change
+        // rows; the v1 file keeps its NARROW int element bytes on disk.
+        StructType wideLogical = WidenArrayElementToLong(table.LogicalSchema, "tags");
+        StructType wideMapped = WidenArrayElementToLong(table.MappedSchema, "tags");
+        await table.WidenAsync(wideLogical, wideMapped, table.MaxColumnId);
+
+        // v3: WIDE append — an element > int.MaxValue proves genuine 64-bit width.
+        await table.AppendAsync(ArrayLongBatch(table, (3, new[] { 3_000_000_000L })));     // v3 wide array<long>
+        AddInserts(model, 3, LongArraySig(3, 3_000_000_000L));
+
+        (StructType schema, List<ActualChange> changes) =
+            await table.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 3), DecodeLongArray);
+
+        // Reconciled END schema: tags element is LONG — the widening witness.
+        var arr = Assert.IsType<ArrayType>(FindField(schema, "tags").DataType);
+        Assert.Equal(DataTypes.LongType, arr.ElementType);
+
+        // The v1 NARROW int elements read-PROMOTE to long; the v3 long-only element reads through.
+        AssertMultisetEqual(model, changes);
+    }
+
+    /// <summary>
+    /// ID-mode ARRAY-ELEMENT widening across CDF versions FAILS CLOSED (#546 §9 O1). The SAME history as the
+    /// name-mode array-element read-through cell but under id mode: the array interior binds by its
+    /// <c>nested.ids</c> element <c>field_id</c> through the by-field-id path
+    /// (<c>NestedParquetColumnReader.ReadListAsync</c>/<c>ExpectScalarLeaf</c> with <c>promoteLeaf: false</c>
+    /// whenever <c>byFieldId</c> is non-null), so the pre-widening narrow (int) element read against the END
+    /// (long) element is a physical-type disagreement that fails the read CLOSED — a deliberate non-promotion,
+    /// reason-pinned exactly like the id-mode struct widening cell.
+    /// </summary>
+    [Fact]
+    public async Task IdMode_NestedArrayElementWidening_AcrossCdfVersions_FailsClosed_546()
+    {
+        using NestedCdfTable table = NewWideningArrayTable(ColumnMappingMode.Id);
+        await table.CreateAsync();
+        await table.AppendAsync(ArrayIntBatch(table, (1, new[] { 10, 11 }), (2, new[] { 12 })));
+
+        StructType wideLogical = WidenArrayElementToLong(table.LogicalSchema, "tags");
+        StructType wideMapped = WidenArrayElementToLong(table.MappedSchema, "tags");
+        await table.WidenAsync(wideLogical, wideMapped, table.MaxColumnId);
+        await table.AppendAsync(ArrayLongBatch(table, (3, new[] { 3_000_000_000L })));
+
+        await AssertIdModeWideningFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(1, 3), DecodeLongArray);
+    }
+
+    /// <summary>
+    /// NAME-mode MAP-VALUE type WIDENING across CDF versions (#546/#854 read-promotion). A typeWidening +
+    /// column-mapping table over <c>{id:long, props:map&lt;string,int&gt;}</c> appends a NARROW
+    /// <c>map&lt;string,int&gt;</c> file, WIDENS the VALUE leaf <c>int→long</c> (metadata-only; container id +
+    /// physicalName preserved — the map KEY stays <c>string</c>, since key widening is not a sanctioned/typical
+    /// change), then appends a WIDE <c>map&lt;string,long&gt;</c> file with a value &gt; <see cref="int.MaxValue"/>.
+    /// The CDF read must reconcile to the END <c>map&lt;string,long&gt;</c> schema AND READ-PROMOTE the
+    /// pre-widening narrow file's VALUES to long. The id-mode dual fails closed
+    /// (<see cref="IdMode_NestedMapValueWidening_AcrossCdfVersions_FailsClosed_546"/>).
+    /// </summary>
+    [Fact]
+    public async Task NameMode_NestedMapValueWidening_AcrossCdfVersions_ReadPromotesEarlierNarrowValues()
+    {
+        using NestedCdfTable table = NewWideningMapTable(ColumnMappingMode.Name);
+        await table.CreateAsync();                                                         // v0 (narrow map<_,int>)
+        var model = new List<ExpectedChange>();
+
+        await table.AppendAsync(MapIntBatch(table, (1, new[] { ("w", 100), ("h", 110) }), (2, new[] { ("z", 120) })));
+        AddInserts(model, 1, MapSig(1, ("w", 100L), ("h", 110L)), MapSig(2, ("z", 120L)));
+
+        // v2: metaData-only widen props VALUE int->long (container id + physicalName preserved; KEY unchanged).
+        StructType wideLogical = WidenMapValueToLong(table.LogicalSchema, "props");
+        StructType wideMapped = WidenMapValueToLong(table.MappedSchema, "props");
+        await table.WidenAsync(wideLogical, wideMapped, table.MaxColumnId);
+
+        // v3: WIDE append — a value > int.MaxValue proves genuine 64-bit width.
+        await table.AppendAsync(MapLongBatch(table, (3, new[] { ("q", 3_000_000_000L) })));  // v3 wide map<_,long>
+        AddInserts(model, 3, MapSig(3, ("q", 3_000_000_000L)));
+
+        (StructType schema, List<ActualChange> changes) =
+            await table.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 3), DecodeMap);
+
+        // Reconciled END schema: props value is LONG (key stays string) — the widening witness.
+        var map = Assert.IsType<MapType>(FindField(schema, "props").DataType);
+        Assert.Equal(DataTypes.StringType, map.KeyType);
+        Assert.Equal(DataTypes.LongType, map.ValueType);
+
+        // The v1 NARROW int values read-PROMOTE to long; the v3 long-only value reads through.
+        AssertMultisetEqual(model, changes);
+    }
+
+    /// <summary>
+    /// ID-mode MAP-VALUE widening across CDF versions FAILS CLOSED (#546 §9 O1). The SAME history as the
+    /// name-mode map-value read-through cell but under id mode: the map value binds by its <c>nested.ids</c>
+    /// value <c>field_id</c> through the by-field-id path (<c>ReadMapAsync</c>/<c>ExpectScalarLeaf</c> with
+    /// <c>promoteLeaf: false</c> whenever <c>byFieldId</c> is non-null), so the pre-widening narrow (int) value
+    /// read against the END (long) value is a physical-type disagreement that fails the read CLOSED — a
+    /// deliberate non-promotion, reason-pinned exactly like the id-mode struct/array widening cells.
+    /// </summary>
+    [Fact]
+    public async Task IdMode_NestedMapValueWidening_AcrossCdfVersions_FailsClosed_546()
+    {
+        using NestedCdfTable table = NewWideningMapTable(ColumnMappingMode.Id);
+        await table.CreateAsync();
+        await table.AppendAsync(MapIntBatch(table, (1, new[] { ("w", 100), ("h", 110) }), (2, new[] { ("z", 120) })));
+
+        StructType wideLogical = WidenMapValueToLong(table.LogicalSchema, "props");
+        StructType wideMapped = WidenMapValueToLong(table.MappedSchema, "props");
+        await table.WidenAsync(wideLogical, wideMapped, table.MaxColumnId);
+        await table.AppendAsync(MapLongBatch(table, (3, new[] { ("q", 3_000_000_000L) })));
+
+        await AssertIdModeWideningFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(1, 3), DecodeMap);
     }
 
     // ============================================================================================
@@ -517,7 +645,8 @@ public sealed class ChangeFeedNestedColumnMappingTests
         await table.CommitMetadataAsync(forged, table.MaxColumnId);
         await table.AppendAsync(StructBatch(table, (2, 1004, 2004))); // v3
 
-        await AssertReadFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(1, 3));
+        await AssertReadFailsClosedAsync(
+            table, DeltaChangeFeedRange.FromVersion(1, 3), "column-mapping identity");
     }
 
     /// <summary>
@@ -552,7 +681,11 @@ public sealed class ChangeFeedNestedColumnMappingTests
                                                                                   // pre-range scan of [earliest=0, start-1=0] (just v0 = I0) also passes. Only the in-range check sees v2.
         await table.CommitMetadataAsync(table.MappedSchema, table.MaxColumnId);   // v4 (I0 restated)
 
-        await AssertReadFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(1, 4));
+        // Pin the IN-RANGE ChangeFeedReader message specifically ("crosses a column-mapping identity change"):
+        // the docstring proves ONLY the in-range check catches this reverted-at-end history, so the reason must
+        // be the in-range one — never the pre-range/end-snapshot identity message.
+        await AssertReadFailsClosedAsync(
+            table, DeltaChangeFeedRange.FromVersion(1, 4), "crosses a column-mapping identity change");
     }
 
     /// <summary>
@@ -661,6 +794,67 @@ public sealed class ChangeFeedNestedColumnMappingTests
                 Insert(1, StructSig(3, 1003L, 2003L, nullStruct: false)),
             },
             changes);
+    }
+
+    /// <summary>
+    /// The ARRAY and MAP null cases under ID mode (each container binds by <c>physicalName</c>, its interior
+    /// element/key/value by <c>delta.columnMapping.nested.ids</c>): a NULL container, an EMPTY container, a
+    /// container carrying a NULL leaf (null array element / null map value), and a PRESENT container must each
+    /// survive the CDF read DISTINCTLY — the signature encoders render <c>array=&lt;null&gt;</c> apart from
+    /// empty <c>array[]</c> and <c>map=&lt;null&gt;</c> apart from empty <c>map{}</c>, so a dropped null cannot
+    /// pass as an equal value. This is the id-mode dual of the array/map arms of
+    /// <see cref="NameMode_NullContainersAndLeaves_SurviveCdfReadDistinctlyFromEmptyAndAbsent"/> (which the
+    /// #854/#839 read-through now unblocks), proving the null decode through the nested.ids-resolved interior is
+    /// not a name-mode-only artifact.
+    /// </summary>
+    [Fact]
+    public async Task IdMode_NullArrayAndMapContainers_SurviveCdfReadDistinctlyFromEmptyAndPresent()
+    {
+        // --- array (id mode): null list, empty list, list with a null element, a present list ---
+        using (NestedCdfTable arrayTable = NewArrayTable(ColumnMappingMode.Id))
+        {
+            await arrayTable.CreateAsync();
+            await arrayTable.AppendAsync(ArrayBatchNullable(
+                arrayTable,
+                (1, null),                                    // null list
+                (2, Array.Empty<string?>()),                  // empty list (distinct from null)
+                (3, new string?[] { "x", null, "z" }),        // list with a null element
+                (4, new string?[] { "p", "q" })));            // present list
+            (_, List<ActualChange> changes) =
+                await arrayTable.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 1), DecodeArray);
+            AssertMultisetEqual(
+                new List<ExpectedChange>
+                {
+                    Insert(1, NullArray(1)),                  // null → array=<null>
+                    Insert(1, ArraySig(2)),                   // empty → array[]
+                    Insert(1, ArraySig(3, "x", "<null>", "z")),
+                    Insert(1, ArraySig(4, "p", "q")),
+                },
+                changes);
+        }
+
+        // --- map (id mode): null map, empty map, map with a null value, a present map ---
+        using (NestedCdfTable mapTable = NewMapTable(ColumnMappingMode.Id))
+        {
+            await mapTable.CreateAsync();
+            await mapTable.AppendAsync(MapBatchNullable(
+                mapTable,
+                (1, null),                                                  // null map
+                (2, Array.Empty<(string, long?)>()),                        // empty map (distinct from null)
+                (3, new (string, long?)[] { ("k", null), ("j", 5003L) }),   // map with a null value
+                (4, new (string, long?)[] { ("w", 5004L) })));              // present map
+            (_, List<ActualChange> changes) =
+                await mapTable.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 1), DecodeMap);
+            AssertMultisetEqual(
+                new List<ExpectedChange>
+                {
+                    Insert(1, NullMap(1)),                                 // null → map=<null>
+                    Insert(1, MapSig(2, Array.Empty<(string, long?)>())),  // empty → map{}
+                    Insert(1, MapSig(3, ("k", (long?)null), ("j", (long?)5003L))),
+                    Insert(1, MapSig(4, ("w", (long?)5004L))),
+                },
+                changes);
+        }
     }
 
     // ============================================================================================
@@ -1233,8 +1427,11 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
     // Fails closed at EITHER the load door (structurally-invalid tamper) OR the read enumeration (valid-but-
     // different identity). Asserts a TYPED exception either way — never a returned mis-mapped batch, and never
-    // a stray NRE/InvalidOperation masquerading as fail-closed.
-    private static async Task AssertReadFailsClosedAsync(NestedCdfTable table, DeltaChangeFeedRange range)
+    // a stray NRE/InvalidOperation masquerading as fail-closed. Optional discriminant substrings pin the
+    // message (matched against the caught exception AND its inner chain) so a WRONG-but-thrown typed error
+    // cannot masquerade as the gate under test — matching the pinning the widening/#839/#585 cells use.
+    private static async Task AssertReadFailsClosedAsync(
+        NestedCdfTable table, DeltaChangeFeedRange range, params string[] expectedSubstrings)
     {
         Exception? caught = null;
         try
@@ -1247,6 +1444,47 @@ public sealed class ChangeFeedNestedColumnMappingTests
         }
 
         AssertTypedFailClosed(caught);
+        string chain = ExceptionChainText(caught!);
+        foreach (string expected in expectedSubstrings)
+        {
+            Assert.Contains(expected, chain, StringComparison.Ordinal);
+        }
+    }
+
+    // The concatenated Message of an exception and every inner exception — so a reason pinned on either the
+    // outer classification (DeltaReadException) or the wrapped cause (DeltaProtocolException/DeltaStorageException)
+    // matches regardless of which layer carries it.
+    private static string ExceptionChainText(Exception exception)
+    {
+        var builder = new StringBuilder();
+        for (Exception? e = exception; e is not null; e = e.InnerException)
+        {
+            builder.Append(e.Message).Append('\n');
+        }
+
+        return builder.ToString();
+    }
+
+    // The shared id-mode nested-leaf WIDENING fail-closed assertion (#546 §9 O1): reading across a widening
+    // boundary where a narrow (int) nested leaf is resolved by field_id against the END (long) leaf must throw
+    // a TYPED SchemaMismatch whose (inner) reason is the physical-type disagreement ("... does not match the
+    // requested ..."), never a silent 32→64-bit mis-read. Shared by the struct/array/map id-mode widening cells.
+    private static async Task AssertIdModeWideningFailsClosedAsync<T>(
+        NestedCdfTable table, DeltaChangeFeedRange range, Func<ChangeRowCursor, T> decode)
+    {
+        Exception? caught = null;
+        try
+        {
+            await table.ReadRangeAsync(range, decode);
+        }
+        catch (Exception ex)
+        {
+            caught = ex;
+        }
+
+        AssertTypedFailClosed(caught);
+        Assert.Contains("SchemaMismatch", caught!.Message, StringComparison.Ordinal);
+        Assert.Contains("does not match the requested", ExceptionChainText(caught), StringComparison.Ordinal);
     }
 
     // Mirrors AssertReadFailsClosedAsync but drives the raw load+drain door directly (the boundary cells whose
@@ -1367,6 +1605,9 @@ public sealed class ChangeFeedNestedColumnMappingTests
         var ptType = (StructType)FindField(c.Schema, "pt").DataType;
         Assert.Equal(new[] { "a" }, ptType.Select(f => f.Name).ToArray());   // b projected out of the END shape
         var pt = (StructColumnVector)c.Batch.Column(c.Schema.IndexOf("pt"));
+        // Directly encode "no stray b at index 1": the decoded vector itself carries exactly ONE field child,
+        // not merely the schema shape — a dropped-but-still-materialized b would surface here.
+        Assert.Equal(1, pt.FieldCount);
 
         string sig;
         if (pt.IsNull(c.Row))
@@ -1399,6 +1640,27 @@ public sealed class ChangeFeedNestedColumnMappingTests
         }
 
         return new ActualChange(c.Version, c.ChangeType, c.Id, ArraySig(c.Id, values.ToArray()).Sig);
+    }
+
+    // Decodes a scalar-LONG array's elements (the array-element widening cell reads its END array<long>) — the
+    // pre-widening narrow int elements must arrive here already promoted to long, so a lost promotion surfaces
+    // as a decode/type mismatch rather than a silent 32-bit read.
+    private static ActualChange DecodeLongArray(ChangeRowCursor c)
+    {
+        var tags = (ListColumnVector)c.Batch.Column(c.Schema.IndexOf("tags"));
+        if (tags.IsNull(c.Row))
+        {
+            return new ActualChange(c.Version, c.ChangeType, c.Id, NullArray(c.Id).Sig);
+        }
+
+        ColumnVector elements = tags.ElementsAt(c.Row);
+        var values = new List<long>();
+        for (int e = 0; e < elements.Length; e++)
+        {
+            values.Add(elements.GetValue<long>(e));
+        }
+
+        return new ActualChange(c.Version, c.ChangeType, c.Id, LongArraySig(c.Id, values.ToArray()).Sig);
     }
 
     private static ActualChange DecodeMap(ChangeRowCursor c)
@@ -1439,6 +1701,10 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
     private static (long Id, string Sig) ArraySig(long id, params string[] elements) =>
         (id, "array[" + string.Join(",", elements) + "]");
+
+    // Long-element array signature (the array-element widening cell): renders each promoted long element.
+    private static (long Id, string Sig) LongArraySig(long id, params long[] elements) =>
+        (id, "array[" + string.Join(",", elements.Select(e => e.ToString(CultureInfo.InvariantCulture))) + "]");
 
     private static (long Id, string Sig) NullArray(long id) => (id, "array=<null>");
 
@@ -1543,7 +1809,41 @@ public sealed class ChangeFeedNestedColumnMappingTests
         return new ManagedColumnBatch(table.LogicalSchema, new ColumnVector[] { id, tags }, rows.Length);
     }
 
-    // Null-capable array builder: a null Tags[] renders a NULL list row (validity=true, zero span); a null
+    // Narrow (int-element) array builder for the array-element widening fixture — the file it writes must
+    // read-promote its elements to long once the table widens (name mode) or fail closed (id mode).
+    private static ColumnBatch ArrayIntBatch(NestedCdfTable table, params (long Id, int[] Tags)[] rows) =>
+        ArrayScalarBatch(table, DataTypes.IntegerType, rows, (v, x) => v.AppendValue(x));
+
+    // Wide (long-element) array builder — used for the post-widen append (an element > int.MaxValue).
+    private static ColumnBatch ArrayLongBatch(NestedCdfTable table, params (long Id, long[] Tags)[] rows) =>
+        ArrayScalarBatch(table, DataTypes.LongType, rows, (v, x) => v.AppendValue(x));
+
+    // Shared scalar-array builder: writes each row's fixed-width elements into a shared child, keyed off the
+    // table's CURRENT logical `tags` element type (int before a widen, long after).
+    private static ColumnBatch ArrayScalarBatch<TElem>(
+        NestedCdfTable table, DataType elementType, (long Id, TElem[] Tags)[] rows,
+        Action<MutableColumnVector, TElem> append)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector elements = ColumnVectors.Create(elementType, 16);
+        var offsets = new int[rows.Length + 1];
+        int cursor = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            id.AppendValue(rows[i].Id);
+            offsets[i] = cursor;
+            foreach (TElem element in rows[i].Tags)
+            {
+                append(elements, element);
+                cursor++;
+            }
+        }
+
+        offsets[rows.Length] = cursor;
+        var arrType = (ArrayType)table.LogicalSchema["tags"].DataType;
+        var tags = new ListColumnVector(arrType, elements, offsets, new bool[rows.Length]);
+        return new ManagedColumnBatch(table.LogicalSchema, new ColumnVector[] { id, tags }, rows.Length);
+    }
     // element string appends a null element into the shared child. Distinct from an empty (non-null) list.
     private static ColumnBatch ArrayBatchNullable(NestedCdfTable table, params (long Id, string?[]? Tags)[] rows)
     {
@@ -1608,7 +1908,43 @@ public sealed class ChangeFeedNestedColumnMappingTests
         return new ManagedColumnBatch(table.LogicalSchema, new ColumnVector[] { id, props }, rows.Length);
     }
 
-    // Null-capable map builder: a null Props[] renders a NULL map row (validity=true); a null entry value
+    // Narrow (int-value) map builder for the map-value widening fixture — the file it writes must read-promote
+    // its VALUES to long once the table widens (name mode) or fail closed (id mode). The KEY stays string.
+    private static ColumnBatch MapIntBatch(NestedCdfTable table, params (long Id, (string Key, int Value)[] Props)[] rows) =>
+        MapScalarValueBatch(table, DataTypes.IntegerType, rows, (v, x) => v.AppendValue(x));
+
+    // Wide (long-value) map builder — used for the post-widen append (a value > int.MaxValue).
+    private static ColumnBatch MapLongBatch(NestedCdfTable table, params (long Id, (string Key, long Value)[] Props)[] rows) =>
+        MapScalarValueBatch(table, DataTypes.LongType, rows, (v, x) => v.AppendValue(x));
+
+    // Shared string-keyed scalar-value map builder, keyed off the table's CURRENT logical `props` value type
+    // (int before a widen, long after); the key vector is always string.
+    private static ColumnBatch MapScalarValueBatch<TVal>(
+        NestedCdfTable table, DataType valueType, (long Id, (string Key, TVal Value)[] Props)[] rows,
+        Action<MutableColumnVector, TVal> appendValue)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector keys = ColumnVectors.Create(DataTypes.StringType, 16);
+        MutableColumnVector values = ColumnVectors.Create(valueType, 16);
+        var offsets = new int[rows.Length + 1];
+        int cursor = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            id.AppendValue(rows[i].Id);
+            offsets[i] = cursor;
+            foreach ((string key, TVal value) in rows[i].Props)
+            {
+                keys.AppendBytes(Encoding.UTF8.GetBytes(key));
+                appendValue(values, value);
+                cursor++;
+            }
+        }
+
+        offsets[rows.Length] = cursor;
+        var mapType = (MapType)table.LogicalSchema["props"].DataType;
+        var props = new MapColumnVector(mapType, keys, values, offsets, new bool[rows.Length]);
+        return new ManagedColumnBatch(table.LogicalSchema, new ColumnVector[] { id, props }, rows.Length);
+    }
     // appends a null map value (the table's props map is valueContainsNull). Distinct from an empty map.
     private static ColumnBatch MapBatchNullable(
         NestedCdfTable table, params (long Id, (string Key, long? Value)[]? Props)[] rows)
@@ -1685,6 +2021,55 @@ public sealed class ChangeFeedNestedColumnMappingTests
     private static StructType WidenStructChildrenToLong(StructType schema, string container) =>
         MapContainerChildren(schema, container, children =>
             children.Select(c => new StructField(c.Name, DataTypes.LongType, c.Nullable, c.Metadata)).ToArray());
+
+    // Widening fixture: {id:long, tags:array<int>} with typeWidening + CDF enabled. A later WidenAsync promotes
+    // the array ELEMENT int->long; the pre-widening narrow file's elements must read-promote (name mode) or
+    // fail closed (id mode, #546 §9 O1).
+    private NestedCdfTable NewWideningArrayTable(ColumnMappingMode mode)
+    {
+        var logical = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("tags", new ArrayType(DataTypes.IntegerType), nullable: true),
+        });
+        return new NestedCdfTable(NewRoot(), mode, logical, "cdf-nested-widen-array", enableTypeWidening: true);
+    }
+
+    // Widening fixture: {id:long, props:map<string,int>} with typeWidening + CDF enabled. A later WidenAsync
+    // promotes the map VALUE int->long (the KEY stays string — key widening is not a sanctioned/typical change).
+    private NestedCdfTable NewWideningMapTable(ColumnMappingMode mode)
+    {
+        var logical = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("props", new MapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: true), nullable: true),
+        });
+        return new NestedCdfTable(NewRoot(), mode, logical, "cdf-nested-widen-map", enableTypeWidening: true);
+    }
+
+    // Widens a top-level array<int> container's ELEMENT leaf to long, PRESERVING the container field's mapping
+    // metadata (id + physicalName + nested.ids) — only the interior element type changes; the container
+    // identity is untouched. Applies to both the logical and the mapped schema.
+    private static StructType WidenArrayElementToLong(StructType schema, string container) =>
+        new(schema.Select(f => f.Name == container
+            ? new StructField(f.Name, new ArrayType(DataTypes.LongType), f.Nullable, f.Metadata)
+            : f).ToList());
+
+    // Widens a top-level map<string,int> container's VALUE leaf to long, PRESERVING the container field's
+    // mapping metadata (id + physicalName + nested.ids) and its KEY type — only the interior value type
+    // changes. Applies to both the logical and the mapped schema.
+    private static StructType WidenMapValueToLong(StructType schema, string container) =>
+        new(schema.Select(f =>
+        {
+            if (f.Name != container)
+            {
+                return f;
+            }
+
+            var map = (MapType)f.DataType;
+            return new StructField(
+                f.Name, new MapType(map.KeyType, DataTypes.LongType, map.ValueContainsNull), f.Nullable, f.Metadata);
+        }).ToList());
 
     private NestedCdfTable NewArrayTable(ColumnMappingMode mode = ColumnMappingMode.Name)
     {
