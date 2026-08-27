@@ -1,3 +1,4 @@
+using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
 
@@ -33,6 +34,9 @@ public static class Functions
     /// <param name="columnName">The column name, or <c>"*"</c>/<c>"t.*"</c> for a star.</param>
     /// <returns>An unresolved column reference.</returns>
     /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    /// <exception cref="AnalysisException"><paramref name="columnName"/> is a dotted name with an empty part
+    /// (e.g. <c>"s."</c>, <c>".x"</c>, <c>"a..b"</c>) — normalised to the single name-resolution failure shape
+    /// (#590).</exception>
     public static Column Col(string columnName)
     {
         ArgumentException.ThrowIfNullOrEmpty(columnName);
@@ -50,7 +54,18 @@ public static class Functions
 
         if (columnName.Contains('.', StringComparison.Ordinal))
         {
-            return new Column(new UnresolvedAttribute(columnName.Split('.')));
+            string[] parts = columnName.Split('.');
+
+            // A dotted name with an empty/blank part (`s.`, `.x`, `a..b`) is an invalid column reference. The
+            // UnresolvedAttribute identifier invariant would surface it as a raw ArgumentException; normalise
+            // it here to an AnalysisException so EVERY column name-resolution failure shares one shape (#590),
+            // never a stray ArgumentException a caller catching AnalysisException would miss.
+            if (Array.Exists(parts, string.IsNullOrEmpty))
+            {
+                throw AnalysisException.InvalidColumnName(columnName);
+            }
+
+            return new Column(new UnresolvedAttribute(parts));
         }
 
         return new Column(new UnresolvedAttribute(columnName));

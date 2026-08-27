@@ -55,19 +55,34 @@ internal enum AnalysisErrorKind
     /// incompatible <c>CASE</c> branch value types.</summary>
     DataTypeMismatch,
 
-    /// <summary>A nested field reference (a struct-field access such as <c>s.f</c>) could not be resolved
-    /// because the base is not a struct or the struct has no such field — a <b>structural</b> absence (the
-    /// field was dropped/renamed, or the base column was retyped away from a struct). This coalesces Spark's
-    /// two <i>distinct</i> field-extraction error classes — <c>INVALID_EXTRACT_BASE_FIELD_TYPE</c> ("need a
-    /// complex type") for a non-struct base, and <c>FIELD_NOT_FOUND</c> for a missing field — <b>both</b> of
-    /// which Spark keeps SEPARATE from the operand-level <c>DATATYPE_MISMATCH</c>. DeltaSharp's flat taxonomy
-    /// coarsens the two into one kind while preserving that separation: it stays distinct from
-    /// <see cref="DataTypeMismatch"/> (a predicate-operand type error, e.g. <c>id &gt; 0</c> after a top-level
-    /// int→string retype) and from the AMBIGUOUS struct-field case (which stays <see cref="DataTypeMismatch"/> —
-    /// there the field exists, the path is merely under-specified). Carries the full nested reference (e.g.
-    /// <c>s.f</c>) in <see cref="AnalysisException.Reference"/> so a caller can attribute the failure to the
-    /// top-level column (#600).</summary>
-    UnresolvedStructField,
+    /// <summary>A nested field reference (<c>s.f</c>) named a field the struct does not contain — the field
+    /// was dropped or renamed. Spark's <c>FIELD_NOT_FOUND</c> ("No such struct field"). A <b>structural</b>
+    /// absence, NOT an operand type mismatch: the base DOES resolve to a struct, but the requested field is
+    /// gone, so a survivor-constraint reclassifier can attribute it to the top-level column (#600). Kept
+    /// distinct from <see cref="DataTypeMismatch"/> (a predicate-operand type error, e.g. <c>id &gt; 0</c>
+    /// after a top-level int→string retype). Carries the full nested reference (e.g. <c>s.f</c>) in
+    /// <see cref="AnalysisException.Reference"/> and the bound base column in
+    /// <see cref="AnalysisException.RootColumn"/> so a caller can attribute the failure to the top-level column
+    /// (#600/#618).</summary>
+    NoSuchStructField,
+
+    /// <summary>A nested field reference (<c>s.f</c>) matched more than one field under case-insensitive
+    /// comparison (e.g. a struct declaring both <c>f</c> and <c>F</c>). Spark's
+    /// <c>AMBIGUOUS_REFERENCE_TO_FIELDS</c>. The path DOES resolve to a struct and the field DOES exist (more
+    /// than once), so this is an <i>under-specified</i> reference, NOT a structural absence: it is kept
+    /// distinct from <see cref="NoSuchStructField"/>/<see cref="InvalidExtractBase"/> and, like the operand
+    /// <see cref="DataTypeMismatch"/> it superseded here, is NOT reclassified as a dropped dependency
+    /// (#600).</summary>
+    AmbiguousStructField,
+
+    /// <summary>A nested field reference (<c>s.f</c>) whose base is NOT a struct — the base column was retyped
+    /// away from a struct, so no field can be extracted from it. Spark's <c>INVALID_EXTRACT_BASE_FIELD_TYPE</c>
+    /// ("cannot extract value … need a complex type"). A <b>structural</b> absence like
+    /// <see cref="NoSuchStructField"/> (both are cases a survivor-constraint reclassifier attributes to the
+    /// top-level column, #600), kept distinct from the operand-level <see cref="DataTypeMismatch"/>. Carries
+    /// the full nested reference in <see cref="AnalysisException.Reference"/> and the bound base column in
+    /// <see cref="AnalysisException.RootColumn"/> (#600/#618).</summary>
+    InvalidExtractBase,
 
     /// <summary>An aggregate function appears outside a valid aggregate context (e.g. in a
     /// <c>Select</c>/<c>Filter</c> with no <c>groupBy</c>/<c>agg</c>).</summary>
@@ -168,7 +183,7 @@ internal sealed class AnalysisException : Exception
     /// <para>
     /// <b>The factories are not the whole class.</b> A second family composes its text in the analyzer
     /// (<c>Analyzer.ExtractStructField</c>, <c>ExpressionCoercion</c>) and hands it to
-    /// <see cref="DataTypeMismatch(string, string)"/> / <see cref="UnresolvedStructField(string, string, string?)"/> as an opaque <c>detail</c>
+    /// <see cref="DataTypeMismatch(string, string)"/> / <see cref="NoSuchStructField(string, string, string?)"/> as an opaque <c>detail</c>
     /// string, so no factory-ranging test can see it. Those sites interpolated a <see cref="DataType"/>,
     /// and a type render is itself a <em>recursive collection</em> — <c>struct&lt;f1:int,…&gt;</c> over
     /// user-authored field names — so an ordinary 60-field nested payload struct was cut by this cap with a
@@ -545,6 +560,25 @@ internal sealed class AnalysisException : Exception
             Array.Empty<string>());
     }
 
+    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedColumn"/> failure for a column name whose
+    /// dotted form contains an EMPTY/blank part — e.g. <c>Col("s.")</c> (parts <c>["s", ""]</c>),
+    /// <c>Col(".x")</c>, or <c>Col("a..b")</c>. This normalises what the <see cref="Plans.Expressions.UnresolvedAttribute"/>
+    /// identifier invariant would otherwise surface as a raw <see cref="ArgumentException"/> into the single
+    /// name-resolution failure shape, so every column name-resolution failure is an
+    /// <see cref="AnalysisException"/> (#590). No candidate listing is available (the failure is at authoring
+    /// time, before any input schema is in scope).</summary>
+    public static AnalysisException InvalidColumnName(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
+        return new AnalysisException(
+            $"Cannot resolve column name '{safeName}': a dotted column name must not contain an empty part "
+            + $"(quote a name that literally contains a dot).",
+            AnalysisErrorKind.UnresolvedColumn,
+            name,
+            Array.Empty<string>());
+    }
+
     public static AnalysisException UnresolvedColumn(
         string name, IReadOnlyList<AttributeReference> input, string? rootColumn = null)
     {
@@ -742,41 +776,96 @@ internal sealed class AnalysisException : Exception
         string reference, Func<string[], string> detail, params DataType[] types) =>
         DataTypeMismatch(reference, ComposeDetailWithTypes(detail, types, d => DataTypeMismatchMessage(reference, d)));
 
-    /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedStructField"/> failure: a nested field
-    /// reference (<paramref name="reference"/>, e.g. <c>s.f</c>) could not be resolved because its base is
-    /// not a struct or the struct has no such field — a <b>structural</b> absence, not a predicate operand
-    /// type mismatch. <paramref name="reference"/> is the full nested path so a caller can normalise it to
-    /// the top-level column (#600).</summary>
-    public static AnalysisException UnresolvedStructField(
-        string reference, string detail, string? rootColumn = null)
+    /// <summary>Builds an <see cref="AnalysisErrorKind.NoSuchStructField"/> failure (Spark
+    /// <c>FIELD_NOT_FOUND</c>): a nested field reference (<paramref name="reference"/>, e.g. <c>s.f</c>) named a
+    /// field the struct does not contain — the field was dropped or renamed, a <b>structural</b> absence rather
+    /// than a predicate operand type mismatch. <paramref name="reference"/> is the full nested path and
+    /// <paramref name="rootColumn"/> the bound base column, so a caller can normalise the failure to the
+    /// top-level column (#600/#618).</summary>
+    public static AnalysisException NoSuchStructField(
+        string reference, string detail, string? rootColumn = null) =>
+        StructFieldFailure(AnalysisErrorKind.NoSuchStructField, reference, detail, rootColumn);
+
+    /// <summary>
+    /// <see cref="NoSuchStructField(string, string, string?)"/> for a detail containing TYPE slots, sized
+    /// against this factory's own composed prose. See
+    /// <see cref="DataTypeMismatch(string, Func{string[], string}, DataType[])"/> for why this is measured here
+    /// rather than reserved by the caller.
+    /// </summary>
+    internal static AnalysisException NoSuchStructField(
+        string reference,
+        Func<string[], string> detail,
+        DataType[] types,
+        string? rootColumn = null) =>
+        NoSuchStructField(
+            reference,
+            ComposeDetailWithTypes(detail, types, d => StructFieldMessage(reference, d)),
+            rootColumn);
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.AmbiguousStructField"/> failure (Spark
+    /// <c>AMBIGUOUS_REFERENCE_TO_FIELDS</c>): a nested field reference (<paramref name="reference"/>) matched
+    /// more than one field under case-insensitive comparison. The path resolves to a struct and the field
+    /// exists (more than once), so this is an under-specified reference — kept distinct from the structural
+    /// <see cref="AnalysisErrorKind.NoSuchStructField"/>/<see cref="AnalysisErrorKind.InvalidExtractBase"/> and
+    /// NOT reclassified as a dropped dependency (#600), hence no <c>rootColumn</c>.</summary>
+    public static AnalysisException AmbiguousStructField(string reference, string detail) =>
+        StructFieldFailure(AnalysisErrorKind.AmbiguousStructField, reference, detail, rootColumn: null);
+
+    /// <summary>
+    /// <see cref="AmbiguousStructField(string, string)"/> for a detail containing TYPE slots, sized against
+    /// this factory's own composed prose. See
+    /// <see cref="DataTypeMismatch(string, Func{string[], string}, DataType[])"/> for why this is measured here
+    /// rather than reserved by the caller.
+    /// </summary>
+    internal static AnalysisException AmbiguousStructField(
+        string reference, Func<string[], string> detail, params DataType[] types) =>
+        AmbiguousStructField(
+            reference, ComposeDetailWithTypes(detail, types, d => StructFieldMessage(reference, d)));
+
+    /// <summary>Builds an <see cref="AnalysisErrorKind.InvalidExtractBase"/> failure (Spark
+    /// <c>INVALID_EXTRACT_BASE_FIELD_TYPE</c>): a nested field reference (<paramref name="reference"/>) whose
+    /// base is NOT a struct — the base column was retyped away from a struct, a <b>structural</b> absence like
+    /// <see cref="AnalysisErrorKind.NoSuchStructField"/>. <paramref name="reference"/> is the full nested path
+    /// and <paramref name="rootColumn"/> the bound base column, so a caller can normalise the failure to the
+    /// top-level column (#600/#618).</summary>
+    public static AnalysisException InvalidExtractBase(
+        string reference, string detail, string? rootColumn = null) =>
+        StructFieldFailure(AnalysisErrorKind.InvalidExtractBase, reference, detail, rootColumn);
+
+    /// <summary>
+    /// <see cref="InvalidExtractBase(string, string, string?)"/> for a detail containing TYPE slots, sized
+    /// against this factory's own composed prose. See
+    /// <see cref="DataTypeMismatch(string, Func{string[], string}, DataType[])"/> for why this is measured here
+    /// rather than reserved by the caller.
+    /// </summary>
+    internal static AnalysisException InvalidExtractBase(
+        string reference,
+        Func<string[], string> detail,
+        DataType[] types,
+        string? rootColumn = null) =>
+        InvalidExtractBase(
+            reference,
+            ComposeDetailWithTypes(detail, types, d => StructFieldMessage(reference, d)),
+            rootColumn);
+
+    // The three nested-field-extraction failures (Spark FIELD_NOT_FOUND / AMBIGUOUS_REFERENCE_TO_FIELDS /
+    // INVALID_EXTRACT_BASE_FIELD_TYPE) share one message shape — `cannot resolve '<path>': <detail>` — and
+    // differ only in Kind and whether a rootColumn is carried, so they route through one builder.
+    private static AnalysisException StructFieldFailure(
+        AnalysisErrorKind kind, string reference, string detail, string? rootColumn)
     {
         ArgumentNullException.ThrowIfNull(reference);
         ArgumentNullException.ThrowIfNull(detail);
         return new AnalysisException(
-            UnresolvedStructFieldMessage(reference, detail),
-            AnalysisErrorKind.UnresolvedStructField,
+            StructFieldMessage(reference, detail),
+            kind,
             reference,
             Array.Empty<string>(),
             rootColumn);
     }
 
-    private static string UnresolvedStructFieldMessage(string reference, string detail) =>
+    private static string StructFieldMessage(string reference, string detail) =>
         $"cannot resolve '{DiagnosticText.Sanitize(reference, CoercionHelpers.DiagnosticReferenceMaxLength)}': {detail}";
-
-    /// <summary>
-    /// <see cref="UnresolvedStructField(string, string, string?)"/> for a detail containing TYPE slots, sized
-    /// against this factory's own composed prose. See <see cref="DataTypeMismatch(string, Func{string[], string}, DataType[])"/>
-    /// for why this is measured here rather than reserved by the caller.
-    /// </summary>
-    internal static AnalysisException UnresolvedStructField(
-        string reference,
-        Func<string[], string> detail,
-        DataType[] types,
-        string? rootColumn = null) =>
-        UnresolvedStructField(
-            reference,
-            ComposeDetailWithTypes(detail, types, d => UnresolvedStructFieldMessage(reference, d)),
-            rootColumn);
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.MisplacedAggregate"/> failure for an aggregate
     /// function used outside a valid aggregate context.</summary>

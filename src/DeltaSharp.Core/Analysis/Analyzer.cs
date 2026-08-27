@@ -709,17 +709,21 @@ internal sealed class Analyzer
     }
 
     // Builds a GetStructField extracting <paramref name="fieldName"/> from a struct-typed
-    // <paramref name="child"/> (case-insensitive field match, Spark parity). A base that is not a
-    // struct, or a struct with no such field, is a STRUCTURAL absence (the field was dropped/renamed
-    // or the base retyped away from a struct) → UnresolvedStructField, so a survivor-constraint
-    // reclassifier can attribute it to the top-level column (#600). An ambiguous field match remains
-    // a DataTypeMismatch (the reference resolves to a struct, but the path is under-specified).
+    // <paramref name="child"/> (case-insensitive field match, Spark parity). Each failure routes to its own
+    // Spark error class so a consumer keying on Kind stays Spark-compatible (#590):
+    //   • a base that is NOT a struct → InvalidExtractBase (Spark INVALID_EXTRACT_BASE_FIELD_TYPE),
+    //   • a struct with NO such field → NoSuchStructField (Spark FIELD_NOT_FOUND),
+    //   • a case-insensitively AMBIGUOUS field → AmbiguousStructField (Spark AMBIGUOUS_REFERENCE_TO_FIELDS).
+    // The first two are STRUCTURAL absences (the field was dropped/renamed or the base retyped away from a
+    // struct), so they carry the bound base column (rootColumn) and a survivor-constraint reclassifier can
+    // attribute them to the top-level column (#600). The ambiguous case is an under-specified — not absent —
+    // reference, so it carries no rootColumn and is NOT reclassified.
     private static Expression ExtractStructField(
         Expression child, string fieldName, UnresolvedAttribute origin, string baseColumnName)
     {
         if (child.Type is not StructType structType)
         {
-            throw AnalysisException.UnresolvedStructField(
+            throw AnalysisException.InvalidExtractBase(
                 origin.Name,
                 t => $"cannot extract field '{DiagnosticText.Sanitize(fieldName)}' from "
                     + $"'{CoercionHelpers.DiagnosticReference(child)}' of type "
@@ -740,7 +744,7 @@ internal sealed class Analyzer
 
             if (ordinal >= 0)
             {
-                throw AnalysisException.DataTypeMismatch(
+                throw AnalysisException.AmbiguousStructField(
                     origin.Name,
                     t => $"field '{DiagnosticText.Sanitize(fieldName)}' is ambiguous in struct type "
                         + $"'{t[0]}'",
@@ -753,7 +757,7 @@ internal sealed class Analyzer
 
         if (ordinal < 0)
         {
-            throw AnalysisException.UnresolvedStructField(
+            throw AnalysisException.NoSuchStructField(
                 origin.Name,
                 t => $"no such struct field '{DiagnosticText.Sanitize(fieldName)}' in '{t[0]}'",
                 [structType],

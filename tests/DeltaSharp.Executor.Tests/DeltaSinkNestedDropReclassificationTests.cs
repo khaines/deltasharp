@@ -17,7 +17,9 @@ namespace DeltaSharp.Executor.Tests;
 /// instead of the raw analyzer failure. Before #600 the analyzer threw <see cref="AnalysisErrorKind.DataTypeMismatch"/>
 /// for a missing/typeless struct field, which the #598/#599 reclassifier (scoped to
 /// <see cref="AnalysisErrorKind.UnresolvedColumn"/>) skipped — leaking a bare "cannot resolve" error. #600 splits
-/// the STRUCTURAL absence of a struct field into <see cref="AnalysisErrorKind.UnresolvedStructField"/> so the
+/// the STRUCTURAL absence of a struct field into two distinct Spark error classes —
+/// <see cref="AnalysisErrorKind.NoSuchStructField"/> (field dropped/renamed) and
+/// <see cref="AnalysisErrorKind.InvalidExtractBase"/> (base retyped away from a struct), the #590 split — so the
 /// reclassifier catches it and normalises `s.f` → top-level `s`. A genuine top-level operand RETYPE (e.g.
 /// <c>id int → string</c> under <c>id &gt; 0</c>) still throws <see cref="AnalysisErrorKind.DataTypeMismatch"/> from
 /// the COMPARISON — not from nested-field extraction — and stays fail-closed but NOT reclassified. The enforcer
@@ -38,7 +40,7 @@ public sealed class DeltaSinkNestedDropReclassificationTests
     {
         // The struct column `s` survives, but its field `f` was renamed away (schema now has `s{g:int}`), so a
         // surviving CHECK `s.f > 0` no longer resolves — "no such struct field 'f'". #600: this is a STRUCTURAL
-        // absence (UnresolvedStructField), reclassified to the dependent-column parity error naming top-level `s`.
+        // absence (NoSuchStructField), reclassified to the dependent-column parity error naming top-level `s`.
         var survivingStruct = new StructType(new[] { new StructField("g", IntegerType.Instance, nullable: false) });
         var schema = new StructType(new[] { new StructField("s", survivingStruct, nullable: true) });
 
@@ -55,7 +57,7 @@ public sealed class DeltaSinkNestedDropReclassificationTests
     {
         // The base column `s` was retyped from a struct to a scalar (int), so `s.f` cannot extract a field from a
         // non-struct — "a nested field reference requires a struct". #600: also a STRUCTURAL absence
-        // (UnresolvedStructField), reclassified to the dependent-column parity error naming top-level `s`.
+        // (InvalidExtractBase), reclassified to the dependent-column parity error naming top-level `s`.
         var schema = new StructType(new[] { new StructField("s", IntegerType.Instance, nullable: false) });
 
         var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
@@ -93,7 +95,7 @@ public sealed class DeltaSinkNestedDropReclassificationTests
         // `f`), so the nested reference `s.f` binds NO base column and the analyzer's trailing-part fallback
         // throws UnresolvedColumn (naming the full path `s.f`) — the pre-#600 kind the reclassifier already
         // caught. Pinned here so BOTH the fully-dropped-base path (UnresolvedColumn) and the surviving-struct
-        // path (#600's UnresolvedStructField) are proven to normalise `s.f` → top-level `s` for the parity error.
+        // path (#600/#590's NoSuchStructField) are proven to normalise `s.f` → top-level `s` for the parity error.
         var schema = new StructType(new[] { new StructField("other", IntegerType.Instance, nullable: false) });
 
         var ex = Assert.Throws<DeltaConstraintDependentColumnException>(
@@ -125,7 +127,8 @@ public sealed class DeltaSinkNestedDropReclassificationTests
     {
         // GUARD (false-positive scope): retyping a TOP-LEVEL column so a surviving CHECK's COMPARISON no longer
         // typechecks (`id > 0` with `id` now a string) throws DataTypeMismatch from the comparison operator — NOT
-        // from nested-field extraction — so #600's UnresolvedStructField split must NOT catch it. The write still
+        // from nested-field extraction — so #600/#590's NoSuchStructField/InvalidExtractBase split must NOT catch
+        // it. The write still
         // fails closed, just not with the dependent-column parity error (a genuine type error, not a dropped dep).
         var schema = new StructType(new[] { new StructField("id", StringType.Instance, nullable: false) });
 

@@ -66,34 +66,45 @@ public sealed class GetStructFieldResolutionTests
     [Fact]
     public void MultipartRef_NonStructLeadingColumn_FailsClosed()
     {
-        // #600: extracting a field from a NON-struct base is a structural absence — UnresolvedStructField, not a
-        // generic DataTypeMismatch — so a survivor-CHECK reclassifier can attribute it to the top-level column.
+        // #590/#600: extracting a field from a NON-struct base is a structural absence — Spark's
+        // INVALID_EXTRACT_BASE_FIELD_TYPE (InvalidExtractBase), NOT a generic DataTypeMismatch — so a
+        // survivor-CHECK reclassifier can attribute it to the top-level column.
         var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
             SchemaWithStructAndTopLevelF,
             new BinaryComparison(Ref("id", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
-        Assert.Equal(AnalysisErrorKind.UnresolvedStructField, ex.Kind);
+        Assert.Equal(AnalysisErrorKind.InvalidExtractBase, ex.Kind);
         Assert.Equal("id.f", ex.Reference); // full nested path, so callers can normalise to top-level `id`
+        Assert.Equal("id", ex.RootColumn); // bound base column, for the dependent-column reclassifier (#600)
+        // Golden message: the clear human-readable detail is preserved alongside the stable kind.
+        Assert.Contains("cannot resolve 'id.f'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("a nested field reference requires a struct", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public void MultipartRef_UnknownStructField_FailsClosed()
     {
-        // #600: a struct with no such field is likewise UnresolvedStructField, carrying the full `s.nope` path.
+        // #590/#600: a struct with no such field is Spark's FIELD_NOT_FOUND (NoSuchStructField), carrying the
+        // full `s.nope` path.
         var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
             SchemaWithStructAndTopLevelF,
             new BinaryComparison(Ref("s", "nope"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
-        Assert.Equal(AnalysisErrorKind.UnresolvedStructField, ex.Kind);
+        Assert.Equal(AnalysisErrorKind.NoSuchStructField, ex.Kind);
         Assert.Equal("s.nope", ex.Reference);
+        Assert.Equal("s", ex.RootColumn);
+        // Golden message.
+        Assert.Contains("cannot resolve 's.nope'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("no such struct field 'nope'", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void MultipartRef_AmbiguousStructField_StaysDataTypeMismatch()
+    public void MultipartRef_AmbiguousStructField_IsAmbiguousStructFieldKind()
     {
-        // #600 GUARD (taxonomy boundary): a struct with two case-insensitively-equal fields (`f`, `F`) makes
-        // `s.f` AMBIGUOUS — the path DOES resolve to a struct and the field DOES exist (twice), so this is a
-        // genuine under-specified reference, NOT a structural absence. It must stay DataTypeMismatch (never
-        // UnresolvedStructField), so the survivor-CHECK reclassifier does NOT treat it as a dropped dependency.
-        // Locks in the asymmetry vs the non-struct-base / no-such-field cases the #600 split newly reclassifies.
+        // #590/#600 GUARD (taxonomy boundary): a struct with two case-insensitively-equal fields (`f`, `F`)
+        // makes `s.f` AMBIGUOUS — Spark's AMBIGUOUS_REFERENCE_TO_FIELDS (AmbiguousStructField). The path DOES
+        // resolve to a struct and the field DOES exist (twice), so this is a genuine under-specified reference,
+        // NOT a structural absence. It must stay distinct from the non-struct-base / no-such-field cases (never
+        // NoSuchStructField/InvalidExtractBase) and, carrying no RootColumn, is NOT reclassified by the
+        // survivor-CHECK reclassifier as a dropped dependency. Locks in the asymmetry the #590 split preserves.
         var ambiguousStruct = new StructType(new[]
         {
             new StructField("f", IntegerType.Instance, nullable: true),
@@ -104,14 +115,18 @@ public sealed class GetStructFieldResolutionTests
         var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
             schema,
             new BinaryComparison(Ref("s", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
-        Assert.Equal(AnalysisErrorKind.DataTypeMismatch, ex.Kind);
+        Assert.Equal(AnalysisErrorKind.AmbiguousStructField, ex.Kind);
+        Assert.Null(ex.RootColumn); // under-specified, not a dropped dependency → not reclassified
+        // Golden message.
+        Assert.Contains("cannot resolve 's.f'", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("field 'f' is ambiguous", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
     public void MultipartRef_QualifiedNestedDrop_RootColumnIsBoundBaseNotQualifier()
     {
         // #618: for a qualified nested ref `t.s.f` (phantom qualifier `t` skipped by the base scan, real base
-        // struct `s` lacking field `f`), the UnresolvedStructField carries RootColumn = the BOUND BASE column
+        // struct `s` lacking field `f`), the NoSuchStructField failure carries RootColumn = the BOUND BASE column
         // `s` — not the qualifier `t` a first-dot split of `t.s.f` would wrongly pick — so a dependent-column
         // reclassifier attributes the failure to `s`. Reference stays the full path for the message.
         var innerNoF = new StructType(new[] { new StructField("g", IntegerType.Instance, nullable: true) });
@@ -120,9 +135,25 @@ public sealed class GetStructFieldResolutionTests
         var ex = Assert.Throws<AnalysisException>(() => ResolveCondition(
             schema,
             new BinaryComparison(Ref("t", "s", "f"), Literal.OfInt(0), ComparisonOperator.GreaterThan)));
-        Assert.Equal(AnalysisErrorKind.UnresolvedStructField, ex.Kind);
+        Assert.Equal(AnalysisErrorKind.NoSuchStructField, ex.Kind);
         Assert.Equal("t.s.f", ex.Reference);
         Assert.Equal("s", ex.RootColumn); // bound base, not the phantom qualifier `t`
+    }
+
+    [Fact]
+    public void Col_DottedNameWithEmptyPart_IsAnalysisExceptionNotArgumentException()
+    {
+        // #590: a dotted column name with an empty/blank part (`Col("s.")` → parts ["s", ""]) previously
+        // surfaced a raw ArgumentException from the UnresolvedAttribute identifier invariant. It is now
+        // normalised to an AnalysisException (UnresolvedColumn kind) so EVERY column name-resolution failure
+        // shares one exception shape — a caller catching AnalysisException never misses a stray ArgumentException.
+        foreach (string bad in new[] { "s.", ".x", "a..b" })
+        {
+            var ex = Assert.Throws<AnalysisException>(() => Functions.Col(bad));
+            Assert.Equal(AnalysisErrorKind.UnresolvedColumn, ex.Kind);
+            Assert.Equal(bad, ex.Reference); // raw structured channel preserved
+            Assert.Contains("must not contain an empty part", ex.Message, StringComparison.Ordinal);
+        }
     }
 
     [Fact]
