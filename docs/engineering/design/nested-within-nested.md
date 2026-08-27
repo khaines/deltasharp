@@ -451,11 +451,19 @@ gate-lift + fieldPath-chain accumulation**, not new machinery:
    | `array<array<int→long>>` | inner element | `element.element` | the array field |
    | `map<string, array<int→long>>` | value-array element | `value.element` | the map field |
    | `array<map<string, int→long>>` | element-map value | `element.value` | the array field |
-   | `map<map<int→long, string>, string>` | key-map key | `key.key` | the map field |
+   | `map<array<int→long>, string>` | key-array element (map **key** widened) | `key.element` | the map field |
+   | `array<map<int→long, string>>` | element-map key (map **key** widened) | `element.key` | the array field |
    | `array<array<array<int→long>>>` (depth-3) | innermost element | `element.element.element` | the array field |
    | `map<string, array<array<int→long>>>` (depth-3) | inner-inner element | `value.element.element` | the map field |
    | `struct<xs: array<int→long>>` | `xs` element | `element` | the **`xs`** StructField |
    | `array<struct<a: int→long>>` | element-struct field `a` | *(none — `fieldPath: null`)* | the inner **`a`** StructField |
+
+   > **Note (map-key chains).** Map **key** widening is sanctioned (mirroring #546's top-level
+   > `Reconcile_MapKeyWidening`, `fieldPath="key"`), so `key`-prefixed chains are valid — but a `key.key` chain
+   > (a map whose key is itself a map) is **unreachable**: DeltaSharp's `MapType` prohibits a map-typed key
+   > (`SchemaValidationException: Map key type 'map' is not supported`). The constructible depth-2 map-key
+   > chains are therefore `key.element` (`map<array<int→long>,string>`) and `element.key`
+   > (`array<map<int→long,string>>`), both exercised in §3.2.
 
 2. **Allowlist + decimal-fit reuse (verbatim, NO new sanction).** The eligibility predicates are unchanged:
    `TypeWidening.IsSchemaEvolutionWidening` (`:174`, append-apply subset — same-family + `date→timestamp_ntz`)
@@ -524,12 +532,15 @@ the **`xs`** StructField (the struct boundary excludes it from any outer chain).
 | R2 | `DecodeStruct` scalar child (`:521`) | `... && depth == 0 && byFieldId is null` → `... && byFieldId is null` (drop `&& depth == 0`). |
 | R3 | `DecodeList` scalar element (`:716`) | drop `&& depth == 0` (keep `&& byFieldId is null`). |
 | R4 | `DecodeMap` scalar key/value (`:804`) | drop `&& depth == 0` (keep `&& byFieldId is null`). |
+| R5 | **Driving-leaf reads** in `DecodeStruct` (struct-presence probe), `DecodeList`, `DecodeMap` (key + value) | **Implementation-discovered gap.** These read a *discarded* driving leaf for its def/rep **structure only**, previously at `FirstScalarType(requested.X)` — the *requested* (now possibly **widened**) first-scalar type. Under 585b a widened deep leaf makes `requested` (e.g. `long`) differ from the narrow physical leaf (`int`), so a driving read at the requested wide type would **fault the raw typed decode**. Fix: read each driving leaf at its **own physical type** (`ParquetTypeMapping.ToDataType(drivingLeaf)`) with `promoteLeaf: false` — def/rep are type-agnostic, so structure is identical and no promotion/fault occurs. `FirstScalarType` is removed (its only callers were these driving reads). |
 
 `ValidateLeafPhysicalType`'s widening arm (`:2289-2292`), `ReadScalarLeafAsync`'s value promotion
 (`:1138-1145`), and `ReadPromotedLeafAsync` are **reused verbatim** — they are already `promoteLeaf`-gated and
 depth-agnostic (the value path already threads the correct `presentFloor` for a nested element, `:728`). Once
 `promoteLeaf` is `true` at a deep leaf, promotion Just Works: 585a rebuilds the structure, 585b relaxes the
-per-leaf exact-match to the allowlist and inserts the **same** value promotion the depth≤1 path uses.
+per-leaf exact-match to the allowlist and inserts the **same** value promotion the depth≤1 path uses. The
+**driving-leaf reads (R5)** are the one place the widened `requested` type leaks into a structural read, so they
+must read at the physical type — the rest of the promotion machinery is untouched.
 
 **PRESERVED — the id-mode fail-closed contract (do NOT wire id-mode nested-leaf promotion; #546 §9 O1 /
 [#839](https://github.com/khaines/deltasharp/issues/839) <!-- issue-state:closed -->, out of 585b scope).**
@@ -764,7 +775,11 @@ end-to-end variants also assert log-JSON round-trip):
 1. `Widen_ArrayOfArrayElement_IntToLong_AppendApplies_EmitsFieldPath_element_element`.
 2. `Widen_MapValueArrayElement_IntToLong_EmitsFieldPath_value_element`.
 3. `Widen_ArrayOfMapValue_IntToLong_EmitsFieldPath_element_value`.
-4. `Widen_MapOfMapKey_IntToLong_EmitsFieldPath_key_key`.
+4. `Widen_MapKeyArrayElement_IntToLong_EmitsFieldPath_key_element` (`map<array<int→long>,string>` — map **key**
+   widened, `key.element`) and `Widen_ArrayOfMapKey_IntToLong_EmitsFieldPath_element_key`
+   (`array<map<int→long,string>>` — map **key** widened, `element.key`). Map-key widening at depth&gt;1 on both
+   the outermost (`key.`) and innermost (`.key`) sides; `key.key` is not constructible (map-typed keys are
+   rejected by `MapType`, see §2.5 note).
 5. `Widen_ArrayOfArrayOfArrayElement_Depth3_EmitsFieldPath_element_element_element` — depth-3 chain (pins the
    accumulator, not a two-token special-case).
 6. `Widen_StructChildArrayElement_EmitsElementFieldPath_OnChildStructField` — `struct<xs:array<int→long>>`:

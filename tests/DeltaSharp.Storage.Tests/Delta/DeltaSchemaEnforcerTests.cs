@@ -1330,6 +1330,306 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.Equal("lookup.value.zip", ex.Path);
     }
 
+    // ---- #860 (585b): depth>1 nested widening applied with the fieldPath CHAIN (design §2.5 / §3.2) -----
+    // The widening machinery (allowlist, fieldPath emission, NestedTypeChange) is reused verbatim; 585b lifts
+    // the MergeCollectionElement depth cap (E3) and threads the accumulated fieldPath chain (E1/E2).
+
+    [Fact]
+    public void Widen_ArrayOfArrayElement_IntToLong_AppendApplies_EmitsFieldPath_element_element()
+    {
+        // Cell 1 (AC2): array<array<int>> → array<array<long>> applies at depth 2, recording the chain
+        // "element.element" on the enclosing field (outermost-first, tokens joined by '.').
+        StructType table = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.IntegerType, true), true), nullable: true));
+        StructType write = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.LongType, true), true), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["x"];
+        ArrayType outer = Assert.IsType<ArrayType>(field.DataType);
+        ArrayType inner = Assert.IsType<ArrayType>(outer.ElementType);
+        Assert.Equal(DataTypes.LongType, inner.ElementType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element.element");
+    }
+
+    [Fact]
+    public void Widen_MapValueArrayElement_IntToLong_EmitsFieldPath_value_element()
+    {
+        // Cell 2 (AC2): map<string, array<int>> → map<string, array<long>> → "value.element".
+        StructType table = Schema(Field(
+            "m", DataTypes.CreateMapType(DataTypes.StringType, new ArrayType(DataTypes.IntegerType, true)),
+            nullable: true));
+        StructType write = Schema(Field(
+            "m", DataTypes.CreateMapType(DataTypes.StringType, new ArrayType(DataTypes.LongType, true)),
+            nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["m"];
+        MapType map = Assert.IsType<MapType>(field.DataType);
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ArrayType>(map.ValueType).ElementType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "value.element");
+    }
+
+    [Fact]
+    public void Widen_ArrayOfMapValue_IntToLong_EmitsFieldPath_element_value()
+    {
+        // Cell 3 (AC2): array<map<string,int>> → array<map<string,long>> → "element.value".
+        StructType table = Schema(Field(
+            "a", new ArrayType(DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType), true),
+            nullable: true));
+        StructType write = Schema(Field(
+            "a", new ArrayType(DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType), true),
+            nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["a"];
+        MapType map = Assert.IsType<MapType>(Assert.IsType<ArrayType>(field.DataType).ElementType);
+        Assert.Equal(DataTypes.LongType, map.ValueType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element.value");
+    }
+
+    [Fact]
+    public void Widen_MapKeyArrayElement_IntToLong_EmitsFieldPath_key_element()
+    {
+        // Cell 4 (AC2) — the KEY-side chain. DeltaSharp forbids a map-TYPED key (MapType rejects it), so the
+        // design's `map<map<…>>` → "key.key" is not constructible; the feasible key-side chain uses an
+        // ARRAY-typed key: map<array<int>, string> → map<array<long>, string> → "key.element" (the "key" token
+        // composes into a chain exactly like "value"/"element"). See the delivery report for this substitution.
+        StructType table = Schema(Field(
+            "m",
+            DataTypes.CreateMapType(new ArrayType(DataTypes.IntegerType, true), DataTypes.StringType),
+            nullable: true));
+        StructType write = Schema(Field(
+            "m",
+            DataTypes.CreateMapType(new ArrayType(DataTypes.LongType, true), DataTypes.StringType),
+            nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["m"];
+        MapType map = Assert.IsType<MapType>(field.DataType);
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ArrayType>(map.KeyType).ElementType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "key.element");
+    }
+
+    [Fact]
+    public void Widen_ArrayOfMapKey_IntToLong_EmitsFieldPath_element_key()
+    {
+        // Cell 4b (AC2) — the map-KEY chain with "key" INNERMOST (the readable counterpart of cell 4's
+        // "key.element"): array<map<int,string>> → array<map<long,string>> → "element.key". Map-key widening
+        // is a sanctioned same-family widening (#546 Reconcile_MapKeyWidening applies it at depth 1 with
+        // fieldPath="key"); 585b composes the "key" token into the chain at depth 2. int→long keys are injective.
+        StructType table = Schema(Field(
+            "a",
+            new ArrayType(DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.StringType), true),
+            nullable: true));
+        StructType write = Schema(Field(
+            "a",
+            new ArrayType(DataTypes.CreateMapType(DataTypes.LongType, DataTypes.StringType), true),
+            nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["a"];
+        MapType map = Assert.IsType<MapType>(Assert.IsType<ArrayType>(field.DataType).ElementType);
+        Assert.Equal(DataTypes.LongType, map.KeyType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element.key");
+    }
+
+    [Fact]
+    public void Widen_ArrayOfArrayOfArrayElement_Depth3_EmitsFieldPath_element_element_element()
+    {
+        // Cell 5 (AC2/AC4): depth-3 array<array<array<int>>> → "element.element.element" — pins the
+        // fieldPath ACCUMULATOR (one token per array/map descent), not a two-token special-case.
+        StructType table = Schema(Field(
+            "x",
+            new ArrayType(new ArrayType(new ArrayType(DataTypes.IntegerType, true), true), true),
+            nullable: true));
+        StructType write = Schema(Field(
+            "x",
+            new ArrayType(new ArrayType(new ArrayType(DataTypes.LongType, true), true), true),
+            nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["x"];
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element.element.element");
+    }
+
+    [Fact]
+    public void Widen_StructChildArrayElement_EmitsElementFieldPath_OnChildStructField()
+    {
+        // Cell 6 (AC2): struct<xs:array<int>> → struct<xs:array<long>> — the change is recorded on the INNER
+        // `xs` StructField with fieldPath="element" (the struct boundary resets the chain to a fresh namespace),
+        // and the enclosing `s` struct field carries NO typeChanges.
+        StructType tableInner = Schema(Field("xs", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType writeInner = Schema(Field("xs", new ArrayType(DataTypes.LongType, true), nullable: true));
+        StructType table = Schema(Field("s", tableInner, nullable: true));
+        StructType write = Schema(Field("s", writeInner, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField sField = merged!["s"];
+        StructType sInner = Assert.IsType<StructType>(sField.DataType);
+        StructField xs = sInner["xs"];
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ArrayType>(xs.DataType).ElementType);
+        AssertSingleNestedTypeChange(xs.Metadata, "integer", "long", "element");
+        Assert.False(sField.Metadata.TryGetValue("delta.typeChanges", out _));
+    }
+
+    [Fact]
+    public void Widen_ArrayOfStructField_StaysFailClosedOnAppend_D9_ReaderOverPermissive()
+    {
+        // Cell 7 (AC2) — DEVIATION from the §3.2 cell-7 PROSE, faithful to decision D9 + edits E1–E3. The
+        // design's cell-7 text expects array<struct<a:int>> → array<struct<a:long>> to APPLY on the inner `a`
+        // StructField, but E1–E3 leave MergeType's default scalar arm (`depth <= 1`) UNCHANGED per D9 (a struct
+        // child re-enters MergeField and reaches the default arm at depth 2), so on APPEND this stays fail-closed
+        // TypeWideningUnsupported — identical to the pre-existing #546 boundary
+        // (Reconcile_WideningInsideArrayOfStruct_IsNotApplied_EvenWhenEnabled). The READER, by contrast, DOES
+        // promote this shape (NestedParquetReadTests.Array_OfStruct_InnerFieldWidening_AtDepth2_..._Promotes),
+        // the D9 "safe over-permissive read" (reader ⊇ enforcer). See the delivery report for the deviation.
+        StructType tableInner = Schema(Field("a", DataTypes.IntegerType, nullable: true));
+        StructType writeInner = Schema(Field("a", DataTypes.LongType, nullable: true));
+        StructType table = Schema(Field("items", new ArrayType(tableInner, true), nullable: true));
+        StructType write = Schema(Field("items", new ArrayType(writeInner, true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("items.element.a", ex.Path);
+    }
+
+    [Fact]
+    public void Widen_CrossFamily_IntToDouble_AtDepth2_AppendFailsClosed()
+    {
+        // Cell 14 (AC3): cross-family int→double is read-promotable but NOT schema-evolution-eligible at ANY
+        // depth — array<array<int>> → array<array<double>> falls through to TypeWideningUnsupported.
+        StructType table = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.IntegerType, true), true), nullable: true));
+        StructType write = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.DoubleType, true), true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("x.element.element", ex.Path);
+    }
+
+    [Fact]
+    public void Widen_DecimalNonGrowOnly_AtDepth2_FailsClosed()
+    {
+        // Cell 15 (AC3): the decimal-fit / grow-only guard inside the widening predicate is reused unchanged at
+        // depth 2. A non-grow-only decimal change of a nested leaf (decimal(10,2) → decimal(9,2), precision
+        // shrinks) is not a sanctioned widening → IncompatibleType (matching the depth-1 reused-predicate
+        // behavior, Reconcile_DecimalNarrowing_WhenEnabled_IsStillRejected). The design's cell-15 label of
+        // "TypeWideningUnsupported" was optimistic — a shrink is not sanctioned at all, so the reused predicate
+        // classifies it IncompatibleType. See the delivery report.
+        StructType table = Schema(Field(
+            "m",
+            DataTypes.CreateMapType(
+                DataTypes.StringType, new ArrayType(DataTypes.CreateDecimalType(10, 2), true)),
+            nullable: true));
+        StructType write = Schema(Field(
+            "m",
+            DataTypes.CreateMapType(
+                DataTypes.StringType, new ArrayType(DataTypes.CreateDecimalType(9, 2), true)),
+            nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
+    public void Widen_Narrowing_AtDepth2_FailsClosed_IncompatibleType()
+    {
+        // Cell 16a (AC3): a narrowing at depth 2 (array<array<long>> → array<array<int>>) is not a widening at
+        // all → IncompatibleType.
+        StructType table = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.LongType, true), true), nullable: true));
+        StructType write = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.IntegerType, true), true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
+    public void Widen_CrossKind_AtDepth2_FailsClosed_IncompatibleType()
+    {
+        // Cell 16b (AC3): a cross-kind change at depth 2 (array<array<int>> → array<array<string>>) →
+        // IncompatibleType.
+        StructType table = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.IntegerType, true), true), nullable: true));
+        StructType write = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.StringType, true), true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
+    }
+
+    [Fact]
+    public void Widen_AtDepth2_FeatureDisabled_FailsClosed()
+    {
+        // Cell 17 (AC3): with the typeWidening feature OFF, an otherwise-sanctioned depth-2 widening is not
+        // auto-applied → TypeWideningUnsupported.
+        StructType table = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.IntegerType, true), true), nullable: true));
+        StructType write = Schema(Field(
+            "x", new ArrayType(new ArrayType(DataTypes.LongType, true), true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+    }
+
+    [Fact]
+    public void Widen_Depth1_ByteIdentical_After585b_SingleToken()
+    {
+        // Cell 21 (AC4): the #546 depth-1 append behavior is unchanged — a top-level array<int> → array<long>
+        // still records a SINGLE-token fieldPath "element" (Combine(null,"element") == "element"), and the
+        // depth-1 gate still applies. Pins that 585b's gate lift + chain accumulation preserve depth-1 behavior.
+        StructType table = Schema(Field("nums", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        AssertSingleNestedTypeChange(merged!["nums"].Metadata, "integer", "long", "element");
+    }
+
     private static void AssertSingleTypeChange(FieldMetadata metadata, string fromType, string toType)
     {
         Assert.True(metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
