@@ -141,19 +141,64 @@ public sealed class GetStructFieldResolutionTests
     }
 
     [Fact]
-    public void Col_DottedNameWithEmptyPart_IsAnalysisExceptionNotArgumentException()
+    public void Col_DottedNameWithBlankPart_IsAnalysisExceptionNotArgumentException()
     {
-        // #590: a dotted column name with an empty/blank part (`Col("s.")` → parts ["s", ""]) previously
-        // surfaced a raw ArgumentException from the UnresolvedAttribute identifier invariant. It is now
+        // #590: a dotted column name with an empty OR whitespace-only (blank) part previously surfaced a raw
+        // ArgumentException from the UnresolvedAttribute/UnresolvedStar identifier invariant. It is now
         // normalised to an AnalysisException (UnresolvedColumn kind) so EVERY column name-resolution failure
         // shares one exception shape — a caller catching AnalysisException never misses a stray ArgumentException.
-        foreach (string bad in new[] { "s.", ".x", "a..b" })
+        // Covers the attribute path (`s.`), the STAR-target path (`.*`, `t..*`, `..*` — the round-2 gap), and
+        // WHITESPACE-only parts (`s. `, "s.\t", ` .x` — the round-2 blank-vs-empty gap).
+        string[] blanks =
+        [
+            // attribute path — empty parts
+            "s.", ".x", "a..b",
+            // attribute path — whitespace-only parts
+            "s. ", "s.\t", " .x",
+            // star path — empty and whitespace-only target parts
+            ".*", "t..*", "..*", "t. .*", " .*",
+        ];
+        foreach (string bad in blanks)
         {
             var ex = Assert.Throws<AnalysisException>(() => Functions.Col(bad));
             Assert.Equal(AnalysisErrorKind.UnresolvedColumn, ex.Kind);
             Assert.Equal(bad, ex.Reference); // raw structured channel preserved
-            Assert.Contains("must not contain an empty part", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("must not contain an empty or blank part", ex.Message, StringComparison.Ordinal);
         }
+    }
+
+    [Fact]
+    public void Col_FieldNameWithInternalOrSurroundingSpaces_ResolvesNormally()
+    {
+        // #590 POSITIVE CONTROL: the IsNullOrWhiteSpace guard rejects only ENTIRELY-blank parts. A field name
+        // with real content plus internal/surrounding spaces (`s.a b` → part "a b") has non-whitespace, so it
+        // must NOT be rejected — it proceeds to normal resolution. Guards against the guard over-reaching from
+        // "blank part" into "part that contains a space".
+        var innerWithSpacedField = new StructType(new[]
+        {
+            new StructField("a b", IntegerType.Instance, nullable: true),
+        });
+        var schema = new StructType(new[] { new StructField("s", innerWithSpacedField, nullable: true) });
+
+        // Col does not throw InvalidColumnName for a real field-with-space...
+        Column col = Functions.Col("s.a b");
+        Assert.NotNull(col);
+
+        // ...and it resolves end-to-end to a GetStructField over the struct column `s`.
+        Expression cond = ResolveCondition(
+            schema, new BinaryComparison(Ref("s", "a b"), Literal.OfInt(0), ComparisonOperator.GreaterThan));
+        var field = Assert.IsType<GetStructField>(Assert.IsType<BinaryComparison>(cond).Left);
+        Assert.Equal("a b", field.FieldName);
+    }
+
+    [Fact]
+    public void Col_NullOrEmpty_StaysArgumentException()
+    {
+        // #590 BOUNDARY: only a dotted name with a blank SEGMENT normalises to AnalysisException. A wholly
+        // null/empty columnName remains the public-API-contract ArgumentException (ThrowIfNullOrEmpty), which
+        // is NOT a name-resolution failure and must not be reshaped.
+        Assert.Throws<ArgumentNullException>(() => Functions.Col(null!));
+        Assert.Throws<ArgumentException>(() => Functions.Col(string.Empty));
     }
 
     [Fact]

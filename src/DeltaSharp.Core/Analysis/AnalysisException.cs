@@ -561,8 +561,10 @@ internal sealed class AnalysisException : Exception
     }
 
     /// <summary>Builds an <see cref="AnalysisErrorKind.UnresolvedColumn"/> failure for a column name whose
-    /// dotted form contains an EMPTY/blank part — e.g. <c>Col("s.")</c> (parts <c>["s", ""]</c>),
-    /// <c>Col(".x")</c>, or <c>Col("a..b")</c>. This normalises what the <see cref="Plans.Expressions.UnresolvedAttribute"/>
+    /// dotted form (an attribute or a <c>.*</c> star target) contains an EMPTY or whitespace-only (blank)
+    /// part — e.g. <c>Col("s.")</c> (parts <c>["s", ""]</c>), <c>Col(".x")</c>, <c>Col("a..b")</c>,
+    /// <c>Col("s. ")</c>, or the star forms <c>Col(".*")</c>/<c>Col("t..*")</c>. This normalises what the
+    /// <see cref="Plans.Expressions.UnresolvedAttribute"/>/<see cref="Plans.Expressions.UnresolvedStar"/>
     /// identifier invariant would otherwise surface as a raw <see cref="ArgumentException"/> into the single
     /// name-resolution failure shape, so every column name-resolution failure is an
     /// <see cref="AnalysisException"/> (#590). No candidate listing is available (the failure is at authoring
@@ -572,8 +574,8 @@ internal sealed class AnalysisException : Exception
         ArgumentNullException.ThrowIfNull(name);
         string safeName = DiagnosticText.Sanitize(name, MaxEchoedReferenceLength);
         return new AnalysisException(
-            $"Cannot resolve column name '{safeName}': a dotted column name must not contain an empty part "
-            + $"(quote a name that literally contains a dot).",
+            $"Cannot resolve column name '{safeName}': a dotted column name must not contain an empty or "
+            + $"blank part (quote a name that literally contains a dot).",
             AnalysisErrorKind.UnresolvedColumn,
             name,
             Array.Empty<string>());
