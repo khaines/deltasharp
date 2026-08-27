@@ -504,6 +504,13 @@ internal static class NestedParquetColumnReader
                 // A struct is TRANSPARENT to repetition: its children share the struct's OWN owner cells and
                 // parent boundary (even a null-struct row yields a null child cell). So recurse with the
                 // struct's parentMaxRep/parentMaxDef UNCHANGED — NOT structMaxRep/structMaxDef.
+                //
+                // 585b defense-in-depth (#868 Issue 2): this deeper recursion nulls `byFieldId`, so the R2/R3/R4
+                // `promoteLeaf` gate's `&& byFieldId is null` conjunct is VACUOUSLY TRUE below. That is SAFE
+                // because an id-mode nested-within-nested SHAPE is rejected UPSTREAM at ValidateShape /
+                // ExpectScalarLeaf (UnsupportedFeature, "a nested type within a nested type … is not supported")
+                // BEFORE decode ever recurses here — so an id-mode read never reaches a deep name-mode promote.
+                // (585b removed the prior `depth == 0` layer; the upstream shape gate is the sufficient guard.)
                 children[i] = await DecodeNode(
                     rowGroup, childNode, field.DataType, rowCount, childContext, budget, byFieldId: null,
                     interiorIds: null, depth + 1, parentMaxRep, parentMaxDef, allowTypeWideningPromotion,
@@ -690,6 +697,10 @@ internal static class NestedParquetColumnReader
                 def, rep, numValues, listMaxDef, listMaxRep, parentMaxDef, parentMaxRep, ownerCells,
                 nestedOffsets, nestedNulls, columnName);
 
+            // 585b defense-in-depth (#868 Issue 2): the nested-element recurse nulls `byFieldId`, so the R3
+            // `promoteLeaf` gate's `&& byFieldId is null` conjunct is vacuously true below — SAFE because an
+            // id-mode nested-within-nested shape is rejected UPSTREAM (UnsupportedFeature) before decode
+            // recurses here (see the DecodeStruct site for the full rationale).
             elements = await DecodeNode(
                 rowGroup, fileList.Item, requested.ElementType, elemCount, elementContext, budget, byFieldId: null,
                 interiorIds: null, depth + 1, listMaxRep, listMaxDef, allowTypeWideningPromotion, cancellationToken)
@@ -901,6 +912,10 @@ internal static class NestedParquetColumnReader
         int entryCount = BuildRepeatedStructure(
             keyDef, keyRep, keyNumValues, mapMaxDef, mapMaxRep, parentMaxDef, parentMaxRep, ownerCells, offsets, nulls, columnName);
 
+        // 585b defense-in-depth (#868 Issue 2): the key/value recurses below null `byFieldId`, so the R4
+        // `promoteLeaf` gate's `&& byFieldId is null` conjunct is vacuously true — SAFE because an id-mode
+        // nested-within-nested shape is rejected UPSTREAM (UnsupportedFeature) before decode recurses here
+        // (see the DecodeStruct site for the full rationale).
         ColumnVector keys = nestedKey
             ? await DecodeNode(
                 rowGroup, fileMap.Key, requested.KeyType, entryCount, $"map column '{columnName}' key", budget,

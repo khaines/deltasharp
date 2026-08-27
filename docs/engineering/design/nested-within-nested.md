@@ -569,8 +569,21 @@ stays fail-closed at every depth: cross-family on append (`IsSchemaEvolutionWide
 `IsSanctionedWidening` → `TypeWideningUnsupported`), non-fitting decimal (fit guard inside the predicate),
 narrowing / cross-kind (`IncompatibleType`), and — critically — the **parity invariant**: the reader's
 name-mode gate lift is **uniform (any leaf, any depth)** while the enforcer only auto-applies array/map
-interior widenings, so **reader coverage ⊇ enforcer coverage**. Anything the enforcer commits into the table
-schema is read-promotable, so 585b never mints an unreadable table (the failure mode §6 calls out).
+interior widenings, so **for a NAME-mode table reader coverage ⊇ enforcer coverage** — anything the enforcer
+commits is name-mode read-promotable, so 585b never mints an unreadable name-mode table (the failure mode §6
+calls out).
+
+> **⚠ id-mode caveat (pre-existing #546, tracked in [#870](https://github.com/khaines/deltasharp/issues/870)).**
+> The `reader ⊇ enforcer` invariant holds **only in name mode**. The enforcer receives only
+> `SchemaEvolutionMode`, never `ColumnMappingMode`, so it auto-applies a nested-collection widening regardless
+> of column-mapping mode — but an **id-mode** nested leaf is deliberately never read-promoted (`promoteLeaf:
+> false`, #839/#546 §9 O1). On an id-mode table with `typeWidening` enabled, the enforcer can therefore commit
+> a nested widening the id-mode reader fails closed on (an unreadable table for pre-widening files). This is
+> **pre-existing #546 behavior at depth 1** and is **not introduced by 585b**: 585b extends only name-mode
+> promotion to depth>1, and id-mode nested-within-nested shapes are rejected upstream (`UnsupportedFeature`),
+> so no *new* unreadable-table surface is added. The proper write-side guard (enforcer must not apply a nested
+> widening under id mode) is tracked in #870; 585b's read-side id-mode fail-closed is pinned by
+> `IdMode_Depth1_NarrowScalarLeaf_WideRequest_GateOpen_FailsClosed_SchemaMismatch`.
 
 **Cross-engine / protocol note (Delta PROTOCOL.md "Type Change Metadata").** The emitted `fieldPath` grammar —
 `element` / `key` / `value` tokens joined by `.`, struct fields excluded (they carry their own per-field
@@ -909,10 +922,15 @@ graph LR
 (`IsSanctionedWidening` read / `IsSchemaEvolutionWidening` append) at any name-mode depth; the residual is the
 **reader ⊇ enforcer** over-permissiveness (the reader promotes some shapes the enforcer never commits — e.g.
 pure struct-nested scalars, D9) which is **safe** (over-permissive read never corrupts, and cannot mint an
-unreadable table since the enforcer commits a strict subset). **Unreadable-table-minting** — the one failure
-mode where apply could outrun read-promote — is closed by that same invariant (§2.5, §3.2-22). Id-mode
-nested-leaf widening stays **fail-closed** (PRESERVED, #839); the single-level residuals (advisory nested
-nullability per #570; foreign legacy-shaped lists readable) propagate recursively.
+unreadable table since, **in name mode**, the enforcer commits a strict subset). **Unreadable-table-minting**
+in **name mode** — the one failure mode where apply could outrun read-promote — is closed by that same
+invariant (§2.5, §3.2-22). **In id mode** the invariant does NOT hold (the enforcer is column-mapping-mode-
+agnostic while the id-mode reader never promotes): the enforcer can commit a nested widening the id-mode reader
+fails closed on. This is **pre-existing #546 behavior at depth 1**, tracked in
+[#870](https://github.com/khaines/deltasharp/issues/870) and **not introduced by 585b** (id-mode
+nested-within-nested is rejected upstream, so 585b adds no new id-mode unreadable surface). Id-mode
+nested-leaf widening stays **fail-closed on read** (PRESERVED, #839); the single-level residuals (advisory
+nested nullability per #570; foreign legacy-shaped lists readable) propagate recursively.
 
 ---
 
@@ -967,9 +985,13 @@ nullability per #570; foreign legacy-shaped lists readable) propagate recursivel
 - (d) accidental widening under 585a → silent promotion at a nested leaf — 585a keeps exact match; §3.1-22
   pins it fail-closed until 585b.
 - (e) 585b apply/read **parity gap** → the enforcer commits a widening the reader cannot promote (unreadable
-  table) — prevented by the **reader ⊇ enforcer** coverage invariant: the name-mode reader gate lift (R1–R4)
-  is uniform (any leaf, any depth) while the enforcer auto-applies only array/map interior widenings, so
-  everything committed is read-promotable (§2.5 fail-closed parity; §3.2-22 property cell).
+  table) — prevented **in name mode** by the **reader ⊇ enforcer** coverage invariant: the name-mode reader
+  gate lift (R1–R4) is uniform (any leaf, any depth) while the enforcer auto-applies only array/map interior
+  widenings, so everything committed is name-mode read-promotable (§2.5 fail-closed parity; §3.2-22). **In id
+  mode the invariant does NOT hold** — the enforcer is column-mapping-mode-agnostic (`SchemaEvolutionMode`
+  only) while the id-mode reader never promotes, so it can commit a nested widening the id-mode reader fails
+  closed on. This is **pre-existing #546 (depth-1), tracked in #870**, and **not introduced by 585b** (id-mode
+  nested-within-nested is rejected upstream). The write-side id-mode guard is #870's scope.
 - (f) 585b built against the **drifted** SPEC-ONLY §2.5 line-refs → wrong edit sites / re-implemented existing
   machinery — prevented by the §2.5 spec-vs-code reconciliation table (read-promote is in
   `NestedParquetColumnReader.cs` not `ParquetFileReader.cs`; the widening arm already exists; the accumulator

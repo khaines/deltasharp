@@ -218,6 +218,41 @@ public sealed class NestedParquetReadTests
         public List<Dictionary<int, string?>?>? Arr { get; set; }
     }
 
+    // array<array<float>> — float leaf at depth 2 (585b float→double read-promote across families).
+    private sealed class ArrayOfArrayFloatRow
+    {
+        public int Id { get; set; }
+
+        public List<List<float?>?>? Outer { get; set; }
+    }
+
+    // array<array<date>> — DateOnly (Parquet DATE physical) at depth 2 (585b date→timestamp_ntz read-promote).
+    private sealed class ArrayOfArrayDateRow
+    {
+        public int Id { get; set; }
+
+        public List<List<DateOnly?>?>? Outer { get; set; }
+    }
+
+    // array<array<decimal(10,2)>> — decimal leaf at depth 2 (585b grow-only decimal read-promote). The
+    // [ParquetDecimal] attribute on the nested list property stamps the leaf's physical precision/scale.
+    private sealed class ArrayOfArrayDecimalRow
+    {
+        public int Id { get; set; }
+
+        [ParquetDecimal(10, 2)]
+        public List<List<decimal?>?>? Outer { get; set; }
+    }
+
+    // array<map<int,int>> — an int→int map inside an array, for the depth>1 BOTH-key-AND-value widen cell
+    // (fieldPaths "element.key" + "element.value"). Disjoint key/value domains so a mis-bind surfaces.
+    private sealed class ArrayOfKvMapRow
+    {
+        public int Id { get; set; }
+
+        public List<Dictionary<int, int?>?>? Arr { get; set; }
+    }
+
     private sealed class SoA
     {
         public List<int?>? Xs { get; set; }
@@ -3624,6 +3659,9 @@ public sealed class NestedParquetReadTests
 
         ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
         var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        // Self-contained: assert the promoted lane type directly (not merely relying on an unpromoted read
+        // throwing) — the inner elements materialize at the requested LONG width.
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ListColumnVector>(outer.Elements).Elements.Type);
         Assert.Equal("null", Describe(outer, 0));       // null outer list
         Assert.Equal("[]", Describe(outer, 1));         // empty outer list
         Assert.Equal("[[],[]]", Describe(outer, 2));    // two empty inner lists
@@ -3689,6 +3727,144 @@ public sealed class NestedParquetReadTests
         var innerMap = Assert.IsType<MapColumnVector>(m.ValuesAt(0));
         Assert.Equal(DataTypes.LongType, innerMap.ValuesAt(0).Type);
         Assert.Equal(77L, innerMap.ValuesAt(0).GetValue<long>(0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_FloatToDouble_Depth2()
+    {
+        // Cell 9-float (AC1/AC3): same-family float→double at depth 2 (array<array<float>> → array<array<double>>).
+        var rows = new List<ArrayOfArrayFloatRow>
+        {
+            new() { Id = 1, Outer = new List<List<float?>?> { new() { 1.5f, null, -2.25f }, new() { 4.5f } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.DoubleType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(DataTypes.DoubleType, inner.Elements.Type);
+        Assert.Equal("[[1.5,null,-2.25],[4.5]]", Describe(outer, 0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_DateToTimestampNtz_Depth2()
+    {
+        // Cell 9-date (AC1/AC3): temporal date→timestamp_ntz (#533) at depth 2 — each epoch-day widens to
+        // epoch-micros at midnight of the date, nulls preserved.
+        var d1 = new DateOnly(2021, 3, 15);
+        var d2 = new DateOnly(1970, 1, 1);
+        var rows = new List<ArrayOfArrayDateRow>
+        {
+            new() { Id = 1, Outer = new List<List<DateOnly?>?> { new() { d1, null }, new() { d2 } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.TimestampNtzType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(DataTypes.TimestampNtzType, inner.Elements.Type);
+
+        const long MicrosPerDay = 86_400L * 1_000_000L;
+        long epochDay1 = d1.DayNumber - new DateOnly(1970, 1, 1).DayNumber;
+        ColumnVector e0 = inner.ElementsAt(0);
+        Assert.Equal(epochDay1 * MicrosPerDay, e0.GetValue<long>(0));
+        Assert.True(e0.IsNull(1)); // null element preserved
+        ColumnVector e1 = inner.ElementsAt(1);
+        Assert.Equal(0L, e1.GetValue<long>(0)); // 1970-01-01 → 0 micros
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_DecimalGrowOnly_Fits_Depth2()
+    {
+        // Cell 9-decimal (AC1/AC3): same-family grow-only decimal(10,2) → decimal(12,2) (integer digits grow
+        // 8→10, scale equal) at depth 2 — a sanctioned widening, rescaled losslessly per leaf.
+        var rows = new List<ArrayOfArrayDecimalRow>
+        {
+            new() { Id = 1, Outer = new List<List<decimal?>?> { new() { 12.34m, null, -0.05m }, new() { 9.99m } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var wide = DataTypes.CreateDecimalType(12, 2);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(DataTypes.CreateArrayType(wide, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(wide, inner.Elements.Type);
+        ColumnVector e0 = inner.ElementsAt(0);
+        Assert.Equal(12.34m, ParquetTypeMapping.ReadDecimal(e0, wide, 0));
+        Assert.True(e0.IsNull(1));
+        Assert.Equal(-0.05m, ParquetTypeMapping.ReadDecimal(e0, wide, 2));
+        Assert.Equal(9.99m, ParquetTypeMapping.ReadDecimal(inner.ElementsAt(1), wide, 0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfMap_KeyAndValue_IntToLong_Depth2()
+    {
+        // Cell 10c (AC1/AC2): a map inside an array with BOTH key AND value widened int→long at depth 2
+        // (element.key + element.value). Disjoint key/value domains so a key/value transposition would surface.
+        var rows = new List<ArrayOfKvMapRow>
+        {
+            new()
+            {
+                Id = 1,
+                Arr = new List<Dictionary<int, int?>?>
+                {
+                    new Dictionary<int, int?> { [10] = 1000, [20] = 2000 },
+                },
+            },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateMapType(DataTypes.LongType, DataTypes.LongType, valueContainsNull: true),
+                    containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        var m = Assert.IsType<MapColumnVector>(arr.ElementsAt(0));
+        ColumnVector keys = m.KeysAt(0);
+        ColumnVector vals = m.ValuesAt(0);
+        Assert.Equal(DataTypes.LongType, keys.Type);
+        Assert.Equal(DataTypes.LongType, vals.Type);
+        var read = new Dictionary<long, long>();
+        for (int i = 0; i < m.EntryLength(0); i++)
+        {
+            read[keys.GetValue<long>(i)] = vals.GetValue<long>(i);
+        }
+
+        Assert.Equal(1000L, read[10L]);
+        Assert.Equal(2000L, read[20L]);
     }
 
     [Fact]
