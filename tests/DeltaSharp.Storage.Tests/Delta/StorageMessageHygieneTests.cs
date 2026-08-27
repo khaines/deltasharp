@@ -470,7 +470,7 @@ public sealed class StorageMessageHygieneTests
             () => NestedParquetColumnReader.ValidateShape(
                 new global::Parquet.Schema.DataField<int>("leaf"),
                 new StructType(new[] { new StructField("f", IntegerType.Instance, nullable: true) }),
-                FullInjectionCorpus));
+                FullInjectionCorpus, allowTypeWideningPromotion: false));
 
         Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
         AssertFullyNeutralized(ex.Message);

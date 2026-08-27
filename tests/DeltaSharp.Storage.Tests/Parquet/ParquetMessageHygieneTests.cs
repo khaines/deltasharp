@@ -255,6 +255,7 @@ public sealed class ParquetMessageHygieneTests
                 new NestedParquetColumnReader.NestedDecodeBudget(50_000_000),
                 byFieldId: null,
                 interiorIds: null,
+                allowTypeWideningPromotion: false,
                 CancellationToken.None));
 
         Assert.Equal(StorageErrorKind.CorruptData, error.Kind);
@@ -283,6 +284,7 @@ public sealed class ParquetMessageHygieneTests
                 new NestedParquetColumnReader.NestedDecodeBudget(50_000_000),
                 byFieldId: null,
                 interiorIds: null,
+                allowTypeWideningPromotion: false,
                 CancellationToken.None));
 
         Assert.True(

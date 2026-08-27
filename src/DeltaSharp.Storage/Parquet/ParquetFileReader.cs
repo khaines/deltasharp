@@ -1677,7 +1677,8 @@ internal sealed class ParquetFileReader
                     throw DeltaStorageException.ColumnNotPresentInFile(name);
                 }
 
-                NestedParquetColumnReader.ValidateShape(nestedField, requestedField.DataType, name);
+                NestedParquetColumnReader.ValidateShape(
+                    nestedField, requestedField.DataType, name, allowTypeWideningPromotion);
                 resolved[c] = ResolvedColumn.ForNested(nestedField);
                 continue;
             }
@@ -2042,7 +2043,7 @@ internal sealed class ParquetFileReader
                         // within the resolved container (containment-scoped); it is null for name/none mode.
                         columns[c] = await NestedParquetColumnReader.ReadAsync(
                             rowGroup, nestedField, requested[c].DataType, rowCount, requested[c].Name, nestedBudget,
-                            resolved.NestedFieldId, resolved.InteriorIds, decodeToken)
+                            resolved.NestedFieldId, resolved.InteriorIds, allowTypeWideningPromotion, decodeToken)
                             .ConfigureAwait(false);
                         continue;
                     }

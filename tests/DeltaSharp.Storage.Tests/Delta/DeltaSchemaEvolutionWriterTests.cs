@@ -4,6 +4,7 @@ using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
+using Parquet.Serialization;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
 
@@ -579,6 +580,106 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         // committed table declares the typeWidening feature, so the read-side promotion gate is open).
         List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
         Assert.Equal(new long[] { 1L, 2L, 3L }, promoted.Single().Column(0).GetValues<long>().ToArray());
+    }
+
+    // A nested-array row for the #546 end-to-end nested widening test. Parquet.Net's typed serializer emits
+    // the real Dremel array<int> shape (DeltaSharp's ParquetFileWriter is scalar-only).
+    private sealed class NumsRow
+    {
+        public List<int?>? Nums { get; set; }
+    }
+
+    // Writes a REAL array<int> nested Parquet file to the backend, so the #546 end-to-end test can widen the
+    // element type over the OLD narrow file and read it back promoted.
+    private async Task<byte[]> WriteNarrowArrayFileAsync(string path, IReadOnlyList<NumsRow> rows)
+    {
+        using var buffer = new MemoryStream();
+        await ParquetSerializer.SerializeAsync(rows, buffer, cancellationToken: CancellationToken.None);
+        byte[] bytes = buffer.ToArray();
+        await _backend.PutIfAbsentAsync(path, bytes, CancellationToken.None);
+        return bytes;
+    }
+
+    // Builds a Delta-log metaData line whose schemaString is serialized with the ENGINE SchemaJson (the
+    // serializer the production DeltaTableWriter uses for metaData.schemaString, and that Snapshot.ParseSchema
+    // reads back) — as opposed to DeltaTestHarness.MetadataWithSchemaAndConfig, which uses the Parquet-FOOTER
+    // serializer (DeltaSchemaJson) that stringifies array/map types (the #518 deferral) and so cannot seed a
+    // nested-typed table. Needed to seed the #546 nested-widening end-to-end test at version 0.
+    private static string MetaLineWithLogSchema(StructType schema, params (string Key, string Value)[] configuration)
+    {
+        string rawSchema = SchemaJson.ToJson(schema);
+        string escaped = rawSchema
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("\"", "\\\"", StringComparison.Ordinal);
+        string config = "{" + string.Join(",", configuration.Select(kv => $"\"{kv.Key}\":\"{kv.Value}\"")) + "}";
+        return "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
+            + $"\"schemaString\":\"{escaped}\",\"partitionColumns\":[],\"configuration\":{config}}}}}";
+    }
+
+    [Fact]
+    public async Task Append_WidenArrayElement_WhenFeatureEnabled_CommitsElementFieldPath_AndPromotesOnRead()
+    {
+        // #546 end-to-end: a typeWidening-ENABLED table whose v0 holds a real array<int> nested file. A
+        // widening append (array<int> → array<long>) is APPLIED: it commits the widened metaData atomically
+        // with the new add, and the committed delta.typeChanges carries fieldPath="element" — proving the
+        // nested type-change metadata survives the Delta-log JSON round-trip (SchemaJson serialize/parse).
+        var initial = Struct(F("Nums", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true));
+        byte[] oldFile = await WriteNarrowArrayFileAsync(
+            "v0.parquet",
+            new List<NumsRow>
+            {
+                new() { Nums = new List<int?> { 1, 2 } },
+                new() { Nums = null },
+                new() { Nums = new List<int?> { 3, null } },
+            });
+        await DeltaTestHarness.WriteCommitAsync(
+            _backend, 0,
+            DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
+            MetaLineWithLogSchema(initial, ("delta.enableTypeWidening", "true")),
+            DeltaTestHarness.Add("v0.parquet"));
+
+        Snapshot readSnapshot = await LoadAsync();
+        DeltaCommitResult result = await Writer().AppendAsync(
+            readSnapshot,
+            Struct(F("Nums", DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true), nullable: true)),
+            new[] { Staged("v1.parquet") },
+            SchemaEvolutionMode.MergeSchema);
+
+        IReadOnlyList<DeltaAction> committed = await Log().ReadCommitActionsAsync(result.Version, CancellationToken.None);
+        Assert.Single(committed.OfType<MetadataAction>());
+        Assert.Contains(committed.OfType<AddFileAction>(), a => a.Path == "v1.parquet");
+
+        // The committed schema widened the element to `long` and recorded delta.typeChanges on the enclosing
+        // `Nums` field WITH fieldPath="element" (Delta PROTOCOL.md "Type Change Metadata"), reloaded from the
+        // committed log (not the in-memory merge) — so the JSON round-trip is exercised end to end.
+        StructType evolved = (await LoadAsync()).Schema;
+        StructField field = evolved["Nums"];
+        ArrayType evolvedArray = Assert.IsType<ArrayType>(field.DataType);
+        Assert.Equal(DataTypes.LongType, evolvedArray.ElementType);
+        Assert.True(field.Metadata.TryGetValue("delta.typeChanges", out MetadataValue? changes));
+        Assert.True(changes!.TryGetArray(out IReadOnlyList<MetadataValue>? entries));
+        MetadataValue only = Assert.Single(entries!);
+        Assert.True(only.TryGetNested(out FieldMetadata? nested));
+        Assert.True(nested!.TryGetString("fromType", out string? from));
+        Assert.True(nested.TryGetString("toType", out string? to));
+        Assert.True(nested.TryGetString("fieldPath", out string? fieldPath));
+        Assert.Equal("integer", from);
+        Assert.Equal("long", to);
+        Assert.Equal("element", fieldPath);
+
+        // The OLD array<int> v0 file is still readable under the now-wide array<long> schema: per-leaf
+        // promotion on read (the committed table declares the typeWidening feature, so the gate is open).
+        List<ColumnBatch> promoted = await ParquetTestHelpers.ReadAllAsync(
+            oldFile, evolved, keepRowGroup: null, allowTypeWideningPromotion: true);
+        var arr = Assert.IsType<ListColumnVector>(promoted.Single().Column("Nums"));
+        ColumnVector e0 = arr.ElementsAt(0);
+        Assert.Equal(DataTypes.LongType, e0.Type);
+        Assert.Equal(1L, e0.GetValue<long>(0));
+        Assert.Equal(2L, e0.GetValue<long>(1));
+        Assert.True(arr.IsNull(1)); // null list preserved
+        ColumnVector e2 = arr.ElementsAt(2);
+        Assert.Equal(3L, e2.GetValue<long>(0));
+        Assert.True(e2.IsNull(1)); // null element preserved
     }
 
     // Writes a REAL single-column Int64 Parquet file to the backend, so a #535 cross-family end-to-end test
