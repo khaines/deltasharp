@@ -2,7 +2,6 @@ using System.Globalization;
 using System.Text;
 using DeltaSharp.Storage.Backends;
 using DeltaSharp.Storage.Delta;
-using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -57,7 +56,7 @@ internal static class DeltaTestHarness
     public static string MetadataWithSchemaAndConfig(
         StructType schema, (string Key, string Value)[] configuration, string id = "t", string[]? partitionColumns = null)
     {
-        string escapedSchema = EscapeForJsonString(DeltaSchemaJson.ToJson(schema));
+        string escapedSchema = EscapeForJsonString(SchemaJson.ToJson(schema));
         // Serialize each config key/value as a proper JSON string (System.Text.Json escapes control chars,
         // quotes, and separators) so an arbitrary — including attacker-crafted CR/LF/control — key or value
         // round-trips faithfully instead of producing invalid JSON. Mirrors the JsonSerializer use in Add.
@@ -73,12 +72,14 @@ internal static class DeltaTestHarness
     }
 
     /// <summary>A <c>metaData</c> line carrying a real (non-empty) table schema, serialized with the
-    /// writer-side <see cref="DeltaSchemaJson"/> and JSON-escaped for embedding, so schema-enforcement
-    /// tests can seed a table whose <see cref="Snapshot.Schema"/> parses back to <paramref name="schema"/>
+    /// production engine <see cref="SchemaJson"/> (the same serializer <see cref="DeltaTableWriter"/> writes
+    /// for <c>metaData.schemaString</c> and <see cref="Snapshot.ParseSchema"/> reads back) and JSON-escaped
+    /// for embedding, so schema-enforcement tests can seed a table — including one with nested (array/map/
+    /// struct) types — whose <see cref="Snapshot.Schema"/> parses back to <paramref name="schema"/>
     /// (STORY-05.4.2). Mirrors the manual escaping of <see cref="EmptySchema"/>.</summary>
     public static string MetadataWithSchema(StructType schema, string id = "t", string[]? partitionColumns = null)
     {
-        string escapedSchema = EscapeForJsonString(DeltaSchemaJson.ToJson(schema));
+        string escapedSchema = EscapeForJsonString(SchemaJson.ToJson(schema));
         return """{"metaData":{"id":"__ID__","format":{"provider":"parquet","options":{}},"schemaString":"__S__","partitionColumns":[__P__],"configuration":{}}}"""
             .Replace("__ID__", id, StringComparison.Ordinal)
             .Replace("__S__", escapedSchema, StringComparison.Ordinal)
@@ -86,7 +87,7 @@ internal static class DeltaTestHarness
     }
 
     // Escapes a raw JSON document so it can be embedded as a JSON string value (backslash then quote —
-    // order matters). The schema JSON DeltaSchemaJson emits contains only '"' from names/keywords, but
+    // order matters). The schema JSON SchemaJson emits contains only '"' from names/keywords, but
     // escaping backslash first keeps this correct for any input.
     private static string EscapeForJsonString(string rawJson) =>
         rawJson.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("\"", "\\\"", StringComparison.Ordinal);

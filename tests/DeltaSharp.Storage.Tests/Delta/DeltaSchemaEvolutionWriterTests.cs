@@ -600,22 +600,6 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         return bytes;
     }
 
-    // Builds a Delta-log metaData line whose schemaString is serialized with the ENGINE SchemaJson (the
-    // serializer the production DeltaTableWriter uses for metaData.schemaString, and that Snapshot.ParseSchema
-    // reads back) — as opposed to DeltaTestHarness.MetadataWithSchemaAndConfig, which uses the Parquet-FOOTER
-    // serializer (DeltaSchemaJson) that stringifies array/map types (the #518 deferral) and so cannot seed a
-    // nested-typed table. Needed to seed the #546 nested-widening end-to-end test at version 0.
-    private static string MetaLineWithLogSchema(StructType schema, params (string Key, string Value)[] configuration)
-    {
-        string rawSchema = SchemaJson.ToJson(schema);
-        string escaped = rawSchema
-            .Replace("\\", "\\\\", StringComparison.Ordinal)
-            .Replace("\"", "\\\"", StringComparison.Ordinal);
-        string config = "{" + string.Join(",", configuration.Select(kv => $"\"{kv.Key}\":\"{kv.Value}\"")) + "}";
-        return "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
-            + $"\"schemaString\":\"{escaped}\",\"partitionColumns\":[],\"configuration\":{config}}}}}";
-    }
-
     [Fact]
     public async Task Append_WidenArrayElement_WhenFeatureEnabled_CommitsElementFieldPath_AndPromotesOnRead()
     {
@@ -635,7 +619,7 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         await DeltaTestHarness.WriteCommitAsync(
             _backend, 0,
             DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
-            MetaLineWithLogSchema(initial, ("delta.enableTypeWidening", "true")),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(initial, new[] { ("delta.enableTypeWidening", "true") }),
             DeltaTestHarness.Add("v0.parquet"));
 
         Snapshot readSnapshot = await LoadAsync();
