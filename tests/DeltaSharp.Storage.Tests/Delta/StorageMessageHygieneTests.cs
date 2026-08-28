@@ -480,18 +480,14 @@ public sealed class StorageMessageHygieneTests
     public void ParquetTypeMapping_NestedColumn_SanitizesFieldNameInMessage()
     {
         // #683: the Parquet mapping's own-schema {field.Name} echoes are the same class — a foreign table's
-        // (or a column-mapped physical) name reaches the fail-closed unsupported-type message. Since #841 a
-        // single-level struct-of-scalars is WRITABLE, so the poisoned name is carried on a shape that still
-        // fails closed: a nested type within a nested type (the #585 boundary).
+        // (or a column-mapped physical) name reaches the fail-closed unsupported-type message. #873 LIFTED the
+        // #585 nested-within-nested reject (struct-of-struct now maps), so the poisoned name rides a shape that
+        // still fails closed: a map whose KEY is a container (#873 D5, nested map key).
         var nested = new StructField(
             FullInjectionCorpus,
-            new StructType(new[]
-            {
-                new StructField(
-                    "x",
-                    new StructType(new[] { new StructField("y", IntegerType.Instance, nullable: true) }),
-                    nullable: true),
-            }),
+            DataTypes.CreateMapType(
+                new StructType(new[] { new StructField("y", IntegerType.Instance, nullable: true) }),
+                LongType.Instance),
             nullable: true);
 
         DeltaStorageException ex = Assert.Throws<DeltaStorageException>(() => ParquetTypeMapping.CreateField(nested, honorReferenceNullability: false));

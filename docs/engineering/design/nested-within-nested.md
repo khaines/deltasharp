@@ -1,7 +1,23 @@
-# Nested-within-nested Parquet support — recursive decode (585a) + depth&gt;1 widening (585b)
+# Nested-within-nested Parquet support — recursive decode (585a) + depth&gt;1 widening (585b) + recursive WRITE (873)
+
+> **873 addendum (WRITE — BUILD-READY off `origin/main` @ `ef35daf`).** §2.10 + §3.3 (and the 873 entries in
+> §4–§9) are the build-ready design for the nested-within-nested **WRITE** residual,
+> [#873](https://github.com/khaines/deltasharp/issues/873) <!-- issue-state:open -->. 585a made
+> `array<struct>` / `map<*,array>` / `array<array>` / `struct<*,struct>` (and every mix, to arbitrary depth)
+> **readable**; they are still **not writable** — the write path rejects a nested type WITHIN a nested type
+> up front at `ParquetTypeMapping.cs:197`/`:241` and `NestedColumnShredder.cs:1532`. #873 lifts those rejects
+> for **name/none column-mapping mode** by making the schema builder (`CreateNestedField`) and the shredder
+> (`NestedColumnShredder`) **recurse** — building the nested repeated/optional group structure and the
+> interleaved `(values, def, rep)` level streams at every depth. The write is the exact **inverse** of the
+> §2.2/§2.4 585a decode, so a **write→read round-trip through 585a is the correctness oracle** (§3.3).
+> **id-mode** nested-within-nested WRITE is out of scope — deferred to
+> [#866](https://github.com/khaines/deltasharp/issues/866) <!-- issue-state:open --> (§2.10.8). This addendum
+> is authored against the ACTUAL worktree code (every `ParquetTypeMapping.cs` / `NestedColumnShredder.cs`
+> line-ref re-verified at `ef35daf`).
 
 > **Status:** 585a **shipped** (PR #856); 585b **BUILD-READY** (#546 merged, PR #864 — this worktree off
-> `2002540`). Issue [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:closed -->
+> `2002540`); **873 (WRITE) BUILD-READY** (this addendum, off `origin/main` @ `ef35daf`). Issue
+> [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:closed -->
 > was **size:XL** and the implement-work-item skill rejects XL, so this design splits it into two
 > clearly-delineated, independently shippable increments:
 >
@@ -463,7 +479,15 @@ gate-lift + fieldPath-chain accumulation**, not new machinery:
    > (a map whose key is itself a map) is **unreachable**: DeltaSharp's `MapType` prohibits a map-typed key
    > (`SchemaValidationException: Map key type 'map' is not supported`). The constructible depth-2 map-key
    > chains are therefore `key.element` (`map<array<int→long>,string>`) and `element.key`
-   > (`array<map<int→long,string>>`), both exercised in §3.2.
+   > (`array<map<int→long,string>>`). **⚠ Writability caveat (873 §2.10.7 D5).** These two differ in physical
+   > writability: `element.key` has a **scalar** map key (`int`, inside a nested map that is an array element)
+   > — it is `REQUIRED` and **writable**, so it round-trips end-to-end. `key.element` has a **nested**
+   > (array-typed) map key, which #873 proves is **NOT physically writable** — Parquet.Net emits the key node
+   > OPTIONAL, which the 585a `EnsureRequiredMapKey` reader rejects, so no data file for `map<array<…>,…>` can
+   > exist. Its 585b **append-apply** cell is therefore a **schema-merge-only** assertion (the enforcer records
+   > `NestedTypeChange("key.element", …)` on the metadata — valid as pure merge logic); there is **no**
+   > read-promote / data round-trip for it, and #713's footer-artifact tests must not attempt to author a
+   > nested-map-key file. `element.key` is unaffected and remains fully exercised in §3.2.
 
 2. **Allowlist + decimal-fit reuse (verbatim, NO new sanction).** The eligibility predicates are unchanged:
    `TypeWidening.IsSchemaEvolutionWidening` (`:174`, append-apply subset — same-family + `date→timestamp_ntz`)
@@ -606,7 +630,7 @@ depth-bounded upstream, and DeltaSharp's **write** path is capped too. The verif
 | Cap | Value | Source | What it bounds |
 |---|---|---|---|
 | `SchemaJson.MaxDepth` | **64** JSON containers | `SchemaJson.cs:50` | log-parse of `metaData.schemaString`; a struct costs 3 JSON containers ⇒ ~**21 struct levels**, array/map cost 1 each ⇒ ~**64 array/map levels** |
-| `ParquetTypeMapping.MaxFooterTypeDepth` | **64** type levels | `ParquetTypeMapping.cs:765` | footer type-tree walk on **read** (mirrors the write cap) |
+| `ParquetTypeMapping.MaxFooterTypeDepth` | **64** type levels | `ParquetTypeMapping.cs:864` | footer type-tree walk on **read** (mirrors the write cap) |
 | `DeltaWriteSchemaEligibility.MaxDepth` | **64** type levels | `DeltaWriteSchemaEligibility.cs:60` | **write** eligibility — the deepest schema DeltaSharp will commit |
 
 The **decode recursion itself** must carry its own explicit bound so a maliciously deep schema cannot exhaust
@@ -685,6 +709,489 @@ Dremel level streams and packed leaf values from the open row group. The eager-d
 allocation, so a crafted deep/wide footer cannot drive an OOM regardless of backend (S3/ADLS/GCS/PVC) — the
 guard is memory, not storage-consistency, bound. Nested columns remain outside the statistics/data-skipping
 surface (unchanged), so no per-child stats are read or emitted at any depth.
+
+### 2.10 nested-within-nested WRITE (873) — recursive shredder level construction
+
+> **BUILD-READY off `origin/main` @ `ef35daf`.** This section is the WRITE inverse of §2.2 (585a decode)
+> and §2.4 (the level-stream trace). Every line-ref below was re-verified in the worktree; where the #873
+> issue's framing diverges from the actual code it is flagged **⚠ discrepancy** (collected in §2.10.9).
+
+#### 2.10.1 The write is the inverse of the 585a decode — per-leaf recursive Dremel emission
+
+Parquet stores each **leaf** column independently as a stream of `(value, def, rep)` triples (§2.1). Writing
+a nested-within-nested column is therefore, per leaf, exactly the inverse of the §2.2 decode: where
+`DecodeList`/`DecodeStruct`/`DecodeMap` reconstruct offsets/nulls **from** `(def, rep)`, the shredder emits
+`(def, rep)` **from** the #570 nested `ColumnVector` tree. The read oracle is normative: **whatever the
+shredder emits for a leaf must be the exact `(def, rep)` stream the 585a reader consumes to rebuild the
+original vectors** — so §2.4's `array<array<int>>` 4-row trace is, read bottom-up, the level stream the
+writer must produce for that fixture (§3.3 golden cell 9).
+
+The current single-level shredder already writes one leaf at a time: `WriteStructAsync` loops the struct
+children, `WriteListAsync`/`WriteMapAsync` emit the element / key+value leaves, each via
+`WriteLeafAsync(leaf, def, rep, rowCount, valueSource)` →
+`ParquetRowGroupWriter.WriteAllPartsAsync<T>(leaf, values, def, rep)` (`NestedColumnShredder.cs:1146`,
+`:1374`). #873 keeps that one-leaf-at-a-time spine and generalizes the **level computation** and the
+**value navigation** from a single container level to a **recursive walk of the full path** from the column
+root down to each leaf. This mirrors the read side's per-leaf *driving-leaf* model (§2.2): each leaf is
+striped independently, and struct / map fan-out (multiple leaves sharing ancestors) is driven by re-walking
+the shared ancestor structure per leaf — exactly what the single-level code already does (`ComputeStructLevels`
+re-derives the struct null mask for every child).
+
+#### 2.10.2 The NORMATIVE level-increment model (all containers OPTIONAL, #730)
+
+Every container DeltaSharp writes is **OPTIONAL** on the wire — Parquet.Net 6.1.0 exposes no public
+`Field.IsNullable` setter for a group node, so the top-level reject `if (!field.Nullable)` at
+`ParquetTypeMapping.cs:116` already refuses a declared-`REQUIRED` container. #873 extends that rule to **every
+depth** (§2.10.7): a nested **container** (an array element / map value / struct child that is *itself*
+array/map/struct) declared non-nullable is refused — writing it OPTIONAL would diverge from the committed
+`schemaString` (#730). A non-nullable **scalar** leaf stays expressible where the encoding allows it (a
+`REQUIRED` struct child / array element / map value leaf, and the always-`REQUIRED` map key).
+
+Walking a path root→leaf, thread two quantities down the recursion:
+
+- **`defBase`** — the definition level already contributed by the **present** optional/repeated ancestors
+  *above* this node (top-level `defBase = 0`).
+- **`entryRep`** — the repetition level to stamp on the **first** slot this subtree emits for the current
+  parent occurrence; and **`parentRep`** — the deepest repeated ancestor level above this node (top-level
+  `entryRep = 0`, `parentRep = 0`).
+
+Per node kind the increments are (this is the write dual of §2.4's definition-level meanings):
+
+| Path node | absent → one placeholder slot | present-but-empty → one slot | present occurrence → `defBase'` handed to child | rep of a *new* occurrence at this node |
+|---|---|---|---|---|
+| **Struct** (optional) | `def = defBase` (struct null) | — (a struct is never "empty") | `defBase + 1` | none — `entryRep` passes through unchanged |
+| **List** (3-level LIST) | `def = defBase` (null list) | `def = defBase + 1` (empty list) | `defBase + 2` | `thisRep = parentRep + 1` |
+| **Map** (3-level MAP) | `def = defBase` (null map) | `def = defBase + 1` (empty map) | `defBase + 2` | `thisRep = parentRep + 1` |
+| **Leaf** — optional | `def = defBase` (leaf null) | — | present → `def = defBase + 1` | none |
+| **Leaf** — required (map key; `REQUIRED` child/element/value) | *(impossible — §2.4a required-lane guard fires)* | — | present → `def = defBase` (no `+1`) | none |
+
+The `+2` for a present list/map occurrence is the canonical 3-level encoding: the optional outer group
+(`+1`, distinguishes null vs present container) then the repeated `list`/`key_value` group (`+1` and
+`rep +1`, distinguishes empty vs element-bearing). `thisRep` becomes the child frame's `parentRep`; a leaf's
+own `MaxRepetitionLevel` is the count of list/map ancestors on its path (a **pure-struct path emits no rep
+stream** — `rep: null`, exactly as the current struct leaf write passes today).
+
+**Self-check against the single-level tables.** For `array<scalar>` (nullable element) at `defBase = 0`:
+null list `def 0`, empty list `def 1`, present-occurrence base `def 2` (= `containerMaxDef`), element present
+`def 3` (= `leafMaxDef`), element null `def 2`. That is byte-identical to `ComputeListLevels` today
+(`:614`). For `array<array<int>>` the model reproduces §2.4 exactly: outer list `{0,1,2}`, inner list rooted
+at `defBase = 2` → `{2,3,4}`, leaf rooted at `defBase = 4` → `{4,5}`, `thisRep` 1 (outer) / 2 (inner). ✔
+
+#### 2.10.3 The recursive level + value construction (`NestedColumnShredder`)
+
+The single-level `ComputeStructLevels` (`:506`) / `ComputeListLevels` (`:614`) / `ComputeMapLevels` (`:754`)
+each compute `(def[, rep])` for **one** container level with a **scalar** leaf, coupling the level table to
+the leaf value emission. #873 factors this into a single recursive per-leaf emitter that follows the leaf's
+**schema path** (the ordered container steps root→leaf) and, in one walk, produces the leaf's `def[]`, `rep[]`
+(or `null`), and the ordered present-value enumeration:
+
+```
+// Emits (def, rep, valuePresence) for the leaf at the tail of `path`.
+// FRAME STATE:
+//   cells   : ordered { row, entryRep } this frame emits for
+//             (top frame: one cell per logical row, entryRep = 0)
+//   defBase : def contributed by present ancestors above this node
+//   parentRep : deepest repeated ancestor level above this node (top = 0)
+//
+// DEPTH GUARD (§2.10.7): if the schema path length exceeds MaxNestedWriteDepth (= 64), fail closed
+//   UnsupportedFeature BEFORE any allocation/descent — parity with MaxNestedReadDepth / the write caps.
+
+EmitPath(node, vector, cells, defBase, parentRep):
+  switch node.kind:
+
+    STRUCT(childOrdinal on the path):                       // struct never repeats; entryRep passes through
+      for cell in cells:
+        v = ExpectStructVector(vector)
+        if v.IsNull(cell.row):
+          sink.slot(def = defBase, rep = cell.entryRep)                     // struct absent — one placeholder
+        else:
+          EmitPath(path.next, v.Child(childOrdinal),
+                   [{ row = cell.row, entryRep = cell.entryRep }],
+                   defBase + 1, parentRep)                                   // struct present
+
+    LIST(element step):
+      thisRep = parentRep + 1
+      for cell in cells:
+        v = ExpectListVector(vector); (start, len) = v.RawElementSpan(cell.row)
+        if v.IsNull(cell.row):        sink.slot(def = defBase,     rep = cell.entryRep)   // null list
+        elif len == 0:                sink.slot(def = defBase + 1, rep = cell.entryRep)   // empty list
+        else:
+          childCells = for e in 0..len:
+                         { row = start + e, entryRep = (e == 0 ? cell.entryRep : thisRep) }
+          EmitPath(path.next, v.Elements, childCells, defBase + 2, thisRep)
+
+    MAP(key step | value step):
+      thisRep = parentRep + 1
+      for cell in cells:
+        v = ExpectMapVector(vector); (start, len) = v.RawEntrySpan(cell.row)
+        if v.IsNull(cell.row):        sink.slot(def = defBase,     rep = cell.entryRep)   // null map
+        elif len == 0:                sink.slot(def = defBase + 1, rep = cell.entryRep)   // empty map
+        else:
+          childCells = for e in 0..len:
+                         { row = start + e, entryRep = (e == 0 ? cell.entryRep : thisRep) }
+          child = (key step ? v.Keys : v.Values)
+          EmitPath(path.next, child, childCells, defBase + 2, thisRep)
+
+    LEAF (optional):
+      for cell in cells:
+        if leafVector.IsNull(cell.row):
+          sink.slot(def = defBase, rep = cell.entryRep)                     // leaf null (own optional absent)
+        else:
+          sink.emit(def = defBase + 1, rep = cell.entryRep, value = read(cell.row))
+
+    LEAF (required — map key / REQUIRED child/element/value):
+      for cell in cells:
+        if leafVector.IsNull(cell.row):
+          throw CorruptData(required-lane, §2.4a)                           // fires at ANY depth
+        sink.emit(def = defBase, rep = cell.entryRep, value = read(cell.row))
+```
+
+**Two passes, unchanged control flow.** As today, the shredder runs the emitter **twice** per leaf: the
+§2.9 N9 **pre-pass** (`ValidateColumnAsync` → `rowGroup: null`) computes `def[]`/`rep[]` and runs
+`RunLevelGuard` with an independently-derived present-cell count **before** `ParquetWriter.CreateAsync`
+publishes a byte; the **write pass** re-walks and streams values into the exactly-sized pooled leaf buffer.
+The recursion changes only *how far* each walk descends; the pre-pass fail-closed-before-first-byte guarantee
+(the whole point of `ValidateColumnAsync`) is preserved because the depth guard, the leaf allowlist, the
+required-lane guards and the container-nullability reject all fire inside the pre-pass walk.
+
+**The writer-side structural level guard MUST be rewritten (`NestedLevelGuard.Validate`, the write dual of
+585a `BuildRepeatedStructure`).** `RunLevelGuard` (`NestedColumnShredder.cs:1165` pre-pass, `:1371` write
+pass) → `NestedLevelGuard.Validate` (`NestedLevelGuard.cs:79`) is the independent self-check that turns a
+shredder level-stream defect into a deterministic pre-write `CorruptData`. **In its shipped form it carries
+the *same* single-repeated-level assumption 585a had to rewrite out of the reader's `BuildRepeatedStructure`
+(§2.2):** it derives ONE container boundary from the leaf —
+`containerMaxDef = leaf.MaxDefinitionLevel − (leaf optional ? 1 : 0)`,
+`emptyContainerDef = containerMaxDef − 1` (`NestedLevelGuard.cs:178`/`:186`) — and treats **every** `rep > 0`
+slot as a continuation of the leaf's *own innermost* repeated container, rejecting it as `CorruptData` when
+`def <= emptyContainerDef` (`:126-131`). **At depth ≥ 2 that FALSE-REJECTS valid data:** a slot with
+`0 < rep < maxRep` opens a **new occurrence at a *shallower* repeated ancestor** whose child container may
+legitimately be null or empty (`def ≤ leaf.emptyContainerDef`). Concretely, the §2.10.4 golden stream
+`(0,0)(0,1)(0,2)(1,3)(0,5)(2,4)(1,5)` for `array<array<int>>` (leaf `MaxDef 5`, so `containerMaxDef 4`,
+`emptyContainerDef 3`) **rejects at slot `(1,3)`** — `rep 1 > 0` and `def 3 ≤ 3` — even though `(1,3)` is a
+new *outer* element whose inner list is legitimately EMPTY. The same false-reject kills `array<struct<a:int>>`
+with a null struct element at list position ≥ 1, and `map<string,array<long>>` with an empty inner value-list
+at entry ≥ 1 — i.e. it kills happy-path §3.3 cells 1, 2, 4, 5, 7, 8, 9, golden 10, and the at-depth SUCCESS
+cell 22.
+
+#873 therefore **rewrites `NestedLevelGuard.Validate` as a FAITHFUL per-level dual of the reader's
+`BuildRepeatedStructure` (`NestedParquetColumnReader.cs:967-1080`)** — it tracks, for **every** repeated
+level, the same owner-open + `ownerComplete` occurrence state the reader keys off each container's **own**
+node. There is **no `rep == maxRep` simplification** (that round-2 gate was itself a bug — §2.10.9-D6): the
+continuation-legality reject must fire at **every** repeated level, not only the innermost.
+
+**Signature change (storage rec #2).** The guard can no longer take only `DataField leaf`: for an
+**interleaved** shape such as `array<struct<array<int>>>` (a struct level sits *between* the two repeated
+levels), a level's `presentDef_j` / `parentPresentDef_j` **cannot** be derived from `(leaf.MaxDefinitionLevel,
+leaf.MaxRepetitionLevel)` alone. `NestedLevelGuard.Validate` now receives the **ordered chain of repeated
+ancestors `R_1 … R_k`** (outermost→innermost) built alongside the schema recursion (or the built footer node /
+schema path), each level `R_j` carrying, read from **its own** node: `repLevel_j` (its `MaxRepetitionLevel`,
+`= j` for a pure list/map chain), `presentDef_j` (its `MaxDefinitionLevel` — "element-bearing"),
+`emptyDef_j = presentDef_j − 1`, and `parentPresentDef_j` (the immediate parent container node's
+`MaxDefinitionLevel`; `0` for `R_1`). This mirrors how the reader threads `thisMaxDef`/`parentMaxDef` per
+container.
+
+**The per-level state machine (single pass over the leaf's `(rep, def)` stream).** Maintain one flag per
+repeated level, `ownerComplete[1..k]` — `true` when that level's *current* occurrence opened as a null/empty
+(non-element-bearing) container, so it admits **no** continuation (the dual of the reader's `ownerComplete`,
+`:986`/`:1031`). For each slot `(r, d)` (after the range check and the `first slot must be rep 0` check):
+
+1. **`rep == 0` opens a logical row** → `rowOpenings++` (depth-invariant, **KEEP**;
+   `NestedLevelGuard.cs:107-112`, `:148-154`).
+2. **Continuation legality at level `r` (r ≥ 1):** the slot continues `R_r`'s current occurrence, so reject
+   `CorruptData` iff `ownerComplete[r] || d < presentDef_r` — the container being continued was opened
+   null/empty **earlier in the row**, *or* this slot is not itself an element-bearing occurrence. **This
+   fires at every `r = 1 … k`** (exactly the reader's `ownerComplete || d < thisMaxDef` gate, `:1027-1035`).
+3. **Re-open the deeper levels this slot starts.** A `rep = r` slot opens a new *owner* for every level
+   `v > r` (and, when `r == 0`, for all `v = 1 … k`); it does **not** re-open level `r` itself (that is the
+   continuation of clause 2). For each such `v` (from `lo = (r == 0 ? 1 : r + 1)` to `k`), classify the new
+   occurrence from **this** slot's `d` against `R_v`'s own markers:
+   `ownerComplete[v] = (d < parentPresentDef_v) ? true : (d < presentDef_v)` — i.e. **absent** parent ⇒
+   complete; **null/empty** container ⇒ complete; **present element-bearing** ⇒ open. (Dual of the reader's
+   owner-open `d >= parentMaxDef` gate + `ownerComplete = d < thisMaxDef`, `:1007`/`:1031`.)
+4. **Range + packed-value clauses unchanged:** `def ∈ [0, maxDef]`, `rep ∈ [0, maxRep]`,
+   `present(def == maxDef) == valueCount` (`:164-168`), `rowOpenings == rowCount`.
+
+**Re-verification — the four required traces (`array<array<int>>`: `presentDef_1 = 2`, `emptyDef_1 = 1`,
+`parentPresentDef_1 = 0`; `presentDef_2 = 4`, `emptyDef_2 = 3`, `parentPresentDef_2 = 2`; `maxRep = 2`):**
+
+- **(a) golden `(0,0)(0,1)(0,2)(1,3)(0,5)(2,4)(1,5)` → PASS.** Walk: `(0,0)` opens row, sets
+  `ownerComplete[1]=(0<2)=T`, `ownerComplete[2]=(0<2 parent-absent)=T`. `(0,1)` →
+  `ownerComplete[1]=(1<2)=T`, `[2]=T`. `(0,2)` → `ownerComplete[1]=(2<2)=F` (outer element-bearing),
+  `[2]=(2<2 parent-absent? no → 2<4)=T` (inner null). `(1,3)` continuation at level 1:
+  `ownerComplete[1]=F && d 3 ≥ presentDef_1 2` → **OK**, then re-opens level 2:
+  `ownerComplete[2]=(3<2? no → 3<4)=T` (inner empty). `(0,5)` → `[1]=(5<2)=F`, `[2]=(5<4)=F`. `(2,4)`
+  continuation at level 2: `ownerComplete[2]=F && d 4 ≥ presentDef_2 4` → **OK**. `(1,5)` continuation at
+  level 1: `ownerComplete[1]=F && 5 ≥ 2` → **OK**, re-opens `[2]=(5<4)=F`. No throw; `rowOpenings=4`. ✔
+- **(b) red-team `(0,0)(1,2)` → REJECT at `(1,2)`.** `(0,0)` sets `ownerComplete[1]=(0<2)=T` (outer opened
+  NULL). `(1,2)` continuation at level 1: `ownerComplete[1]=T` → **`CorruptData`**. (The companion
+  `(0,1)(1,2)` — a `rep 1` after an *empty* outer, `def 1` — also rejects: `ownerComplete[1]=(1<2)=T`.)
+  The round-2 gate waved both through because it only policed `rep == maxRep`; the per-level gate catches
+  them at the **shallower** level 1. ✔ (§3.3 cell 29)
+- **(c) innermost phantom `(2,3)` → REJECT.** In context `(0,3)(2,3)`: `(0,3)` sets
+  `ownerComplete[2]=(3<4)=T` (inner empty). `(2,3)` continuation at level 2: `ownerComplete[2]=T` →
+  **`CorruptData`**. A present-inner variant `…(0,5)(2,4)(2,3)` rejects the trailing `(2,3)` via
+  `d 3 < presentDef_2 4`. ✔ (§3.3 cell 28)
+- **(d) single-level `maxRep == 1` → byte-identical.** Only `R_1` exists (`presentDef_1 = containerMaxDef`,
+  `parentPresentDef_1 = 0`). A `rep 0` slot sets `ownerComplete[1] = (d < containerMaxDef)` — identical to
+  the shipped `currentRowOpenDef <= emptyContainerDef` (`:126` neighbourhood); a `rep 1` slot rejects iff
+  `ownerComplete[1] || d < containerMaxDef` — identical to the shipped `def <= emptyContainerDef ||
+  currentRowOpenDef <= emptyContainerDef`. Every continuation is at `rep == maxRep == 1`, so the two
+  conditions coincide and the guard is **byte-identical** to today (regression §3.3-21). *(The shipped guard
+  already carried the owner-open `currentRowOpenDef` check; round-2 wrongly dropped it for shallower levels —
+  the per-level rewrite restores it at every level.)*
+
+**`rep` presence per leaf.** A leaf whose path contains **no** list/map (pure-struct path) emits **no** rep
+stream (`rep: null`) — `WriteLeafAsync` already accepts `ReadOnlyMemory<int>?`. A leaf with `k` list/map
+ancestors emits a rep stream reaching `k` (= its `MaxRepetitionLevel`), which the reader's
+`ValidateLeafStructuralLevels` (§2.2) validates against the footer node.
+
+**Value navigation generalizes the `IValueSource` trio.** The present-cell enumerators
+`StructValueSource`/`ListValueSource`/`MapValueSource` (`:896`/`:922`/`:956`) each navigate exactly one
+level today. #873 replaces them with a **path-navigating** value source that descends the same path the
+level emitter walks (skipping null/empty containers, yielding only present leaf cells in slot order). The
+present-cell **count** it returns still feeds §2.3c's packed-values clause (derived from the vectors' null
+masks, never from the level stream), so that clause keeps its teeth at every depth.
+
+#### 2.10.4 Worked traces — the write reproduces §2.4 exactly
+
+**`array<array<int>>`, the §2.4 4-row fixture** (`null` / `[]` / `[null, []]` / `[[7,null],[9]]`). The leaf
+path is `[LIST(outer), LIST(inner), LEAF(int, optional)]`. Running `EmitPath` from the top frame
+(`cells = {row0..row3, entryRep 0}`, `defBase 0`, `parentRep 0`):
+
+| row | outer frame | inner frame (`defBase 2`, `parentRep 1`) | leaf frame (`defBase 4`, `parentRep 2`) | emitted `(rep, def, value)` |
+|---|---|---|---|---|
+| 0 | null → slot | — | — | `(0, 0, —)` |
+| 1 | empty → slot | — | — | `(0, 1, —)` |
+| 2 | 2 elems, entryRep 0/1 | inner#0 null → slot `(0,2)`; inner#1 empty → slot `(1,3)` | — | `(0, 2, —)`, `(1, 3, —)` |
+| 3 | 2 elems, entryRep 0/1 | inner#0 = 2 elems (entryRep 0/2); inner#1 = 1 elem (entryRep 1) | 7 `(0,5)`, null `(2,4)`, 9 `(1,5)` | `(0, 5, 7)`, `(2, 4, —)`, `(1, 5, 9)` |
+
+The emitted leaf stream is `(0,0) (0,1) (0,2) (1,3) (0,5) (2,4) (1,5)` — **identical**, slot-for-slot, to the
+§2.4 driving-leaf trace the 585a reader consumes. §3.3 cell 9 asserts this byte-for-byte (the write→read
+golden). Note the writer never emits the released reader's *defect* stream (`outer offsets [0,0,0,2,5]`): it
+counts inner-**list** occurrences structurally, so the round-trip is exact.
+
+**`map<string, array<long>>` — the key/value **decouple** (the case single-level `ComputeMapLevels` cannot
+express).** Two leaves: `key` (path `[MAP-key, LEAF(string, required)]`) and `value.element` (path
+`[MAP-value, LIST(element), LEAF(long, optional)]`).
+- **key** stream reaches `def ∈ {0,1,2}`, `rep ∈ {0,1}` (`MaxRep 1`) — one slot per entry, key `REQUIRED` so
+  present entry `def = mapPresentBase = 2` (no leaf `+1`). Matches the single-level key lane.
+- **value.element** stream reaches `def ∈ {0..5}`, `rep ∈ {0,1,2}` (`MaxRep 2`) — the value-side list adds a
+  repeated level the key side does not have, so the value leaf's stream is **longer** than the key leaf's.
+
+This is the crux the single-level map path gets wrong: `WriteMapAsync` computes `keyDef/valueDef/keyRep/valueRep`
+as **equal-length parallel arrays** (one slot per entry) and cross-checks them with `ValidateMapParallelLevels`
+(`:1438`). For `map<*,nested>` the key and value leaf streams have **different lengths**, so that full-stream
+parity check is structurally inapplicable (§2.10.5).
+
+#### 2.10.5 Map key/value decoupling — the parity generalization
+
+A 3-level map nests key and value in **one** repeated `key_value` group, so the read side validates that the
+key and value driving leaves agree at the **entry** level (`ValidateParallelRepetition`/`Definition`, §2.2).
+On the **write** side both leaf streams are generated from **one trusted `MapColumnVector`** — the same
+`RawEntrySpan(row)` and the same per-entry `entryRep` — so entry-level agreement holds **by construction**.
+#873 therefore:
+
+- Computes the **map entry structure** (per-entry rep + null/empty/present classification) **once** per map
+  node, and drives **both** the key subtree and the value subtree from it (they share the `MAP` frame, then
+  diverge below it — §2.10.4).
+- **Replaces** the single-level full-stream `ValidateMapParallelLevels` with an **entry-level** self-check
+  for `map<*,nested>` (and `map<nested,*>`): assert the key-side and value-side walks agree on **entry
+  count** and **entry-level rep** (the shared `MAP` frame), *not* on the full (unequal-length) leaf streams.
+  For `map<scalar,scalar>` the streams are equal-length and the existing full-stream check is **retained
+  unchanged** as the base case (regression §3.3-20).
+
+This is a genuine algorithm change, not a reject lift: the single-level map lane **assumes** scalar key *and*
+scalar value; `map<*,array>` / `map<map>` / `array<map>` break that assumption and require the decoupled
+per-subtree emission above.
+
+#### 2.10.6 The recursive Parquet schema construction (`ParquetTypeMapping.CreateNestedField`)
+
+`CreateNestedField` (`:99`) builds the top-level group node; `CreateNestedLeaf` (`:232`, array element / map
+key+value) and `CreateStructChildLeaf` (`:191`, struct child) build the interiors. Today both **reject** a
+nested interior (`:197`, `:241`). #873 makes them **recurse**, building the canonical nested group structure
+the 585a reader reconstructs:
+
+- **Array interior that is a container** → a nested `PqListField` whose item is the recursively-built child
+  group (repeated `list` group, canonical element name `element`), instead of `CreateNestedLeaf` throwing.
+- **Map VALUE that is a container** → a nested `PqMapField`/`PqListField`/`PqStructField` under the
+  `key_value` group, with canonical `key`/`value` child names.
+- **Map KEY that is a container** (`map<array<…>,*>`, `map<struct<…>,*>`, `map<map<…>,*>`) → **FAILS CLOSED,
+  at every depth** (§2.10.7). A Parquet map key must be **REQUIRED**, but Parquet.Net 6.1.0's
+  `ListField`/`StructField`/`MapField` ctors emit **OPTIONAL** group nodes only (no required-nested-container),
+  so a nested key node would carry `Key.MaxDefinitionLevel > Map.MaxDefinitionLevel` — which the shipped 585a
+  reader `EnsureRequiredMapKey` (`NestedParquetColumnReader.cs:1742`) strictly rejects
+  (`SchemaMismatch: "map key is nullable"`). Writing it would mint a **permanently-unreadable** file, so #873
+  refuses it up front. A **scalar** map key (the normal case) is unaffected — it is already `REQUIRED`
+  (`Key.MaxDef == Map.MaxDef`).
+- **Struct child that is a container** → a nested `PqStructField`/`PqListField`/`PqMapField` (optional group),
+  instead of `CreateStructChildLeaf` throwing.
+
+Concretely, factor the leaf builders into one recursive `CreateNestedNode(type, nullable, canonicalName,
+context, honorReferenceNullability, depth)` that dispatches: a **scalar** type routes to the existing
+`CreateScalarField` (the leaf allowlist, unchanged — void / decimal&gt;28 / unmapped still reject at every
+depth); a **container** type builds the nested `PqListField`/`PqMapField`/`PqStructField` and **recurses**
+into its element/key/value/children — **except a container in a map-KEY position, which fails closed
+(§2.10.7 nested-map-key reject) before construction**. The canonical child names the reader binds by
+(`element`, `key`, `value`) are emitted at every level (585a `EnsureCanonicalMapChildNames` reads them back).
+The depth guard (§2.10.7) is checked at each recursion entry. The `try/catch (ArgumentException)` wrapper
+(`:167`) that maps Parquet.Net's raw ctor faults onto the typed contract stays in force at every level.
+
+**Group-node max levels come off the structure, not a leaf.** The single-level shredder derives
+`containerMaxDef`/`mapMaxDef` from a leaf via `NestedLevelGuard.ContainerMaxDefinitionLevel(leaf)` (`:575`,
+`:687`). The recursion instead derives the `(def, rep)` increments **structurally** (§2.10.2), which is the
+write dual of the read side keying each container off *its own node's* `MaxRepetitionLevel`/`MaxDefinitionLevel`
+(§2.1). Parquet.Net stamps those per-node levels from the group structure the recursion builds, so the
+written footer's per-node levels are exactly what `ValidateLeafStructuralLevels` and the `DecodeList`/`Map`/
+`Struct` reconstructions expect (§2.2).
+
+#### 2.10.7 Reject sites lifted; fail-closed parity; the write depth bound
+
+**The three `#585` reject sites — which are lifted, for which shapes:**
+
+| Site | Current reject | #873 |
+|---|---|---|
+| `ParquetTypeMapping.cs:197` `CreateStructChildLeaf` | struct child that is array/map/struct → `UnsupportedFeature` "nested type within a nested type (#585)" | **LIFTED** in name/none mode → recurse (`struct<*,struct>`, `struct<*,array>`, `struct<*,map>`, deeper). **Re-pointed to #866** when `idMode` (§2.10.8) |
+| `ParquetTypeMapping.cs:241` `CreateNestedLeaf` | array element / map key+value that is array/map/struct → `UnsupportedFeature` "#585" | **LIFTED** in name/none mode → recurse (`array<struct>`, `array<array>`, `array<map>`, `map<*,struct>`, `map<*,array>`, `map<map>`, deeper) — **EXCEPT a container in a map-KEY position, which stays fail-closed** (see the nested-map-key row below). **Re-pointed to #866** when `idMode` |
+| `NestedColumnShredder.cs:1532` `ExpectLeaf` | mapped Parquet field is a group, not a `DataField` → `UnsupportedFeature` "#585" | **LIFTED** → the shredder dispatches on the child field kind and **recurses** (`EmitPath`) instead of `ExpectLeaf`-then-throw. See ⚠ discrepancy §2.10.9-D1: this site is a *secondary* backstop today (unreachable because `CreateNestedField` rejects first) |
+
+**Fail-closed parity — preserved at every depth** (the write door's existing guards, applied recursively):
+
+| Guard | Site | At depth (873) |
+|---|---|---|
+| Leaf scalar allowlist (void / decimal&gt;28 / unmapped) | `CreateScalarField` | applied to **every** leaf at every depth (recursion routes each scalar through it unchanged) → `UnsupportedFeature` |
+| Zero-field struct | `:151` | applied to a nested struct at any depth → `UnsupportedFeature` |
+| **Nested map KEY** (a `map<array<…>,*>` / `map<struct<…>,*>` / `map<map<…>,*>` — the key is a container) | **new** — `CreateNestedField` MapType arm / `CreateNestedNode` key position (§2.10.6) | **FAILS CLOSED at every depth** — Parquet.Net emits every group node OPTIONAL, so a nested key would carry `Key.MaxDef > Map.MaxDef`, which the shipped 585a reader `EnsureRequiredMapKey` (`NestedParquetColumnReader.cs:1742`) rejects → the file would be **permanently unreadable**; refuse before construction → `UnsupportedFeature`. A **scalar** map key is unaffected (already `REQUIRED`). *(Distinct from #860's map-**typed**-key infeasibility, which `MapType` rejects at type construction; here the key is a constructible array/struct type but is not physically writable.)* |
+| Non-nullable **container** (declared `REQUIRED` array element / map value / struct child that is itself a container) | new — parity with the top-level `:116` `!field.Nullable` reject | refused at every depth (Parquet emits containers OPTIONAL; writing `REQUIRED` diverges, #730) → `UnsupportedFeature` |
+| Leaf repetition ↔ declared nullability (#730) | `EnsureLeafRepetition` `:1514` | asserted per leaf at every depth → `CorruptData` |
+| Required-lane null (a `REQUIRED` leaf holds a null; a null map key) | `ComputeStructLevels`/`ListLevels`/`MapLevels` value guards | the `EmitPath` LEAF-required arm fires at every depth → `CorruptData` |
+| **Structural level guard (REWRITTEN)** — `NestedLevelGuard.Validate` | `NestedColumnShredder.cs:1165`/`:1371` → `NestedLevelGuard.cs:79` | **rewritten as a FAITHFUL per-level dual of 585a `BuildRepeatedStructure`** (`NestedParquetColumnReader.cs:967-1080`; §2.10.3): **signature change** — now receives the ordered repeated-ancestor chain `R_1…R_k` (each with its own `repLevel_j`/`presentDef_j`/`emptyDef_j`/`parentPresentDef_j` read from its own footer node, **not** derived from `leaf.MaxDef`/`MaxRep`, which is insufficient for interleaved shapes like `array<struct<array>>`); tracks `ownerComplete[1..k]` per level; the continuation-legality reject (`ownerComplete[r] || def < presentDef_r`) fires at **EVERY** repeated level `r = 1…k`, **not** innermost-only; keeps `rowOpenings == rowCount`. Un-rewritten it **false-rejects** valid depth-≥2 streams (the §2.10.4 golden `(1,3)` slot); the round-2 `rep == maxRep` gate **false-accepted** a shallower phantom (`(0,0)(1,2)`) → both fixed. Catches phantom continuations at the innermost (§3.3 cell 28) AND a shallower level (§3.3 cell 29) → `CorruptData` |
+| Foreign / mismatched vector | `IsForeignVectorFault`, `ExpectStructVector`/`List`/`Map` | the recursion's per-frame `ExpectXxxVector` + the single `IsForeignVectorFault` boundary cover every descendant navigation → `UnsupportedFeature` |
+
+**The write recursion-depth bound.** The shredder recursion and the schema recursion both walk an
+attacker-/generator-influenced type tree and must carry an explicit bound so a pathological schema fails
+closed rather than overflowing the stack. #873 introduces **`MaxNestedWriteDepth = 64`**, checked at each
+`EmitPath` / `CreateNestedNode` entry **before** any allocation or descent → `UnsupportedFeature` (never a
+`StackOverflowException`). The value **64** is fixed for **read-after-write parity** with the caps that
+already bound the write door and the read cap (all **64**, verified in the worktree):
+
+| Cap | Value | Source |
+|---|---|---|
+| `DeltaWriteSchemaEligibility.MaxDepth` | **64** | `DeltaWriteSchemaEligibility.cs:60` — deepest schema DeltaSharp will commit (checked before `schemaString` exists) |
+| `ParquetTypeMapping.MaxFooterTypeDepth` | **64** | `ParquetTypeMapping.cs:864` — footer type-tree walk on read |
+| `MaxNestedReadDepth` (585a) | **64** | §2.6 — the decode recursion bound |
+| `SchemaJson.MaxDepth` | **64** JSON containers | `SchemaJson.cs:50` — log-parse of `schemaString` |
+| **`MaxNestedWriteDepth`** (873, new) | **64** | the shredder + schema recursion bound |
+
+Because `EnsureCommittable` (`DeltaWriteSchemaEligibility`) already rejects a &gt;64 schema before the writer
+runs, `MaxNestedWriteDepth` is a **true backstop** that fires only on schemas already at/over the commit cap;
+setting it equal to (not below) the read/commit caps guarantees any nested-within-nested table #873 **writes**
+is a schema 585a can **read** (no read-after-write parity gap). §3.3-21 is the at-bound SUCCESS companion.
+
+**Slot-planning / budget recursion (⚠ §2.10.9-D4).** The row-group planner's `RowSlots`/`SlotsForRow`
+(`:245`/`:263`) count **one slot per element/entry** — correct only for a single repeated level. For
+nested-within-nested a row's leaf-slot contribution is the **recursive** sum over the path (an `array<array>`
+row contributes Σ over its inner lists of `max(1, innerLen)` slots, plus null/empty placeholders). #873
+generalizes the per-row slot count to the same recursive walk `EmitPath` performs (counting slots without
+emitting values), so `PlanRowCount` (`:173`), `CountListSlots`/`CountMapSlots` (`:825`/`:843`) and the
+`CheckSlotBound` addressable-ceiling guard (`:861`) remain exact at depth and a wide/deep nested column is
+still split across row groups (never rented past the ceiling). The eager-slot ceiling is charged over **all
+descendant leaves** before allocation, so a crafted deep/wide vector cannot amplify allocation beyond its
+declared cells (§5).
+
+#### 2.10.8 Column-mapping mode scope — name/none only; the #866 boundary
+
+The 585a reader binds nested-within-nested **by physical name** (struct children by name, list by `element`,
+map by canonical `key`/`value`). A **name-mode** and a **none-mode** physical file are both **field_id-free**
+(name mode strips id metadata; none mode never had it). So #873 targets **name-mode + none-mode**: the
+recursion emits a field_id-free nested group structure that the 585a name-binding reader round-trips (§3.3
+is the oracle).
+
+**id mode is out of scope — deferred to [#866](https://github.com/khaines/deltasharp/issues/866)
+<!-- issue-state:open -->.** Single-level id-mode nested write (#676 struct-child `delta.columnMapping.id`;
+#839 array/map interior `delta.columnMapping.nested.ids`) stamps interior `field_id`s **one level deep**. A
+nested-within-nested id-mode file needs a **recursive** interior id-assignment + physical-name scheme (e.g.
+`nested.ids` keyed by nested paths `element.element`, `value.element`, `struct-child.element`, …) **and** an
+id-mode nested-within-nested **reader** that binds interiors by `field_id` at every depth — both are #866's
+scope, not #873's. Therefore #873's boundary is explicit:
+
+- When `idMode = ColumnMapping.TryGetId(field)` is **false** (name/none) → **lift** the reject, recurse
+  (§2.10.6).
+- When `idMode` is **true** *and* any node below the top container is itself a container
+  (nested-within-nested) → **fail closed** at the write door with a reject **re-pointed to #866** (not #585):
+  an unstamped or mis-stamped interior leaf would commit a permanently-unreadable file. Single-level id-mode
+  write (struct-of-scalars, array/map-of-scalars) is **unchanged** (still supported via #676/#839).
+
+This keeps #873 and #866 cleanly separated: #873 is the **name/none-mode** recursive encode (round-tripped by
+the shipped 585a name-binding reader); #866 is the **id-mode** recursive encode **and** its matching id-mode
+reader.
+
+#### 2.10.9 Component boundaries, ⚠ discrepancies (issue framing vs actual code), residuals
+
+- **D1 — the shredder reject at `:1532` is a *secondary* backstop, not a co-equal up-front gate.** The #873
+  issue lists all three `#585` sites as up-front "rejects a nested type within a nested type up front."
+  In the actual flow `ParquetFileWriter` calls `ParquetTypeMapping.CreateField` (schema) **before**
+  `NestedColumnShredder.WriteColumnAsync` (`ParquetFileWriter.cs:120`, `:226`). `CreateNestedField` rejects
+  nested-within-nested at **schema construction** (`:197`/`:241`) *before the shredder ever runs*, so the
+  shredder's `ExpectLeaf` throw (`:1532`) is **unreachable today** — it fires only if a nested group field
+  reaches the shredder, which the schema reject prevents. Lifting is therefore **ordered**: the schema
+  builder must first produce nested **group** nodes (so `parquetStruct.Fields[i]` / `parquetList.Item` /
+  `parquetMap.Value` become groups), *then* the shredder's `ExpectLeaf` becomes the real recursion
+  dispatch point. Both must be lifted together; the schema builder is the first-firing gate.
+- **D2 — `map<*,nested>` is not a reject-lift; it is an algorithm change.** The issue frames #873 as
+  uniformly "lift the reject + recurse." For maps that is **not** sufficient: the single-level map lane
+  (`ComputeMapLevels` + `ValidateMapParallelLevels`, `:754`/`:1438`) hard-assumes **equal-length** key/value
+  streams (one slot per entry). `map<*,array>` / `map<map>` produce **unequal-length** key/value leaf streams
+  and require the decoupled per-subtree emission + entry-level self-check (§2.10.5). Same for `array<map>` /
+  `map<array>`.
+- **D3 — the issue's named shapes are a *subset*; the recursion is the full closure.** The issue names
+  `array<struct>` / `map<*,array>` / `array<array>` / `struct<*,struct>`. #873 handles the **entire**
+  nested-within-nested closure uniformly: also `struct<*,array>`, `struct<*,map>`, `map<*,struct>`,
+  `map<map>`, `array<map>`, `map<array>`, and every depth-3+ mix (`array<struct<array>>`,
+  `map<*,struct<map>>`, …), bounded by `MaxNestedWriteDepth`.
+- **D4 — planner slot counting must recurse** (§2.10.7): `RowSlots`/`SlotsForRow` are single-repeated-level;
+  they undercount nested-within-nested rows and must generalize or the row-group split/ceiling guards drift.
+- **D5 (BLOCKING, red-team) — a nested map KEY cannot be written readably; fail it closed.** `map<array<…>,*>`
+  / `map<struct<…>,*>` / `map<map<…>,*>` (a map whose *key* is a container) is a **constructible** `MapType`,
+  but Parquet.Net 6.1.0 emits every group node **OPTIONAL**, so the written key node carries
+  `Key.MaxDef > Map.MaxDef` — which the shipped 585a reader `EnsureRequiredMapKey`
+  (`NestedParquetColumnReader.cs:1742`) rejects (`SchemaMismatch: "map key is nullable"`). A written nested-key
+  file is therefore **permanently unreadable**. #873's original §2.10.6 line "the map key stays REQUIRED" was
+  **FALSE for a nested key** (and §2.10.7's #730 container-nullability reject omitted the map-key case);
+  corrected to a dedicated **fail-closed at every depth** at `CreateNestedField`/`CreateNestedNode` (§2.10.6,
+  §2.10.7 table). A **scalar** map key is unaffected. *(Distinct from #860's map-typed-key infeasibility,
+  where `MapType` rejects a map-typed key at type construction — there the key is a map; here it is an
+  array/struct, constructible but not writable.)*
+- **D6 (BLOCKING, storage + red-team; round-2 introduced, round-3 corrected) — the writer-side structural
+  level guard must be a FAITHFUL PER-LEVEL dual of `BuildRepeatedStructure`.** `NestedLevelGuard.Validate`
+  (`NestedLevelGuard.cs:79`, invoked at `NestedColumnShredder.cs:1165`/`:1371`) as shipped carried the
+  single-repeated-level assumption 585a rewrote out of the reader: it derives one container boundary from the
+  leaf and treats every `rep > 0` slot as a continuation of the leaf's own innermost container
+  (`def <= emptyContainerDef` reject, `:126`), which **false-rejects** valid depth-≥2 streams — the §2.10.4
+  golden `(1,3)` slot, `array<struct>` with a null struct element at position ≥ 1, `map<*,array>` with an
+  empty inner value-list at entry ≥ 1 (killing §3.3 cells 1, 2, 4, 5, 7, 8, 9, 10, 22). **The round-2 rewrite
+  proposed gating the continuation-past-empty reject to `rep == maxRep` (innermost-only) — that was ITSELF a
+  bug (red-team round-3 MISS): it FALSE-ACCEPTS a shallower phantom** such as `(0,0)(1,2)` (a `rep 1`
+  continuation into an outer list that opened NULL at `def 0`), which the shipped 585a `BuildRepeatedStructure`
+  then rejects on every future read → permanently-unreadable file, defeating the pre-pass net. **Round-3 fix
+  (§2.10.3): remove the `rep == maxRep` simplification entirely** and track `ownerComplete[1..k]` per level
+  exactly as the reader does (`:986`/`:1031`): the continuation reject (`ownerComplete[r] || def < presentDef_r`)
+  fires at **EVERY** level `r = 1…k`, keyed on each level's own footer-node markers. Requires the
+  **signature change** (rec #2): the guard receives the ordered `R_1…R_k` chain (each level's
+  `presentDef_j`/`parentPresentDef_j` read from its own node — insufficient from `leaf.MaxDef`/`MaxRep` alone
+  for interleaved shapes like `array<struct<array>>`). Single-level (`maxRep == 1`) is byte-identical
+  (§3.3-21); a genuine phantom-continuation fails closed at the **innermost** (§3.3 cell 28) **and** a
+  **shallower** level (§3.3 cell 29). **Added to both the §2.10.3 algorithm and the §2.10.7 fail-closed
+  table.**
+- **Residual — non-nullable nested containers stay refused (#730), at every depth.** `array<struct>` with
+  `ContainsNull = false` (non-null struct elements), a non-null map value that is a container, or a
+  `Nullable = false` struct child that is a container is **refused** — Parquet.Net emits every group OPTIONAL,
+  so honoring `REQUIRED` is impossible without a footer↔log divergence. This is **parity with the existing
+  top-level `!field.Nullable` reject** (`:116`), lifted to depth, and is an accepted fail-closed boundary
+  (§9 O2), not a #873 regression. Non-nullable **scalar** leaves at depth remain expressible.
+- **Composition with 585b widening.** #873 always writes the **exact** declared leaf physical type (widening
+  is an append-time schema *merge*, not a write-time transform). A later widening append + 585b read-promote
+  works because #873 produces a valid narrow nested-within-nested file that 585a/585b read (§3.3-24 pins the
+  compose: write narrow via #873 → widen append → 585b read-promotes).
 
 ---
 
@@ -789,10 +1296,12 @@ end-to-end variants also assert log-JSON round-trip):
 2. `Widen_MapValueArrayElement_IntToLong_EmitsFieldPath_value_element`.
 3. `Widen_ArrayOfMapValue_IntToLong_EmitsFieldPath_element_value`.
 4. `Widen_MapKeyArrayElement_IntToLong_EmitsFieldPath_key_element` (`map<array<int→long>,string>` — map **key**
-   widened, `key.element`) and `Widen_ArrayOfMapKey_IntToLong_EmitsFieldPath_element_key`
-   (`array<map<int→long,string>>` — map **key** widened, `element.key`). Map-key widening at depth&gt;1 on both
-   the outermost (`key.`) and innermost (`.key`) sides; `key.key` is not constructible (map-typed keys are
-   rejected by `MapType`, see §2.5 note).
+   widened, `key.element`; **schema-merge-only** — the nested-array key is not physically writable per 873
+   §2.10.7/D5, so this cell asserts ONLY the enforcer merge + `fieldPath` on metadata, with **no** data
+   round-trip / read-promote) and `Widen_ArrayOfMapKey_IntToLong_EmitsFieldPath_element_key`
+   (`array<map<int→long,string>>` — map **key** widened, `element.key`; **scalar** key → fully writable +
+   read-promotable). Map-key widening at depth&gt;1 on both the outermost (`key.`) and innermost (`.key`)
+   sides; `key.key` is not constructible (map-typed keys are rejected by `MapType`, see §2.5 note).
 5. `Widen_ArrayOfArrayOfArrayElement_Depth3_EmitsFieldPath_element_element_element` — depth-3 chain (pins the
    accumulator, not a two-token special-case).
 6. `Widen_StructChildArrayElement_EmitsElementFieldPath_OnChildStructField` — `struct<xs:array<int→long>>`:
@@ -846,6 +1355,120 @@ equal values (parity with §3.1). Cell 11 is the **public-API-observable** proof
 a defense-in-depth site shadowed by `ValidateShape` (§2.5, D9) and has no independent killing decode cell by
 construction — its observable effect is the validate-side lift R1 (cell 11's up-front validation).
 
+### 3.3 · 873 — recursive WRITE (write→read round-trip oracle)
+
+> **Buildable now** off `origin/main` @ `ef35daf`. The oracle is a **write→read round-trip through 585a**:
+> the shredder (§2.10) writes a real Parquet file via `ParquetFileWriter`, the 585a reader (§2.2) reads it
+> back, and the test asserts value + null-structure identity. Because 585a is shipped, no synthesized-footer
+> harness is needed for the happy path — #873's own writer authors the depth-2/3 files that 585a reads. The
+> `internal` level-computation helpers (`EmitPath`/`ComputeXxxLevels`) also permit a **golden level-stream**
+> assertion (the write is the byte-exact inverse of §2.4). Same-typed-sibling nested leaves draw from
+> **disjoint value domains** so a positional mis-bind cannot pass on equal values (parity with §3.1/§3.2).
+
+**Happy-path write→read round-trips (one per shape family; present / null / empty at *every* level):**
+1. `Write_ArrayOfStruct_RoundTripsThrough585a` — `array<struct<a:int,b:string>>`: null list / empty list /
+   list with a null struct element / present struct with a null field — all distinguished on read-back.
+2. `Write_StructOfArray_RoundTrips` — `struct<xs:array<long>, name:string>`: null struct / present struct
+   with null array / empty array / present array with a null element.
+3. `Write_StructOfStruct_RoundTrips` — `struct<inner:struct<a:int,b:long>, c:string>`: nested null-struct
+   parity across two optional struct levels (no rep stream — pure-struct path, `rep: null`).
+4. `Write_MapOfStruct_RoundTrips` — `map<string, struct<a:int,b:long>>`: null map / empty map / entry with a
+   null value-struct / present value-struct with a null field.
+5. `Write_ArrayOfArray_RoundTrips` — `array<array<int>>`: the four-way null taxonomy over **two repeated
+   levels** (null outer / empty outer / outer-of-null-or-empty-inner / present with a null inner element).
+   **Asserts the emitted outer boundaries count inner-*list* occurrences, not inner leaf cells** (the §2.4 /
+   §2.10.4 trace).
+6. `Write_MapOfMap_RoundTrips` — `map<string, map<string,long>>`: canonical `key`/`value` names emitted at
+   **both** map levels (585a reads them back); entry with a null inner-map value.
+7. `Write_ArrayOfMap_RoundTrips` / `Write_MapOfArray_RoundTrips` — mixed repeated nesting; **exercises the
+   key/value decouple** (§2.10.5): the value/element leaf stream is longer than the key/entry stream.
+
+**Depth-3 (recursion, not special-casing):**
+8. `Write_ArrayOfStructOfArray_RoundTrips` — `array<struct<xs:array<int>>>`: three-level def/rep emission.
+9. `Write_MapOfStructOfMap_RoundTrips` — `map<string, struct<m:map<string,long>>>`.
+
+**Golden level-stream (write is the exact inverse of §2.4) — one per repeated-shape family (M1 hardening):**
+10. `Write_ArrayOfArray_EmitsExactDremelStream` — for the §2.4 4-row fixture, assert the emitted leaf
+    `(rep, def)` slot stream equals `(0,0)(0,1)(0,2)(1,3)(0,5)(2,4)(1,5)` **byte-for-byte** (the §2.10.4
+    table) via the `internal` `EmitPath` helper — the cell that fails if the outer level miscounts inner-list
+    occurrences OR if the rewritten `NestedLevelGuard` (§2.10.3) false-rejects slot `(1,3)`.
+10a. `Write_ArrayOfStruct_EmitsExactDremelStream` — **struct-nested golden** (M1): for `array<struct<a:int>>`
+    over `null` / `[]` / `[null]` / `[{a:7},{a:null}]`, assert the leaf-`a` `(rep, def)` stream byte-for-byte
+    (leaf `MaxDef 4`, `MaxRep 1`; struct-null element → `def 2`, present-null-field → `def 3`, present →
+    `def 4`) — pins the struct-optional-group def increment (§2.10.2) and that the guard admits a
+    struct-null element at list position ≥ 1.
+10b. `Write_MapValueArray_EmitsExactDremelStream` — **map-nested golden** (M1): for `map<string,array<long>>`,
+    assert BOTH the `key` stream (`MaxRep 1`, `def ∈ {0,1,2}`) AND the `value.element` stream (`MaxRep 2`,
+    `def ∈ {0..5}`) byte-for-byte over an entry whose inner value-list is empty at entry ≥ 1 — pins the
+    key/value **decouple** (§2.10.5, unequal-length streams) and that the guard admits the shallower-level
+    empty value-list.
+
+**Value / temporal / decimal leaves at depth (allowlist parity per leaf):**
+11. `Write_NestedLeaves_AllScalarTypes_RoundTrip` — a depth-2 struct/array/map carrying date, timestamp,
+    timestamp_ntz, decimal(≤28), binary, string, and each integral/float leaf; each leaf's physical type is
+    written and read back exactly (`CreateScalarField` reused per leaf).
+
+**Fail-closed cells (write door — each asserts the exact exception, all *before the first byte* via the N9
+pre-pass `ValidateColumnAsync`):**
+
+| # | Scenario | Expected |
+|---|---|---|
+| 12 | `Write_NestedLeaf_VoidType_FailsClosed` (`array<struct<x:void>>`) | `UnsupportedFeature` |
+| 13 | `Write_NestedLeaf_DecimalPrecision29_FailsClosed` (`map<string, struct<d:decimal(29,2)>>`) | `UnsupportedFeature` |
+| 14 | `Write_ZeroFieldStruct_AtDepth2_FailsClosed` (`array<struct<>>`) | `UnsupportedFeature` |
+| 15 | `Write_NonNullableNestedContainer_AtDepth_FailsClosed` (`array<struct<…>>`, `ContainsNull=false`; and a non-null map-value struct) | `UnsupportedFeature` — #730 parity at depth (§2.10.7 residual) |
+| 16 | `Write_RequiredNestedLeaf_HoldsNull_AtDepth_FailsClosed` (`array<struct<a:int NOT NULL>>` with a null `a`) | `CorruptData` — required-lane guard fires at depth |
+| 17 | `Write_NullMapKey_AtDepth_FailsClosed` (`array<map<string,long>>` with a null inner-map key) / `Write_RequiredMapValueNull_AtDepth` | `CorruptData` |
+| 18 | `Write_IdModeNestedWithinNested_FailsClosed_RepointedTo866` (id-mode `array<struct<…>>`) | `UnsupportedFeature`, message referencing **#866** (not #585) — id-mode boundary (§2.10.8) |
+| 19 | `Write_SchemaDeeperThanMaxNestedWriteDepth_FailsClosed` (`array<array<…>>` chain past depth 64) | `UnsupportedFeature`, rejected **before any byte** (pre-pass depth guard) |
+| 20 | `Write_ForeignNestedVector_FailsClosed` (a non-DeltaSharp managed vector at a nested level) | `UnsupportedFeature` (bounded KIND, no raw library text) |
+| 27 | `Write_NestedMapKey_FailsClosed_AtEveryDepth` (`map<array<int>,string>`, `map<struct<a:int>,string>`, and a nested-key map buried at depth 2, e.g. `array<map<array<int>,string>>`) | `UnsupportedFeature` — **nested map KEY not physically writable** (§2.10.6/§2.10.7 D5): Parquet.Net emits the key node OPTIONAL, which the 585a `EnsureRequiredMapKey` rejects → the file would be permanently unreadable; refused at the write door. Asserts a **scalar**-key map (`map<string,array<int>>`) is unaffected (companion success). *Also add the synthesized-footer read cell `ReadPromote_NestedMapKey_Unreadable_FailsClosed`: a hand-authored file with an OPTIONAL nested key is rejected by 585a `EnsureRequiredMapKey` (`SchemaMismatch`) — the read-side proof that motivates the write reject.* |
+| 28 | `Write_LevelGuard_InnermostPhantomContinuation_FailsClosed` (crafted `internal` `EmitPath`/`NestedLevelGuard` fixture for `array<array<int>>` continuing the **innermost** list past its own empty marker, e.g. `(0,3)(2,3)` — a `rep 2` after an empty inner list; and `(0,5)(2,4)(2,3)` — a `rep 2` at `def < presentDef_2`) | `CorruptData` — the per-level guard (§2.10.3) catches the **innermost** phantom via `ownerComplete[2]` (empty-inner variant) and via `def < presentDef_2` (present-inner variant); the **write dual of §3.2 cell 19**. Companion positive: the §2.4 golden slot `(rep 1, def 3)` (a new *shallower* occurrence with an empty inner list) **passes** (cell 10). |
+| 29 | `Write_LevelGuard_ShallowerPhantomContinuation_FailsClosed` (crafted `internal` fixture for `array<array<int>>` emitting a **shallower** phantom: a `rep 1` slot following a `def 0` NULL-outer marker — `(0,0)(1,2)` — and the companion `rep 1` after a `def 1` EMPTY-outer marker — `(0,1)(1,2)`) | `CorruptData`, thrown **before any byte** (N9 pre-pass) — the per-level guard catches the continuation into an outer list (level `R_1`) that opened null/empty, via `ownerComplete[1]`. **This is the cell the round-2 `rep == maxRep` gate FALSE-ACCEPTED** (red-team round-3 MISS); the shipped 585a `BuildRepeatedStructure` would otherwise reject the committed file on every read → permanently unreadable. **Cells 28 AND 29 together prove the per-level gate catches phantom continuations at BOTH the innermost (`R_k`) and a shallower (`R_1`) repeated level.** |
+
+**Regression / parity:**
+21. `Write_SingleLevelNested_ByteIdentical_After873` — the depth-1 write path
+    (`struct<scalars>` / `array<scalar>` / `map<scalar,scalar>`) writes **byte-identically** to pre-873 (the
+    recursion's base case == the old single-level `ComputeStructLevels`/`ListLevels`/`MapLevels` path);
+    includes the `map<scalar,scalar>` full-stream `ValidateMapParallelLevels` base case (§2.10.5).
+22. `Write_AtMaxNestedWriteDepth_RoundTrips_Success` — a legitimate nested chain at depth ==
+    `MaxNestedWriteDepth` (= 64) **writes and reads back** (value + null structure), pinning that the write
+    depth cap does **not** over-reject a schema `DeltaWriteSchemaEligibility` admits (read-after-write parity,
+    §2.10.7). SUCCESS companion to cell 19.
+23. `Write_NestedSlotBudget_SplitsAcrossRowGroups_AtDepth` — a deep/wide nested column whose recursive slot
+    count exceeds one row group is **split** (not rented past the addressable ceiling), pinning the §2.10.7
+    recursive `RowSlots`/`CheckSlotBound` generalization.
+
+**Composition oracles (585a decode + 585b widening + footer reconciliation):**
+24. `Write_ThenWidenAppend_585bReadPromotes` — write `array<array<int>>` via #873, widen-append to
+    `array<array<long>>` (585b enforcer), then read-promote via 585b; asserts value promotion + null-structure
+    preservation across the widen (writes narrow, reads wide — the three increments compose).
+25. `Write_NestedWithinNested_FooterRowCountReconciles` — the post-write footer `NumRows` reconciliation
+    (`ParquetFileWriter.cs` §2.4b) holds for a nested-within-nested column (a dropped/duplicated deep slot is
+    caught by the row-count reconcile, not just the type door).
+
+**Interop (cross-engine read oracle — the ONLY proof the physical names/annotations are canonical, not merely
+self-consistent with our own reader):**
+26. `Write_NestedWithinNested_ReadableBySparkAndDeltaRs` — a #873-written file is read back by **Apache Spark**
+    and **delta-rs** to the original values. **REQUIRED (non-optional) gate for at least one array, one map,
+    and one struct shape** — `array<struct<a:int,b:string>>`, `map<string,array<long>>`, and
+    `struct<xs:array<int>,name:string>` — because the canonical 3-level LIST/MAP structure, the
+    `element`/`key_value`/`key`/`value` child names, and the OPTIONAL/REQUIRED (repetition) annotations are
+    an **external** contract that our own 585a reader (which we also authored) cannot independently prove; a
+    self-consistent-but-non-canonical layout would round-trip through 585a yet be unreadable by Spark/delta-rs.
+    Deeper mixes (depth-3, `map<map>`, `array<map>`) remain CI-gated follow-up. Unblocks #713's footer-artifact
+    object-arm tests (currently helper-only).
+
+**AC → killing-cell oracle (every #873 acceptance criterion maps to ≥ 1 cell):**
+
+| #873 Acceptance criterion | Killing cell(s) | Mechanism |
+|---|---|---|
+| AC1 — writes a real Parquet file for `array<struct>` / `map<string,array>` / `array<array>` / `struct<struct>` (+ mixed) with correct nested def/rep | 1–9, 10, 10a, 10b | write→read round-trip + golden level-stream (array/struct/map) |
+| AC2 — 585a reads the written file back to the original values (null/empty/present at every level) | 1–11, 24 | round-trip through the shipped 585a reader |
+| AC3 — fail-closed parity preserved; recursion-depth bound honored on write | 12–20, 22, 23, 27, 28, 29 | pre-pass write-door rejects (incl. nested-map-key 27 + per-level level-guard phantom at innermost 28 AND shallower 29); at-bound success; slot-budget split |
+| AC4 — the three `#585` reject references lifted for supported shapes, re-pointed for residual (id-mode) | 1–9 (lifted), 18 (#866 re-point), 27 (nested-map-key stays closed) | name/none-mode recurse; id-mode → #866; nested map key → fail-closed |
+| AC5 — unblocks #713 recursive object-arm footer tests | 26 (REQUIRED array/map/struct interop), 25 | real writer authors the files #713 pinned helper-only; cross-engine canonical-layout proof |
+
 ---
 
 ## 4 · Performance
@@ -868,6 +1491,22 @@ construction — its observable effect is the validate-side lift R1 (cell 11's u
 - **Regression gate:** a depth-2 `array<struct<…>>` and `map<string,struct<…>>` decode micro-benchmark stays
   within the nested-decode noise floor; the single-level and flat paths are byte- and perf-unchanged
   (§3.1-23).
+
+**873 (WRITE).**
+- **Workload:** per-leaf recursive Dremel emission — O(total leaf cells + total structural slots) per column,
+  the same asymptotic cost as single-level nested write; the recursion adds one stack frame per container
+  node on the leaf's path (≤ `MaxNestedWriteDepth`), not per row. Struct / map fan-out re-walks shared
+  ancestors per leaf — identical to the single-level shredder's existing per-child re-walk, not a new cost
+  class.
+- **Two passes preserved:** the N9 pre-pass (`ValidateColumnAsync`) and the write pass each descend the
+  recursion once; the pre-pass touches no value and rents no value buffer (`CountingVisitor`), so the
+  fail-closed-before-first-byte guarantee costs one extra structural walk, unchanged from depth-1.
+- **Memory:** the recursive slot-ceiling charge (§2.10.7) sums every descendant leaf's declared slot
+  footprint before allocation; peak transient level-buffer memory is bounded by the (ceiling-checked)
+  declared footprint, and a wide/deep column is split across row groups (`PlanRowCount`) rather than rented
+  in one — a deep schema cannot amplify allocation beyond its declared cells.
+- **Regression gate:** depth-1 nested write is **byte-identical** (§3.3-21); a depth-2 `array<struct>` /
+  `map<string,array>` write micro-benchmark stays within the nested-write noise floor.
 
 ---
 
@@ -895,6 +1534,24 @@ construction — its observable effect is the validate-side lift R1 (cell 11's u
   self-consistent at one level but violates a deeper invariant fails closed `CorruptData` at that level.
 - **Supply-chain:** no new dependencies; reuses Parquet.Net 6.1.0 raw-level reads.
 
+**873 (WRITE) — the write door is symmetric to the read door.**
+- **Attacker/generator surface:** the declared write schema (from a caller-supplied `StructType`) and the
+  source `ColumnVector` tree are the influenced inputs. Every write-door guard is applied **recursively** at
+  each depth (§2.10.7): the leaf scalar allowlist (void / decimal&gt;28 / unmapped), the zero-field-struct
+  reject, the non-nullable-container reject (#730 parity), the leaf-repetition↔nullability assertion, the
+  required-lane null guards, and the foreign-vector boundary. All fire in the **N9 pre-pass** — *before*
+  `ParquetWriter.CreateAsync` publishes a single byte — so a rejected column never leaves a partial file.
+- **Recursion-depth DoS bound (`MaxNestedWriteDepth`, §2.10.7):** a maliciously deep declared schema fails
+  closed `UnsupportedFeature` at the pre-pass, **before** any allocation or descent — never a
+  `StackOverflowException`. Fixed to **64 = the read cap = the commit cap**, so no read-after-write parity
+  gap: every table #873 writes is a schema 585a reads.
+- **No id/field-id smuggling:** #873 is **name/none-mode only** (§2.10.8) — it emits a field_id-free physical
+  file bound by physical name; an id-mode nested-within-nested schema fails closed (re-pointed to #866),
+  so #873 mints no id-mode unreadable surface.
+- **Diagnostic hygiene:** every reject echoes only the sanitized column label (`DiagnosticText.Sanitize`) and
+  bounded type **kinds** (`DiagnosticText.DescribeType`) — never a foreign nested child name and never
+  vector bytes — the existing #683/#686 discipline, applied at every recursion level.
+
 ---
 
 ## 6 · Threat Model
@@ -917,6 +1574,11 @@ graph LR
 | **Tampering** (585b) | forged `delta.typeChanges` / malformed `fieldPath` chain in a foreign log | a crafted `fieldPath` (unknown token, wrong depth, cross-family `fromType→toType`) drives a bogus read-promote or an unreadable table | `fieldPath` is **advisory metadata**, never a decode key — the reader promotes by comparing the **actual file physical type** to the requested schema through `IsSanctionedWidening`, so a forged `fieldPath` cannot force a non-sanctioned promotion; a non-sanctioned `fromType→toType` fails closed `SchemaMismatch`. On append the enforcer only ever **emits** the chain from its own merge, never trusts an inbound one |
 | **Elevation** | unsupported scalar smuggled into a deep leaf | `void`/`decimal>28`/unmapped decodes | recursive scalar allowlist (`CreateScalarField`) at every leaf → `UnsupportedFeature` |
 | **Info disclosure** | fail-closed message on a nested request | raw foreign nested names / fieldPath recursed into `SimpleString` | bounded `DescribeType` + sanitized paths at every level (#683/#686/#705); the emitted `fieldPath` is composed only from the fixed `element`/`key`/`value` tokens (no foreign name) |
+| **DoS** (873 WRITE) | maliciously deep declared **write** schema / wide nested vector | unbounded shredder/schema recursion → stack exhaustion; slot fan-out → allocation blow-up | `MaxNestedWriteDepth` (= 64) checked at each `EmitPath`/`CreateNestedNode` entry before descent; upstream `DeltaWriteSchemaEligibility.MaxDepth`; recursive slot-ceiling charge over all descendant leaves + row-group split before allocation (§2.10.7) → `UnsupportedFeature` |
+| **Tampering** (873 WRITE) | a source vector holding a null in a `REQUIRED` leaf / null map key at depth | a silently-mislabelled null commits a file the reader mis-reads as a null container | recursive required-lane guards (`EmitPath` LEAF-required arm) fire at every depth in the N9 pre-pass, before any byte → `CorruptData` |
+| **Tampering** (873 WRITE) | a declared-`REQUIRED` nested **container** at depth | Parquet emits it OPTIONAL → footer↔log divergence (#730) at depth | recursive non-nullable-container reject (parity with the top-level `:116` reject) → `UnsupportedFeature` |
+| **Elevation** (873 WRITE) | id-mode nested-within-nested schema | an unstamped interior leaf commits a permanently-unreadable file | #873 is name/none-mode only; id-mode nested-within-nested fails closed, re-pointed to #866 (§2.10.8) → `UnsupportedFeature` |
+| **Tampering** (873 WRITE, D5) | a `map<array/struct/map<…>,*>` (nested map KEY) | Parquet.Net emits the key group OPTIONAL → `Key.MaxDef > Map.MaxDef` → a **permanently-unreadable** file (585a `EnsureRequiredMapKey` rejects it on every future read) | nested-map-key fail-closed at `CreateNestedField`/`CreateNestedNode` before construction (§2.10.6/§2.10.7) → `UnsupportedFeature`; a scalar map key is unaffected (already `REQUIRED`) |
 
 **Residual (585a + 585b):** nested-leaf **widening** is now enabled by 585b under the **unchanged** allowlist
 (`IsSanctionedWidening` read / `IsSchemaEvolutionWidening` append) at any name-mode depth; the residual is the
@@ -943,9 +1605,17 @@ nested nullability per #570; foreign legacy-shaped lists readable) propagate rec
   existing eager-decode-ceiling accounting, extended over descendants.
 - **Correlation:** rejections surface under the existing table-path/version fields on the read activity.
 
+**873 (WRITE).**
+- **Logging:** write-door rejections surface via the same sanitized `DeltaStorageException` path with the
+  sanitized column label + bounded type kind; no new happy-path log site (nested write is a hot path). The
+  post-write footer `NumRows` reconciliation (§2.4b, generalized to nested-within-nested) is the existing
+  correctness alarm — a slot/level defect that silently loses or duplicates a deep row surfaces there.
+- **Metrics:** none new — nested write reuses the existing per-column budget accounting; the recursive
+  slot-ceiling charge is the existing eager-ceiling logic extended over descendant leaves.
+
 ---
 
-## 8 · Rollout & Risk
+## 8 · Rollout &amp; Risk
 
 **Sequencing (the decomposition, made operational):**
 
@@ -1000,6 +1670,63 @@ nested nullability per #570; foreign legacy-shaped lists readable) propagate rec
   retaining the `&& byFieldId is null` conjunct in R2–R4 and the hardcoded `promoteLeaf: false` at every
   id-mode site (§2.5 PRESERVED contract; §3.2-18).
 
+**873 (WRITE) sequencing.** 873 is **BUILD-READY now** off `origin/main` @ `ef35daf` — it depends only on the
+shipped 585a **read** (the round-trip oracle) and the merged #834/#842 single-level **write** path it
+generalizes. It lifts the three `#585` write rejects for **name/none-mode** nested-within-nested shapes and
+adds `MaxNestedWriteDepth`. Ships **independently** of 585b (widening is orthogonal — §2.10.9). **Kill-switch:**
+a defect → reinstate the `CreateNestedLeaf`/`CreateStructChildLeaf` schema rejects (`:197`/`:241`) and the
+shredder `ExpectLeaf` reject (`:1532`) (revert to single-level write scope); tables already written are
+unaffected on **read** (585a reads them regardless). Existing single-level and flat writes are
+byte/behaviour-unchanged (§3.3-21).
+
+**873 (WRITE) risk register:**
+- (h) recursive mis-emit at depth → **wrong data on disk** — mitigated by the write→read round-trip oracle
+  through the shipped 585a reader (§3.3-1…9), the golden level-stream cell (§3.3-10, the byte-exact inverse of
+  §2.4), and the depth-1 byte-identical regression (§3.3-21).
+- (h′) **`map<*,nested>` key/value decouple** → the single-level equal-length parity assumption breaks
+  (§2.10.9-D2); a naïve reject-lift would mis-pair or throw on valid data. Mitigated by the decoupled
+  per-subtree emission + entry-level self-check (§2.10.5) and cells §3.3-7 (mixed) / §3.3-4/6 (map value/inner
+  map).
+- (i) deep-schema / wide-vector DoS on write → stack/alloc exhaustion — `MaxNestedWriteDepth` (= 64) + the
+  recursive slot-ceiling + row-group split (§2.10.7); §3.3-19 (reject) / §3.3-22 (at-bound success) /
+  §3.3-23 (split).
+- (i′) **read-after-write parity gap** → a write cap **above** the read cap would mint an unreadable table —
+  prevented by fixing `MaxNestedWriteDepth = MaxNestedReadDepth = DeltaWriteSchemaEligibility.MaxDepth = 64`
+  (§2.10.7); §3.3-22 guards against a regression.
+- (j) planner slot undercount at depth → a row group rented past the ceiling / a lost-or-duplicated deep row
+  — mitigated by the recursive `RowSlots` generalization (§2.10.7, D4) + the footer `NumRows` reconciliation
+  (§3.3-25).
+- (k) id-mode nested-within-nested accidentally written unstamped → permanently-unreadable file — prevented by
+  the explicit id-mode fail-closed re-pointed to #866 (§2.10.8); §3.3-18.
+- (l) non-nullable nested container silently written OPTIONAL → footer↔log divergence (#730) — prevented by
+  the recursive non-nullable-container reject (§2.10.7 residual); §3.3-15.
+- (m) **BLOCKING (D5) — nested map KEY written as an OPTIONAL group → permanently-unreadable file** (the 585a
+  `EnsureRequiredMapKey` rejects `Key.MaxDef > Map.MaxDef`). Prevented by the dedicated nested-map-key
+  fail-closed at `CreateNestedField`/`CreateNestedNode` (§2.10.6/§2.10.7); §3.3-27 (write reject +
+  synthesized-footer read reject). A scalar key is unaffected.
+- (n) **BLOCKING (D6) — the `NestedLevelGuard.Validate` structural guard mis-handles depth ≥ 2 both ways**:
+  as shipped it **false-rejects** valid streams (the golden `(1,3)` slot; struct-null element at list pos ≥ 1;
+  empty inner value-list at entry ≥ 1 — killing cells 1/2/4/5/7/8/9/10/22), and the round-2 `rep == maxRep`
+  gate **false-accepts** a shallower phantom (`(0,0)(1,2)`) that mints a permanently-unreadable file. Prevented
+  by rewriting the guard as a **faithful per-level dual** of `BuildRepeatedStructure` (§2.10.3): track
+  `ownerComplete[1..k]` per level, fire the continuation reject (`ownerComplete[r] || def < presentDef_r`) at
+  **every** level `r = 1…k` (no `maxRep` gate), receive the `R_1…R_k` chain (signature change). §3.3-10/10a/10b
+  (golden streams pass) + §3.3-28 (innermost phantom caught) + §3.3-29 (shallower phantom caught) + §3.3-21
+  (single-level byte-identical).
+
+**Launch checklist (873 WRITE):** schema-builder recursion (`CreateNestedField`/`CreateNestedNode`, **incl.
+nested-map-key fail-close**) + shredder recursion (`EmitPath` + decoupled map key/value + recursive slot count
++ **per-level `NestedLevelGuard.Validate` rewrite (signature change → `R_1…R_k` chain)**) + the three `#585`
+reject lifts (`:197`/`:241`/`:1532`) + `MaxNestedWriteDepth`; write→read round-trip suite (§3.3-1…11) green on
+both TFMs; the three golden level-stream cells (§3.3-10/10a/10b — array/struct/map) green; the depth-1
+byte-identical regression (§3.3-21) green; the at-bound success (§3.3-22) + slot-split (§3.3-23) green; the
+nested-map-key fail-close (§3.3-27) + the per-level level-guard phantom-continuation cells at BOTH the
+innermost (§3.3-28) AND a shallower level (§3.3-29) green; the REQUIRED array/map/struct cross-engine interop
+(§3.3-26) green; the id-mode #866 re-point cell (§3.3-18) green; the 585b compose cell (§3.3-24) green;
+`dotnet format`; determinism ban; DCO; RFL PASS; **every
+`ParquetTypeMapping.cs`/`NestedColumnShredder.cs`/`NestedLevelGuard.cs` line-ref re-verified against the
+worktree** before editing (the schema builder is the first-firing gate — §2.10.9-D1).
+
 **Launch checklist (585a):** unit + integration (§3.1) green on both TFMs; `dotnet format`; determinism ban;
 DCO; RFL PASS; the single-level byte-identical regression (§3.1-23) green. *(585a shipped, PR #856.)*
 
@@ -1029,7 +1756,7 @@ RFL PASS; **every §2.5/§10 line-ref re-verified against the worktree** (the SP
    change, **not** "unchanged code."
 3. **Recursion-depth bound value — RESOLVED (D3): `MaxNestedReadDepth = 64` (= the write cap).** The verified
    upstream caps (§2.6/§5) are: the **write** caps `ParquetTypeMapping.MaxFooterTypeDepth = 64`
-   (`ParquetTypeMapping.cs:765`) and `DeltaWriteSchemaEligibility.MaxDepth = 64`
+   (`ParquetTypeMapping.cs:864`) and `DeltaWriteSchemaEligibility.MaxDepth = 64`
    (`DeltaWriteSchemaEligibility.cs:60`); and the log-parse serialization cap `SchemaJson.MaxDepth = 64` JSON
    containers (`SchemaJson.cs:50`) which admits ~21 struct levels (3 JSON containers/struct) but ~64
    array/map levels (1 container each). The read cap **must be ≥ the write cap** so a schema DeltaSharp can
@@ -1074,6 +1801,73 @@ RFL PASS; **every §2.5/§10 line-ref re-verified against the worktree** (the SP
    never commits it, so the shape only arises via external migration, where the reader tolerating it is
    defense-in-depth, never unreadable-table minting. Deep pure-struct-scalar append-apply is a separate,
    distinctly-tracked concern.
+
+**873 (WRITE) decisions:**
+
+10. **Write recursion structure — RESOLVED (§2.10.3): per-leaf `EmitPath` recursion, the byte-exact inverse
+    of 585a decode.** Keep the current one-leaf-at-a-time write spine (`WriteLeafAsync` →
+    `WriteAllPartsAsync<T>`) and generalize the level computation + value navigation to a recursive walk of
+    the leaf's full schema path, threading `(defBase, entryRep, parentRep)` per the §2.10.2 increment model.
+    Struct/map fan-out re-walks shared ancestors per leaf (identical to the current per-child re-walk). The
+    §2.4 `array<array<int>>` trace, read bottom-up, is the level stream the writer must emit — the write→read
+    round-trip through the shipped 585a reader is the oracle (§3.3).
+11. **Write depth bound — RESOLVED (§2.10.7): `MaxNestedWriteDepth = 64` = read cap = commit cap.** Checked at
+    each `EmitPath`/`CreateNestedNode` entry before descent → `UnsupportedFeature`, never a
+    `StackOverflowException`. Equal (not below) the read/commit caps guarantees read-after-write parity (every
+    table #873 writes is a schema 585a reads).
+12. **Column-mapping mode scope — RESOLVED (§2.10.8): name/none-mode ONLY; id-mode deferred to #866.** A
+    name/none-mode nested-within-nested file is field_id-free and round-trips via the 585a name-binding
+    reader. Id-mode nested-within-nested (recursive interior `field_id`/physical-name assignment + an id-mode
+    reader) is [#866](https://github.com/khaines/deltasharp/issues/866) <!-- issue-state:open -->'s scope;
+    #873 fails it closed at the write door, re-pointed to #866. Single-level id-mode write (#676/#839) is
+    unchanged.
+13. **`map<*,nested>` — RESOLVED (§2.10.5): decouple key/value emission.** The single-level equal-length
+    key/value parity assumption (`ComputeMapLevels`/`ValidateMapParallelLevels`) does **not** hold when the
+    value (or key) side is itself a container. Compute the map entry structure once, drive both subtrees from
+    it, and replace the full-stream parity check with an **entry-level** self-check for nested maps; retain
+    the full-stream check unchanged for `map<scalar,scalar>`.
+14. **Reject-site lift ordering — RESOLVED (§2.10.9-D1): the schema builder is the first-firing gate.**
+    `CreateNestedField` (`:197`/`:241`) rejects at schema construction *before* the shredder runs, so the
+    shredder `ExpectLeaf` reject (`:1532`) is an unreachable backstop today. Lift the schema builder first (so
+    nested group nodes reach the shredder), then make the shredder recurse. Both lifted together.
+15. **Non-nullable nested container — RESOLVED (§2.10.7 residual, D-open): stays refused (#730) at every
+    depth.** Parquet.Net emits every group OPTIONAL; a declared-`REQUIRED` nested container cannot be honored
+    without a footer↔log divergence. Parity with the existing top-level `!field.Nullable` reject. **Open
+    follow-up:** if Parquet.Net later exposes a group-node repetition setter, this reject (top-level and
+    nested) can be lifted together — tracked with the existing #730 residual, not #873.
+16. **Interop coverage depth — RESOLVED (round-2 M1, §3.3-26).** The write→read oracle through our *own* 585a
+    reader cannot prove the physical layout is **canonical** (a self-consistent-but-non-canonical layout would
+    round-trip through 585a yet fail Spark/delta-rs). The cross-engine interop cell is therefore **REQUIRED
+    (non-optional)** for at least one **array**, one **map**, and one **struct** shape
+    (`array<struct<…>>`, `map<string,array<…>>`, `struct<xs:array<…>>`) — proving the canonical 3-level
+    LIST/MAP structure, the `element`/`key_value`/`key`/`value` names, and the OPTIONAL/REQUIRED annotations.
+    Deeper mixes (depth-3, `map<map>`, `array<map>`) remain CI-gated follow-up.
+17. **Nested map KEY — RESOLVED (round-2 BLOCKING/D5, §2.10.6/§2.10.7): FAIL CLOSED at every depth.** A
+    `map<array<…>,*>` / `map<struct<…>,*>` / `map<map<…>,*>` is a constructible `MapType`, but Parquet.Net
+    6.1.0 emits every group node OPTIONAL, so a nested key would carry `Key.MaxDef > Map.MaxDef`, which the
+    shipped 585a `EnsureRequiredMapKey` (`NestedParquetColumnReader.cs:1742`) rejects — the file would be
+    permanently unreadable. #873 refuses it at `CreateNestedField`/`CreateNestedNode` before construction (a
+    scalar map key is unaffected — already `REQUIRED`). The original §2.10.6 "the map key stays REQUIRED" was
+    corrected; §2.5/§3.2's `key.element` (`map<array<…>,…>`) widening cell is downgraded to **schema-merge-only**
+    (no data round-trip); `element.key` (scalar key) is unaffected. **Follow-up:** `DeltaWriteSchemaEligibility`
+    could reject a nested-map-key schema up-front so the column is never committed (currently the write-door
+    reject fires on the first data write) — a hardening follow-up, out of #873's data-path scope.
+18. **Writer-side structural level guard — RESOLVED (round-2 BLOCKING/D6, **corrected round-3**, §2.10.3):
+    REWRITE `NestedLevelGuard.Validate` as a FAITHFUL PER-LEVEL dual of `BuildRepeatedStructure`.** The shipped
+    guard carried the single-repeated-level assumption 585a had to rewrite out of the reader
+    (`def <= emptyContainerDef` for every `rep > 0`), which **false-rejects** valid depth-≥2 streams (the
+    §2.10.4 golden `(1,3)`; struct-null element / empty inner value-list at position ≥ 1). **The round-2
+    proposal to gate the reject to `rep == maxRep` (innermost-only) was itself a bug — it FALSE-ACCEPTS a
+    shallower phantom** `(0,0)(1,2)` (a `rep 1` continuation into a NULL outer list) that mints a
+    permanently-unreadable file. **Round-3 fix: remove the `rep == maxRep` simplification entirely.** Track
+    `ownerComplete[1..k]` per level and fire the continuation reject (`ownerComplete[r] || def < presentDef_r`)
+    at **EVERY** repeated level `r = 1…k`, keyed on each level's own footer-node markers — exactly the reader's
+    `ownerComplete || d < thisMaxDef` gate (`NestedParquetColumnReader.cs:1027-1035`). **Signature change**
+    (rec #2): the guard receives the ordered `R_1…R_k` chain (each `presentDef_j`/`parentPresentDef_j` read
+    from its own node — insufficient from `leaf.MaxDef`/`MaxRep` for interleaved shapes like
+    `array<struct<array>>`). Keep `rowOpenings == rowCount`. Single-level (`maxRep == 1`) byte-identical
+    (§3.3-21); phantom-continuations fail closed at the innermost (§3.3-28) **and** a shallower level
+    (§3.3-29). Added to the §2.10.3 algorithm AND the §2.10.7 fail-closed table.
 
 ---
 
@@ -1121,3 +1915,39 @@ RFL PASS; **every §2.5/§10 line-ref re-verified against the worktree** (the SP
   `MapColumnVector.cs` (`:87`), `NestedValidity.cs` — the recursion target ctors + length invariants.
   `src/DeltaSharp.Abstractions/SchemaJson.cs`: `MaxDepth = 64` (`:50`) — the upstream JSON depth cap.
 - Delta PROTOCOL.md "Type Change Metadata" — the `fieldPath` `element`/`key`/`value` token grammar (585b).
+- **873 (WRITE) code anchors (worktree `ef35daf` — RE-VERIFY before editing):**
+  `src/DeltaSharp.Storage/Parquet/ParquetTypeMapping.cs`: `CreateField` (`:88`), `CreateNestedField`
+  (`:99`, top-level container-nullability reject `:116`, **new nested-map-KEY reject** in the MapType arm),
+  `CreateStructChildLeaf` (`:191`, **#585 reject to LIFT/recurse `:197`**), `CreateNestedLeaf` (`:232`,
+  **#585 reject to LIFT/recurse `:241`**), zero-field struct reject (`:151`), `ArgumentException` wrapper
+  (`:167`), `CreateScalarField` (`:338`, the per-leaf allowlist reused verbatim at every depth),
+  `MaxFooterTypeDepth = 64` (`:864`), id-mode helpers `ResolveArrayElementId`/`ResolveMapInteriorIds`
+  (name/none path returns `null`; id-mode nested-within-nested → #866).
+  `src/DeltaSharp.Storage/Parquet/NestedColumnShredder.cs`: `WriteColumnAsync`/`ValidateColumnAsync` (`:272`/
+  `:293`), `ShredAsync` dispatch (`:302`), `WriteStructAsync` (`:369`) + `ComputeStructLevels` (`:506`),
+  `WriteListAsync` (`:560`) + `ComputeListLevels` (`:614`), `WriteMapAsync` (`:670`) + `ComputeMapLevels`
+  (`:754`) + `ValidateMapParallelLevels` (`:1438`, **replace with entry-level check for `map<*,nested>`**),
+  `WriteLeafAsync` (`:1146`) → `WriteAllPartsAsync<T>` (`:1359`), the `IValueSource` trio
+  `StructValueSource`/`ListValueSource`/`MapValueSource` (`:896`/`:922`/`:956`, **generalize to path-navigating**),
+  `PlanRowCount`/`RowSlots`/`SlotsForRow` (`:173`/`:245`/`:263`, **recurse for depth**),
+  `CountListSlots`/`CountMapSlots`/`CheckSlotBound` (`:825`/`:843`/`:861`), `EnsureLeafRepetition` (`:1514`),
+  `RunLevelGuard` (`:1165`/`:1371`) → **`NestedLevelGuard.Validate` (`NestedLevelGuard.cs:79`, REWRITE — the
+  write dual of `BuildRepeatedStructure`, §2.10.3; markers `ContainerMaxDefinitionLevel:178` /
+  `EmptyContainerDefinitionLevel:186`, un-gated continuation reject `:126`)**,
+  **shredder #585 reject to LIFT** `ExpectLeaf` (`:1529-1533`, secondary backstop — §2.10.9-D1),
+  `IsForeignVectorFault` (`:361`), `NestedLevelGuard.ContainerMaxDefinitionLevel` (`:412`/`:575`/`:687`).
+  `src/DeltaSharp.Storage/Parquet/NestedParquetColumnReader.cs`: `EnsureRequiredMapKey` (`:1742`) — the shipped
+  required-map-key invariant the nested-map-KEY write reject protects (§2.10.6).
+  `src/DeltaSharp.Storage/Parquet/ParquetFileWriter.cs`: the write orchestration — `CreateField` per column
+  (`:120`), nested `WriteColumnAsync` dispatch (`:226`), N9 pre-pass `ValidateColumnAsync` (`:344`), and the
+  §2.4b post-write footer `NumRows` reconciliation (generalizes to nested-within-nested).
+  `src/DeltaSharp.Storage/Delta/DeltaWriteSchemaEligibility.cs`: `MaxDepth = 64` (`:60`) — the commit-time
+  depth cap `MaxNestedWriteDepth` mirrors.
+  Companion: `docs/engineering/design/nested-parquet-write.md` (#834/#842 single-level write — the depth-1
+  level tables §2.3 #873 generalizes; §2.6 "Fail-closed boundary → #585" is the reject #873 lifts).
+  Issue [#873](https://github.com/khaines/deltasharp/issues/873) <!-- issue-state:open --> (this addendum);
+  boundary [#866](https://github.com/khaines/deltasharp/issues/866) <!-- issue-state:open --> (id-mode
+  nested-within-nested column mapping); unblocks
+  [#713](https://github.com/khaines/deltasharp/issues/713) <!-- issue-state:closed --> (footer artifact
+  object-arm tests). 585a decode PR #856 (the round-trip oracle); single-level write
+  [#841](https://github.com/khaines/deltasharp/issues/841) <!-- issue-state:closed -->.

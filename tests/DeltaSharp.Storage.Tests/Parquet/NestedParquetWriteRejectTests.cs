@@ -25,27 +25,12 @@ public sealed class NestedParquetWriteRejectTests
 
     public static TheoryData<string, DataType, bool> OutOfScopeShapes() => new()
     {
-        // Nested within nested — the #585 boundary, in all three container positions.
-        { "array-of-array", DataTypes.CreateArrayType(DataTypes.CreateArrayType(DataTypes.LongType)), true },
-        { "array-of-struct", DataTypes.CreateArrayType(
-            DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) })), true },
-        { "array-of-map", DataTypes.CreateArrayType(
-            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType)), true },
-        { "map-value-nested", DataTypes.CreateMapType(
-            DataTypes.StringType, DataTypes.CreateArrayType(DataTypes.LongType)), true },
+        // A map whose KEY is a container (#873 D5): a constructible MapType that is NOT physically writable —
+        // Parquet.Net emits the key node OPTIONAL, which the reader's EnsureRequiredMapKey rejects, so the file
+        // would be permanently unreadable. Refused at the write door at every depth.
         { "map-key-nested", DataTypes.CreateMapType(
             DataTypes.CreateStructType(new[] { new StructField("x", DataTypes.LongType) }),
             DataTypes.LongType), true },
-        { "struct-of-struct", DataTypes.CreateStructType(new[]
-        {
-            new StructField("x", DataTypes.LongType),
-            new StructField(
-                "y", DataTypes.CreateStructType(new[] { new StructField("z", DataTypes.LongType) })),
-        }), true },
-        { "struct-of-array", DataTypes.CreateStructType(new[]
-        {
-            new StructField("x", DataTypes.CreateArrayType(DataTypes.LongType)),
-        }), true },
 
         // A zero-field struct (§2.4a/NEW-5): Parquet.Net's own ctor raises a raw ArgumentException for it.
         { "zero-field-struct", DataTypes.CreateStructType(Array.Empty<StructField>()), true },
@@ -76,13 +61,17 @@ public sealed class NestedParquetWriteRejectTests
     public void CreateField_NestedShapeMessages_NeverEchoANestedFieldName()
     {
         // §2.8 diagnostic hygiene: the message identifies the offending child by ORDINAL and the offending
-        // type by KIND, so no foreign nested field name (and no recursive SimpleString) reaches a log.
+        // type by KIND, so no foreign nested field name (and no recursive SimpleString) reaches a log. #873
+        // lifted the #585 rejects, so this uses a still-rejected shape — a nested map KEY (#873 D5) buried
+        // under secret struct child names — to exercise the recursive schema builder's reject path.
         var type = DataTypes.CreateStructType(new[]
         {
             new StructField("harmless", DataTypes.LongType),
             new StructField(
                 "SECRET_CHILD_NAME",
-                DataTypes.CreateStructType(new[] { new StructField("DEEPER_SECRET", DataTypes.LongType) })),
+                DataTypes.CreateMapType(
+                    DataTypes.CreateStructType(new[] { new StructField("DEEPER_SECRET", DataTypes.LongType) }),
+                    DataTypes.LongType)),
         });
 
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(

@@ -270,6 +270,11 @@ public sealed class NestedParquetLevelStreamTests
             return rowGroup.ReadRawAsync<int>(field, new int[numValues], definitions, repetitions, default);
         }
 
+        if (clrType == typeof(long))
+        {
+            return rowGroup.ReadRawAsync<long>(field, new long[numValues], definitions, repetitions, default);
+        }
+
         if (clrType == typeof(string) || clrType == typeof(ReadOnlyMemory<char>))
         {
             return rowGroup.ReadRawAsync<ReadOnlyMemory<char>>(

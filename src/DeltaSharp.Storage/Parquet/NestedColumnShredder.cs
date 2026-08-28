@@ -186,10 +186,20 @@ internal static class NestedColumnShredder
         long maxSplitSlots = Math.Max(budgetBytes / splitBytesPerSlot, 1);
         int levelBytesPerSlot = LevelBufferBytesPerSlot(schemaField.DataType);
         long maxLevelSlots = Math.Max(budgetBytes / levelBytesPerSlot, 1);
-        if (schemaField.DataType is StructType)
+
+        // #873 D4 (§2.10.7): a nested-within-nested column's per-row leaf-slot contribution is the RECURSIVE
+        // sum over its leaf paths, not a single repeated level. Route it to the recursive planner so a wide /
+        // deep nested column is split across row groups (never rented past the ceiling), and a single
+        // unfittable row still fails closed.
+        PathStep[][]? deepPaths = IsNestedWithinNested(schemaField.DataType)
+            ? EnumerateSlotPaths(schemaField.DataType)
+            : null;
+
+        if (deepPaths is null && schemaField.DataType is StructType)
         {
-            // Exactly one slot per row, so the plan is a pure division — no vector walk needed. A struct
-            // never rejects (its per-row slot count is fixed at 1), so it packs on the folded SPLIT budget.
+            // Single-level struct: exactly one slot per row, so the plan is a pure division — no vector walk
+            // needed. A struct never rejects (its per-row slot count is fixed at 1), so it packs on the folded
+            // SPLIT budget.
             return (int)Math.Min(rowCount, maxSplitSlots);
         }
 
@@ -202,7 +212,9 @@ internal static class NestedColumnShredder
             {
                 for (int j = 0; j < segment.Length && row < rowCount; j++, row++)
                 {
-                    long rowSlots = RowSlots(schemaField.DataType, segment.Vector, segment.Start + j, label);
+                    long rowSlots = deepPaths is null
+                        ? RowSlots(schemaField.DataType, segment.Vector, segment.Start + j, label)
+                        : DeepRowSlots(deepPaths, segment.Vector, segment.Start + j, label);
 
                     // ACCEPTANCE (reject) is LEVEL-ONLY: a single row is only unwritable when its own level
                     // buffers alone cannot fit any row group (nothing left to split). The folded value width
@@ -262,6 +274,64 @@ internal static class NestedColumnShredder
     // here means the two counting paths cannot drift and over/under-plan a row group.
     private static int SlotsForRow(bool isNull, int length) => isNull || length == 0 ? 1 : length;
 
+    // #873 D4 (§2.10.7): the recursive per-row slot count for a nested-within-nested column — the SUM over all
+    // leaf paths of that leaf's recursive slot contribution for the row. Splitting a wide/deep column across
+    // row groups requires the true per-row cost, which a single-repeated-level count undercounts. The paths are
+    // derived from the DataType tree alone (the planner has no Parquet field), which is sufficient for a slot
+    // COUNT (offsets/null masks come off the vector).
+    private static long DeepRowSlots(PathStep[][] paths, ColumnVector vector, int row, string label)
+    {
+        long slots = 0;
+        foreach (PathStep[] path in paths)
+        {
+            slots = checked(slots + CountCell(path, 0, vector, row, label));
+        }
+
+        return slots;
+    }
+
+    private static PathStep[][] EnumerateSlotPaths(DataType type)
+    {
+        var into = new List<PathStep[]>();
+        CollectSlotPaths(type, new List<PathStep>(), into);
+        return into.ToArray();
+    }
+
+    private static void CollectSlotPaths(DataType type, List<PathStep> path, List<PathStep[]> into)
+    {
+        switch (type)
+        {
+            case StructType structType:
+                for (int i = 0; i < structType.Count; i++)
+                {
+                    path.Add(new PathStep(StepKind.Struct, i));
+                    CollectSlotPaths(structType[i].DataType, path, into);
+                    path.RemoveAt(path.Count - 1);
+                }
+
+                break;
+
+            case ArrayType array:
+                path.Add(new PathStep(StepKind.List, 0));
+                CollectSlotPaths(array.ElementType, path, into);
+                path.RemoveAt(path.Count - 1);
+                break;
+
+            case MapType map:
+                path.Add(new PathStep(StepKind.MapKey, 0));
+                CollectSlotPaths(map.KeyType, path, into);
+                path.RemoveAt(path.Count - 1);
+                path.Add(new PathStep(StepKind.MapValue, 0));
+                CollectSlotPaths(map.ValueType, path, into);
+                path.RemoveAt(path.Count - 1);
+                break;
+
+            default:
+                into.Add(path.ToArray());
+                break;
+        }
+    }
+
     /// <summary>
     /// Shreds <paramref name="schemaField"/>'s nested column over <paramref name="segments"/> and writes every
     /// leaf into <paramref name="rowGroup"/>.
@@ -314,6 +384,17 @@ internal static class NestedColumnShredder
         string label = DiagnosticText.Sanitize(schemaField.Name);
         try
         {
+            // #873 (§2.10): a nested-within-nested column (a container whose interior is itself a container)
+            // is shredded by the RECURSIVE per-leaf path emitter, which generalizes the single-level level
+            // computation + value navigation to a full root→leaf walk. A single-level column keeps the
+            // byte-identical single-level spine below (regression §3.3-21).
+            if (IsNestedWithinNested(schemaField.DataType))
+            {
+                await ShredDeepAsync(rowGroup, field, schemaField, segments, rowCount, budgetBytes, label, cancellationToken)
+                    .ConfigureAwait(false);
+                return;
+            }
+
             switch (schemaField.DataType)
             {
                 case StructType structType when field is PqStructField parquetStruct:
@@ -363,6 +444,611 @@ internal static class NestedColumnShredder
             or ArgumentException or NullReferenceException
         && ex is not DeltaStorageException
         && ex is not ObjectDisposedException;
+
+    // ===== #873 nested-within-nested recursive shredding (§2.10) =====
+
+    // A column is nested-within-nested when a node BELOW the top container is itself a container. The
+    // single-level spine handles everything else, byte-identically (regression §3.3-21).
+    private static bool IsNestedWithinNested(DataType type) => type switch
+    {
+        ArrayType array => array.ElementType is ArrayType or MapType or StructType,
+        MapType map => map.KeyType is ArrayType or MapType or StructType
+            || map.ValueType is ArrayType or MapType or StructType,
+        StructType structType => AnyChildIsContainer(structType),
+        _ => false,
+    };
+
+    private static bool AnyChildIsContainer(StructType structType)
+    {
+        for (int i = 0; i < structType.Count; i++)
+        {
+            if (structType[i].DataType is ArrayType or MapType or StructType)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // One container step on a leaf's schema path, root→leaf (design §2.10.3). A struct step carries the child
+    // ordinal; list/map steps carry none.
+    private enum StepKind
+    {
+        Struct,
+        List,
+        MapKey,
+        MapValue,
+    }
+
+    private readonly record struct PathStep(StepKind Kind, int StructOrdinal);
+
+    // A fully-resolved shred plan for one leaf of a nested-within-nested column: its ordered container path,
+    // the schema-attached Parquet leaf (for the guard bounds + the physical write), the leaf's scalar type +
+    // declared nullability, and the ordered repeated-ancestor chain R_1…R_k (each level's markers read from
+    // its OWN footer node — §2.10.3).
+    private sealed class LeafPlan
+    {
+        public required PathStep[] Path { get; init; }
+
+        public required DataField ParquetLeaf { get; init; }
+
+        public required DataType LeafType { get; init; }
+
+        public required bool LeafNullable { get; init; }
+
+        public required RepeatedLevel[] Chain { get; init; }
+
+        public required string Context { get; init; }
+
+        public bool LeafRequired => !LeafNullable;
+
+        public bool HasRep => Chain.Length > 0;
+    }
+
+    // §2.10.3: shreds a nested-within-nested column one leaf at a time, each via the recursive per-leaf level
+    // emitter + a path-navigating value source. Every leaf's stream is independently generated from the trusted
+    // #570 vector tree, so a map's key and value subtrees agree at the entry level BY CONSTRUCTION (they share
+    // the MAP frame — §2.10.5), and the per-leaf NestedLevelGuard runs on each leaf against its own R-chain.
+    private static async Task ShredDeepAsync(
+        ParquetRowGroupWriter? rowGroup,
+        Field field,
+        StructField schemaField,
+        IReadOnlyList<ColumnSegment> segments,
+        int rowCount,
+        long budgetBytes,
+        string label,
+        CancellationToken cancellationToken)
+    {
+        var leaves = new List<LeafPlan>();
+        EnumerateLeaves(
+            schemaField.DataType, schemaField.Nullable, field, new List<PathStep>(),
+            new List<RepeatedLevel>(), parentPresentDef: 0, label, leaves);
+
+        foreach (LeafPlan leaf in leaves)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // §2.10.7 depth backstop (schema construction already enforced it; defense in depth before any
+            // per-leaf allocation).
+            if (leaf.Path.Length + 1 > ParquetTypeMapping.MaxNestedWriteDepth)
+            {
+                throw DeltaStorageException.UnsupportedFeature(
+                    $"Parquet nested write for column '{label}': the schema nests deeper than the supported "
+                    + $"write limit of {ParquetTypeMapping.MaxNestedWriteDepth} type levels.");
+            }
+
+            // #730 per-leaf: the mapped Parquet leaf's repetition must equal the declared nullability at every
+            // depth.
+            EnsureLeafRepetition(leaf.ParquetLeaf, leaf.LeafNullable, label, leaf.Context);
+
+            int bytesPerSlot = (leaf.HasRep ? 2 : 1) * sizeof(int);
+            long rawSlots = CountLeafSlots(leaf.Path, segments, label);
+            int slots = CheckSlotBound(rawSlots, label, Math.Max(bytesPerSlot, sizeof(int)), budgetBytes);
+
+            int[] def = ArrayPool<int>.Shared.Rent(Math.Max(slots, 1));
+            int[] rep = leaf.HasRep ? ArrayPool<int>.Shared.Rent(Math.Max(slots, 1)) : Array.Empty<int>();
+            try
+            {
+                int slot = 0;
+                foreach (ColumnSegment segment in segments)
+                {
+                    for (int j = 0; j < segment.Length; j++)
+                    {
+                        EmitLeafLevels(
+                            leaf, stepIndex: 0, segment.Vector, segment.Start + j, entryRep: 0,
+                            defBase: 0, parentRep: 0, label, def, rep, ref slot);
+                    }
+                }
+
+                if (slot != slots)
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{label}': the recursive shredder emitted {slot} level slot(s) but the "
+                        + $"vector tree describes {slots}.");
+                }
+
+                var source = new PathValueSource(leaf.Path, segments);
+                ReadOnlyMemory<int>? repArg;
+                if (leaf.HasRep)
+                {
+                    repArg = rep.AsMemory(0, slots);
+                }
+                else
+                {
+                    repArg = null;
+                }
+
+                await WriteLeafAsync(
+                    rowGroup, leaf.ParquetLeaf, leaf.LeafType, def.AsMemory(0, slots),
+                    repArg, rowCount, label, source, cancellationToken,
+                    leaf.Chain).ConfigureAwait(false);
+            }
+            finally
+            {
+                ArrayPool<int>.Shared.Return(def, clearArray: true);
+                if (leaf.HasRep)
+                {
+                    ArrayPool<int>.Shared.Return(rep, clearArray: true);
+                }
+            }
+        }
+    }
+
+    // Walks the (DeltaSharp DataType, Parquet Field) trees in parallel, emitting one LeafPlan per leaf. Each
+    // list/map node contributes a repeated level to the chain, read from its OWN footer node
+    // (MaxRepetitionLevel/MaxDefinitionLevel) with the immediate parent container node's MaxDefinitionLevel as
+    // parentPresentDef — the interleave-correct markers the per-level guard needs (§2.10.3). `parentPresentDef`
+    // is the MaxDefinitionLevel of the nearest enclosing group node (0 at the top).
+    private static void EnumerateLeaves(
+        DataType type,
+        bool nullable,
+        Field pqField,
+        List<PathStep> path,
+        List<RepeatedLevel> chain,
+        int parentPresentDef,
+        string label,
+        List<LeafPlan> into)
+    {
+        switch (type)
+        {
+            case StructType structType:
+                {
+                    PqStructField ps = ExpectParquetStruct(pqField, label);
+                    for (int i = 0; i < structType.Count; i++)
+                    {
+                        StructField child = structType[i];
+                        path.Add(new PathStep(StepKind.Struct, i));
+                        EnumerateLeaves(
+                            child.DataType, child.Nullable, ps.Fields[i], path, chain, ps.MaxDefinitionLevel,
+                            label, into);
+                        path.RemoveAt(path.Count - 1);
+                    }
+
+                    break;
+                }
+
+            case ArrayType array:
+                {
+                    PqListField pl = ExpectParquetList(pqField, label);
+                    var level = new RepeatedLevel(pl.MaxRepetitionLevel, pl.MaxDefinitionLevel, parentPresentDef);
+                    path.Add(new PathStep(StepKind.List, 0));
+                    chain.Add(level);
+                    EnumerateLeaves(
+                        array.ElementType, array.ContainsNull, pl.Item, path, chain, pl.MaxDefinitionLevel,
+                        label, into);
+                    chain.RemoveAt(chain.Count - 1);
+                    path.RemoveAt(path.Count - 1);
+                    break;
+                }
+
+            case MapType map:
+                {
+                    PqMapField pm = ExpectParquetMap(pqField, label);
+                    var level = new RepeatedLevel(pm.MaxRepetitionLevel, pm.MaxDefinitionLevel, parentPresentDef);
+
+                    path.Add(new PathStep(StepKind.MapKey, 0));
+                    chain.Add(level);
+                    EnumerateLeaves(
+                        map.KeyType, nullable: false, pm.Key, path, chain, pm.MaxDefinitionLevel, label, into);
+                    chain.RemoveAt(chain.Count - 1);
+                    path.RemoveAt(path.Count - 1);
+
+                    path.Add(new PathStep(StepKind.MapValue, 0));
+                    chain.Add(level);
+                    EnumerateLeaves(
+                        map.ValueType, map.ValueContainsNull, pm.Value, path, chain, pm.MaxDefinitionLevel,
+                        label, into);
+                    chain.RemoveAt(chain.Count - 1);
+                    path.RemoveAt(path.Count - 1);
+                    break;
+                }
+
+            default:
+                {
+                    DataField leaf = ExpectLeaf(pqField, label);
+                    into.Add(new LeafPlan
+                    {
+                        Path = path.ToArray(),
+                        ParquetLeaf = leaf,
+                        LeafType = type,
+                        LeafNullable = nullable,
+                        Chain = chain.ToArray(),
+                        Context = DescribePathContext(path),
+                    });
+                    break;
+                }
+        }
+    }
+
+    private static string DescribePathContext(List<PathStep> path)
+    {
+        if (path.Count == 0)
+        {
+            return "leaf";
+        }
+
+        PathStep last = path[^1];
+        return last.Kind switch
+        {
+            StepKind.Struct => $"field {last.StructOrdinal}",
+            StepKind.List => "element",
+            StepKind.MapKey => "key",
+            StepKind.MapValue => "value",
+            _ => "leaf",
+        };
+    }
+
+    // §2.10.3 recursive slot count: the number of def/rep slots the leaf at the tail of `path` emits over all
+    // segments. A null/empty container contributes ONE placeholder slot; a struct passes through; a present
+    // list/map fans out one child sub-count per element/entry (D4 — the recursive generalization of
+    // SlotsForRow).
+    private static long CountLeafSlots(PathStep[] path, IReadOnlyList<ColumnSegment> segments, string label)
+    {
+        long slots = 0;
+        foreach (ColumnSegment segment in segments)
+        {
+            for (int j = 0; j < segment.Length; j++)
+            {
+                slots = checked(slots + CountCell(path, 0, segment.Vector, segment.Start + j, label));
+            }
+        }
+
+        return slots;
+    }
+
+    private static long CountCell(PathStep[] path, int stepIndex, ColumnVector vector, int row, string label)
+    {
+        if (stepIndex == path.Length)
+        {
+            return 1;
+        }
+
+        PathStep step = path[stepIndex];
+        switch (step.Kind)
+        {
+            case StepKind.Struct:
+                {
+                    StructColumnVector sv = ExpectStructVector(vector, label);
+                    if (sv.IsNull(row))
+                    {
+                        return 1;
+                    }
+
+                    int ordinal = step.StructOrdinal;
+                    ColumnVector child = ResolveChild(() => sv.Child(ordinal), label, "struct field");
+                    return CountCell(path, stepIndex + 1, child, row, label);
+                }
+
+            case StepKind.List:
+                {
+                    ListColumnVector lv = ExpectListVector(vector, label);
+                    (int start, int length) = lv.RawElementSpan(row);
+                    if (lv.IsNull(row) || length == 0)
+                    {
+                        return 1;
+                    }
+
+                    ColumnVector elements = ResolveChild(() => lv.Elements, label, "array element");
+                    long sum = 0;
+                    for (int e = 0; e < length; e++)
+                    {
+                        sum = checked(sum + CountCell(path, stepIndex + 1, elements, start + e, label));
+                    }
+
+                    return sum;
+                }
+
+            default:
+                {
+                    MapColumnVector mv = ExpectMapVector(vector, label);
+                    (int start, int length) = mv.RawEntrySpan(row);
+                    if (mv.IsNull(row) || length == 0)
+                    {
+                        return 1;
+                    }
+
+                    bool keys = step.Kind == StepKind.MapKey;
+                    MapColumnVector current = mv;
+                    ColumnVector child = keys
+                        ? ResolveChild(() => current.Keys, label, "map key")
+                        : ResolveChild(() => current.Values, label, "map value");
+                    long sum = 0;
+                    for (int e = 0; e < length; e++)
+                    {
+                        sum = checked(sum + CountCell(path, stepIndex + 1, child, start + e, label));
+                    }
+
+                    return sum;
+                }
+        }
+    }
+
+    // §2.10.3 recursive level emission (the write dual of the reader's per-leaf Dremel decode). Fills def[]/rep[]
+    // for the leaf at the tail of `leaf.Path`, one incoming cell (row, entryRep) at a time.
+    private static void EmitLeafLevels(
+        LeafPlan leaf,
+        int stepIndex,
+        ColumnVector vector,
+        int row,
+        int entryRep,
+        int defBase,
+        int parentRep,
+        string label,
+        int[] def,
+        int[] rep,
+        ref int slot)
+    {
+        if (stepIndex == leaf.Path.Length)
+        {
+            // LEAF frame.
+            if (leaf.LeafRequired)
+            {
+                if (vector.IsNull(row))
+                {
+                    throw DeltaStorageException.CorruptData(
+                        $"Nested column '{label}' {leaf.Context} is declared non-nullable but holds a null at "
+                        + $"row {row}.");
+                }
+
+                def[slot] = defBase;
+            }
+            else
+            {
+                def[slot] = vector.IsNull(row) ? defBase : defBase + 1;
+            }
+
+            if (leaf.HasRep)
+            {
+                rep[slot] = entryRep;
+            }
+
+            slot++;
+            return;
+        }
+
+        PathStep step = leaf.Path[stepIndex];
+        switch (step.Kind)
+        {
+            case StepKind.Struct:
+                {
+                    StructColumnVector sv = ExpectStructVector(vector, label);
+                    if (sv.IsNull(row))
+                    {
+                        def[slot] = defBase;
+                        if (leaf.HasRep)
+                        {
+                            rep[slot] = entryRep;
+                        }
+
+                        slot++;
+                        return;
+                    }
+
+                    int ordinal = step.StructOrdinal;
+                    ColumnVector child = ResolveChild(() => sv.Child(ordinal), label, "struct field");
+                    EmitLeafLevels(
+                        leaf, stepIndex + 1, child, row, entryRep, defBase + 1, parentRep, label, def, rep,
+                        ref slot);
+                    return;
+                }
+
+            case StepKind.List:
+                {
+                    ListColumnVector lv = ExpectListVector(vector, label);
+                    int thisRep = parentRep + 1;
+                    (int start, int length) = lv.RawElementSpan(row);
+                    if (lv.IsNull(row))
+                    {
+                        def[slot] = defBase;
+                        rep[slot] = entryRep;
+                        slot++;
+                        return;
+                    }
+
+                    if (length == 0)
+                    {
+                        def[slot] = defBase + 1;
+                        rep[slot] = entryRep;
+                        slot++;
+                        return;
+                    }
+
+                    ColumnVector elements = ResolveChild(() => lv.Elements, label, "array element");
+                    for (int e = 0; e < length; e++)
+                    {
+                        int childEntryRep = e == 0 ? entryRep : thisRep;
+                        EmitLeafLevels(
+                            leaf, stepIndex + 1, elements, start + e, childEntryRep, defBase + 2, thisRep,
+                            label, def, rep, ref slot);
+                    }
+
+                    return;
+                }
+
+            default:
+                {
+                    MapColumnVector mv = ExpectMapVector(vector, label);
+                    int thisRep = parentRep + 1;
+                    (int start, int length) = mv.RawEntrySpan(row);
+                    if (mv.IsNull(row))
+                    {
+                        def[slot] = defBase;
+                        rep[slot] = entryRep;
+                        slot++;
+                        return;
+                    }
+
+                    if (length == 0)
+                    {
+                        def[slot] = defBase + 1;
+                        rep[slot] = entryRep;
+                        slot++;
+                        return;
+                    }
+
+                    bool keys = step.Kind == StepKind.MapKey;
+                    MapColumnVector current = mv;
+                    ColumnVector child = keys
+                        ? ResolveChild(() => current.Keys, label, "map key")
+                        : ResolveChild(() => current.Values, label, "map value");
+                    for (int e = 0; e < length; e++)
+                    {
+                        int childEntryRep = e == 0 ? entryRep : thisRep;
+                        EmitLeafLevels(
+                            leaf, stepIndex + 1, child, start + e, childEntryRep, defBase + 2, thisRep, label,
+                            def, rep, ref slot);
+                    }
+
+                    return;
+                }
+        }
+    }
+
+    // §2.10.3 path-navigating value source: yields each PRESENT (non-null) leaf cell in the SAME slot order the
+    // level emitter walks, descending through present/non-null containers and skipping null/empty ones. The
+    // returned COUNT is derived purely from the vectors' null masks (never the level stream), so it keeps the
+    // packed-values clause's teeth at every depth (§2.3c).
+    private readonly struct PathValueSource(PathStep[] path, IReadOnlyList<ColumnSegment> segments) : IValueSource
+    {
+        public int ForEachPresent<TVisitor>(ref TVisitor visitor, string label)
+            where TVisitor : struct, IPresentVisitor
+        {
+            int count = 0;
+            foreach (ColumnSegment segment in segments)
+            {
+                for (int j = 0; j < segment.Length; j++)
+                {
+                    count += VisitCell(path, 0, segment.Vector, segment.Start + j, ref visitor, label);
+                }
+            }
+
+            return count;
+        }
+
+        private static int VisitCell<TVisitor>(
+            PathStep[] path, int stepIndex, ColumnVector vector, int row, ref TVisitor visitor, string label)
+            where TVisitor : struct, IPresentVisitor
+        {
+            if (stepIndex == path.Length)
+            {
+                if (vector.IsNull(row))
+                {
+                    return 0;
+                }
+
+                visitor.Visit(vector, row);
+                return 1;
+            }
+
+            PathStep step = path[stepIndex];
+            switch (step.Kind)
+            {
+                case StepKind.Struct:
+                    {
+                        StructColumnVector sv = ExpectStructVector(vector, label);
+                        if (sv.IsNull(row))
+                        {
+                            return 0;
+                        }
+
+                        int ordinal = step.StructOrdinal;
+                        ColumnVector child = ResolveChild(() => sv.Child(ordinal), label, "struct field");
+                        return VisitCell(path, stepIndex + 1, child, row, ref visitor, label);
+                    }
+
+                case StepKind.List:
+                    {
+                        ListColumnVector lv = ExpectListVector(vector, label);
+                        if (lv.IsNull(row))
+                        {
+                            return 0;
+                        }
+
+                        (int start, int length) = lv.RawElementSpan(row);
+                        if (length == 0)
+                        {
+                            return 0;
+                        }
+
+                        ColumnVector elements = ResolveChild(() => lv.Elements, label, "array element");
+                        int c = 0;
+                        for (int e = 0; e < length; e++)
+                        {
+                            c += VisitCell(path, stepIndex + 1, elements, start + e, ref visitor, label);
+                        }
+
+                        return c;
+                    }
+
+                default:
+                    {
+                        MapColumnVector mv = ExpectMapVector(vector, label);
+                        if (mv.IsNull(row))
+                        {
+                            return 0;
+                        }
+
+                        (int start, int length) = mv.RawEntrySpan(row);
+                        if (length == 0)
+                        {
+                            return 0;
+                        }
+
+                        bool keys = step.Kind == StepKind.MapKey;
+                        MapColumnVector current = mv;
+                        ColumnVector child = keys
+                            ? ResolveChild(() => current.Keys, label, "map key")
+                            : ResolveChild(() => current.Values, label, "map value");
+                        int c = 0;
+                        for (int e = 0; e < length; e++)
+                        {
+                            c += VisitCell(path, stepIndex + 1, child, start + e, ref visitor, label);
+                        }
+
+                        return c;
+                    }
+            }
+        }
+    }
+
+    private static PqStructField ExpectParquetStruct(Field field, string label) =>
+        field as PqStructField
+        ?? throw DeltaStorageException.UnsupportedFeature(
+            $"Parquet nested write for column '{label}': the mapped Parquet field does not match the declared "
+            + "nested struct shape.");
+
+    private static PqListField ExpectParquetList(Field field, string label) =>
+        field as PqListField
+        ?? throw DeltaStorageException.UnsupportedFeature(
+            $"Parquet nested write for column '{label}': the mapped Parquet field does not match the declared "
+            + "nested array shape.");
+
+    private static PqMapField ExpectParquetMap(Field field, string label) =>
+        field as PqMapField
+        ?? throw DeltaStorageException.UnsupportedFeature(
+            $"Parquet nested write for column '{label}': the mapped Parquet field does not match the declared "
+            + "nested map shape.");
 
     // ----- struct -----
 
@@ -1152,7 +1838,8 @@ internal static class NestedColumnShredder
         int rowCount,
         string label,
         TSource source,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RepeatedLevel[]? chain = null)
         where TSource : struct, IValueSource
     {
         int valueCount = CountAtLevel(def.Span, leaf.MaxDefinitionLevel);
@@ -1162,7 +1849,7 @@ internal static class NestedColumnShredder
             // value and rent no value buffer.
             var counter = default(CountingVisitor);
             int present = source.ForEachPresent(ref counter, label);
-            RunLevelGuard(leaf, def, rep, present, rowCount, label);
+            RunLevelGuard(leaf, def, rep, present, rowCount, label, chain);
             return Task.CompletedTask;
         }
 
@@ -1170,39 +1857,39 @@ internal static class NestedColumnShredder
         {
             BooleanType => EmitAsync<bool, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => vector.GetValue<bool>(row), cancellationToken),
+                static (vector, row) => vector.GetValue<bool>(row), cancellationToken, chain),
             ByteType => EmitAsync<sbyte, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => unchecked((sbyte)vector.GetValue<byte>(row)), cancellationToken),
+                static (vector, row) => unchecked((sbyte)vector.GetValue<byte>(row)), cancellationToken, chain),
             ShortType => EmitAsync<short, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => vector.GetValue<short>(row), cancellationToken),
+                static (vector, row) => vector.GetValue<short>(row), cancellationToken, chain),
             IntegerType => EmitAsync<int, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => vector.GetValue<int>(row), cancellationToken),
+                static (vector, row) => vector.GetValue<int>(row), cancellationToken, chain),
             LongType => EmitAsync<long, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => vector.GetValue<long>(row), cancellationToken),
+                static (vector, row) => vector.GetValue<long>(row), cancellationToken, chain),
             FloatType => EmitAsync<float, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => vector.GetValue<float>(row), cancellationToken),
+                static (vector, row) => vector.GetValue<float>(row), cancellationToken, chain),
             DoubleType => EmitAsync<double, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-                static (vector, row) => vector.GetValue<double>(row), cancellationToken),
+                static (vector, row) => vector.GetValue<double>(row), cancellationToken, chain),
             DateType => EmitAsync<DateTime, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
                 static (vector, row) => ParquetTypeMapping.EpochDayToDateTime(vector.GetValue<int>(row)),
-                cancellationToken),
+                cancellationToken, chain),
             TimestampType or TimestampNtzType => EmitAsync<DateTime, TSource>(
                 rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
                 static (vector, row) => ParquetTypeMapping.EpochMicrosToDateTime(vector.GetValue<long>(row)),
-                cancellationToken),
+                cancellationToken, chain),
             DecimalType decimalType => EmitDecimalAsync(
-                rowGroup, leaf, def, rep, rowCount, valueCount, label, source, decimalType, cancellationToken),
+                rowGroup, leaf, def, rep, rowCount, valueCount, label, source, decimalType, cancellationToken, chain),
             StringType => EmitStringAsync(
-                rowGroup, leaf, def, rep, rowCount, valueCount, label, source, cancellationToken),
+                rowGroup, leaf, def, rep, rowCount, valueCount, label, source, cancellationToken, chain),
             BinaryType => EmitBinaryAsync(
-                rowGroup, leaf, def, rep, rowCount, valueCount, label, source, cancellationToken),
+                rowGroup, leaf, def, rep, rowCount, valueCount, label, source, cancellationToken, chain),
             _ => throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet nested write for column '{label}': leaf type "
                 + $"'{DiagnosticText.DescribeType(leafType)}' is not supported."),
@@ -1219,7 +1906,8 @@ internal static class NestedColumnShredder
         string label,
         TSource source,
         Func<ColumnVector, int, T> read,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RepeatedLevel[]? chain)
         where T : struct
         where TSource : struct, IValueSource
     {
@@ -1233,7 +1921,7 @@ internal static class NestedColumnShredder
             int collected = source.ForEachPresent(ref collector, label);
             await WriteAllPartsAsync<T>(
                 rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, collected, label,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, chain).ConfigureAwait(false);
         }
         finally
         {
@@ -1251,11 +1939,12 @@ internal static class NestedColumnShredder
         string label,
         TSource source,
         DecimalType decimalType,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RepeatedLevel[]? chain)
         where TSource : struct, IValueSource =>
         EmitAsync<decimal, TSource>(
             rowGroup, leaf, def, rep, rowCount, valueCount, label, source,
-            (vector, row) => ParquetTypeMapping.ReadDecimal(vector, decimalType, row), cancellationToken);
+            (vector, row) => ParquetTypeMapping.ReadDecimal(vector, decimalType, row), cancellationToken, chain);
 
     // §2.3b string lane. The managed vectors store a String as UTF-8, so the shredder TRANSCODES UTF-8→UTF-16
     // into a per-leaf pooled char[] and hands ReadOnlyMemory<char> VIEWS into it. TWO span walks, no
@@ -1274,7 +1963,8 @@ internal static class NestedColumnShredder
         int valueCount,
         string label,
         TSource source,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RepeatedLevel[]? chain)
         where TSource : struct, IValueSource
     {
         int budget = MeasurePayloadBytes(source, label);
@@ -1287,7 +1977,7 @@ internal static class NestedColumnShredder
             int collected = source.ForEachPresent(ref transcoder, label);
             await WriteAllPartsAsync<ReadOnlyMemory<char>>(
                 rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, collected, label,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, chain).ConfigureAwait(false);
         }
         finally
         {
@@ -1306,7 +1996,8 @@ internal static class NestedColumnShredder
         int valueCount,
         string label,
         TSource source,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RepeatedLevel[]? chain)
         where TSource : struct, IValueSource
     {
         int budget = MeasurePayloadBytes(source, label);
@@ -1319,7 +2010,7 @@ internal static class NestedColumnShredder
             int collected = source.ForEachPresent(ref copier, label);
             await WriteAllPartsAsync<ReadOnlyMemory<byte>>(
                 rowGroup, leaf, values.AsMemory(0, valueCount), def, rep, rowCount, collected, label,
-                cancellationToken).ConfigureAwait(false);
+                cancellationToken, chain).ConfigureAwait(false);
         }
         finally
         {
@@ -1365,10 +2056,11 @@ internal static class NestedColumnShredder
         int rowCount,
         int collected,
         string label,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        RepeatedLevel[]? chain)
         where T : struct
     {
-        RunLevelGuard(leaf, def, rep, collected, rowCount, label);
+        RunLevelGuard(leaf, def, rep, collected, rowCount, label, chain);
         try
         {
             await rowGroup.WriteAllPartsAsync(leaf, values, def, rep, cancellationToken).ConfigureAwait(false);
@@ -1384,17 +2076,29 @@ internal static class NestedColumnShredder
     }
 
     // The one place the §2.3c per-leaf guard is invoked, from BOTH the write lane and the N9 pre-pass, so the
-    // two can never diverge. `collected` is the SOURCE-derived present-cell count (B1).
+    // two can never diverge. `collected` is the SOURCE-derived present-cell count (B1). A non-null `chain` is
+    // the explicit ordered repeated-ancestor chain the nested-within-nested (§2.10.3) path threads (its
+    // per-level markers cannot be derived from the leaf alone for interleaved shapes); a null `chain` derives
+    // the single-level chain from the leaf — byte-identical to the pre-#873 guard.
     private static void RunLevelGuard(
         DataField leaf,
         ReadOnlyMemory<int> def,
         ReadOnlyMemory<int>? rep,
         int collected,
         int rowCount,
-        string label) =>
-        NestedLevelGuard.Validate(
-            leaf, def.Span, rep.HasValue ? rep.Value.Span : ReadOnlySpan<int>.Empty, rep.HasValue,
-            collected, rowCount, label);
+        string label,
+        RepeatedLevel[]? chain)
+    {
+        ReadOnlySpan<int> repSpan = rep.HasValue ? rep.Value.Span : ReadOnlySpan<int>.Empty;
+        if (chain is null)
+        {
+            NestedLevelGuard.Validate(leaf, def.Span, repSpan, rep.HasValue, collected, rowCount, label);
+        }
+        else
+        {
+            NestedLevelGuard.Validate(leaf, chain, def.Span, repSpan, rep.HasValue, collected, rowCount, label);
+        }
+    }
 
     // ----- cross-leaf guards (§2.3c) -----
 

@@ -31,6 +31,17 @@ internal static class ParquetTypeMapping
     /// 96-bit magnitude, so it round-trips through Parquet.Net's <see cref="decimal"/>-typed field.</summary>
     internal const int MaxSupportedDecimalPrecision = 28;
 
+    /// <summary>
+    /// The recursion-depth bound for the nested-within-nested WRITE schema construction (#873, §2.10.7),
+    /// checked at each <see cref="CreateNestedNode"/> entry BEFORE any descent so a pathological type tree
+    /// fails closed (<see cref="StorageErrorKind.UnsupportedFeature"/>) rather than overflowing the stack. It
+    /// is fixed at <b>64</b> for read-after-write parity with the other DeltaSharp caps
+    /// (<c>DeltaWriteSchemaEligibility.MaxDepth</c>, <see cref="MaxFooterTypeDepth"/>,
+    /// <c>NestedParquetColumnReader.MaxNestedReadDepth</c>, <c>SchemaJson.MaxDepth</c> — all 64), so any
+    /// nested-within-nested table #873 writes is a schema the reader can read.
+    /// </summary>
+    internal const int MaxNestedWriteDepth = 64;
+
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
 
     // System.Decimal supports at most 28 fractional digits (mirrors RowMaterializer.MaxDecimalScale).
@@ -127,6 +138,20 @@ internal static class ParquetTypeMapping
             {
                 case ArrayType array:
                     {
+                        if (array.ElementType is ArrayType or MapType or StructType)
+                        {
+                            // #873 (§2.10.6/§2.10.8): a container element is nested-within-nested. In id mode
+                            // it is re-pointed to #866 (a recursive interior id scheme + id-mode reader are
+                            // #866's scope); in name/none mode recurse to build the nested group.
+                            RejectIdModeNestedWithinNested(idMode, label, array.ElementType.TypeName);
+                            return new PqListField(
+                                field.Name,
+                                CreateNestedNode(
+                                    array.ElementType, array.ContainsNull, "element",
+                                    $"array column '{label}' element", honorReferenceNullability,
+                                    isMapKey: false, depth: 2));
+                        }
+
                         long? elementId = ResolveArrayElementId(field, idMode, label);
                         return new PqListField(
                             field.Name,
@@ -135,6 +160,25 @@ internal static class ParquetTypeMapping
 
                 case MapType map:
                     {
+                        // #873 D5 (§2.10.6/§2.10.7): a map whose KEY is a container is a constructible MapType
+                        // but not physically writable — Parquet.Net emits every group node OPTIONAL, so a
+                        // nested key would carry Key.MaxDef > Map.MaxDef, which the 585a reader
+                        // EnsureRequiredMapKey rejects → a permanently-unreadable file. Fail closed up front.
+                        RejectNestedMapKey(map.KeyType, $"map column '{label}' key");
+
+                        if (map.ValueType is ArrayType or MapType or StructType)
+                        {
+                            RejectIdModeNestedWithinNested(idMode, label, map.ValueType.TypeName);
+                            (long? scalarKeyId, _) = ResolveMapInteriorIds(field, idMode, label);
+                            return new PqMapField(
+                                field.Name,
+                                CreateNestedLeaf(map.KeyType, nullable: false, "key", $"map column '{label}' key", honorReferenceNullability, scalarKeyId),
+                                CreateNestedNode(
+                                    map.ValueType, map.ValueContainsNull, "value",
+                                    $"map column '{label}' value", honorReferenceNullability,
+                                    isMapKey: false, depth: 2));
+                        }
+
                         (long? keyId, long? valueId) = ResolveMapInteriorIds(field, idMode, label);
                         return new PqMapField(
                             field.Name,
@@ -157,6 +201,18 @@ internal static class ParquetTypeMapping
                         StructField child = structType[i];
                         // §2.8: identify the offending child by ORDINAL, never by name — the child name is
                         // foreign schema text and a struct can carry thousands of them.
+                        if (child.DataType is ArrayType or MapType or StructType)
+                        {
+                            // #873 (§2.10.6/§2.10.8): a container struct child is nested-within-nested. id mode
+                            // → #866; name/none mode → recurse.
+                            RejectIdModeNestedWithinNested(idMode, label, child.DataType.TypeName);
+                            children[i] = CreateNestedNode(
+                                child.DataType, child.Nullable, child.Name,
+                                $"struct column '{label}' field {i}", honorReferenceNullability,
+                                isMapKey: false, depth: 2);
+                            continue;
+                        }
+
                         children[i] = CreateStructChildLeaf(
                             child, idMode, $"struct column '{label}' field {i}", honorReferenceNullability);
                     }
@@ -179,6 +235,131 @@ internal static class ParquetTypeMapping
                 $"Parquet mapping for nested column '{label}' of kind '{field.DataType.TypeName}': the nested "
                 + "Parquet shape could not be constructed.",
                 ex);
+        }
+    }
+
+    // #873 §2.10.8 boundary: id-mode nested-within-nested is deferred to #866 (it needs a recursive interior
+    // id-assignment scheme AND an id-mode nested-within-nested reader, both of which are #866's scope). An
+    // unstamped/mis-stamped interior leaf would commit a permanently-unreadable file, so refuse it at the
+    // write door with a message re-pointed to #866 (NOT #585, which is lifted for name/none mode).
+    private static void RejectIdModeNestedWithinNested(bool idMode, string label, string interiorKind)
+    {
+        if (idMode)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for nested column '{label}': a nested type within a nested type "
+                + $"('{DiagnosticText.Sanitize(interiorKind)}') under column-mapping id mode is not supported "
+                + "(deferred, #866): a recursive interior field_id scheme and an id-mode reader are required.");
+        }
+    }
+
+    // #873 D5 (§2.10.6/§2.10.7): a map whose KEY is a container fails closed at EVERY depth. A Parquet map key
+    // must be REQUIRED, but Parquet.Net 6.1.0 emits every group node OPTIONAL, so a nested key node would
+    // carry Key.MaxDef > Map.MaxDef — which the shipped 585a reader EnsureRequiredMapKey rejects → the written
+    // file would be permanently unreadable. A SCALAR map key is unaffected (already REQUIRED). Distinct from
+    // #860's map-typed-key infeasibility, which MapType rejects at type construction.
+    private static void RejectNestedMapKey(DataType keyType, string context)
+    {
+        if (keyType is ArrayType or MapType or StructType)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: a map whose key is a container "
+                + $"('{keyType.TypeName}') cannot be written — Parquet.Net emits every nested group as "
+                + "OPTIONAL, so the key would be nullable, which makes the file permanently unreadable (the "
+                + "reader requires a non-null map key). A scalar map key is unaffected.");
+        }
+    }
+
+    // #873 §2.10.6: the recursive interior schema builder for NAME/none mode (id mode is fail-closed before it
+    // is reached — RejectIdModeNestedWithinNested). Builds the canonical nested group structure the 585a
+    // reader reconstructs by physical name: a scalar routes to CreateScalarField (the leaf allowlist unchanged
+    // at every depth); a container builds the nested PqListField/PqMapField/PqStructField and recurses into its
+    // element/key/value/children, emitting the canonical child names ('element'/'key'/'value') at every level.
+    // A container in a map-KEY position (isMapKey) fails closed (RejectNestedMapKey). The depth guard fires at
+    // each entry BEFORE any descent so a pathological type tree is a deterministic UnsupportedFeature, never a
+    // StackOverflowException. No field_id is ever stamped (a name/none physical file is field_id-free).
+    private static Field CreateNestedNode(
+        DataType type,
+        bool nullable,
+        string canonicalName,
+        string context,
+        bool honorReferenceNullability,
+        bool isMapKey,
+        int depth)
+    {
+        if (depth > MaxNestedWriteDepth)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: the schema nests deeper than the "
+                + $"supported write limit of {MaxNestedWriteDepth} type levels.");
+        }
+
+        // §2.10.7 non-nullable container reject (parity with the top-level ':116' !field.Nullable reject,
+        // lifted to depth): Parquet.Net emits every container OPTIONAL, so a declared-REQUIRED nested container
+        // would diverge from the committed schemaString (#730). A non-nullable SCALAR leaf stays expressible.
+        if (type is ArrayType or MapType or StructType && !nullable)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet mapping for {context}: a non-nullable ('nullable':false) nested container "
+                + $"('{type.TypeName}') cannot be written — Parquet.Net emits every nested container as "
+                + "OPTIONAL, which would diverge from the declared schema (#730).");
+        }
+
+        switch (type)
+        {
+            case ArrayType array:
+                return new PqListField(
+                    canonicalName,
+                    CreateNestedNode(
+                        array.ElementType, array.ContainsNull, "element", $"{context} element",
+                        honorReferenceNullability, isMapKey: false, depth + 1));
+
+            case MapType map:
+                RejectNestedMapKey(map.KeyType, $"{context} key");
+                return new PqMapField(
+                    canonicalName,
+                    CreateNestedNode(
+                        map.KeyType, nullable: false, "key", $"{context} key",
+                        honorReferenceNullability, isMapKey: true, depth + 1),
+                    CreateNestedNode(
+                        map.ValueType, map.ValueContainsNull, "value", $"{context} value",
+                        honorReferenceNullability, isMapKey: false, depth + 1));
+
+            case StructType structType:
+                if (structType.Count == 0)
+                {
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet mapping for {context}: a zero-field struct is not supported.");
+                }
+
+                var children = new Field[structType.Count];
+                for (int i = 0; i < structType.Count; i++)
+                {
+                    StructField child = structType[i];
+                    children[i] = CreateNestedNode(
+                        child.DataType, child.Nullable, child.Name, $"{context} field {i}",
+                        honorReferenceNullability, isMapKey: false, depth + 1);
+                }
+
+                return new PqStructField(canonicalName, children);
+
+            default:
+                // A scalar leaf. Route through the SAME allowlist CreateScalarField enforces (void / decimal>28
+                // / unmapped still reject at every depth). Synthesize a StructField carrying no mapping
+                // metadata so no field_id is stamped (name/none mode). Re-raise on the bounded ORDINAL context
+                // (never the foreign child name) plus the bounded leaf KIND.
+                try
+                {
+                    return CreateScalarField(
+                        new StructField(canonicalName, type, nullable), honorReferenceNullability);
+                }
+                catch (DeltaStorageException ex)
+                {
+                    throw DeltaStorageException.UnsupportedFeature(
+                        $"Parquet mapping for {context}: the leaf type '{DiagnosticText.DescribeType(type)}' has "
+                        + "no supported Parquet mapping.",
+                        ex);
+                }
         }
     }
 
