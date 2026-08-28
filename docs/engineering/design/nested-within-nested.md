@@ -873,33 +873,72 @@ with a null struct element at list position ≥ 1, and `map<string,array<long>>`
 at entry ≥ 1 — i.e. it kills happy-path §3.3 cells 1, 2, 4, 5, 7, 8, 9, golden 10, and the at-depth SUCCESS
 cell 22.
 
-#873 therefore **rewrites `NestedLevelGuard.Validate` as the writer-side dual of the reader's single-pass
-repeated-level emitter (§2.2)** — thread the ordered chain of repeated ancestors `R_1 … R_k`
-(outermost→innermost) off the **built footer node**, each with its own `(repLevel_j, presentDef_j, emptyDef_j
-= presentDef_j − 1)`, and:
+#873 therefore **rewrites `NestedLevelGuard.Validate` as a FAITHFUL per-level dual of the reader's
+`BuildRepeatedStructure` (`NestedParquetColumnReader.cs:967-1080`)** — it tracks, for **every** repeated
+level, the same owner-open + `ownerComplete` occurrence state the reader keys off each container's **own**
+node. There is **no `rep == maxRep` simplification** (that round-2 gate was itself a bug — §2.10.9-D6): the
+continuation-legality reject must fire at **every** repeated level, not only the innermost.
 
-- **`rep == 0` opens a logical row** and `rowOpenings == rowCount` is **depth-invariant — KEEP unchanged**
-  (`NestedLevelGuard.cs:107-112`, `:148-154`).
-- **A `rep = r` (1 ≤ r ≤ maxRep) slot opens a new occurrence at ancestor `R_r`.** Its legality is checked
-  against `R_r`'s **own** markers (computed independently per level, **not** the leaf's): the new occurrence
-  must exist as an element of `R_r` (`def ≥ presentDef_r`) and its enclosing shallower ancestors
-  `R_1 … R_{r−1}` must have opened present + element-bearing (track each level's current-occurrence opening
-  def). A new occurrence at `R_r` whose *child* (`R_{r+1}` or the leaf) is null/empty — `def < presentDef_{r+1}`
-  — is **LEGAL** and must NOT be rejected.
-- **The "continuation past an empty/null marker" reject fires ONLY at `rep == maxRep`** (the leaf's innermost
-  repeated container `R_k`): a *subsequent element of the same innermost container* requires that container
-  present + non-empty (`def ≥ presentDef_k`, i.e. reject `def ≤ emptyDef_k`). This is the write dual of the
-  reader's phantom-inner-element reject (§3.2 cell 19); the current guard's un-gated `def <= emptyContainerDef`
-  check (`:126`) is exactly this reject with the `rep == maxRep` gate **missing** — the depth-≥2 bug.
-- **The packed-present-value clause** (`present == valueCount`, `:164-168`) and the range checks are unchanged.
+**Signature change (storage rec #2).** The guard can no longer take only `DataField leaf`: for an
+**interleaved** shape such as `array<struct<array<int>>>` (a struct level sits *between* the two repeated
+levels), a level's `presentDef_j` / `parentPresentDef_j` **cannot** be derived from `(leaf.MaxDefinitionLevel,
+leaf.MaxRepetitionLevel)` alone. `NestedLevelGuard.Validate` now receives the **ordered chain of repeated
+ancestors `R_1 … R_k`** (outermost→innermost) built alongside the schema recursion (or the built footer node /
+schema path), each level `R_j` carrying, read from **its own** node: `repLevel_j` (its `MaxRepetitionLevel`,
+`= j` for a pure list/map chain), `presentDef_j` (its `MaxDefinitionLevel` — "element-bearing"),
+`emptyDef_j = presentDef_j − 1`, and `parentPresentDef_j` (the immediate parent container node's
+`MaxDefinitionLevel`; `0` for `R_1`). This mirrors how the reader threads `thisMaxDef`/`parentMaxDef` per
+container.
 
-Re-running the guard on the golden stream under the rewrite: slot `(1,3)` has `rep 1 < maxRep 2` → checked
-against `R_1`'s markers, a new outer element with an empty inner list (`def 3 ≥ presentDef_1 = 2`) → **PASS**;
-slot `(2,4)` has `rep 2 == maxRep` → inner-continuation, `def 4 ≥ presentDef_2 = 4` → **PASS**; a genuine
-phantom `(2,3)` (continue the innermost list past its own empty marker) → `def 3 ≤ emptyDef_2 = 3` →
-**REJECT** (§3.3 cell 28). The single-level (`maxRep == 1`, one repeated ancestor) behaviour is **byte-identical**
-to today — `rep == maxRep == 1` for every continuation, so the gate is always active exactly as before
-(regression §3.3-21).
+**The per-level state machine (single pass over the leaf's `(rep, def)` stream).** Maintain one flag per
+repeated level, `ownerComplete[1..k]` — `true` when that level's *current* occurrence opened as a null/empty
+(non-element-bearing) container, so it admits **no** continuation (the dual of the reader's `ownerComplete`,
+`:986`/`:1031`). For each slot `(r, d)` (after the range check and the `first slot must be rep 0` check):
+
+1. **`rep == 0` opens a logical row** → `rowOpenings++` (depth-invariant, **KEEP**;
+   `NestedLevelGuard.cs:107-112`, `:148-154`).
+2. **Continuation legality at level `r` (r ≥ 1):** the slot continues `R_r`'s current occurrence, so reject
+   `CorruptData` iff `ownerComplete[r] || d < presentDef_r` — the container being continued was opened
+   null/empty **earlier in the row**, *or* this slot is not itself an element-bearing occurrence. **This
+   fires at every `r = 1 … k`** (exactly the reader's `ownerComplete || d < thisMaxDef` gate, `:1027-1035`).
+3. **Re-open the deeper levels this slot starts.** A `rep = r` slot opens a new *owner* for every level
+   `v > r` (and, when `r == 0`, for all `v = 1 … k`); it does **not** re-open level `r` itself (that is the
+   continuation of clause 2). For each such `v` (from `lo = (r == 0 ? 1 : r + 1)` to `k`), classify the new
+   occurrence from **this** slot's `d` against `R_v`'s own markers:
+   `ownerComplete[v] = (d < parentPresentDef_v) ? true : (d < presentDef_v)` — i.e. **absent** parent ⇒
+   complete; **null/empty** container ⇒ complete; **present element-bearing** ⇒ open. (Dual of the reader's
+   owner-open `d >= parentMaxDef` gate + `ownerComplete = d < thisMaxDef`, `:1007`/`:1031`.)
+4. **Range + packed-value clauses unchanged:** `def ∈ [0, maxDef]`, `rep ∈ [0, maxRep]`,
+   `present(def == maxDef) == valueCount` (`:164-168`), `rowOpenings == rowCount`.
+
+**Re-verification — the four required traces (`array<array<int>>`: `presentDef_1 = 2`, `emptyDef_1 = 1`,
+`parentPresentDef_1 = 0`; `presentDef_2 = 4`, `emptyDef_2 = 3`, `parentPresentDef_2 = 2`; `maxRep = 2`):**
+
+- **(a) golden `(0,0)(0,1)(0,2)(1,3)(0,5)(2,4)(1,5)` → PASS.** Walk: `(0,0)` opens row, sets
+  `ownerComplete[1]=(0<2)=T`, `ownerComplete[2]=(0<2 parent-absent)=T`. `(0,1)` →
+  `ownerComplete[1]=(1<2)=T`, `[2]=T`. `(0,2)` → `ownerComplete[1]=(2<2)=F` (outer element-bearing),
+  `[2]=(2<2 parent-absent? no → 2<4)=T` (inner null). `(1,3)` continuation at level 1:
+  `ownerComplete[1]=F && d 3 ≥ presentDef_1 2` → **OK**, then re-opens level 2:
+  `ownerComplete[2]=(3<2? no → 3<4)=T` (inner empty). `(0,5)` → `[1]=(5<2)=F`, `[2]=(5<4)=F`. `(2,4)`
+  continuation at level 2: `ownerComplete[2]=F && d 4 ≥ presentDef_2 4` → **OK**. `(1,5)` continuation at
+  level 1: `ownerComplete[1]=F && 5 ≥ 2` → **OK**, re-opens `[2]=(5<4)=F`. No throw; `rowOpenings=4`. ✔
+- **(b) red-team `(0,0)(1,2)` → REJECT at `(1,2)`.** `(0,0)` sets `ownerComplete[1]=(0<2)=T` (outer opened
+  NULL). `(1,2)` continuation at level 1: `ownerComplete[1]=T` → **`CorruptData`**. (The companion
+  `(0,1)(1,2)` — a `rep 1` after an *empty* outer, `def 1` — also rejects: `ownerComplete[1]=(1<2)=T`.)
+  The round-2 gate waved both through because it only policed `rep == maxRep`; the per-level gate catches
+  them at the **shallower** level 1. ✔ (§3.3 cell 29)
+- **(c) innermost phantom `(2,3)` → REJECT.** In context `(0,3)(2,3)`: `(0,3)` sets
+  `ownerComplete[2]=(3<4)=T` (inner empty). `(2,3)` continuation at level 2: `ownerComplete[2]=T` →
+  **`CorruptData`**. A present-inner variant `…(0,5)(2,4)(2,3)` rejects the trailing `(2,3)` via
+  `d 3 < presentDef_2 4`. ✔ (§3.3 cell 28)
+- **(d) single-level `maxRep == 1` → byte-identical.** Only `R_1` exists (`presentDef_1 = containerMaxDef`,
+  `parentPresentDef_1 = 0`). A `rep 0` slot sets `ownerComplete[1] = (d < containerMaxDef)` — identical to
+  the shipped `currentRowOpenDef <= emptyContainerDef` (`:126` neighbourhood); a `rep 1` slot rejects iff
+  `ownerComplete[1] || d < containerMaxDef` — identical to the shipped `def <= emptyContainerDef ||
+  currentRowOpenDef <= emptyContainerDef`. Every continuation is at `rep == maxRep == 1`, so the two
+  conditions coincide and the guard is **byte-identical** to today (regression §3.3-21). *(The shipped guard
+  already carried the owner-open `currentRowOpenDef` check; round-2 wrongly dropped it for shallower levels —
+  the per-level rewrite restores it at every level.)*
 
 **`rep` presence per leaf.** A leaf whose path contains **no** list/map (pure-struct path) emits **no** rep
 stream (`rep: null`) — `WriteLeafAsync` already accepts `ReadOnlyMemory<int>?`. A leaf with `k` list/map
@@ -1025,7 +1064,7 @@ written footer's per-node levels are exactly what `ValidateLeafStructuralLevels`
 | Non-nullable **container** (declared `REQUIRED` array element / map value / struct child that is itself a container) | new — parity with the top-level `:116` `!field.Nullable` reject | refused at every depth (Parquet emits containers OPTIONAL; writing `REQUIRED` diverges, #730) → `UnsupportedFeature` |
 | Leaf repetition ↔ declared nullability (#730) | `EnsureLeafRepetition` `:1514` | asserted per leaf at every depth → `CorruptData` |
 | Required-lane null (a `REQUIRED` leaf holds a null; a null map key) | `ComputeStructLevels`/`ListLevels`/`MapLevels` value guards | the `EmitPath` LEAF-required arm fires at every depth → `CorruptData` |
-| **Structural level guard (REWRITTEN)** — `NestedLevelGuard.Validate` | `NestedColumnShredder.cs:1165`/`:1371` → `NestedLevelGuard.cs:79` | **rewritten as the write dual of 585a `BuildRepeatedStructure`** (§2.10.3): thread the ordered repeated-ancestor chain `R_1…R_k` (each with its own `presentDef_j`/`emptyDef_j` off the built footer node); gate the "continuation past an empty/null marker" reject to `rep == maxRep` (innermost); keep `rowOpenings == rowCount`. Un-rewritten it **false-rejects** valid depth-≥2 streams (the §2.10.4 golden `(1,3)` slot) as `CorruptData`; rewritten it still catches a genuine innermost phantom-continuation → `CorruptData` (§3.3 cell 28) |
+| **Structural level guard (REWRITTEN)** — `NestedLevelGuard.Validate` | `NestedColumnShredder.cs:1165`/`:1371` → `NestedLevelGuard.cs:79` | **rewritten as a FAITHFUL per-level dual of 585a `BuildRepeatedStructure`** (`NestedParquetColumnReader.cs:967-1080`; §2.10.3): **signature change** — now receives the ordered repeated-ancestor chain `R_1…R_k` (each with its own `repLevel_j`/`presentDef_j`/`emptyDef_j`/`parentPresentDef_j` read from its own footer node, **not** derived from `leaf.MaxDef`/`MaxRep`, which is insufficient for interleaved shapes like `array<struct<array>>`); tracks `ownerComplete[1..k]` per level; the continuation-legality reject (`ownerComplete[r] || def < presentDef_r`) fires at **EVERY** repeated level `r = 1…k`, **not** innermost-only; keeps `rowOpenings == rowCount`. Un-rewritten it **false-rejects** valid depth-≥2 streams (the §2.10.4 golden `(1,3)` slot); the round-2 `rep == maxRep` gate **false-accepted** a shallower phantom (`(0,0)(1,2)`) → both fixed. Catches phantom continuations at the innermost (§3.3 cell 28) AND a shallower level (§3.3 cell 29) → `CorruptData` |
 | Foreign / mismatched vector | `IsForeignVectorFault`, `ExpectStructVector`/`List`/`Map` | the recursion's per-frame `ExpectXxxVector` + the single `IsForeignVectorFault` boundary cover every descendant navigation → `UnsupportedFeature` |
 
 **The write recursion-depth bound.** The shredder recursion and the schema recursion both walk an
@@ -1122,18 +1161,27 @@ reader.
   §2.10.7 table). A **scalar** map key is unaffected. *(Distinct from #860's map-typed-key infeasibility,
   where `MapType` rejects a map-typed key at type construction — there the key is a map; here it is an
   array/struct, constructible but not writable.)*
-- **D6 (BLOCKING, storage) — the writer-side structural level guard must be rewritten.** `NestedLevelGuard.Validate`
-  (`NestedLevelGuard.cs:79`, invoked at `NestedColumnShredder.cs:1165`/`:1371`) carried the **same
-  single-repeated-level assumption** 585a had to rewrite out of the reader's `BuildRepeatedStructure`
-  (§2.2): it derives one container boundary from the leaf and treats every `rep > 0` slot as a continuation
-  of the leaf's own innermost container (`def <= emptyContainerDef` reject, `:126`), which **false-rejects**
-  valid depth-≥2 streams — the §2.10.4 golden `(1,3)` slot, `array<struct>` with a null struct element at
-  position ≥ 1, `map<*,array>` with an empty inner value-list at entry ≥ 1 (killing §3.3 cells 1, 2, 4, 5,
-  7, 8, 9, 10, 22). Rewritten as the write dual of `BuildRepeatedStructure` (§2.10.3): thread `R_1…R_k`, gate
-  the continuation-past-empty reject to `rep == maxRep`, keep `rowOpenings == rowCount`. The single-level
-  (`maxRep == 1`) behaviour is byte-identical (§3.3-21); a genuine innermost phantom-continuation still fails
-  closed (§3.3 cell 28). **This guard is absent from the shipped design's change list — it is added here to
-  both the §2.10.3 algorithm and the §2.10.7 fail-closed table.**
+- **D6 (BLOCKING, storage + red-team; round-2 introduced, round-3 corrected) — the writer-side structural
+  level guard must be a FAITHFUL PER-LEVEL dual of `BuildRepeatedStructure`.** `NestedLevelGuard.Validate`
+  (`NestedLevelGuard.cs:79`, invoked at `NestedColumnShredder.cs:1165`/`:1371`) as shipped carried the
+  single-repeated-level assumption 585a rewrote out of the reader: it derives one container boundary from the
+  leaf and treats every `rep > 0` slot as a continuation of the leaf's own innermost container
+  (`def <= emptyContainerDef` reject, `:126`), which **false-rejects** valid depth-≥2 streams — the §2.10.4
+  golden `(1,3)` slot, `array<struct>` with a null struct element at position ≥ 1, `map<*,array>` with an
+  empty inner value-list at entry ≥ 1 (killing §3.3 cells 1, 2, 4, 5, 7, 8, 9, 10, 22). **The round-2 rewrite
+  proposed gating the continuation-past-empty reject to `rep == maxRep` (innermost-only) — that was ITSELF a
+  bug (red-team round-3 MISS): it FALSE-ACCEPTS a shallower phantom** such as `(0,0)(1,2)` (a `rep 1`
+  continuation into an outer list that opened NULL at `def 0`), which the shipped 585a `BuildRepeatedStructure`
+  then rejects on every future read → permanently-unreadable file, defeating the pre-pass net. **Round-3 fix
+  (§2.10.3): remove the `rep == maxRep` simplification entirely** and track `ownerComplete[1..k]` per level
+  exactly as the reader does (`:986`/`:1031`): the continuation reject (`ownerComplete[r] || def < presentDef_r`)
+  fires at **EVERY** level `r = 1…k`, keyed on each level's own footer-node markers. Requires the
+  **signature change** (rec #2): the guard receives the ordered `R_1…R_k` chain (each level's
+  `presentDef_j`/`parentPresentDef_j` read from its own node — insufficient from `leaf.MaxDef`/`MaxRep` alone
+  for interleaved shapes like `array<struct<array>>`). Single-level (`maxRep == 1`) is byte-identical
+  (§3.3-21); a genuine phantom-continuation fails closed at the **innermost** (§3.3 cell 28) **and** a
+  **shallower** level (§3.3 cell 29). **Added to both the §2.10.3 algorithm and the §2.10.7 fail-closed
+  table.**
 - **Residual — non-nullable nested containers stay refused (#730), at every depth.** `array<struct>` with
   `ContainsNull = false` (non-null struct elements), a non-null map value that is a container, or a
   `Nullable = false` struct child that is a container is **refused** — Parquet.Net emits every group OPTIONAL,
@@ -1375,7 +1423,8 @@ pre-pass `ValidateColumnAsync`):**
 | 19 | `Write_SchemaDeeperThanMaxNestedWriteDepth_FailsClosed` (`array<array<…>>` chain past depth 64) | `UnsupportedFeature`, rejected **before any byte** (pre-pass depth guard) |
 | 20 | `Write_ForeignNestedVector_FailsClosed` (a non-DeltaSharp managed vector at a nested level) | `UnsupportedFeature` (bounded KIND, no raw library text) |
 | 27 | `Write_NestedMapKey_FailsClosed_AtEveryDepth` (`map<array<int>,string>`, `map<struct<a:int>,string>`, and a nested-key map buried at depth 2, e.g. `array<map<array<int>,string>>`) | `UnsupportedFeature` — **nested map KEY not physically writable** (§2.10.6/§2.10.7 D5): Parquet.Net emits the key node OPTIONAL, which the 585a `EnsureRequiredMapKey` rejects → the file would be permanently unreadable; refused at the write door. Asserts a **scalar**-key map (`map<string,array<int>>`) is unaffected (companion success). *Also add the synthesized-footer read cell `ReadPromote_NestedMapKey_Unreadable_FailsClosed`: a hand-authored file with an OPTIONAL nested key is rejected by 585a `EnsureRequiredMapKey` (`SchemaMismatch`) — the read-side proof that motivates the write reject.* |
-| 28 | `Write_LevelGuard_InnermostPhantomContinuation_FailsClosed` (a crafted `internal` `EmitPath`/`NestedLevelGuard` fixture for `array<array<int>>` that continues the **innermost** list past its own empty marker, e.g. a slot `(rep 2, def 3)`) | `CorruptData` — the **rewritten** guard (§2.10.3) still catches a genuine innermost phantom-continuation (`rep == maxRep && def ≤ emptyDef_k`); the **write dual of §3.2 cell 19**. Companion positive: the §2.4 golden slot `(rep 1, def 3)` (new shallower occurrence, empty inner list) **passes** (cell 10). |
+| 28 | `Write_LevelGuard_InnermostPhantomContinuation_FailsClosed` (crafted `internal` `EmitPath`/`NestedLevelGuard` fixture for `array<array<int>>` continuing the **innermost** list past its own empty marker, e.g. `(0,3)(2,3)` — a `rep 2` after an empty inner list; and `(0,5)(2,4)(2,3)` — a `rep 2` at `def < presentDef_2`) | `CorruptData` — the per-level guard (§2.10.3) catches the **innermost** phantom via `ownerComplete[2]` (empty-inner variant) and via `def < presentDef_2` (present-inner variant); the **write dual of §3.2 cell 19**. Companion positive: the §2.4 golden slot `(rep 1, def 3)` (a new *shallower* occurrence with an empty inner list) **passes** (cell 10). |
+| 29 | `Write_LevelGuard_ShallowerPhantomContinuation_FailsClosed` (crafted `internal` fixture for `array<array<int>>` emitting a **shallower** phantom: a `rep 1` slot following a `def 0` NULL-outer marker — `(0,0)(1,2)` — and the companion `rep 1` after a `def 1` EMPTY-outer marker — `(0,1)(1,2)`) | `CorruptData`, thrown **before any byte** (N9 pre-pass) — the per-level guard catches the continuation into an outer list (level `R_1`) that opened null/empty, via `ownerComplete[1]`. **This is the cell the round-2 `rep == maxRep` gate FALSE-ACCEPTED** (red-team round-3 MISS); the shipped 585a `BuildRepeatedStructure` would otherwise reject the committed file on every read → permanently unreadable. **Cells 28 AND 29 together prove the per-level gate catches phantom continuations at BOTH the innermost (`R_k`) and a shallower (`R_1`) repeated level.** |
 
 **Regression / parity:**
 21. `Write_SingleLevelNested_ByteIdentical_After873` — the depth-1 write path
@@ -1416,7 +1465,7 @@ self-consistent with our own reader):**
 |---|---|---|
 | AC1 — writes a real Parquet file for `array<struct>` / `map<string,array>` / `array<array>` / `struct<struct>` (+ mixed) with correct nested def/rep | 1–9, 10, 10a, 10b | write→read round-trip + golden level-stream (array/struct/map) |
 | AC2 — 585a reads the written file back to the original values (null/empty/present at every level) | 1–11, 24 | round-trip through the shipped 585a reader |
-| AC3 — fail-closed parity preserved; recursion-depth bound honored on write | 12–20, 22, 23, 27, 28 | pre-pass write-door rejects (incl. nested-map-key 27 + rewritten level-guard phantom 28); at-bound success; slot-budget split |
+| AC3 — fail-closed parity preserved; recursion-depth bound honored on write | 12–20, 22, 23, 27, 28, 29 | pre-pass write-door rejects (incl. nested-map-key 27 + per-level level-guard phantom at innermost 28 AND shallower 29); at-bound success; slot-budget split |
 | AC4 — the three `#585` reject references lifted for supported shapes, re-pointed for residual (id-mode) | 1–9 (lifted), 18 (#866 re-point), 27 (nested-map-key stays closed) | name/none-mode recurse; id-mode → #866; nested map key → fail-closed |
 | AC5 — unblocks #713 recursive object-arm footer tests | 26 (REQUIRED array/map/struct interop), 25 | real writer authors the files #713 pinned helper-only; cross-engine canonical-layout proof |
 
@@ -1655,22 +1704,26 @@ byte/behaviour-unchanged (§3.3-21).
   `EnsureRequiredMapKey` rejects `Key.MaxDef > Map.MaxDef`). Prevented by the dedicated nested-map-key
   fail-closed at `CreateNestedField`/`CreateNestedNode` (§2.10.6/§2.10.7); §3.3-27 (write reject +
   synthesized-footer read reject). A scalar key is unaffected.
-- (n) **BLOCKING (D6) — the un-rewritten `NestedLevelGuard.Validate` false-rejects valid depth-≥2 streams**
-  as `CorruptData` (the golden `(1,3)` slot; struct-null element at list pos ≥ 1; empty inner value-list at
-  entry ≥ 1), killing happy-path cells 1/2/4/5/7/8/9/10/22. Prevented by rewriting the guard as the write dual
-  of `BuildRepeatedStructure` (§2.10.3): gate the continuation-past-empty reject to `rep == maxRep`, thread
-  `R_1…R_k`. §3.3-10/10a/10b (golden streams pass) + §3.3-28 (genuine innermost phantom still caught) +
-  §3.3-21 (single-level byte-identical).
+- (n) **BLOCKING (D6) — the `NestedLevelGuard.Validate` structural guard mis-handles depth ≥ 2 both ways**:
+  as shipped it **false-rejects** valid streams (the golden `(1,3)` slot; struct-null element at list pos ≥ 1;
+  empty inner value-list at entry ≥ 1 — killing cells 1/2/4/5/7/8/9/10/22), and the round-2 `rep == maxRep`
+  gate **false-accepts** a shallower phantom (`(0,0)(1,2)`) that mints a permanently-unreadable file. Prevented
+  by rewriting the guard as a **faithful per-level dual** of `BuildRepeatedStructure` (§2.10.3): track
+  `ownerComplete[1..k]` per level, fire the continuation reject (`ownerComplete[r] || def < presentDef_r`) at
+  **every** level `r = 1…k` (no `maxRep` gate), receive the `R_1…R_k` chain (signature change). §3.3-10/10a/10b
+  (golden streams pass) + §3.3-28 (innermost phantom caught) + §3.3-29 (shallower phantom caught) + §3.3-21
+  (single-level byte-identical).
 
 **Launch checklist (873 WRITE):** schema-builder recursion (`CreateNestedField`/`CreateNestedNode`, **incl.
 nested-map-key fail-close**) + shredder recursion (`EmitPath` + decoupled map key/value + recursive slot count
-+ **rewritten `NestedLevelGuard.Validate`**) + the three `#585` reject lifts (`:197`/`:241`/`:1532`) +
-`MaxNestedWriteDepth`; write→read round-trip suite (§3.3-1…11) green on both TFMs; the three golden
-level-stream cells (§3.3-10/10a/10b — array/struct/map) green; the depth-1 byte-identical regression
-(§3.3-21) green; the at-bound success (§3.3-22) + slot-split (§3.3-23) green; the nested-map-key fail-close
-(§3.3-27) + the rewritten-guard phantom-continuation (§3.3-28) green; the REQUIRED array/map/struct
-cross-engine interop (§3.3-26) green; the id-mode #866 re-point cell (§3.3-18) green; the 585b compose cell
-(§3.3-24) green; `dotnet format`; determinism ban; DCO; RFL PASS; **every
++ **per-level `NestedLevelGuard.Validate` rewrite (signature change → `R_1…R_k` chain)**) + the three `#585`
+reject lifts (`:197`/`:241`/`:1532`) + `MaxNestedWriteDepth`; write→read round-trip suite (§3.3-1…11) green on
+both TFMs; the three golden level-stream cells (§3.3-10/10a/10b — array/struct/map) green; the depth-1
+byte-identical regression (§3.3-21) green; the at-bound success (§3.3-22) + slot-split (§3.3-23) green; the
+nested-map-key fail-close (§3.3-27) + the per-level level-guard phantom-continuation cells at BOTH the
+innermost (§3.3-28) AND a shallower level (§3.3-29) green; the REQUIRED array/map/struct cross-engine interop
+(§3.3-26) green; the id-mode #866 re-point cell (§3.3-18) green; the 585b compose cell (§3.3-24) green;
+`dotnet format`; determinism ban; DCO; RFL PASS; **every
 `ParquetTypeMapping.cs`/`NestedColumnShredder.cs`/`NestedLevelGuard.cs` line-ref re-verified against the
 worktree** before editing (the schema builder is the first-firing gate — §2.10.9-D1).
 
@@ -1799,17 +1852,22 @@ RFL PASS; **every §2.5/§10 line-ref re-verified against the worktree** (the SP
     (no data round-trip); `element.key` (scalar key) is unaffected. **Follow-up:** `DeltaWriteSchemaEligibility`
     could reject a nested-map-key schema up-front so the column is never committed (currently the write-door
     reject fires on the first data write) — a hardening follow-up, out of #873's data-path scope.
-18. **Writer-side structural level guard — RESOLVED (round-2 BLOCKING/D6, §2.10.3): REWRITE `NestedLevelGuard.Validate`
-    as the write dual of `BuildRepeatedStructure`.** The shipped guard carried the single-repeated-level
-    assumption 585a had to rewrite out of the reader (`def <= emptyContainerDef` for every `rep > 0`), which
-    **false-rejects** valid depth-≥2 streams (the §2.10.4 golden `(1,3)`; struct-null element / empty inner
-    value-list at position ≥ 1). Rewrite: thread the ordered repeated-ancestor chain `R_1…R_k` off the built
-    footer node (each with its own `presentDef_j`/`emptyDef_j`); gate the "continuation past an empty/null
-    marker" reject to `rep == maxRep` (innermost `R_k`); police a shallower `rep = r < maxRep` slot against
-    `R_r`'s own markers (a new shallower occurrence whose child is null/empty is LEGAL); keep
-    `rowOpenings == rowCount` (depth-invariant). Single-level (`maxRep == 1`) behaviour is byte-identical
-    (§3.3-21); a genuine innermost phantom-continuation still fails closed (§3.3-28). Added to the §2.10.3
-    algorithm AND the §2.10.7 fail-closed table.
+18. **Writer-side structural level guard — RESOLVED (round-2 BLOCKING/D6, **corrected round-3**, §2.10.3):
+    REWRITE `NestedLevelGuard.Validate` as a FAITHFUL PER-LEVEL dual of `BuildRepeatedStructure`.** The shipped
+    guard carried the single-repeated-level assumption 585a had to rewrite out of the reader
+    (`def <= emptyContainerDef` for every `rep > 0`), which **false-rejects** valid depth-≥2 streams (the
+    §2.10.4 golden `(1,3)`; struct-null element / empty inner value-list at position ≥ 1). **The round-2
+    proposal to gate the reject to `rep == maxRep` (innermost-only) was itself a bug — it FALSE-ACCEPTS a
+    shallower phantom** `(0,0)(1,2)` (a `rep 1` continuation into a NULL outer list) that mints a
+    permanently-unreadable file. **Round-3 fix: remove the `rep == maxRep` simplification entirely.** Track
+    `ownerComplete[1..k]` per level and fire the continuation reject (`ownerComplete[r] || def < presentDef_r`)
+    at **EVERY** repeated level `r = 1…k`, keyed on each level's own footer-node markers — exactly the reader's
+    `ownerComplete || d < thisMaxDef` gate (`NestedParquetColumnReader.cs:1027-1035`). **Signature change**
+    (rec #2): the guard receives the ordered `R_1…R_k` chain (each `presentDef_j`/`parentPresentDef_j` read
+    from its own node — insufficient from `leaf.MaxDef`/`MaxRep` for interleaved shapes like
+    `array<struct<array>>`). Keep `rowOpenings == rowCount`. Single-level (`maxRep == 1`) byte-identical
+    (§3.3-21); phantom-continuations fail closed at the innermost (§3.3-28) **and** a shallower level
+    (§3.3-29). Added to the §2.10.3 algorithm AND the §2.10.7 fail-closed table.
 
 ---
 
