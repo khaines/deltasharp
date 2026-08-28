@@ -1216,6 +1216,164 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.False(addressField.Metadata.TryGetValue("delta.typeChanges", out _));
     }
 
+    // ---- #870: column-mapping id-mode gates the NESTED-leaf widening APPLY (enforcer ⊆ reader) ----------
+    //
+    // Empirically (read probes against a real written footer): under id mode the flat reader PROMOTES a
+    // top-level scalar by field_id (ValidateFileField gates on the promotion flag alone, no field_id
+    // conjunct) — so a top-level widen is READABLE and must NOT be blocked. But the NESTED reader binds an
+    // array element / map key-value / struct child by field_id with promoteLeaf:false hardcoded
+    // (#839/#546 §9 O1), so it fails closed SchemaMismatch on a pre-widening narrow file — an UNREADABLE
+    // table. The enforcer therefore refuses to APPLY those nested widenings under id mode (fail-closed
+    // TypeWideningUnsupported), so enforcer ⊆ reader holds. name/none mode is byte-for-byte unchanged.
+
+    [Fact]
+    public void Reconcile_ArrayElementWidening_IdMode_FailsClosed_AsTypeWideningUnsupported()
+    {
+        // array<int> → array<long> under id mode: the id-mode element reader (nested.ids, promoteLeaf:false)
+        // cannot promote the pre-widening narrow file, so the enforcer refuses to apply — fail-closed.
+        StructType table = Schema(Field("nums", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                typeWideningEnabled: true, columnMappingMode: ColumnMappingMode.Id));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("nums.element", ex.Path);
+        Assert.Contains("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_MapValueWidening_IdMode_FailsClosed_AsTypeWideningUnsupported()
+    {
+        StructType table = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType), nullable: true));
+        StructType write = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                typeWideningEnabled: true, columnMappingMode: ColumnMappingMode.Id));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("lookup.value", ex.Path);
+        Assert.Contains("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_MapKeyWidening_IdMode_FailsClosed_AsTypeWideningUnsupported()
+    {
+        StructType table = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.StringType), nullable: true));
+        StructType write = Schema(
+            Field("lookup", DataTypes.CreateMapType(DataTypes.LongType, DataTypes.StringType), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                typeWideningEnabled: true, columnMappingMode: ColumnMappingMode.Id));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("lookup.key", ex.Path);
+    }
+
+    [Fact]
+    public void Reconcile_StructChildWidening_IdMode_FailsClosed_AsTypeWideningUnsupported()
+    {
+        // struct<zip:int> → struct<zip:long> under id mode: the id-mode struct-child reader
+        // (ResolveStructFieldById, promoteLeaf:false) cannot promote the pre-widening narrow file — the
+        // struct-child (depth 1) widen is refused fail-closed, mirroring the nested-collection interior.
+        StructType tableInner = Schema(Field("zip", DataTypes.IntegerType, nullable: true));
+        StructType writeInner = Schema(Field("zip", DataTypes.LongType, nullable: true));
+        StructType table = Schema(Field("address", tableInner, nullable: true));
+        StructType write = Schema(Field("address", writeInner, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                typeWideningEnabled: true, columnMappingMode: ColumnMappingMode.Id));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("address.zip", ex.Path);
+        Assert.Contains("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_TopLevelScalarWidening_IdMode_IsStillApplied()
+    {
+        // CONTROL (Step-0 probe 1): a TOP-LEVEL scalar int→long under id mode is READ-PROMOTED by the flat
+        // reader (by field_id, on the promotion gate alone), so the enforcer STILL APPLIES it — the id-mode
+        // guard is scoped to nested leaves ONLY and must not over-block a genuinely-readable widen.
+        StructType table = Schema(Field("value", DataTypes.IntegerType, nullable: true));
+        StructType write = Schema(Field("value", DataTypes.LongType, nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+            typeWideningEnabled: true, columnMappingMode: ColumnMappingMode.Id);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["value"];
+        Assert.Equal(DataTypes.LongType, field.DataType);
+        AssertSingleTypeChange(field.Metadata, "integer", "long");
+    }
+
+    [Fact]
+    public void Reconcile_ArrayElementWidening_NameMode_IsStillApplied()
+    {
+        // CONTROL: name mode is unaffected — the array element widen still applies and records
+        // fieldPath="element" exactly as #546/#860 (the name-mode reader promotes a nested leaf by physical
+        // name, so the round-trip stays readable).
+        StructType table = Schema(Field("nums", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+            typeWideningEnabled: true, columnMappingMode: ColumnMappingMode.Name);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["nums"];
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ArrayType>(field.DataType).ElementType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element");
+    }
+
+    [Fact]
+    public void Reconcile_ArrayElementWidening_DefaultMode_IsStillApplied()
+    {
+        // CONTROL: the DEFAULT (omitted columnMappingMode ⇒ None) still applies the array element widen —
+        // proves the new parameter's default preserves the pre-#870 (name/none) behavior byte-for-byte.
+        StructType table = Schema(Field("nums", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
+
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(
+            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+
+        Assert.NotNull(merged);
+        StructField field = merged!["nums"];
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ArrayType>(field.DataType).ElementType);
+        AssertSingleNestedTypeChange(field.Metadata, "integer", "long", "element");
+    }
+
+    [Fact]
+    public void Reconcile_ArrayElementWidening_IdMode_WhenFeatureDisabled_StaysGenericTypeWideningUnsupported()
+    {
+        // When the feature is DISABLED the id-mode path never reaches the new guard (the apply arm is not
+        // entered): the array element widen is rejected by the pre-existing generic TypeWideningUnsupported,
+        // unchanged — the #870 guard is purely about a widen the reader can't honor WHEN it would be applied.
+        StructType table = Schema(Field("nums", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                typeWideningEnabled: false, columnMappingMode: ColumnMappingMode.Id));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        // The disabled-feature message names the enablement requirement (not the id-mode-specific one).
+        Assert.DoesNotContain("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Reconcile_ArrayElementDecimalGrowOnlyWidening_WhenEnabled_IsAppliedWithElementPath()
     {

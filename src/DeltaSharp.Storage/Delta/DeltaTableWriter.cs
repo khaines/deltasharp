@@ -1202,8 +1202,13 @@ internal sealed class DeltaTableWriter
             ? null
             : readSnapshot.Metadata.PartitionColumns;
         bool typeWideningEnabled = TypeWideningFeature.IsWriteEnabled(readSnapshot);
+        // #870: thread the table's column-mapping mode so the enforcer refuses to APPLY a nested widening the
+        // id-mode reader cannot promote (which would mint an unreadable table). name/none is the default and
+        // leaves the enforcer's behavior byte-identical.
+        ColumnMappingMode columnMappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         return DeltaSchemaEnforcer.Reconcile(
-            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled);
+            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled,
+            columnMappingMode);
     }
 
     // #616: before an ALTER that changes the LOGICAL schema (DROP/RENAME COLUMN) commits, refuse fail-closed
