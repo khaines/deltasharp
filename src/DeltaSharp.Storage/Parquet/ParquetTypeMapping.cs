@@ -149,7 +149,7 @@ internal static class ParquetTypeMapping
                                 CreateNestedNode(
                                     array.ElementType, array.ContainsNull, "element",
                                     $"array column '{label}' element", honorReferenceNullability,
-                                    isMapKey: false, depth: 2));
+                                    depth: 2));
                         }
 
                         long? elementId = ResolveArrayElementId(field, idMode, label);
@@ -176,7 +176,7 @@ internal static class ParquetTypeMapping
                                 CreateNestedNode(
                                     map.ValueType, map.ValueContainsNull, "value",
                                     $"map column '{label}' value", honorReferenceNullability,
-                                    isMapKey: false, depth: 2));
+                                    depth: 2));
                         }
 
                         (long? keyId, long? valueId) = ResolveMapInteriorIds(field, idMode, label);
@@ -209,7 +209,7 @@ internal static class ParquetTypeMapping
                             children[i] = CreateNestedNode(
                                 child.DataType, child.Nullable, child.Name,
                                 $"struct column '{label}' field {i}", honorReferenceNullability,
-                                isMapKey: false, depth: 2);
+                                depth: 2);
                             continue;
                         }
 
@@ -275,16 +275,17 @@ internal static class ParquetTypeMapping
     // reader reconstructs by physical name: a scalar routes to CreateScalarField (the leaf allowlist unchanged
     // at every depth); a container builds the nested PqListField/PqMapField/PqStructField and recurses into its
     // element/key/value/children, emitting the canonical child names ('element'/'key'/'value') at every level.
-    // A container in a map-KEY position (isMapKey) fails closed (RejectNestedMapKey). The depth guard fires at
-    // each entry BEFORE any descent so a pathological type tree is a deterministic UnsupportedFeature, never a
-    // StackOverflowException. No field_id is ever stamped (a name/none physical file is field_id-free).
+    // A map whose KEY is a container fails closed via RejectNestedMapKey, called BEFORE descending into the key
+    // node (the map case below), so a container never reaches a map-key position through this builder. The
+    // depth guard fires at each entry BEFORE any descent so a pathological type tree is a deterministic
+    // UnsupportedFeature, never a StackOverflowException. No field_id is ever stamped (a name/none physical
+    // file is field_id-free).
     private static Field CreateNestedNode(
         DataType type,
         bool nullable,
         string canonicalName,
         string context,
         bool honorReferenceNullability,
-        bool isMapKey,
         int depth)
     {
         if (depth > MaxNestedWriteDepth)
@@ -312,7 +313,7 @@ internal static class ParquetTypeMapping
                     canonicalName,
                     CreateNestedNode(
                         array.ElementType, array.ContainsNull, "element", $"{context} element",
-                        honorReferenceNullability, isMapKey: false, depth + 1));
+                        honorReferenceNullability, depth + 1));
 
             case MapType map:
                 RejectNestedMapKey(map.KeyType, $"{context} key");
@@ -320,10 +321,10 @@ internal static class ParquetTypeMapping
                     canonicalName,
                     CreateNestedNode(
                         map.KeyType, nullable: false, "key", $"{context} key",
-                        honorReferenceNullability, isMapKey: true, depth + 1),
+                        honorReferenceNullability, depth + 1),
                     CreateNestedNode(
                         map.ValueType, map.ValueContainsNull, "value", $"{context} value",
-                        honorReferenceNullability, isMapKey: false, depth + 1));
+                        honorReferenceNullability, depth + 1));
 
             case StructType structType:
                 if (structType.Count == 0)
@@ -338,7 +339,7 @@ internal static class ParquetTypeMapping
                     StructField child = structType[i];
                     children[i] = CreateNestedNode(
                         child.DataType, child.Nullable, child.Name, $"{context} field {i}",
-                        honorReferenceNullability, isMapKey: false, depth + 1);
+                        honorReferenceNullability, depth + 1);
                 }
 
                 return new PqStructField(canonicalName, children);
