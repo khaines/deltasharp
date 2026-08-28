@@ -1,6 +1,7 @@
 using System.Text.RegularExpressions;
 using DeltaSharp.Engine.Columnar;
 using DeltaSharp.Storage.Parquet;
+using DeltaSharp.Storage.Tests.Parquet;
 using DeltaSharp.Types;
 using Parquet;
 using Parquet.Data;
@@ -218,11 +219,25 @@ public sealed class ParquetWriterTests
         // artifact layer over field metadata (including the #330 unquoted-integer column-mapping id
         // contract), over every scalar type the writer accepts with the decimal parameter boundaries,
         // and over field names requiring JSON escaping — plus a completeness guard that fires if the
-        // writer ever accepts a type this corpus does not pin. What remains uncovered at this
-        // layer is only the part that is INHERENTLY unreachable: nested types cannot be written at
-        // all today, because ParquetTypeMapping.CreateField rejects array/map/struct with
-        // UnsupportedFeature (design §2.9), so no artifact test can pin them until that lands. They
-        // are pinned at the helper layer meanwhile. Tracked in #713.
+        // writer ever accepts a type this corpus does not pin.
+        //
+        // NESTED types (#713): single-level array/map/struct write support landed in #841, so the
+        // reachable nested shapes are now pinned at THIS artifact layer too. Two tests split the work:
+        // WrittenFooter_PinsSingleLevelNestedTypes pins the footer `delta.schema` STRING (the serializer
+        // call site) for the array containsNull arm (both polarities), the map valueContainsNull arm
+        // (both polarities), a nested struct field, the scalar elementType/keyType/valueType recursion
+        // arms, and column-mapping metadata on a nested container and leaf;
+        // WrittenFooter_PinsNestedTypes_FromRealNestedRows additionally drives real nested rows through
+        // the shredder and ROUND-TRIPS them back through the reader, pinning that the physical nested
+        // bytes read back correctly (write→read fidelity) — the schema STRING alone does not, since it is
+        // stamped before shredding. Deep Dremel level-stream byte pinning is NestedParquetWriteTests'
+        // job. What remains helper-only is only the part still INHERENTLY unreachable: the recursive
+        // OBJECT arms — a nested container/struct nested INSIDE another (array<struct>, map<string,array>,
+        // struct<x:struct>) — which the writer still refuses ("a nested type within a nested type ...
+        // deferred, #585" — a dangling ref to the closed #585, tracked by #873), so no artifact test can
+        // pin them until nested-within-nested WRITE support lands (#873). They stay pinned at the helper
+        // layer (DeltaSchemaJsonComplexTypeTests) meanwhile, and the completeness guard's
+        // AssertWriterRefusesAsync probes pin that refusal boundary on the write side.
         //
         // The three Assert.Contains calls below are substring checks: blind to field ORDER, to
         // property order within a field, and to anything additional, so they could never have caught
@@ -565,13 +580,268 @@ public sealed class ParquetWriterTests
         // particular is real cross-engine corruption, not a cosmetic difference: an NTZ column
         // silently becomes UTC for every external reader.
         //
-        // Nested types are deliberately absent: CreateField throws UnsupportedFeature for
-        // array/map/struct (design §2.9), so they cannot be written at all and cannot be pinned here
-        // until that lands (#713). If nested write support arrives, extend this corpus.
+        // Nested types are deliberately absent from the SCALAR corpus: their wire shape is an
+        // {"type":"array"|"map"|"struct", ...} OBJECT, not a scalar type-name string, so it is pinned
+        // by the nested artifact tests below (WrittenFooter_PinsSingleLevelNestedTypes and its
+        // data-bearing sibling) rather than here. Single-level nested write landed in #841; the
+        // recursive OBJECT arms (a nested container/struct INSIDE another) are still refused by the
+        // writer (the message says "deferred, #585", a dangling ref to the closed #585; tracked by #873),
+        // so those remain helper-only for now — see the nested tests below.
         string schemaJson = await WriteAndReadFooterSchemaAsync(ScalarCorpusSchema);
 
         Assert.Equal(ScalarFooterGolden, schemaJson);
         Assert.Equal(SchemaJson.ToJson(ScalarCorpusSchema), schemaJson);
+    }
+
+    /// <summary>
+    /// The nested artifact corpus — the SINGLE-LEVEL nested shapes the writer accepts since #841:
+    /// <c>array&lt;scalar&gt;</c> (both <c>containsNull</c> polarities), <c>map(scalar → scalar)</c>
+    /// (both <c>valueContainsNull</c> polarities) and a nested <c>struct&lt;scalars&gt;</c> field
+    /// (bare, and one carrying #191/#676 column-mapping metadata on both the container and a nested
+    /// leaf). Every nested container is <c>nullable:true</c> because the writer refuses a
+    /// non-nullable nested container (#730 — Parquet.Net emits every nested container as OPTIONAL);
+    /// the <c>containsNull</c>/<c>valueContainsNull</c> polarities live on the ELEMENT/VALUE, which is
+    /// independent of the container's own nullability.
+    /// </summary>
+    private static readonly StructType NestedCorpusSchema = new(new[]
+    {
+        new StructField("tags", DataTypes.CreateArrayType(DataTypes.StringType, containsNull: true), nullable: true),
+        new StructField("ids", DataTypes.CreateArrayType(DataTypes.LongType, containsNull: false), nullable: true),
+        new StructField(
+            "props",
+            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType, valueContainsNull: true),
+            nullable: true),
+        new StructField(
+            "counts",
+            DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: false),
+            nullable: true),
+        new StructField("point", DataTypes.CreateStructType(new[]
+        {
+            new StructField("a", DataTypes.IntegerType, nullable: true),
+            new StructField("b", DataTypes.StringType, nullable: false),
+        }), nullable: true),
+        new StructField(
+            "mapped",
+            DataTypes.CreateStructType(new[]
+            {
+                new StructField("leaf", DataTypes.LongType, nullable: false, FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(7)),
+                    new KeyValuePair<string, MetadataValue>(
+                        "delta.columnMapping.physicalName", MetadataValue.String("col-7")),
+                })),
+            }),
+            nullable: true,
+            FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>("delta.columnMapping.id", MetadataValue.Long(3)),
+                new KeyValuePair<string, MetadataValue>(
+                    "delta.columnMapping.physicalName", MetadataValue.String("col-3")),
+            })),
+    });
+
+    /// <summary>Footer bytes for <see cref="NestedCorpusSchema"/>, read back out of a real file.</summary>
+    private const string NestedFooterGolden =
+        "{\"type\":\"struct\",\"fields\":[" +
+        "{\"name\":\"tags\",\"type\":{\"type\":\"array\",\"elementType\":\"string\",\"containsNull\":true}," +
+        "\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"ids\",\"type\":{\"type\":\"array\",\"elementType\":\"long\",\"containsNull\":false}," +
+        "\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"props\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"long\"," +
+        "\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"counts\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"integer\"," +
+        "\"valueContainsNull\":false},\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"point\",\"type\":{\"type\":\"struct\",\"fields\":[" +
+        "{\"name\":\"a\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"b\",\"type\":\"string\",\"nullable\":false,\"metadata\":{}}]}," +
+        "\"nullable\":true,\"metadata\":{}}," +
+        "{\"name\":\"mapped\",\"type\":{\"type\":\"struct\",\"fields\":[" +
+        "{\"name\":\"leaf\",\"type\":\"long\",\"nullable\":false,\"metadata\":{" +
+        "\"delta.columnMapping.id\":7,\"delta.columnMapping.physicalName\":\"col-7\"}}]}," +
+        "\"nullable\":true,\"metadata\":{" +
+        "\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"col-3\"}}]}";
+
+    [Fact]
+    public async Task WrittenFooter_PinsSingleLevelNestedTypes()
+    {
+        // #713: ARTIFACT-layer coverage of NESTED TYPES. Before #841 the writer refused array/map/struct
+        // outright (UnsupportedFeature, design §2.9), so these shapes were pinned ONLY at the helper
+        // layer (DeltaSchemaJsonComplexTypeTests over DeltaSchemaJson/SchemaJson goldens). That layer is
+        // provenance-blind by construction: it asserts what the SERIALIZER would produce, never what
+        // ParquetFileWriter DID stamp into a footer, so a call-site swap for a nested-typed table was
+        // undetectable. Single-level nested write landed in #841, so the reachable half is now pinned
+        // here at the artifact layer — the footer `delta.schema` STRING bytes are read back out of a
+        // real file, the same way the scalar corpus above is.
+        //
+        // SCOPE, stated plainly: this test (and its NestedFooterGolden) pins the footer `delta.schema`
+        // STRING artifact — the serializer call-site — NOT the physical Parquet nested structure. It
+        // writes ZERO batches, so nothing here depends on the shredder; the physical write→read fidelity
+        // of nested rows is pinned by WrittenFooter_PinsNestedTypes_FromRealNestedRows below, and deep
+        // Dremel level-stream byte pinning by NestedParquetWriteTests.
+        //
+        // The corpus pins the schema-string shapes the issue names as the residual:
+        //   * the array containsNull arm, BOTH polarities ("tags" true, "ids" false);
+        //   * the map valueContainsNull arm, BOTH polarities ("props" true, "counts" false);
+        //   * a nested struct field ("point"), including a non-nullable child ("b") so the child
+        //     nullability inside the object shape is pinned, not just the container's;
+        //   * the scalar elementType / keyType / valueType recursion arms (string, long, integer) that
+        //     the object shape carries at its base;
+        //   * field metadata on BOTH a nested container ("mapped") and a nested leaf ("leaf") — the
+        //     #191/#676 column-mapping payload stamped into a nested tree, with the #330 unquoted
+        //     integer id contract, now pinned at the artifact layer rather than only the helper layer.
+        //
+        // NOT pinned here, because the writer still REFUSES it (message: "deferred, #585", a dangling ref
+        // to the closed #585; tracked by #873): the recursive OBJECT
+        // arms — a nested container or struct nested INSIDE another (array<struct>, map<string,array>,
+        // struct<x:struct>). CreateNestedLeaf throws "a nested type within a nested type ... (deferred,
+        // #585)" for those, so no artifact test can pin them until that write support lands. They
+        // remain helper-only (DeltaSchemaJsonComplexTypeTests) meanwhile; see the completeness guard's
+        // AssertWriterRefusesAsync probes, which pin that refusal boundary on the write side.
+        string schemaJson = await WriteAndReadFooterSchemaAsync(NestedCorpusSchema);
+
+        // Same dual oracle as the scalar/metadata siblings, same execution order: the golden fires
+        // first for any footer-byte divergence (a call-site swap AND shared-serializer drift reaching
+        // the footer both trip it, shadowing the equality); the equality is the only assertion that can
+        // fail while the footer still matches the golden, i.e. when SchemaJson drifts and the footer
+        // does not follow. Neither subsumes the other.
+        Assert.Equal(NestedFooterGolden, schemaJson);
+        Assert.Equal(SchemaJson.ToJson(NestedCorpusSchema), schemaJson);
+    }
+
+    [Fact]
+    public async Task WrittenFooter_PinsNestedTypes_FromRealNestedRows()
+    {
+        // #713: the DATA-BEARING nested test. The corpus test above writes ZERO batches: it pins the
+        // footer `delta.schema` STRING artifact (catching a serializer call-site swap for nested
+        // shapes — the #713/#693 scope), but because that string is stamped into the custom-metadata
+        // dict BEFORE the row-group loop, shredding cannot affect it, so a zero-batch (or
+        // schema-string-only) assertion is TAUTOLOGICAL with respect to the shredder. It says nothing
+        // about whether the physical nested bytes are correct.
+        //
+        // This test therefore asserts something that DEPENDS on the shredded physical bytes: it drives
+        // real nested rows through the NestedColumnShredder, then reads them back through the real
+        // nested READ path (ParquetFileReader → the #571 nested decoders that independently validate
+        // the Dremel level streams) and asserts the VALUES round-trip. A shredder that emits wrong
+        // physical bytes surfaces here as a read-side rejection or a value mismatch — not silently.
+        //
+        // SCOPE, stated plainly so no reader over-claims: the schema-string assertions below pin the
+        // footer `delta.schema` ARTIFACT (a call-site swap), NOT the physical Parquet nested structure;
+        // the round-trip pins that the shredder's physical output READS BACK correctly (write→read
+        // fidelity); deep Dremel level-stream BYTE pinning (literal definition/repetition arrays) is
+        // NestedParquetWriteTests' job, not this test's.
+        //
+        // Both polarities are exercised on the DATA path: `a` is array containsNull:true (carries a
+        // null element), `af` is array containsNull:false (all elements present), `m` is map
+        // valueContainsNull:true (carries a null value), `mf` is map valueContainsNull:false (all
+        // values present). The false-polarity rows respect the non-null-element/value contract.
+        var arrT = DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true);
+        var arrF = DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: false);
+        var mapT = DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: true);
+        var mapF = DataTypes.CreateMapType(DataTypes.StringType, DataTypes.IntegerType, valueContainsNull: false);
+        var structType = DataTypes.CreateStructType(new[]
+        {
+            new StructField("a", DataTypes.IntegerType, nullable: true),
+            new StructField("b", DataTypes.StringType, nullable: true),
+        });
+        var schema = new StructType(new[]
+        {
+            new StructField("a", arrT, nullable: true),
+            new StructField("af", arrF, nullable: true),
+            new StructField("m", mapT, nullable: true),
+            new StructField("mf", mapF, nullable: true),
+            new StructField("s", structType, nullable: true),
+        });
+
+        // Four rows exercising every nested Dremel branch: present / null-container / empty-container /
+        // (present-with-null-element or -field). The false-polarity rows carry no null element/value.
+        var aRows = new int?[]?[] { new int?[] { 1, 2 }, null, Array.Empty<int?>(), new int?[] { 3, null } };
+        var afRows = new int?[]?[] { new int?[] { 10, 20 }, null, Array.Empty<int?>(), new int?[] { 30 } };
+        var mRows = new IReadOnlyList<(string Key, int? Value)>?[]
+        {
+            new[] { ("k1", (int?)1) }, null, Array.Empty<(string, int?)>(), new[] { ("k2", (int?)null) },
+        };
+        var mfRows = new IReadOnlyList<(string Key, int? Value)>?[]
+        {
+            new[] { ("k1", (int?)1), ("k2", (int?)2) }, null, Array.Empty<(string, int?)>(), new[] { ("k3", (int?)3) },
+        };
+        var sRows = new (int? A, string? B)?[] { (1, "one"), null, (3, null), (null, "two") };
+
+        var batch = new ManagedColumnBatch(
+            schema,
+            new ColumnVector[]
+            {
+                NestedVectors.IntList(arrT, aRows),
+                NestedVectors.IntList(arrF, afRows),
+                NestedVectors.StringIntMap(mapT, mRows),
+                NestedVectors.StringIntMap(mapF, mfRows),
+                NestedVectors.IntStringStruct(structType, sRows),
+            },
+            rowCount: 4);
+
+        byte[] bytes = await ParquetTestHelpers.WriteToBytesAsync(schema, new[] { batch });
+
+        // ---- the load-bearing part: round-trip the shredded physical bytes back through the reader ----
+        ColumnBatch decoded = await ReadSingleBatchAsync(bytes, schema);
+
+        NestedVectors.AssertListsEqual(aRows, NestedVectors.ReadIntList((ListColumnVector)decoded.Column(0)));
+        NestedVectors.AssertListsEqual(afRows, NestedVectors.ReadIntList((ListColumnVector)decoded.Column(1)));
+        NestedVectors.AssertMapsEqual(mRows, NestedVectors.ReadStringIntMap((MapColumnVector)decoded.Column(2)));
+        NestedVectors.AssertMapsEqual(mfRows, NestedVectors.ReadStringIntMap((MapColumnVector)decoded.Column(3)));
+        NestedVectors.AssertStructsEqual(sRows, NestedVectors.ReadIntStringStruct((StructColumnVector)decoded.Column(4)));
+
+        // ---- schema-string artifact assertions (still pin the footer `delta.schema` STRING) ----
+        const string dataFooterGolden =
+            "{\"type\":\"struct\",\"fields\":[" +
+            "{\"name\":\"a\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":true}," +
+            "\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"af\",\"type\":{\"type\":\"array\",\"elementType\":\"integer\",\"containsNull\":false}," +
+            "\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"m\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"integer\"," +
+            "\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"mf\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":\"integer\"," +
+            "\"valueContainsNull\":false},\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"s\",\"type\":{\"type\":\"struct\",\"fields\":[" +
+            "{\"name\":\"a\",\"type\":\"integer\",\"nullable\":true,\"metadata\":{}}," +
+            "{\"name\":\"b\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}," +
+            "\"nullable\":true,\"metadata\":{}}]}";
+
+        string dataBearing = await ReadFooterSchemaAsync(bytes);
+        Assert.Equal(dataFooterGolden, dataBearing);
+        Assert.Equal(SchemaJson.ToJson(schema), dataBearing);
+
+        // PROVENANCE on the schema STRING (not the physical structure): the footer `delta.schema` must
+        // be byte-identical whether or not nested vectors were materialised. The zero-batch path builds
+        // the custom-metadata dict before the row-group loop; this asserts the shredding path did not
+        // perturb it. If they ever diverge, one of the two call sites stamps a different schema string
+        // for the same schema.
+        string zeroBatch = await WriteAndReadFooterSchemaAsync(schema);
+        Assert.Equal(zeroBatch, dataBearing);
+    }
+
+    /// <summary>Reads the footer <c>delta.schema</c> string out of already-written Parquet bytes.</summary>
+    private static async Task<string> ReadFooterSchemaAsync(byte[] bytes)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        await using ParquetReader reader =
+            await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        return reader.CustomMetadata[FooterWireKeys.Schema];
+    }
+
+    /// <summary>Reads written Parquet bytes back through the real nested read path, asserting a single batch.</summary>
+    private static async Task<ColumnBatch> ReadSingleBatchAsync(byte[] bytes, StructType schema)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        ColumnBatch? only = null;
+        await foreach (ColumnBatch decoded in new ParquetFileReader().ReadAsync(
+            stream, schema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false,
+            CancellationToken.None))
+        {
+            Assert.Null(only);
+            only = decoded;
+        }
+
+        Assert.NotNull(only);
+        return only!;
     }
 
     /// <summary>Footer bytes for the escaped-name corpus; shared with the escape-form guard.</summary>
@@ -972,10 +1242,14 @@ public sealed class ParquetWriterTests
         //     support is this same derived list.
         // A type that is neither pinned nor generated would be invisible; none is.
         // NESTED types are excluded from the SCALAR corpus's completeness obligation: since #841 the
-        // writer accepts array/map/struct, but their wire shape is a Dremel level encoding rather than a
-        // scalar footer field, so it is pinned by NestedParquetWriteTests (round-trip + literal level
-        // streams) instead of by ScalarFooterGolden. The refusal-boundary assertions below pin that
-        // acceptance so this exclusion cannot quietly hide a regression in either direction.
+        // writer accepts single-level array/map/struct, but their footer wire shape is an
+        // {"type":"array"|"map"|"struct", ...} OBJECT rather than a scalar type-name string, so their
+        // FOOTER bytes are pinned by WrittenFooter_PinsSingleLevelNestedTypes /
+        // WrittenFooter_PinsNestedTypes_FromRealNestedRows (artifact layer, both polarities of
+        // containsNull/valueContainsNull and a nested struct), and their Dremel level encoding by
+        // NestedParquetWriteTests (round-trip + literal level streams), instead of by ScalarFooterGolden.
+        // The refusal-boundary assertions below pin that acceptance so this exclusion cannot quietly
+        // hide a regression in either direction.
         string[] unparameterised = accepted
             .Where(t => !t.TypeName.StartsWith("decimal", StringComparison.Ordinal))
             .Where(t => t is not (ArrayType or MapType or StructType))
@@ -1009,12 +1283,33 @@ public sealed class ParquetWriterTests
         Assert.Contains("struct", acceptedNames, StringComparer.Ordinal);
         Assert.DoesNotContain("void", acceptedNames, StringComparer.Ordinal);
 
-        // The residual refusals (#585/§2.4a/§2.6): nested-within-nested, a zero-field struct, and a
-        // non-nullable nested container. Asserted through the same real-write probe the acceptance set is
-        // derived from, so the boundary is measured on both sides rather than described on one.
+        // The residual refusals (§2.4a/§2.6 + the nested-within-nested defer, message "deferred, #585"
+        // now tracked by #873): each of the THREE named object arms individually — array<array>,
+        // map<string,array>, struct<x:struct> — plus a zero-field struct and a non-nullable nested
+        // container. Each object arm is probed on its own so a future writer that starts accepting ONE
+        // (e.g. array elements) while still refusing another (e.g. map values or struct fields) is
+        // caught rather than masked by a single representative. Asserted through the same real-write
+        // probe the acceptance set is derived from, so the boundary is measured on both sides rather
+        // than described on one.
         await AssertWriterRefusesAsync(
             new StructField(
                 "probe", DataTypes.CreateArrayType(DataTypes.CreateArrayType(DataTypes.LongType)),
+                nullable: true));
+        await AssertWriterRefusesAsync(
+            new StructField(
+                "probe",
+                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.CreateArrayType(DataTypes.LongType)),
+                nullable: true));
+        await AssertWriterRefusesAsync(
+            new StructField(
+                "probe",
+                DataTypes.CreateStructType(new[]
+                {
+                    new StructField(
+                        "x",
+                        DataTypes.CreateStructType(new[] { new StructField("y", DataTypes.LongType, nullable: true) }),
+                        nullable: true),
+                }),
                 nullable: true));
         await AssertWriterRefusesAsync(
             new StructField("probe", DataTypes.CreateStructType(Array.Empty<StructField>()), nullable: true));
