@@ -1613,6 +1613,73 @@ public sealed class NestedParquetReadTests
     }
 
     [Fact]
+    public async Task AbsentNullableVoidLeaf_DirectNestedRead_FailsClosed_UnsupportedFeature()
+    {
+        // #863: an ABSENT nullable struct child whose leaf type has no managed column vector (void/NullType)
+        // is null-filled via NestedParquetColumnReader.BuildAllNullSubtree -> ColumnVectors.Create, which
+        // rejects void with a raw UnsupportedTypeException. That raw exception must NOT escape the storage
+        // boundary: the reader normalizes it to a TYPED, bounded, sanitized DeltaStorageException
+        // (UnsupportedFeature). Through the full public door ParquetTypeMapping.EnsureReadSupported rejects such
+        // a leaf up front, so this asserts the reader's OWN independent fail-closed contract by calling
+        // ReadAsync directly (bypassing that front-line gate) — the absent-child (#857 null-fill) path, which
+        // the gate would otherwise never let reach the reader with an unsupported leaf. The child's hostile
+        // struct-field name is sanitized and only the leaf KIND is rendered (never a foreign SimpleString).
+        const string hostileFieldName = "v\r\n[CRITICAL] forged";
+        byte[] bytes = await WriteAsync(new List<AOnlyRow>
+        {
+            new() { Id = 1, S = new InnerAOnly { A = 10 } },
+            new() { Id = 2, S = null },
+        });
+
+        var requested = new StructType(new[]
+        {
+            new StructField("A", DataTypes.IntegerType, nullable: false),        // present physical leaf (int)
+            new StructField(hostileFieldName, DataTypes.NullType, nullable: true), // absent void leaf → null-fill
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadNestedDirectAsync(bytes, "S", requested));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("has no supported column vector", error.Message, StringComparison.Ordinal);
+        Assert.Contains("'void'", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostileFieldName, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', error.Message);
+        Assert.DoesNotContain('\n', error.Message);
+    }
+
+    [Fact]
+    public async Task AbsentNullableStructWithVoidLeaf_DirectNestedRead_FailsClosed_UnsupportedFeature()
+    {
+        // #863 (nested variant): the absent child is itself a struct whose leaf is void, so BuildAllNullSubtree
+        // RECURSES into the child's lanes before hitting ColumnVectors.Create at the void leaf. The recursion
+        // must still fail closed with the typed UnsupportedFeature contract, with the hostile inner field name
+        // sanitized out of the message.
+        const string hostileInner = "w\r\n[ALERT] forged";
+        byte[] bytes = await WriteAsync(new List<AOnlyRow>
+        {
+            new() { Id = 1, S = new InnerAOnly { A = 10 } },
+            new() { Id = 2, S = null },
+        });
+
+        StructType voidStruct =
+            new(new[] { new StructField(hostileInner, DataTypes.NullType, nullable: true) });
+        var requested = new StructType(new[]
+        {
+            new StructField("A", DataTypes.IntegerType, nullable: false),
+            new StructField("N", voidStruct, nullable: true), // absent struct<void> subtree → recursive null-fill
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadNestedDirectAsync(bytes, "S", requested));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("has no supported column vector", error.Message, StringComparison.Ordinal);
+        Assert.Contains("'void'", error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain(hostileInner, error.Message, StringComparison.Ordinal);
+        Assert.DoesNotContain('\r', error.Message);
+        Assert.DoesNotContain('\n', error.Message);
+    }
+
+    [Fact]
     public async Task WrongContainerKind_FailsClosed_SchemaMismatch()
     {
         // The file column 'S' is physically a struct; requesting it as an array is a structural mismatch and
@@ -3962,6 +4029,25 @@ public sealed class NestedParquetReadTests
         using var stream = new MemoryStream();
         await ParquetSerializer.SerializeAsync(rows, stream, cancellationToken: CancellationToken.None);
         return stream.ToArray();
+    }
+
+    // Reads a single nested column DIRECTLY through NestedParquetColumnReader.ReadAsync, deliberately BYPASSING
+    // ParquetFileReader.EnsureReadSupported (the front-line gate that rejects an unsupported requested leaf up
+    // front). This exercises the nested reader's OWN fail-closed contract (#863) — specifically the absent-child
+    // null-fill path (#857), which EnsureReadSupported would otherwise never let reach the reader with an
+    // unsupported leaf, so the reader's independent normalization is only observable via this direct entry.
+    private static async Task ReadNestedDirectAsync(byte[] bytes, string columnName, StructType requestedType)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        await using global::Parquet.ParquetReader reader =
+            await global::Parquet.ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
+        var fileField = reader.Schema.Fields.Single(f => f.Name == columnName);
+        using global::Parquet.ParquetRowGroupReader rowGroup = reader.OpenRowGroupReader(0);
+        int rowCount = checked((int)rowGroup.RowCount);
+        var budget = new NestedParquetColumnReader.NestedDecodeBudget(4L * 1024 * 1024);
+        await NestedParquetColumnReader.ReadAsync(
+            rowGroup, fileField, requestedType, rowCount, columnName, budget,
+            byFieldId: null, interiorIds: null, allowTypeWideningPromotion: false, CancellationToken.None);
     }
 
     private static async Task EnumerateAsync(ParquetFileReader reader, byte[] bytes, StructType requested)
