@@ -705,7 +705,7 @@ public sealed class DeltaSchemaEvolutionWriterTests : IDisposable
         await DeltaTestHarness.WriteCommitAsync(
             _backend, 0,
             DeltaTestHarness.ProtocolWithReaderFeature("typeWidening"),
-            MetaLineWithLogSchema(initial, ("delta.enableTypeWidening", "true")),
+            DeltaTestHarness.MetadataWithSchemaAndConfig(initial, new[] { ("delta.enableTypeWidening", "true") }),
             DeltaTestHarness.Add("v0.parquet"));
 
         Snapshot readSnapshot = await LoadAsync();
