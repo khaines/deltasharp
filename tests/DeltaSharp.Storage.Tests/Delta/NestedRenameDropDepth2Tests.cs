@@ -216,6 +216,113 @@ public sealed class NestedRenameDropDepth2Tests : IDisposable
         Assert.Equal("y", Encoding.UTF8.GetString(readInner.Child("b").GetBytes(1)));
     }
 
+    // ================================================================ §3.18b — depth>1 rename collision (F6a)
+
+    [Fact]
+    public async Task RenameDepth2StructChild_CollidesWithDeepSibling_FailsClosed_F6a()
+    {
+        // Balanced N1: the depth>1 analogue of the single-level F6a cell — renaming a nested struct child to a
+        // name ordinally equal to an existing sibling AT THAT LEVEL fails closed at the door (no commit).
+        StructType schema = Depth2Schema();
+        await WriteNameMappedAsync(schema, Depth2Batch(schema));
+        using var backend = new LocalFileSystemBackend(_root);
+
+        // outer.inner has {a, b}; rename b -> a collides with sibling a.
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).RenameColumnAsync(new[] { "outer", "inner", "b" }, "a"));
+        Assert.Contains("already exists at this level", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000001.json")));
+    }
+
+    // ============================================== §3.19c — zero-field guard (red-team, table-integrity) ======
+
+    [Fact]
+    public async Task DropLastChildOfNestedStruct_FailsClosed_NoCommit()
+    {
+        // (a) Dropping the SOLE child of a nested struct would leave a zero-field struct — invalid under Delta.
+        // Fail closed at the API DOOR (a clean InvalidOperationException, NOT a downstream committer
+        // DeltaProtocolException), and write NO new commit version.
+        var schema = new StructType(new[]
+        {
+            new StructField("s", new StructType(new[]
+            {
+                new StructField("a", DataTypes.LongType, nullable: true),
+            }), nullable: true),
+        });
+        var inner = new StructColumnVector(
+            (StructType)schema["s"].DataType, new ColumnVector[] { Long(1L, 2L) }, new[] { false, false });
+        await WriteNameMappedAsync(schema, new ManagedColumnBatch(schema, new ColumnVector[] { inner }, 2));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).DropColumnAsync(new[] { "s", "a" }));
+        Assert.Contains("at least one field", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("last column cannot be dropped", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000001.json")));
+    }
+
+    [Fact]
+    public async Task DropLastTopLevelColumn_FailsClosed_NoCommit_TableStillReadable()
+    {
+        // (b) Dropping the SOLE top-level column would brick the table with a zero-field schema. Pre-fix this
+        // BYPASSED committer validation and silently committed a corrupt table; the API-door guard now rejects
+        // it with NO commit written, and the table stays readable at the prior version (proof it is NOT
+        // bricked).
+        var schema = new StructType(new[] { new StructField("a", DataTypes.LongType, nullable: false) });
+        await WriteNameMappedAsync(schema, new ManagedColumnBatch(schema, new ColumnVector[] { Long(1L, 2L) }, 2));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => new DeltaTableWriter(backend).DropColumnAsync(new[] { "a" }));
+        Assert.Contains("at least one field", ex.Message, StringComparison.Ordinal);
+        Assert.False(File.Exists(Path.Combine(_root, "_delta_log", "00000000000000000001.json")));
+
+        // The table is still readable at v0 — not bricked by a zero-field commit.
+        ColumnBatch read = await ReadSingleBatchAsync();
+        Assert.Equal(1L, read.Column(0).GetValue<long>(0));
+        Assert.Equal(2L, read.Column(0).GetValue<long>(1));
+    }
+
+    [Fact]
+    public async Task DropNonLastTopLevelColumn_LeavesAtLeastOne_Succeeds_NoOverReject()
+    {
+        // (c) POSITIVE regression guard: the zero-field guard must NOT over-reject — dropping a top-level column
+        // that leaves >= 1 sibling still succeeds metadata-only (keeps single-level #840 unregressed).
+        StructType schema = Depth2Schema(); // { id, outer } — dropping id leaves outer.
+        await WriteNameMappedAsync(schema, Depth2Batch(schema));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        DeltaCommitResult result = await new DeltaTableWriter(backend).DropColumnAsync(new[] { "id" });
+        Assert.Equal(1L, result.Version);
+
+        Dictionary<string, int> actions = await CommitActionKindsAsync(1);
+        Assert.Equal(1, actions.GetValueOrDefault("metaData"));
+        Assert.Equal(0, actions.GetValueOrDefault("add"));
+        Assert.Equal(0, actions.GetValueOrDefault("remove"));
+
+        Snapshot after = await LoadSnapshotAsync();
+        Assert.False(after.Schema.TryGetField("id", out _));
+        Assert.True(after.Schema.TryGetField("outer", out _));
+    }
+
+    [Fact]
+    public async Task DropNonLastChildOfNestedStruct_LeavesAtLeastOne_Succeeds_NoOverReject()
+    {
+        // (c) POSITIVE regression guard at depth>1: dropping one of two nested children leaves the sibling and
+        // succeeds metadata-only — the zero-field guard fires ONLY when the containing struct would be emptied.
+        StructType schema = Depth2Schema(); // outer.inner has { a, b }
+        await WriteNameMappedAsync(schema, Depth2Batch(schema));
+
+        using var backend = new LocalFileSystemBackend(_root);
+        DeltaCommitResult result = await new DeltaTableWriter(backend).DropColumnAsync(new[] { "outer", "inner", "a" });
+        Assert.Equal(1L, result.Version);
+
+        Snapshot after = await LoadSnapshotAsync();
+        var innerAfter = (StructType)((StructType)after.Schema["outer"].DataType)["inner"].DataType;
+        Assert.False(innerAfter.TryGetField("a", out _));
+        Assert.True(innerAfter.TryGetField("b", out _));
+    }
+
     // ================================================================ §3.19 — array/map interior fail-closed (F4)
 
     [Fact]
@@ -299,7 +406,7 @@ public sealed class NestedRenameDropDepth2Tests : IDisposable
         Assert.Contains("name' mode", drop.Message, StringComparison.Ordinal);
     }
 
-    // ================================================================ §3.19 — ambiguous / non-existent path
+    // ================================================================ §3.19b — path-resolution boundaries (F2/F3)
 
     [Fact]
     public async Task Depth2_NonExistentDeepSegment_FailsClosed_F2()
@@ -308,7 +415,9 @@ public sealed class NestedRenameDropDepth2Tests : IDisposable
         await WriteNameMappedAsync(schema, Depth2Batch(schema));
         using var backend = new LocalFileSystemBackend(_root);
 
-        // outer.inner.absent — the intermediate struct chain resolves but the deep target is missing.
+        // outer.inner.absent — the intermediate struct chain resolves but the deep target is missing. Segment
+        // arrays are unambiguous by construction (never a dotted string), so a "non-existent" path is the only
+        // resolution-miss shape — there is no distinct ambiguous-path case (N2: F2 covers it).
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => new DeltaTableWriter(backend).RenameColumnAsync(new[] { "outer", "inner", "absent" }, "x"));
         Assert.Contains("no such", ex.Message, StringComparison.Ordinal);

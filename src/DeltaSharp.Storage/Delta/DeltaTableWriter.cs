@@ -926,6 +926,19 @@ internal sealed class DeltaTableWriter
             }
 
             // Drop: omit exactly the target child from its parent (maxColumnId unchanged; id never reused).
+            // Zero-field guard (#866 866c red-team): dropping the SOLE field of its containing struct (or the
+            // SOLE top-level column, at depth 0) would leave a zero-field struct/table — invalid under Delta
+            // (a struct/table must have >= 1 field) and, at the top level, a silently-committable table-bricking
+            // corruption. Fail closed at the API door (BEFORE any commit) with a clean, sanitized rejection —
+            // Spark parity ("cannot drop the last/only column"). The SAME guard covers both the top-level and
+            // the nested depth>1 cases (`current` is the containing struct at whatever depth).
+            if (current.Count == 1)
+            {
+                throw new InvalidOperationException(
+                    $"Cannot drop {RenderPath(path)}: it is the only field of its containing struct; a "
+                    + "struct or table must have at least one field, so the last column cannot be dropped.");
+            }
+
             return RebuildWithout(current, field);
         }
 
