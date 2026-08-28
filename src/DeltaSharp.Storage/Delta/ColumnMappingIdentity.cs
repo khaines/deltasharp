@@ -58,9 +58,9 @@ internal readonly struct ColumnMappingIdentity
                 + "schema must be a struct, so the log is inconsistent and the read fails closed.");
         }
 
-        Collect(schema, ImmutableArray<string>.Empty, columns);
-        return new ColumnMappingIdentity(
-            ColumnMapping.ResolveMode(metadata.Configuration), metadata.PartitionColumns, columns);
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(metadata.Configuration);
+        Collect(schema, ImmutableArray<string>.Empty, columns, mode);
+        return new ColumnMappingIdentity(mode, metadata.PartitionColumns, columns);
     }
 
     /// <summary>
@@ -73,10 +73,13 @@ internal readonly struct ColumnMappingIdentity
     /// still-present logical column (that column stays keyed and is compared).</para>
     /// <para>Alternate structured paths with the same dotted spelling (literal-dot vs nested) are handled by
     /// the structured <c>ColumnPathKey</c> (a literal top-level <c>"a.b"</c> is one segment; nested
-    /// <c>a</c>→<c>b</c> is two). Under #676 nested column mapping is enabled for the single-level surface:
-    /// <see cref="Collect"/> already descends DIRECT struct children, so a struct child's (id, physicalName)
-    /// participates in this immutability compare. Array-element / map-value STRUCTS are a nested-within-nested
-    /// shape deferred to #585 and rejected fail-closed upstream, so no array/map interior descent is needed here.</para>
+    /// <c>a</c>→<c>b</c> is two). Under #676 nested column mapping is enabled for the single-level surface and
+    /// under #866 866a for the depth&gt;1 NAME/none-mode surface: <see cref="Collect"/> descends DIRECT struct
+    /// children at every depth AND name/none-mode array element / map key-value interior structs (segment
+    /// tokens element/key/value), so an <c>array&lt;struct&gt;</c> / <c>map&lt;*,struct&gt;</c> / nested
+    /// interior struct child's (id, physicalName) participates in this immutability compare. ID-mode
+    /// nested-within-nested is still rejected fail-closed upstream, so an id-mode array/map interior is not
+    /// descended here.</para>
     /// <para><b>Rename-equivalent residual (not a preventable mismap).</b> Dropping a logical column
     /// <c>victim(id=1, phys=col-A)</c> and adding a NEW logical column <c>attacker(id=1, phys=col-A)</c> that
     /// REUSES the dropped id/physical name is byte-identical, in the metadata, to a legal RENAME of
@@ -111,16 +114,18 @@ internal readonly struct ColumnMappingIdentity
     // logical path. That makes a literal top-level name such as "a.b" (one segment) distinct from nested
     // a→b (two segments), so CDF compares identities across retained versions without a literal-dot collision.
     //
-    // Recurses DIRECT StructField.DataType structs only (#676 §2.8 H6 discharge). Under C1 this fully covers a
-    // mapped table's identity: mapping attaches to StructFields at every depth, and a struct child's identity
-    // is descended here. It intentionally does NOT descend through array element or map key/value structs —
-    // those nested StructFields would carry Delta column-mapping identity too, but an array/map interior struct
-    // is a nested-within-nested shape deferred to #585 and rejected fail-closed upstream (ColumnMapping's
-    // assignment/validation doors), so no array/map interior descent is needed until #585 lands.
+    // Recurses DIRECT StructField.DataType structs at every depth, AND — under #866 866a — descends the
+    // NAME/none-mode interior structs of an array element / map key/value (segment tokens element/key/value),
+    // so an array<struct>/map<*,struct>/nested interior struct child's (id, physicalName) participates in the
+    // cross-version immutability compare (IsImmutableFrom) for exactly the shapes 866a enables. ID-mode
+    // nested-within-nested is still rejected fail-closed upstream (ColumnMapping's assignment/validation
+    // doors), so an id-mode array/map interior is NOT descended here (it can never legitimately appear).
+    // Collect is bounded by SchemaJson.FromJson's MaxDepth (the schemaString is always JSON-parsed first).
     private static void Collect(
         StructType schema,
         ImmutableArray<string> prefix,
-        Dictionary<ColumnPathKey, ColumnKey> into)
+        Dictionary<ColumnPathKey, ColumnKey> into,
+        ColumnMappingMode mode)
     {
         foreach (StructField field in schema)
         {
@@ -134,12 +139,38 @@ internal readonly struct ColumnMappingIdentity
             var columnKey = new ColumnKey(id, physicalName);
             into[pathKey] = columnKey;
 
-            if (field.DataType is StructType nested)
-            {
-                Collect(nested, path, into);
-            }
+            DescendInterior(field.DataType, path, into, mode);
         }
     }
+
+    // Descends a field's nested interior to reach deeper StructFields carrying column-mapping identity: a
+    // struct is collected as its own level; in NAME/none mode an array element / map key/value that is (or
+    // contains) a struct is descended under the canonical element/key/value segment token (mirrors
+    // ColumnMapping.ValidateMappedInterior). ID-mode array/map interiors are skipped (rejected upstream).
+    private static void DescendInterior(
+        DataType type,
+        ImmutableArray<string> path,
+        Dictionary<ColumnPathKey, ColumnKey> into,
+        ColumnMappingMode mode)
+    {
+        switch (type)
+        {
+            case StructType nested:
+                Collect(nested, path, into, mode);
+                break;
+            case ArrayType array when mode != ColumnMappingMode.Id:
+                DescendInterior(array.ElementType, path.Add(ElementSegment), into, mode);
+                break;
+            case MapType map when mode != ColumnMappingMode.Id:
+                DescendInterior(map.KeyType, path.Add(KeySegment), into, mode);
+                DescendInterior(map.ValueType, path.Add(ValueSegment), into, mode);
+                break;
+        }
+    }
+
+    private const string ElementSegment = "element";
+    private const string KeySegment = "key";
+    private const string ValueSegment = "value";
 
     // A collision-proof logical column path. ImmutableArray<T> does not provide sequence value equality, so
     // this key compares and hashes the ordered path segments explicitly.
