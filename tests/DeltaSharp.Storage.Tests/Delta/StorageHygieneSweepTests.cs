@@ -995,7 +995,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: false));
 
         Assert.Contains("is not compatible with the table type", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
@@ -1008,7 +1008,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaSchemaMismatchException mirrored = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                scalarTable, nestedWrite, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                scalarTable, nestedWrite, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null,
                 typeWideningEnabled: false));
 
         Assert.Contains("is not compatible with the table type", mirrored.Message, StringComparison.Ordinal);
@@ -1025,7 +1025,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, ["part"], typeWideningEnabled: false));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, ["part"], typeWideningEnabled: false));
 
         AssertNeutralizedAndBounded(ex.Message, p);
 
@@ -1036,7 +1036,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaSchemaMismatchException mirrored = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                scalarTable, nestedWrite, SchemaEvolutionMode.MergeSchema, ["part"], typeWideningEnabled: false));
+                scalarTable, nestedWrite, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, ["part"], typeWideningEnabled: false));
 
         AssertNeutralizedAndBounded(mirrored.Message, p);
     }
@@ -1075,7 +1075,7 @@ public sealed class StorageHygieneSweepTests
         var write = new StructType([new StructField("payload", DataTypes.LongType, nullable: true)]);
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: false));
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.DoesNotContain("The type change", ex.Message, StringComparison.Ordinal);
 
@@ -1084,7 +1084,7 @@ public sealed class StorageHygieneSweepTests
         var wideWrite = new StructType([new StructField("payload", DataTypes.LongType, nullable: true)]);
         DeltaSchemaMismatchException widening = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                wideTable, wideWrite, SchemaEvolutionMode.MergeSchema, partitionColumns: null,
+                wideTable, wideWrite, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null,
                 typeWideningEnabled: false));
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, widening.Kind);
         Assert.Contains("The type change 'int'→'bigint'", widening.Message, StringComparison.Ordinal);

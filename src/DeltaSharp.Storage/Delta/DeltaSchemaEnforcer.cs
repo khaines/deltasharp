@@ -113,6 +113,14 @@ internal static class DeltaSchemaEnforcer
     /// <param name="tableSchema">The table's current schema.</param>
     /// <param name="writeSchema">The incoming write's schema.</param>
     /// <param name="mode">Which additive evolution (if any) is permitted.</param>
+    /// <param name="columnMappingMode">The table's active column-mapping mode. <b>Required</b> and threaded
+    /// through the whole merge so the #870 id-mode guard can refuse to APPLY a nested widening the id-mode
+    /// reader cannot promote (an <c>id</c>-mode array-element / map key-value / nested-struct-child widening
+    /// mints an UNREADABLE table). This is deliberately a REQUIRED parameter with NO default: a silent
+    /// <see cref="ColumnMappingMode.None"/> default would let a caller that forgot to thread the table's real
+    /// mode take the none-mode path and bypass that guard — so every caller must state the mode explicitly.
+    /// Pass <see cref="ColumnMappingMode.None"/> for a name/none-mode table (the enforcer's behavior there is
+    /// byte-identical to the pre-#870 path).</param>
     /// <param name="partitionColumns">The table's partition columns (top-level names). A differing partition
     /// column type: an intra-family Delta-sanctioned widening is APPLIED (metadata-only, rewrite-free; #537)
     /// when <paramref name="typeWideningEnabled"/>; a cross-family (#535) or date→timestamp_ntz (#533) sanctioned
@@ -131,9 +139,9 @@ internal static class DeltaSchemaEnforcer
         StructType tableSchema,
         StructType writeSchema,
         SchemaEvolutionMode mode,
+        ColumnMappingMode columnMappingMode,
         IReadOnlyCollection<string>? partitionColumns = null,
-        bool typeWideningEnabled = false,
-        ColumnMappingMode columnMappingMode = ColumnMappingMode.None)
+        bool typeWideningEnabled = false)
     {
         ArgumentNullException.ThrowIfNull(tableSchema);
         ArgumentNullException.ThrowIfNull(writeSchema);

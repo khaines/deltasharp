@@ -59,7 +59,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", DataTypes.StringType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("value", ex.Path);
@@ -72,7 +72,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", DataTypes.IntegerType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("value", ex.Path);
@@ -87,7 +87,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("name", DataTypes.StringType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.MissingRequiredColumn, ex.Kind);
         Assert.Equal("id", ex.Path);
@@ -101,7 +101,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("name", DataTypes.StringType, nullable: true));
         StructType write = Schema(Field("id", DataTypes.LongType, nullable: false));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None, ColumnMappingMode.None);
 
         Assert.Null(merged);
     }
@@ -113,7 +113,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("id", DataTypes.LongType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.NullabilityViolation, ex.Kind);
         Assert.Equal("id", ex.Path);
@@ -128,7 +128,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("extra", DataTypes.StringType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.NewColumnNotAllowed, ex.Kind);
         Assert.Equal("extra", ex.Path);
@@ -144,7 +144,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         // Strict enforcement (None) does not permit new columns; only AddNewColumns/MergeSchema does.
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.NewColumnNotAllowed, ex.Kind);
     }
@@ -158,7 +158,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("extra", DataTypes.StringType, nullable: false));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.NewColumnMustBeNullable, ex.Kind);
         Assert.Equal("extra", ex.Path);
@@ -176,7 +176,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", DataTypes.LongType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, (SchemaEvolutionMode)mode));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, (SchemaEvolutionMode)mode, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("value", ex.Path);
@@ -192,7 +192,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("id", DataTypes.LongType, nullable: false),
             Field("name", DataTypes.StringType, nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None);
 
         Assert.NotNull(merged);
         Assert.Equal(2, merged!.Count);
@@ -210,7 +210,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", to, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("value", ex.Path);
@@ -236,7 +236,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("ts", DataTypes.TimestampType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("ts", ex.Path);
@@ -252,7 +252,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("ts", DataTypes.TimestampNtzType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("ts", ex.Path);
@@ -265,7 +265,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("ts", DataTypes.DateType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -279,7 +279,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", DataTypes.LongType, nullable: false));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
     }
@@ -297,7 +297,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("value", DataTypes.IntegerType, nullable: true),
             Field("note", DataTypes.StringType, nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None);
 
         Assert.NotNull(merged);
         Assert.True(merged![0].Metadata.TryGetString("comment", out string? comment));
@@ -317,7 +317,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("amount", DataTypes.CreateDecimalType(toP, toS), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("amount", ex.Path);
@@ -333,7 +333,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("amount", DataTypes.CreateDecimalType(toP, toS), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("amount", ex.Path);
@@ -351,7 +351,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("address", writeInner, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("address.zip", ex.Path);
@@ -366,7 +366,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("address", writeInner, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("address.zip", ex.Path);
@@ -382,7 +382,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType table = Schema(Field("address", tableInner, nullable: true));
         StructType write = Schema(Field("address", writeInner, nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None);
 
         Assert.NotNull(merged);
         StructType mergedInner = Assert.IsType<StructType>(merged![0].DataType);
@@ -402,7 +402,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType table = Schema(Field("items", DataTypes.CreateArrayType(tableElement, containsNull: false), nullable: true));
         StructType write = Schema(Field("items", DataTypes.CreateArrayType(writeElement, containsNull: false), nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None);
 
         Assert.NotNull(merged);
         ArrayType mergedArray = Assert.IsType<ArrayType>(merged![0].DataType);
@@ -424,7 +424,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType table = Schema(Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, tableValue, valueContainsNull: false), nullable: true));
         StructType write = Schema(Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, writeValue, valueContainsNull: false), nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None);
 
         Assert.NotNull(merged);
         MapType mergedMap = Assert.IsType<MapType>(merged![0].DataType);
@@ -445,7 +445,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("tags", DataTypes.CreateArrayType(DataTypes.LongType), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("tags.element", ex.Path);
@@ -458,7 +458,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("tags", DataTypes.CreateArrayType(DataTypes.IntegerType), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("tags.element", ex.Path);
@@ -473,7 +473,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("tags", DataTypes.CreateArrayType(DataTypes.IntegerType, containsNull: true), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.NullabilityViolation, ex.Kind);
         Assert.Equal("tags.element", ex.Path);
@@ -489,7 +489,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("lookup.value", ex.Path);
@@ -510,7 +510,7 @@ public sealed class DeltaSchemaEnforcerTests
                 nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.NullabilityViolation, ex.Kind);
         Assert.Equal("lookup.value", ex.Path);
@@ -525,7 +525,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("lookup", DataTypes.CreateMapType(DataTypes.IntegerType, DataTypes.StringType), nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
         Assert.Equal("lookup.key", ex.Path);
@@ -542,7 +542,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("Id", DataTypes.LongType, nullable: false));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.MissingRequiredColumn, ex.Kind);
         Assert.Equal("id", ex.Path);
@@ -560,7 +560,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("ID", DataTypes.StringType, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.CaseInsensitiveDuplicateColumn, ex.Kind);
         Assert.Equal("ID", ex.Path);
@@ -579,7 +579,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("address", writeInner, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.CaseInsensitiveDuplicateColumn, ex.Kind);
         Assert.Equal("address.ZIP", ex.Path);
@@ -604,7 +604,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, new[] { "region" }));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, new[] { "region" }));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("region", ex.Path);
@@ -624,7 +624,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("note", DataTypes.StringType, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.AddNewColumns, new[] { "region" });
+            table, write, SchemaEvolutionMode.AddNewColumns, ColumnMappingMode.None, new[] { "region" });
 
         Assert.NotNull(merged);
         Assert.Equal(3, merged!.Count);
@@ -645,7 +645,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", to, nullable: true));
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
-            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema));
+            () => DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -677,7 +677,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
     }
@@ -694,7 +694,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: false));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
     }
@@ -722,7 +722,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -750,7 +750,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -766,7 +766,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -780,7 +780,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("id", DataTypes.LongType, nullable: false),
             Field("name", DataTypes.StringType, nullable: true));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, table, SchemaEvolutionMode.MergeSchema);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, table, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None);
 
         Assert.Null(merged);
     }
@@ -796,7 +796,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("name", DataTypes.StringType, nullable: true),
             Field("id", DataTypes.LongType, nullable: false));
 
-        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None);
+        StructType? merged = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.None, ColumnMappingMode.None);
 
         Assert.Null(merged);
     }
@@ -810,8 +810,8 @@ public sealed class DeltaSchemaEnforcerTests
             Field("value", DataTypes.IntegerType, nullable: true),
             Field("extra", DataTypes.StringType, nullable: true));
 
-        StructType? first = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema);
-        StructType? second = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema);
+        StructType? first = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None);
+        StructType? second = DeltaSchemaEnforcer.Reconcile(table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None);
 
         Assert.NotNull(first);
         Assert.NotNull(second);
@@ -831,7 +831,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", to, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["value"];
@@ -851,7 +851,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("amount", to, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["amount"];
@@ -870,7 +870,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -885,7 +885,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("ts", DataTypes.TimestampNtzType, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["ts"];
@@ -903,7 +903,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -917,7 +917,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -933,7 +933,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -947,7 +947,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -961,7 +961,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: false));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
     }
@@ -983,7 +983,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("part", DataTypes.LongType, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: new[] { "part" }, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["part"];
@@ -1000,7 +1000,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported, ex.Kind);
     }
@@ -1021,7 +1021,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("part", ex.Path);
@@ -1044,7 +1044,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("part", ex.Path);
@@ -1063,7 +1063,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: new[] { "part" }, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.PartitionColumnEvolutionUnsupported, ex.Kind);
         Assert.Equal("part", ex.Path);
@@ -1091,7 +1091,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("value", DataTypes.LongType, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["value"];
@@ -1116,7 +1116,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("nums", writeArray, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["nums"];
@@ -1136,7 +1136,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("lookup", DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["lookup"];
@@ -1156,7 +1156,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("lookup", DataTypes.CreateMapType(DataTypes.LongType, DataTypes.StringType), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["lookup"];
@@ -1177,7 +1177,7 @@ public sealed class DeltaSchemaEnforcerTests
             Field("lookup", DataTypes.CreateMapType(DataTypes.LongType, DataTypes.IntegerType), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["lookup"];
@@ -1203,7 +1203,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("address", writeInner, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField addressField = merged!["address"];
@@ -1277,6 +1277,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("lookup.key", ex.Path);
+        Assert.Contains("'id'-mode", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1339,15 +1340,17 @@ public sealed class DeltaSchemaEnforcerTests
     }
 
     [Fact]
-    public void Reconcile_ArrayElementWidening_DefaultMode_IsStillApplied()
+    public void Reconcile_ArrayElementWidening_NoneMode_IsStillApplied()
     {
-        // CONTROL: the DEFAULT (omitted columnMappingMode ⇒ None) still applies the array element widen —
-        // proves the new parameter's default preserves the pre-#870 (name/none) behavior byte-for-byte.
+        // CONTROL: none mode still applies the array element widen — proves the enforcer's name/none behavior
+        // is byte-for-byte the pre-#870 path (the #870 id-mode guard is scoped to columnMappingMode == Id).
+        // (#8: columnMappingMode is now a REQUIRED parameter with no silent default, so callers must state the
+        // mode explicitly; None here is the name/none path.)
         StructType table = Schema(Field("nums", new ArrayType(DataTypes.IntegerType, true), nullable: true));
         StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["nums"];
@@ -1374,6 +1377,105 @@ public sealed class DeltaSchemaEnforcerTests
         Assert.DoesNotContain("'id'-mode", ex.Message, StringComparison.Ordinal);
     }
 
+    // ---- #870 future-proofing: the id-mode guard at depth ≥ 2 MIXED (struct + collection) nesting ----------
+    // The pinned #870 cells above exercise depth-1 collection leaves (array element / map key-value) and a
+    // depth-1 struct child. These add DEEPER mixed shapes so a future change to the recursion cannot silently
+    // reopen the id-mode hole at an interleaved struct/collection position.
+
+    [Fact]
+    public void Reconcile_StructNestedArrayElementWidening_IdMode_FailsClosed_AsTypeWideningUnsupported()
+    {
+        // struct<x: array<int>> → struct<x: array<long>> under id mode. The widened leaf is an ARRAY ELEMENT
+        // nested one level below a struct field (depth 2), bound by the id-mode nested reader by field_id with
+        // promoteLeaf:false — it cannot read-promote the pre-widening narrow file, so the enforcer must refuse
+        // to APPLY the widen (fail-closed) rather than mint an unreadable table.
+        StructType tableInner = Schema(Field("x", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType writeInner = Schema(Field("x", new ArrayType(DataTypes.LongType, true), nullable: true));
+        StructType table = Schema(Field("s", tableInner, nullable: true));
+        StructType write = Schema(Field("s", writeInner, nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.Id, partitionColumns: null,
+                typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("s.x.element", ex.Path);
+        Assert.Contains("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_StructNestedArrayElementWidening_NameAndNoneModes_AreApplied()
+    {
+        // CONTROL for the mixed depth-2 shape: a collection-element widen is APPLIED at ANY depth in name/none
+        // mode (585b lifted the depth cap for array/map elements), recording fieldPath="element" on the inner
+        // 'x' field — the name/none reader promotes a nested leaf by physical name, so the round-trip is
+        // readable. The #870 guard must not over-block these genuinely-readable widenings.
+        StructType tableInner = Schema(Field("x", new ArrayType(DataTypes.IntegerType, true), nullable: true));
+        StructType writeInner = Schema(Field("x", new ArrayType(DataTypes.LongType, true), nullable: true));
+        StructType table = Schema(Field("s", tableInner, nullable: true));
+        StructType write = Schema(Field("s", writeInner, nullable: true));
+
+        foreach (ColumnMappingMode mode in new[] { ColumnMappingMode.Name, ColumnMappingMode.None })
+        {
+            StructType? merged = DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, mode, partitionColumns: null,
+                typeWideningEnabled: true);
+
+            Assert.NotNull(merged);
+            StructType mergedInner = Assert.IsType<StructType>(merged!["s"].DataType);
+            StructField xField = mergedInner["x"];
+            Assert.Equal(DataTypes.LongType, Assert.IsType<ArrayType>(xField.DataType).ElementType);
+            AssertSingleNestedTypeChange(xField.Metadata, "integer", "long", "element");
+        }
+    }
+
+    [Fact]
+    public void Reconcile_ArrayOfStructChildWidening_IdMode_FailsClosed_AsTypeWideningUnsupported()
+    {
+        // array<struct<a:int>> → array<struct<a:long>> under id mode. The widened leaf is a STRUCT CHILD nested
+        // one level below an array element (depth 2); the id-mode struct-child reader (ResolveStructFieldById,
+        // promoteLeaf:false) cannot promote the pre-widening narrow file, so the widen fails closed with the
+        // id-mode-specific reason.
+        StructType tableInner = Schema(Field("a", DataTypes.IntegerType, nullable: true));
+        StructType writeInner = Schema(Field("a", DataTypes.LongType, nullable: true));
+        StructType table = Schema(Field("rows", new ArrayType(tableInner, true), nullable: true));
+        StructType write = Schema(Field("rows", new ArrayType(writeInner, true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.Id, partitionColumns: null,
+                typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("rows.element.a", ex.Path);
+        Assert.Contains("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Reconcile_ArrayOfStructChildWidening_NameMode_FailsClosed_AtDepth2StructChildBoundary()
+    {
+        // BOUNDARY (documents the CURRENT limit, not the id-mode guard): a STRUCT-CHILD scalar widen at
+        // depth ≥ 2 stays fail-closed in name/none mode too — 585b lifted the depth cap for COLLECTION elements
+        // (array element / map key-value), but a struct child at depth ≥ 2 is still refused because #571's
+        // reader does not promote it. So this shape is rejected as the GENERIC TypeWideningUnsupported (no
+        // id-mode reason) in name mode — distinct from the id-mode reject above, which future-proofs that the
+        // two paths keep producing distinct messages at deeper mixed nesting.
+        StructType tableInner = Schema(Field("a", DataTypes.IntegerType, nullable: true));
+        StructType writeInner = Schema(Field("a", DataTypes.LongType, nullable: true));
+        StructType table = Schema(Field("rows", new ArrayType(tableInner, true), nullable: true));
+        StructType write = Schema(Field("rows", new ArrayType(writeInner, true), nullable: true));
+
+        DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
+            () => DeltaSchemaEnforcer.Reconcile(
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.Name, partitionColumns: null,
+                typeWideningEnabled: true));
+
+        Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
+        Assert.Equal("rows.element.a", ex.Path);
+        Assert.DoesNotContain("'id'-mode", ex.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void Reconcile_ArrayElementDecimalGrowOnlyWidening_WhenEnabled_IsAppliedWithElementPath()
     {
@@ -1384,7 +1486,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("amounts", DataTypes.CreateArrayType(to), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["amounts"];
@@ -1418,7 +1520,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("nums", DataTypes.CreateArrayType(DataTypes.LongType), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["nums"];
@@ -1440,7 +1542,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("nums.element", ex.Path);
@@ -1463,7 +1565,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("items.element.zip", ex.Path);
@@ -1482,7 +1584,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("lookup.value.zip", ex.Path);
@@ -1503,7 +1605,7 @@ public sealed class DeltaSchemaEnforcerTests
             "x", new ArrayType(new ArrayType(DataTypes.LongType, true), true), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["x"];
@@ -1525,7 +1627,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["m"];
@@ -1546,7 +1648,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["a"];
@@ -1572,7 +1674,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["m"];
@@ -1598,7 +1700,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["a"];
@@ -1622,7 +1724,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["x"];
@@ -1646,7 +1748,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         AssertSingleNestedTypeChange(merged!["m"].Metadata, "integer", "long", "value.element.element");
@@ -1662,7 +1764,7 @@ public sealed class DeltaSchemaEnforcerTests
             "x", new ArrayType(new ArrayType(DataTypes.DoubleType, true), true), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["x"];
@@ -1681,7 +1783,7 @@ public sealed class DeltaSchemaEnforcerTests
             "x", new ArrayType(new ArrayType(DataTypes.TimestampNtzType, true), true), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         AssertSingleNestedTypeChange(
@@ -1701,7 +1803,7 @@ public sealed class DeltaSchemaEnforcerTests
             "x", new ArrayType(new ArrayType(to, true), true), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         AssertSingleNestedTypeChange(merged!["x"].Metadata, from.TypeName, to.TypeName, "element.element");
@@ -1723,7 +1825,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -1742,7 +1844,7 @@ public sealed class DeltaSchemaEnforcerTests
             nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField field = merged!["a"];
@@ -1768,7 +1870,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("s", writeInner, nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         StructField sField = merged!["s"];
@@ -1797,7 +1899,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("items.element.a", ex.Path);
@@ -1815,7 +1917,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
         Assert.Equal("x.element.element", ex.Path);
@@ -1843,7 +1945,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -1860,7 +1962,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -1877,7 +1979,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true));
 
         Assert.Equal(DeltaSchemaMismatchKind.IncompatibleType, ex.Kind);
     }
@@ -1894,7 +1996,7 @@ public sealed class DeltaSchemaEnforcerTests
 
         DeltaSchemaMismatchException ex = Assert.Throws<DeltaSchemaMismatchException>(
             () => DeltaSchemaEnforcer.Reconcile(
-                table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: false));
+                table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: false));
 
         Assert.Equal(DeltaSchemaMismatchKind.TypeWideningUnsupported, ex.Kind);
     }
@@ -1909,7 +2011,7 @@ public sealed class DeltaSchemaEnforcerTests
         StructType write = Schema(Field("nums", new ArrayType(DataTypes.LongType, true), nullable: true));
 
         StructType? merged = DeltaSchemaEnforcer.Reconcile(
-            table, write, SchemaEvolutionMode.MergeSchema, partitionColumns: null, typeWideningEnabled: true);
+            table, write, SchemaEvolutionMode.MergeSchema, ColumnMappingMode.None, partitionColumns: null, typeWideningEnabled: true);
 
         Assert.NotNull(merged);
         AssertSingleNestedTypeChange(merged!["nums"].Metadata, "integer", "long", "element");
