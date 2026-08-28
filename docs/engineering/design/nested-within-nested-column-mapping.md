@@ -244,9 +244,9 @@ Every site below is grounded at `origin/main` @ `b0397b0`. **Lift** = recurse/de
 | **G4** | Write physical-schema reject | `ColumnMapping.cs:1558-1578` | `ToPhysicalType` | **LIFT** — recurse name-only relabel of struct interiors at any depth (mode-independent name substitution) | 866a |
 | **G5** | The reject helper itself | `ColumnMapping.cs:1627` | `RejectNestedWithinNested` | **UPDATE + narrow** — message/comment cite **#866** not the closed #585; the helper is **retained** as the map-key-container / bounded-depth guard **and** as the **id-mode depth&gt;1 guard until 866b** (the by-construction fail-closed anchor, §8). The #585→#866 sweep spans **three** files (§3.27, m2) | 866a |
 | **R1** | id-mode nested container resolution | `ParquetFileReader.cs:1587-1670` | `ResolveFileFields` | **LIFT** — recurse containment: a struct child / array-map interior that is itself a container descends into the resolved sub-container and binds its own interiors | 866b |
-| **R2** | id-mode struct-child binding | `NestedParquetColumnReader.cs:2036,2088` | `ResolveStructFieldById`, `ValidateStructShapeById` | **LIFT + DataType-aware `TryResolve` (M4)** — `ResolveStructFieldById` branches on the child's `DataType`: a **scalar** child binds by direct leaf id (absent-but-valid nullable → null-fill); a **container** child (struct/array/map) binds **structurally + recurses** (keeping `byFieldId`), presence decided by **descendant leaf ids** — its own group id is expected-absent and **must not** null-fill it (else a present nested struct is silently dropped — §2.5). `ValidateStructShapeById` becomes likewise DataType-aware | 866b |
-| **R3** | id-mode array/map interior binding | `NestedParquetColumnReader.cs:2192,2212` | `ValidateArrayShapeById`, `ValidateMapShapeById` | **LIFT + DataType-branch (M2)** — branch on the requested element/value kind: a **container** element/value binds **structurally** (verify its `P.element`/`P.value` **group** id is absent from footer leaves) and recurses; only a **scalar** interior goes through `ResolveInteriorLeafById` (#839). Fixes the `array<struct>` fail-close (§1's most common shape) | 866b |
-| **R4** | interior-leaf collection | `NestedParquetColumnReader.cs:2131,2142` | `ListInteriorLeaves`, `MapInteriorLeaves` | **LIFT + `TryResolve`** — a nested interior (`Item`/`Value` is a group, not a `DataField`) descends into its sub-container's leaves; a scalar interior binds by id with absent-but-valid nullable → null-fill (§2.5) | 866b |
+| **R2** | id-mode struct-child binding | `NestedParquetColumnReader.cs:2036,2088` | `ResolveStructFieldById`, `ValidateStructShapeById` | **LIFT + DataType-aware `TryResolve` (M4 + M5)** — `ResolveStructFieldById` branches on the child's `DataType`: a **scalar** child binds by direct leaf id (absent-but-valid nullable → null-fill); a **container** child (struct/array/map) is **located structurally by its stable `physicalName`** (reusing `TryResolveStructChildNode` `:1784`) then **recurses** (keeping `byFieldId`). **Container presence = its group node is structurally located, NOT whether any requested descendant leaf resolves** — a located container reads its structure + per-leaf null-fills; only a structurally-absent nullable container null-fills its subtree (§2.5). `ValidateStructShapeById` becomes likewise DataType-aware | 866b |
+| **R3** | id-mode array/map interior binding | `NestedParquetColumnReader.cs:2192,2212` | `ValidateArrayShapeById`, `ValidateMapShapeById` | **LIFT + DataType-branch (M2 + M5)** — branch on the requested element/value kind: a **container** element/value is **positionally present whenever its enclosing array/map is present** (canonical `element`/`key`/`value`), binds structurally (verify its `P.element`/`P.value` **group** id is absent from footer leaves) and recurses; only a **scalar** interior goes through `ResolveInteriorLeafById` (#839). Fixes the `array<struct>` fail-close (§1's most common shape) | 866b |
+| **R4** | interior-leaf collection | `NestedParquetColumnReader.cs:2131,2142` | `ListInteriorLeaves`, `MapInteriorLeaves` | **LIFT + `TryResolve`** — a nested interior (`Item`/`Value` is a group, structurally present with its enclosing container) descends into its sub-container; a scalar interior binds by id with absent-but-valid nullable → null-fill (§2.5) | 866b |
 | **R5** | `nested.ids` selector parse | `ColumnMapping.cs:621` (`ValidateNestedIds`, `:638-661`) | `ValidateNestedIds` | **LIFT + leaf/group discrimination (M2)** — accept **multi-token** dotted keys (`P.element.element`, `P.value.key`) computed from the **full** declared depth&gt;1 shape; mark each key **leaf** (footer-resolvable) vs **group** (structural-only, e.g. `P.element` of an `array<struct>`); single-token scalar stays #839 | 866b |
 | **R6** | name-mode physical relabel | `ColumnMappingProjection.cs:95,219` | `BuildPhysicalDataType`, `AssertStructCongruent` | **LIFT** — recurse array/map struct interiors to substitute interior struct-child physical names (today struct-only recursion; array/map carried verbatim) | 866a |
 | **R7** | name-mode decode validator/reassembler | `NestedParquetColumnReader.cs:136` | `ValidateNode`/`DecodeContainer` (585a) | **RETAIN (reuse)** — already recursive to any depth; no change (green in §2.1) | — |
@@ -301,24 +301,31 @@ mismatch fails closed as a typed `DeltaStorageException.SchemaMismatch` (sanitiz
      container-id-on-leaf reject at `ParquetFileReader.cs:1631`); a group id **found on a leaf** is forged →
      `SchemaMismatch`. **Its group-id absence must NEVER trigger null-fill** — a group id is expected-absent
      **by construction** (Parquet.Net 6.1.0 stamps ids on leaves only, §2.6). **Container presence is decided by
-     its DESCENDANT LEAVES, recursively** (below), not by its own id. `map` **key** is scalar-only; a
-     **container** map key is unsupported (`RejectNestedMapKey`, `ParquetTypeMapping.cs:261`) and fail-closed at
-     write, so id mode never resolves one. Multi-token `nested.ids` entries (`P.element.element`, `P.value.key`,
-     …) bind the **deep scalar leaves** reachable without an intervening struct; each is a *scalar* interior by
-     the rule above (id-anchored, null-fillable when nullable-absent, containment-checked).
+     the STRUCTURAL LOCATION of its own group node** (below), **not** by its own id **and not by whether any
+     currently-requested descendant leaf resolves** (M5). `map` **key** is scalar-only; a **container** map key
+     is unsupported (`RejectNestedMapKey`, `ParquetTypeMapping.cs:261`) and fail-closed at write, so id mode
+     never resolves one. Multi-token `nested.ids` entries (`P.element.element`, `P.value.key`, …) bind the **deep
+     scalar leaves** reachable without an intervening struct; each is a *scalar* interior by the rule above
+     (id-anchored, null-fillable when nullable-absent, containment-checked).
 
-   > **The uniform rule closes the round-2 collision: a PRESENT nested struct child must never be null-filled
-   > (red-team M4).** Round-2 specified the container→structural branch at the **array-element / map-value**
-   > level but **not** at **struct-child** resolution (`ResolveStructFieldById`, `NestedParquetColumnReader.cs:2036`,
-   > which returns a single **scalar** leaf via `ExpectScalarLeaf`), and keyed null-fill on the interior's **own**
-   > id being absent from the footer. For a **container** struct child (e.g. `b` in
-   > `array<struct<a:int, b:struct<c:long>>>`) the group id is **always** absent (leaves-only stamping) — so a
-   > naive own-id-absence null-fill would **null-fill `b` and DROP its physically-present leaf `c`: silent data
-   > loss** (worse than the original fail-closed miss). The fix makes `ResolveStructFieldById` **DataType-aware**:
-   > a **scalar** child takes the leaf-id `TryResolve` + null-fill path; a **container** child is bound
-   > structurally and recurses, with presence keyed on descendant leaves. **585a decode is correct given a
-   > structural binding** — name-mode decode already reconstructs a present nested struct positionally, recursing
-   > with `byFieldId: null` (`NestedParquetColumnReader.cs:484`); the id-mode analogue recurses with `byFieldId`
+   > **The uniform rule closes the round-2/round-3 collisions: a structurally-PRESENT nested container must never
+   > be null-filled (red-team M4 + M5).** Round-2 specified the container→structural branch at the
+   > **array-element / map-value** level but **not** at **struct-child** resolution (`ResolveStructFieldById`,
+   > `NestedParquetColumnReader.cs:2036`, which returns a single **scalar** leaf via `ExpectScalarLeaf`), and
+   > keyed null-fill on the interior's **own** id being absent. For a **container** struct child (e.g. `b` in
+   > `array<struct<a:int, b:struct<c:long>>>`) the group id is **always** absent (leaves-only stamping), so a
+   > naive own-id-absence null-fill would **drop present `b.c`** (M4). Round-3 then keyed container presence on
+   > **descendant leaves** — also wrong (M5): `array<struct<a>>`→`array<struct<b>>` reading an old file has
+   > **all** currently-requested descendant leaves (`b`) absent, so "all descendant leaves absent → null-fill
+   > subtree" would **drop the whole array's per-row lengths**, reading `null` instead of `[{b:null}, …]` —
+   > silent data loss again. The fix keys container presence on the **structural location of the container's own
+   > group node** (a struct field by its stable `physicalName`; an array/map interior positionally): a **located**
+   > container **always** reads its structure + recurses (leaves by id, per-leaf null-fill), and only a
+   > **structurally-absent** nullable container null-fills its subtree. `ResolveStructFieldById` becomes
+   > **DataType-aware**: a **scalar** child → leaf-id `TryResolve` (null-fill if nullable-absent); a **container**
+   > child → structural-locate (physicalName) + recurse. **585a decode is correct given a structural binding** —
+   > name-mode decode already reconstructs a present nested container positionally, recursing with
+   > `byFieldId: null` (`NestedParquetColumnReader.cs:484`); the id-mode analogue recurses with `byFieldId`
    > **retained** so deep scalar leaves bind by id. The bug is purely in the id-mode **resolution** layer's
    > bind-vs-null-fill decision, **not** in decode (confirmed §9.7).
 
@@ -341,7 +348,7 @@ mismatch fails closed as a typed `DeltaStorageException.SchemaMismatch` (sanitiz
    (`MaxRepetitionLevel`/`MaxDefinitionLevel`) are taken from the **resolved** (provenance-verified)
    sub-container, exactly as 585a's `ValidateNode` keys each container's guards off that node's own levels.
 
-**Absent-after-add null-fill (id mode) — evolution tolerance, keyed on interior KIND (red-team M3 + M4).** A
+**Absent-after-add null-fill (id mode) — evolution tolerance, container presence by STRUCTURAL LOCATION (red-team M3 + M4 + M5).** A
 `struct<…>` / `array<struct<…>>` evolved by **adding a nullable child** mints that child a fresh id, but a data
 file written **before** the add has **no** footer `field_id` for it — and column mapping's whole purpose is to
 read such historical files. **Verified in the worktree (§9.7):** name mode already null-fills an absent nested
@@ -350,44 +357,76 @@ child (`ReadStructAsync`/`SynthesizeAbsentChild`/`BuildAllNullSubtree`, **#857**
 column (`ResolveFileFields:1727`, #497), **but the nested id-mode resolvers do NOT** — `ResolveStructFieldById`
 (`:2036`) and `ResolveInteriorLeafById` (`:2164`) throw `SchemaMismatch` **unconditionally** on an absent id.
 This is a **shared** #676/#839 gap, not new to depth&gt;1. 866b converts both to a **`TryResolve → DataField?`**
-pattern — **but null-fill is keyed on interior KIND**, because a container's own group id is expected-absent by
-construction (a naive own-id-absence rule silently drops a present nested struct — M4):
+pattern — **but container presence is decided by the container's own STRUCTURAL LOCATION, not by its
+descendant leaves** (the round-3 descendant-leaf rule was itself wrong — M5, below).
 
-**Container presence is decided by DESCENDANT LEAVES, recursively (M4).** For a **container/struct** interior in
-id mode, presence-vs-absence is decided by whether **any descendant scalar-leaf id resolves** in this file's
-footer — the id-mode analogue of name-mode #857 (which descends the declared subtree via `SynthesizeAbsentChild`
-/ `BuildAllNullSubtree`, `:447-480` / `:1855-1920`), keyed on descendant leaf **ids** instead of the child's
-physical name:
+**Container presence is decided by the STRUCTURAL LOCATION of its own group node (M5 — corrects M4's
+descendant-leaf rule).** "The container exists in the file" and "a currently-requested descendant leaf exists in
+the file" are **different**: a container can be fully present (real per-row lengths / repetition / definition
+structure) while **every** leaf the *current* schema requests was added after the file was written
+(`array<struct<a:int>>` evolved to `array<struct<b:int>>`, reading an old file that physically holds the array
++ leaf `a`). Keying presence on requested descendant leaves would null-fill the **whole array** — dropping its
+real per-row lengths — and read every row as `null` instead of `[{b:null}, {b:null}, …]`: **silent data loss**.
+So container presence is the **structural location of the container's own group node**, exactly as name mode
+locates it:
 
-- **≥ 1 descendant leaf id resolves** → the container is **PRESENT** → bind structurally + recurse; null-fill
-  **only** the individual descendant leaves that are themselves absent-and-nullable (recursively, each by the
-  scalar rule). **NEVER null-fill a present container** (that is the M4 data-loss bug).
-- **ALL descendant leaf ids absent** AND the container is **nullable** → **null-fill the whole subtree**
-  (legitimate added-after-write; reuse `SynthesizeAbsentChild`/`BuildAllNullSubtree`, `:1855`, which reads no
-  leaf → O(rows)).
-- **ALL descendant leaf ids absent** AND the container is **required** → `ColumnNotPresentInFile`.
+- a **struct FIELD that is a container** (`b: struct<…>`, `rows: array<…>`, a map-valued field) is located by
+  its **stable column-mapping `physicalName`** — physical names do **not** change on a logical rename (the whole
+  point of column mapping), so this is rename-tolerant. This reuses name mode's `TryResolveStructChildNode`
+  (`NestedParquetColumnReader.cs:447,1784`), which matches a file field by name; in **id mode** the requested
+  (physical) schema field's `Name` **is** the physicalName (§below), so the same structural match applies.
+- an **array ELEMENT / map KEY / map VALUE** group is **canonical/positional** (`element` / `key` / `value`) —
+  it is structurally present **whenever its enclosing array/map is present** (there is no separate name to
+  resolve).
 
-Disposition table (keyed on interior kind so **no fail-closed hole opens and no present column is dropped**):
+**Resolution then splits on structural presence, NOT on descendant leaves:**
+
+- **container group node LOCATED (present)** → read its **structure** (per-row lengths / rep / def) and
+  **recurse**, binding descendant **scalar leaves by id** and null-filling **only** the individual leaves that
+  are themselves absent-and-nullable (recursively, each by the scalar rule). This reads the array lengths
+  correctly and null-fills the new leaves per element. **NEVER null-fill a structurally-present container.**
+- **container group node ABSENT** (the struct field's physicalName is not in the file, or the enclosing
+  array/map is itself absent) AND the container is **nullable** → **null-fill the whole subtree**
+  (`SynthesizeAbsentChild`/`BuildAllNullSubtree`, `:1855`, which reads no leaf → O(rows)).
+- **container group node ABSENT** AND the container is **required** → `ColumnNotPresentInFile`.
+
+**How the struct-field container's stable physical name is obtained in id mode.** Column mapping stamps
+`delta.columnMapping.physicalName` (`ColumnMapping.PhysicalNameKey`, `ColumnMapping.cs:123`) on every
+`StructField` at assignment (`AssignMappedField`→`WithMapping`, `:908`); that physicalName **doubles as the
+Parquet column name** at every node depth (`ColumnMapping.cs:204`, `:299-300`), so a Parquet.Net **group** node
+carries the container's physicalName even though it carries no `field_id`. The id-mode **read** schema is the
+**physical** schema (`ToPhysicalSchema(schema, Id)` — renames each field to its physicalName **and** keeps
+`delta.columnMapping.id`), so a requested nested field's `Name` is its physicalName (structural location works
+by name) **and** it carries `delta.columnMapping.id` in metadata (its scalar-leaf descendants still bind by id).
+A logical rename changes the logical name only, never the physicalName — so locating the container by
+physicalName is rename-tolerant, and the leaves remain id-bound (rename/reorder-tolerant): this is now a
+**closer** analogue of name-mode #857 (container by stable name, leaves by id) than the round-3 rule was.
+
+Disposition table (container presence keyed on **structural location**; leaf null-fill applied only **within** a
+present container — so **no fail-closed hole opens and no present column is dropped**):
 
 | Interior kind | Signal | Disposition |
 |---|---|---|
 | **scalar leaf** | own leaf id **absent** from footer + **nullable** | **null-fill** that leaf (added-after-write, #857 posture) |
 | **scalar leaf** | own leaf id **absent** from footer + **required** | fail closed `ColumnNotPresentInFile` (a required lane cannot carry nulls) |
 | **scalar leaf** | id **present** but resolves **outside** the container's subtree | fail closed `SchemaMismatch` (containment / mis-attribution) |
-| **container** (struct/array/map) | **≥ 1 descendant** leaf id present | **bind structurally + recurse** (null-fill only absent+nullable descendant leaves, recursively) — **NEVER null-fill the whole present container** |
-| **container** | **ALL descendant** leaf ids absent + **nullable** | null-fill whole subtree (`BuildAllNullSubtree`) |
-| **container** | **ALL descendant** leaf ids absent + **required** | fail closed `ColumnNotPresentInFile` |
+| **container** (struct/array/map) | group node **LOCATED** (struct field by physicalName; array element / map key-value positionally, its enclosing container present) | **read structure (lengths/rep/def) + recurse** — bind descendant scalar leaves by id, null-fill only absent+nullable leaves recursively; **NEVER null-fill a present container** (even if ALL currently-requested leaves are new — M5) |
+| **container** | group node **ABSENT** (struct-field physicalName not in file, or enclosing array/map absent) + **nullable** | null-fill whole subtree (`BuildAllNullSubtree`) |
+| **container** | group node **ABSENT** + **required** | fail closed `ColumnNotPresentInFile` |
 | **any** | a **group** id (`P.element`/`P.value`/a container's own id) found **on a footer leaf** | fail closed `SchemaMismatch` (a group id is structural-only, §3.17a — no conflict: group ids are never a presence signal) |
 
-**Re-audit — no other §2.5 site conflates leaf vs group.** Every place that treats "interior id absent from
-footer" as a signal now handles **only a scalar leaf** (the sole kind whose id is expected in the footer); a
-**container** interior — struct-child-is-struct/array/map, array-element-is-struct/array, map-value-is-struct/array
-— is uniformly bound structurally with presence-by-descendant-leaf, so a container's structural (always-true)
-id-absence never drives a bind-vs-null-fill decision. `map` key stays scalar/fail-closed; the group-id-on-leaf
-reject (§3.17a) is orthogonal (it checks a group id appearing **on** a leaf, never uses group absence as a
-presence signal). Because `ResolveStructFieldById`/`ResolveInteriorLeafById` are the **shared** resolvers used
-at single-level (#676/#839) **and** recursively at depth&gt;1, this fix closes the pre-existing **single-level**
-id-mode gap as a natural consequence — §3 pins a single-level companion regression cell (§3.8g).
+**Re-audit — every container disposition keys presence on STRUCTURAL LOCATION, never on requested leaves.**
+Struct-child-is-struct/array/map, array-element-is-struct/array/map, map-value-is-struct/array/map, and deep
+chains (`array<array<…>>`, `map<*,struct<array<…>>>`, depth-4) all follow the one rule: **locate the container
+group node** (struct field by physicalName; array/map interior positionally within its located enclosing
+container), and only **within a located container** do descendant scalar leaves null-fill individually. A
+container whose group node is located but **all** its currently-requested leaves are new reads its structure and
+per-leaf null-fills — it is **never** whole-subtree dropped (the M5 case). The `map` key stays scalar/fail-closed;
+the group-id-on-leaf reject (§3.17a) is orthogonal (it checks a group id appearing **on** a leaf, never uses
+group presence/absence as a signal). Because `ResolveStructFieldById`/`ResolveInteriorLeafById` are the
+**shared** resolvers used at single-level (#676/#839) **and** recursively at depth&gt;1, this fix closes the
+pre-existing **single-level** id-mode gap as a natural consequence — §3 pins a single-level companion regression
+cell (§3.8g).
 
 **Residual (id-authoritative, same as #676/#839).** Once every ancestor group is provenance-verified and each
 id-selected leaf is type-validated, a forged footer that permutes `field_id` stamps across **same-typed**
@@ -421,10 +460,13 @@ identical posture #839 shipped, extended by depth.
 - Resolution is the #676/#839 containment/identity-selection lookup applied **recursively** — `BuildFieldIdMap`
   (path-keyed, depth-agnostic) + `IsDirectLeafChild`/interior containment at each level, keyed by direct
   `StructField` id (struct) or `nested.ids` id (array/map scalar interior), **branching on the requested
-  interior `DataType`** (container → structural descent; scalar → footer-`field_id` lookup, M2). The interior
-  resolvers become **`TryResolve → DataField?`**: a valid-current-id absent from *this* file's footer null-fills
-  a nullable child (§2.5), so evolution (added-after-write) reads through — a single behavior with single-level
-  (the shared resolver, §9.7).
+  interior `DataType`** (container → structural location + descent; scalar → footer-`field_id` lookup, M2). The
+  interior resolvers become **`TryResolve → DataField?`**: a **scalar** child whose valid-current id is absent
+  from *this* file's footer null-fills when nullable; a **container** child null-fills its subtree **only when
+  its own group node is structurally absent** (located by stable `physicalName`, M5) — a structurally-present
+  container reads its structure + per-leaf null-fills, so evolution (added-after-write, including
+  all-children-replaced) reads through without dropping structure. A single behavior with single-level (the
+  shared resolver, §9.7).
 - `nested.ids` parses once at validation into a structured `(dotted-suffix) → id` table keyed off the nearest
   container's physical name; **each value's `MetadataValueKind` is checked `Long`** before use (unchanged
   #839, Finding 3); **no component composes or parses a dotted physical path for binding** — the dotted key is
@@ -532,7 +574,7 @@ array<struct<a:int,b:struct<c:long>>> (depth-3, the M4 present-nested-struct sha
    **`IdMode_Depth2_InteriorIdResolvesToSiblingContainerLeaf_FailsClosed`** — the recursive containment check
    (R1/R2/R4) rejects a forged footer that stamps a deep id on a foreign sub-container's leaf.
 
-**Id-mode container-element resolution + evolution null-fill (M2 + red-team M3/M4 — all 866b)**
+**Id-mode container-element resolution + evolution null-fill (M2 + red-team M3/M4/M5 — all 866b)**
 - 8a. **`IdMode_ArrayOfStruct_ElementGroupIdStructural_BindsStructChildrenByDirectId`** — §1's most common shape:
   `array<struct<a:int,b:string>>` resolves (NOT fail-closed). The `P.element` **group** id is structural-only
   (bound structurally + verified absent from footer leaves); `a`,`b` bind by **direct** `StructField` id within
@@ -559,21 +601,40 @@ array<struct<a:int,b:struct<c:long>>> (depth-3, the M4 present-nested-struct sha
   gap (`struct<a:int>` id mode + nullable `b` add → old file null-fills, not the current unconditional
   `SchemaMismatch` at `NestedParquetColumnReader.cs:2036`). Pins the fix at both depths (§9.7).
 
-**Present-nested-container is never null-filled — the M4 collision cells (all 866b, `array<struct<a:int,b:struct<c:long>>>`)**
-- 8h. **`IdMode_Depth3_ArrayStructStruct_PresentNestedStruct_ReadsCorrectly`** — the miss's **positive** case:
-  `array<struct<a:int, b:struct<c:long>>>` in id mode with `b` **physically present** (`c`'s leaf id in the
-  footer) reads back `a` **and** `b.c` correctly — `b` is bound **structurally** (its group id is expected-absent
-  and must NOT trigger null-fill) and recursed, `c` bound by direct id. Witness that a naive own-id-absence
-  null-fill (which would DROP present `b.c` → silent data loss) is not taken. Disjoint witness domains on `a`,`c`.
-- 8i. **`IdMode_Depth3_AbsentNullableNestedStruct_NullFills`** — same shape, `b` **genuinely added-after-write**
-  (ALL of `b`'s descendant leaf ids absent from the footer) + `b` nullable → `b` null-fills the whole subtree
-  (`BuildAllNullSubtree`), `a` intact. Presence decided by descendant leaves, not `b`'s group id.
-- 8j. **`IdMode_Depth3_RequiredNestedStructAbsent_FailsClosed`** — same shape with `b` **required** and all its
-  descendant leaf ids absent → `ColumnNotPresentInFile` (a required container cannot null-fill).
-- 8k. **`IdMode_Depth3_PartiallyPresentNestedStruct_NullFillsOnlyAbsentNullableLeaf`** — `b` present (one
-  descendant leaf id resolves) but a **second** nullable leaf `b.d` added-after-write is absent → `b` binds
-  structurally, `b.c` reads, only `b.d` null-fills (recursive per-leaf rule) — proves null-fill is per-descendant,
-  not whole-container, when the container is present.
+**Present nested container never dropped — the M4 + M5 collision cells (all 866b)**
+- 8h. **`IdMode_Depth3_ArrayStructStruct_PresentNestedStruct_ReadsCorrectly`** (M4) — the miss's **positive**
+  case: `array<struct<a:int, b:struct<c:long>>>` in id mode with `b` **structurally present** (its group node
+  located; `c`'s leaf id in the footer) reads back `a` **and** `b.c` correctly — `b` is bound **structurally**
+  (its group id is expected-absent and must NOT trigger null-fill) and recursed, `c` bound by direct id.
+  Witness that a naive own-id-absence null-fill (which would DROP present `b.c` → silent data loss) is not
+  taken. Disjoint witness domains on `a`,`c`.
+- 8i. **`IdMode_Depth3_StructurallyAbsentNullableNestedStruct_NullFills`** (M4/M5 corrected) — same shape, `b`
+  **genuinely added-after-write**: `b`'s **group node is structurally ABSENT** from the old file (its
+  physicalName is not a field of the element struct in the footer) + `b` nullable → `b` null-fills the whole
+  subtree (`BuildAllNullSubtree`), `a` intact. **Precondition is the container's group node being structurally
+  absent — NOT merely that all requested descendant leaves are absent (M5).**
+- 8j. **`IdMode_Depth3_RequiredNestedStructStructurallyAbsent_FailsClosed`** — same shape with `b` **required**
+  and its group node structurally absent → `ColumnNotPresentInFile` (a required container cannot null-fill).
+- 8k. **`IdMode_Depth3_PartiallyPresentNestedStruct_NullFillsOnlyAbsentNullableLeaf`** — `b`'s group node
+  located (present) but a **second** nullable leaf `b.d` added-after-write has its leaf id absent → `b` reads its
+  structure, `b.c` reads, only `b.d` null-fills (recursive per-leaf rule) — proves null-fill is per-descendant
+  within a **present** container, never whole-container.
+- 8l. **`IdMode_Depth2_Array_AllChildrenReplaced_RetainsArrayLengths`** (M5 — the exact red-team case) —
+  `array<struct<a:int>>` **evolved** to `array<struct<b:int>>` (drop `a`, add `b`); read an **old** file that
+  physically holds the array + leaf `a` with **non-trivial per-row lengths** (incl. an **empty** row and a
+  **multi-element** row). The array container is located by its stable `physicalName` (present), so its
+  **per-row lengths/rep are read from the file** and `b` is null-filled **per element** → reads back
+  `[[], [{b:null},{b:null}], [{b:null}], …]` with the **same lengths**, `a` dropped. **Asserts array
+  lengths/rep preserved — NOT a null array** (the M5 data-loss regression pin). Every currently-requested
+  descendant leaf (`b`) is absent, yet the container is **present**.
+- 8m. **`IdMode_StructField_Container_AllChildrenReplaced_StructPresent_NullFillsLeaves`** — struct-field
+  companion: `struct<s: struct<a:int>>` evolved to `struct<s: struct<b:int>>`, old file holds `s` + `s.a`; `s`
+  located by `physicalName` (present) → reads `s`'s presence/null structure, `b` null-filled per row (`s` is
+  **not** null-filled whole even though `b` is its only requested child and is absent).
+- 8n. **`IdMode_Container_StructurallyAbsent_NullFillsSubtree`** — the genuine-absence companion: a nullable
+  container struct field whose **group node** is entirely absent from the file (its physicalName is not present)
+  → whole-subtree null-fill (`BuildAllNullSubtree`); the required variant → `ColumnNotPresentInFile`. Pins that
+  whole-subtree null-fill fires **only** on structural absence.
 
 **Fail-closed invariants over the depth&gt;1 tree (AC-fail-closed)**
 9. **`Depth2_DuplicateFieldIdAnywhereInTree_FailsClosed`** (`BuildFieldIdMap` dup guard, any depth).
@@ -658,7 +719,7 @@ writer; there is **no** unmerged write-path dependency (unlike #676, which was g
 | Acceptance criterion (#866) | §3 cells |
 |---|---|
 | Recursive `(id,physicalName)` assignment for depth&gt;1 leaves; monotonic `maxColumnId`; `RejectNestedWithinNested` lifted | §3.1, §3.2, §3.3, §3.27 |
-| Name-mode + id-mode resolution of depth&gt;1 leaves (id mode via `nested.ids` at each interior level; `array<struct>`/`map<*,struct>` container-element resolution; present-nested-container never dropped; absent-after-add null-fill keyed on interior kind) | §3.4–§3.8, §3.8a–§3.8k |
+| Name-mode + id-mode resolution of depth&gt;1 leaves (id mode via `nested.ids` at each interior level; `array<struct>`/`map<*,struct>` container-element resolution; present nested container never dropped — presence by structural location, incl. all-children-replaced retaining array lengths; absent-after-add null-fill only on structural absence) | §3.4–§3.8, §3.8a–§3.8n |
 | Metadata-only rename/drop of a depth&gt;1 nested field | §3.18 (§3.19–§3.20 boundaries) |
 | Fail-closed invariants (duplicate/missing/range/relabel + `nested.ids` containment + structural-group-id-on-leaf + null-fill no-hole + required-container-absent) over the depth&gt;1 tree; cross-engine interop | §3.9–§3.17, §3.17a, §3.8e–§3.8f, §3.8j, §3.21–§3.22, §3.25 |
 | Update `RejectNestedWithinNested` / retained-reject messages to reference #866 not the closed #585 (three files) | §3.27 |
@@ -701,14 +762,16 @@ writer; there is **no** unmerged write-path dependency (unlike #676, which was g
   a deep leaf whose declared id is absent from the footer; every group node's structural-only id never triggers
   name fallback and fails closed if found on a footer leaf; plain id-mode array/map without `nested.ids`,
   map-key containers, and (Parquet.Net-limited) group-node id matching all fail closed rather than mis-bind. The
-  **one** admitted absence path is the **added-after-write null-fill** (§2.5), and it is **keyed on interior
-  kind** so it neither opens a fail-closed hole nor drops present data: a **scalar** leaf null-fills only when
-  its *valid-current* id is absent **and** it is nullable; a **container** null-fills only when **all** its
-  descendant leaf ids are absent (presence is decided by descendant leaves, never the container's expected-absent
-  group id) — a present container is **always** bound structurally + recursed, never dropped. A containment
-  violation or a group-id-on-leaf still `SchemaMismatch`; a required-absent interior still fails closed. This is
-  the #857/#497 evolution posture extended to nested id mode, not a loosening of the mis-attribution guard
-  (§3.8c–§3.8k prove the no-hole *and* no-data-loss boundaries).
+  **one** admitted absence path is the **added-after-write null-fill** (§2.5), and it is **keyed on structural
+  presence** so it neither opens a fail-closed hole nor drops present data: a **scalar** leaf null-fills only
+  when its *valid-current* id is absent **and** it is nullable; a **container** null-fills only when its **own
+  group node is structurally ABSENT** from the file (a struct field by its stable `physicalName`, an array/map
+  interior with its enclosing container) **and** it is nullable — a **structurally-present** container is
+  **always** bound structurally + recursed (structure read, leaves null-filled per element), never dropped, even
+  when every currently-requested leaf is new. A containment violation or a group-id-on-leaf still
+  `SchemaMismatch`; a required structurally-absent interior still fails closed. This is the #857/#497 evolution
+  posture extended to nested id mode, not a loosening of the mis-attribution guard (§3.8c–§3.8n prove the no-hole
+  *and* no-data-loss boundaries).
 - **DoS:** recursion depth is capped (`MaxNestedReadDepth`, `MaxFooterFieldIdMapDepth`, `SchemaJson.MaxDepth`),
   checked **before** any descent or allocation (585a §2.6 bound reused).
 - **Supply-chain:** no new dependencies; depth&gt;1 write via the merged #873 recursive shredder.
@@ -734,7 +797,7 @@ graph LR
 | **Spoofing** | id-mode deep leaf | declared id absent from footer → silent name fallback | fail closed; group-node structural-only id never name-falls-back (§3.8) |
 | **Confusion** | array/map group-node id (Parquet.Net leaf-only) | invented group id → wire divergence | groups bound structurally/by-name; a group id found on a footer leaf fails closed (§2.6, §3.22) |
 | **Info disclosure** | deep read-exit relabel | raw nested `SimpleString`/foreign names in an exception | typed `DeltaStorageException` + sanitized path **before** `ManagedColumnBatch` (§2.5, §3.5) |
-| **Data loss (integrity)** | id-mode container interior + null-fill | a naive own-group-id-absence null-fill **silently drops a physically-present nested container** (`b.c` present, `b` null-filled) → wrong read | interior-KIND-keyed rule (§2.5): container presence decided by **descendant leaf ids**, a present container **always** bound structurally + recursed, never null-filled (§3.8h–§3.8k, M4) |
+| **Data loss (integrity)** | id-mode container interior + null-fill | a null-fill keyed on the container's own group-id (M4) or on its requested descendant leaves (M5) **silently drops a physically-present nested container** (`b.c` present but `b` dropped; or a whole array whose every requested leaf is new — per-row lengths lost) → wrong read | container presence keyed on **structural location** of its group node (struct field by stable `physicalName`; array/map interior positionally): a located container **always** reads structure + recurses, never null-filled; only a structurally-absent nullable container null-fills (§2.5, §3.8h–§3.8n) |
 | **DoS** | deeply/widely nested schema | unbounded recursion / allocation | depth caps checked before descent (585a bound reused) |
 
 **Residual:** the array/map/struct **group-node** id gap (§2.6) is an **interop** limitation (fail-closed
@@ -794,18 +857,22 @@ so it composes on 866a with no id-mode dependency.
   interop — documented caveat, not silent (§2.6, §3.22); (f) rename/drop descending an array/map interior →
   §3.19 boundary; (g) **added-after-write id-mode child throws instead of null-filling → historical data
   permanently unreadable** (a *shared* #676/#839 gap) — mitigated by the 866b `TryResolve`/null-fill with the
-  no-hole disposition table (§2.5) + §3.8c–§3.8g; (h) null-fill masking a genuine mapping defect → the no-hole
-  cells §3.8e–§3.8f pin that only a valid-current-id/absent/nullable **scalar** child null-fills; (i)
-  **a naive own-id-absence null-fill silently DROPS a physically-present nested container** (`b.c` in
-  `array<struct<a,b:struct<c>>>`) → **silent data loss** (worse than a fail-closed read) — mitigated by the
-  interior-KIND-keyed rule: a container's presence is decided by **descendant leaf ids**, never its own
-  (expected-absent) group id, so a present container is always bound structurally + recursed, never null-filled
-  (§2.5 disposition table + §3.8h–§3.8k, the M4 cells).
+  structural-presence disposition table (§2.5) + §3.8c–§3.8g; (h) null-fill masking a genuine mapping defect →
+  the no-hole cells §3.8e–§3.8f pin that only a valid-current-id/absent/nullable **scalar** leaf null-fills;
+  (i) **a naive own-id-absence null-fill silently DROPS a physically-present nested container** (`b.c` in
+  `array<struct<a,b:struct<c>>>`) → silent data loss (M4); (j) **keying container presence on requested
+  descendant leaves silently DROPS a present container whose every requested leaf is new** (`array<struct<a>>`→
+  `array<struct<b>>` reading an old file → whole array null-filled, per-row lengths lost) → silent data loss
+  (M5, *worse*: real structural data discarded). (i) and (j) are both mitigated by keying container presence on
+  the **structural location of the container's own group node** (struct field by stable `physicalName`; array/map
+  interior positionally): a located container **always** reads its structure + per-leaf null-fills, only a
+  structurally-absent nullable container null-fills its subtree (§2.5 disposition table + §3.8h–§3.8n).
 - **Launch checklist:** unit + integration (§3) green on both TFMs; `dotnet format`; determinism ban; DCO; RFL
   PASS; the closed-#585→#866 message sweep verified across **all three** files (`ColumnMapping.cs`,
   `ParquetTypeMapping.cs`, `DeltaTableWriter.cs`, §3.27); the id-mode null-fill no-hole cells (§3.8e–§3.8f), the
-  **present-nested-container-not-dropped** cell (§3.8h, M4), and the single-level companion (§3.8g) green;
-  **#839, #840, #873 confirmed closed/merged** (they are) and **#866 open** before PASS.
+  **present-nested-container-not-dropped** cells (§3.8h M4, §3.8l/§3.8m M5 — array lengths / struct structure
+  retained when all requested leaves are new), and the single-level companion (§3.8g) green; **#839, #840, #873
+  confirmed closed/merged** (they are) and **#866 open** before PASS.
 
 ---
 
@@ -844,29 +911,41 @@ so it composes on 866a with no id-mode dependency.
    document** (§2.6, §8); revisit only if Parquet.Net exposes a group-node `field_id` setter.
 6. **Prerequisite states — RESOLVED.** #839 and #840 are **CLOSED/merged** (verified live), so no #866 AC is
    gated on an unmerged prerequisite (§2.9). The issue text's "filed, open" framing is stale.
-7. **Id-mode nested absent-after-add null-fill — RESOLVED (866b), keyed on interior KIND to avoid silently
-   dropping a present nested container (red-team M3 + M4), and a pre-existing single-level gap it also closes.**
-   Verified in the worktree: **single-level id-mode nested does NOT null-fill** an absent-by-id child —
-   `ResolveStructFieldById` (`NestedParquetColumnReader.cs:2036`) and `ResolveInteriorLeafById` (`:2164`) throw
-   `SchemaMismatch` on an absent id, whereas **top-level** id mode (`ResolveFileFields:1727`, #497) and
-   **name-mode nested** (#857, `:447-480` / `:1855-1920`) both null-fill (name-mode recurses a present nested
-   child with `byFieldId: null`, `:484`). So a `struct<…>`/`array<struct<…>>` evolved by adding a nullable
-   child, read from an **old** file, is currently **permanently unreadable under id mode** — a **shared**
-   #676/#839 gap, not new to depth&gt;1.
-   **The M4 trap:** a **naive** null-fill keyed on the interior's **own** id-absence would, for a **container**
-   child (e.g. `b` in `array<struct<a:int,b:struct<c:long>>>`), fire on `b`'s group id — which is **always**
-   absent (Parquet.Net stamps leaves only) — and **silently drop the physically-present `b.c`** (data loss,
-   *worse* than the fail-closed original). The fix keys null-fill on **interior KIND**: a **scalar** leaf's
-   id-absence is the added-after-write signal; a **container**'s presence is decided by whether **any descendant
-   leaf id resolves** (the id-mode analogue of name-mode #857's subtree descent), and a present container is
-   **always bound structurally + recursed**, never null-filled whole (§2.5 disposition table). **585a decode is
-   confirmed correct given a structural binding** — decode is name/positional (name-mode recurses with
-   `byFieldId: null`); the bug was purely in the id-mode **resolution** layer's bind-vs-null-fill decision, and
-   the id-mode recurse retains `byFieldId` so deep scalar leaves still bind by id. §3.8c–§3.8k pin the positive
-   present-nested-struct read (§3.8h — the anti-data-loss cell), the whole-subtree null-fill (§3.8i), the
-   required-absent fail-close (§3.8j), the partial per-leaf null-fill (§3.8k), the no-hole cells (§3.8e–§3.8f),
-   and the single-level companion (§3.8g). **Companion note:** because the fix lands in the shared single-level
-   resolver, reviewers should confirm the single-level null-fill is asserted (§3.8g), not merely inherited.
+7. **Id-mode nested absent-after-add null-fill — RESOLVED (866b), container presence keyed on STRUCTURAL
+   LOCATION to avoid silently dropping a present nested container (red-team M3 + M4 + M5), and a pre-existing
+   single-level gap it also closes.** Verified in the worktree: **single-level id-mode nested does NOT null-fill**
+   an absent-by-id child — `ResolveStructFieldById` (`NestedParquetColumnReader.cs:2036`) and
+   `ResolveInteriorLeafById` (`:2164`) throw `SchemaMismatch` on an absent id, whereas **top-level** id mode
+   (`ResolveFileFields:1727`, #497) and **name-mode nested** (#857, `:447-480` / `:1855-1920`) both null-fill
+   (name-mode locates a nested child by **physical name** via `TryResolveStructChildNode` `:1784`, then recurses
+   with `byFieldId: null`, `:484`). So a `struct<…>`/`array<struct<…>>` evolved by adding a nullable child, read
+   from an **old** file, is currently **permanently unreadable under id mode** — a **shared** #676/#839 gap, not
+   new to depth&gt;1.
+   **Two silent-data-loss traps found and closed:** **(M4)** a naive null-fill keyed on the interior's **own**
+   id-absence fires on a **container** child's group id — always absent (Parquet.Net stamps leaves only) — and
+   drops the physically-present `b.c` in `array<struct<a,b:struct<c>>>`. **(M5)** keying container presence on
+   **requested descendant leaves** drops a container whose group node is present but whose every *currently
+   requested* leaf is new: `array<struct<a:int>>`→`array<struct<b:int>>` reading an old file has all requested
+   descendants (`b`) absent, so a descendant-leaf rule null-fills the **whole array**, discarding its real
+   per-row lengths and reading `null` instead of `[{b:null}, …]` — real structural data lost.
+   **The fix keys container presence on the STRUCTURAL LOCATION of the container's own group node**, exactly as
+   name mode: a **struct-field** container is located by its stable `delta.columnMapping.physicalName`
+   (`ColumnMapping.PhysicalNameKey`, `ColumnMapping.cs:123`, stamped at `AssignMappedField`→`WithMapping` `:908`;
+   the physicalName **is** the Parquet group-node name, `:204`,`:299-300`, and the id-mode read schema
+   `ToPhysicalSchema(schema, Id)` carries it as the field `Name` while keeping `delta.columnMapping.id` for
+   leaves) — so location is rename-tolerant and leaves stay id-bound; an **array element / map key-value** is
+   canonical/positional (present with its enclosing container). A **located** container **always** reads its
+   structure (lengths/rep/def) + recurses (scalar leaves by id, per-leaf null-fill); only a **structurally-absent**
+   nullable container null-fills its subtree (required → `ColumnNotPresentInFile`). This is now a **closer**
+   analogue of name-mode #857 than the round-3 descendant-leaf rule. **585a decode is confirmed correct given a
+   structural binding** — decode is name/positional; the bug was purely in the id-mode **resolution** layer's
+   bind-vs-null-fill decision, and the id-mode recurse retains `byFieldId` so deep scalar leaves still bind by id.
+   §3.8c–§3.8n pin the positive present-nested-struct read (§3.8h, M4), the array-lengths-retained
+   all-children-replaced case (§3.8l, the M5 pin) and its struct-field companion (§3.8m), the structural-absence
+   whole-subtree null-fill (§3.8i/§3.8n), the required-absent fail-close (§3.8j), the partial per-leaf null-fill
+   (§3.8k), the no-hole cells (§3.8e–§3.8f), and the single-level companion (§3.8g). **Companion note:** because
+   the fix lands in the shared single-level resolver, reviewers should confirm the single-level null-fill is
+   asserted (§3.8g), not merely inherited.
 
 ---
 
