@@ -1389,7 +1389,14 @@ internal static class NestedParquetColumnReader
         ValidateLevelRange(def, leaf.MaxDefinitionLevel, leaf.Path.ToString(), "definition");
         ValidateLevelRange(rep, leaf.MaxRepetitionLevel, leaf.Path.ToString(), "repetition");
 
-        var child = ColumnVectors.Create(elementType, Math.Max(numValues, 1));
+        var child = CreateLeafVector(
+            elementType, Math.Max(numValues, 1),
+            // Defense-in-depth twin of the absent-child site (#863): ReadLeafAsync<T> is dispatched only for
+            // SUPPORTED physical scalars (T : struct), and a NullType/void leaf against a PRESENT physical leaf
+            // fails closed earlier (ValidateLeafPhysicalType SchemaMismatch / the leaf-decode UnsupportedFeature
+            // dispatch default), so ColumnVectors.Create never rejects `elementType` here today — CreateLeafVector
+            // keeps this site fail-closed-typed if that ever changes.
+            $"nested leaf '{DiagnosticText.Sanitize(leaf.Path.ToString())}'");
         int fieldMaxDef = leaf.MaxDefinitionLevel;
         int packed = 0;
         if (def is null)
@@ -1859,7 +1866,7 @@ internal static class NestedParquetColumnReader
         // plus a per-cell validity byte, summed over the requested subtree (bounded by MaxNestedReadDepth).
         // No per-VALUE payload term — every cell is null, so nothing is materialized beyond the lanes.
         budget.ChargeStructural(rowCount, AbsentCellWidth(type, depth), context);
-        return BuildAllNullSubtree(type, rowCount, depth);
+        return BuildAllNullSubtree(type, rowCount, depth, context);
     }
 
     // Materializes an all-null vector for the requested subtree WITHOUT charging (the parent SynthesizeAbsent
@@ -1872,7 +1879,7 @@ internal static class NestedParquetColumnReader
     // by AbsentCellWidth. The requested subtree depth is bounded by MaxNestedReadDepth (fail-closed past it),
     // matching the sibling DecodeNode/ValidateNode guards, so a programmatically-constructed deep type cannot
     // recurse unbounded into a StackOverflow.
-    private static ColumnVector BuildAllNullSubtree(DataType type, int rowCount, int depth)
+    private static ColumnVector BuildAllNullSubtree(DataType type, int rowCount, int depth, string context)
     {
         if (depth > MaxNestedReadDepth)
         {
@@ -1886,7 +1893,10 @@ internal static class NestedParquetColumnReader
             var children = new ColumnVector[structType.Count];
             for (int i = 0; i < structType.Count; i++)
             {
-                children[i] = BuildAllNullSubtree(structType[i].DataType, rowCount, depth + 1);
+                StructField structField = structType[i];
+                string childContext =
+                    $"struct column '{context}' field '{DiagnosticText.Sanitize(structField.Name)}'";
+                children[i] = BuildAllNullSubtree(structField.DataType, rowCount, depth + 1, childContext);
             }
 
             var nulls = new bool[rowCount];
@@ -1894,13 +1904,43 @@ internal static class NestedParquetColumnReader
             return new StructColumnVector(structType, children, nulls);
         }
 
-        MutableColumnVector vector = ColumnVectors.Create(type, Math.Max(rowCount, 1));
+        // #863: an absent nullable child whose (scalar) leaf type has no managed column vector (e.g.
+        // void/NullType) must fail closed with the reader's TYPED contract, not a raw UnsupportedTypeException
+        // escaping the storage boundary. Through the public read door ParquetTypeMapping.EnsureReadSupported
+        // already rejects such a leaf up front (UnsupportedFeature); CreateLeafVector keeps THIS path
+        // independently fail-closed for a direct/defense-in-depth call (the present-decode path's twin site
+        // below).
+        MutableColumnVector vector = CreateLeafVector(type, Math.Max(rowCount, 1), context);
         for (int r = 0; r < rowCount; r++)
         {
             vector.AppendNull();
         }
 
         return vector;
+    }
+
+    // Allocates a nested leaf's value lane, normalizing ColumnVectors.Create's UnsupportedTypeException — a
+    // leaf type with no managed column vector (e.g. void/NullType) — into the reader's fail-closed TYPED
+    // contract (#863): a bounded, sanitized DeltaStorageException.UnsupportedFeature, never a raw exception
+    // across the storage boundary. Through the public read door ParquetTypeMapping.EnsureReadSupported already
+    // rejects such a leaf up front (UnsupportedFeature); this keeps NestedParquetColumnReader INDEPENDENTLY
+    // fail-closed, consistent with its sibling defense-in-depth guards. The catch is scoped to the allocation
+    // call and to UnsupportedTypeException ONLY, so an unrelated fault still propagates (no over-catch). The
+    // raw cause is retained as the inner for server-side diagnostics (N3). `context` is a pre-sanitized
+    // diagnostic label; DescribeType renders the bounded leaf KIND (never a recursive foreign SimpleString),
+    // matching the sibling unsupported-leaf messages in this file.
+    private static MutableColumnVector CreateLeafVector(DataType type, int capacity, string context)
+    {
+        try
+        {
+            return ColumnVectors.Create(type, capacity);
+        }
+        catch (UnsupportedTypeException ex)
+        {
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested read for {context}: the leaf type '{DiagnosticText.DescribeType(type)}' has no "
+                + "supported column vector.", ex);
+        }
     }
 
     // The conservative per-owner-cell byte width of an all-null subtree (§2.6): a scalar contributes its value
