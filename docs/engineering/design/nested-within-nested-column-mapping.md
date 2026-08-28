@@ -255,7 +255,7 @@ Every site below is grounded at `origin/main` @ `b0397b0`. **Lift** = recurse/de
 | **R5** | `nested.ids` selector parse | `ColumnMapping.cs:621` (`ValidateNestedIds`, `:638-661`) | `ValidateNestedIds` | **LIFT + leaf/group discrimination (M2)** — accept **multi-token** dotted keys (`P.element.element`, `P.value.key`) computed from the **full** declared depth&gt;1 shape; mark each key **leaf** (footer-resolvable) vs **group** (structural-only, e.g. `P.element` of an `array<struct>`); single-token scalar stays #839 | 866b |
 | **R6** | name-mode physical relabel + id-mode read schema | `DeltaReadSource.cs:186`, `ColumnMappingProjection.cs:64,95,219` | `BuildDataSchema`→`BuildPhysicalDataType`, `AssertStructCongruent` | **LIFT** — recurse array/map struct interiors to substitute interior struct-child physical names (today struct-only recursion, `:97` early-returns on non-struct; array/map carried verbatim). This is the **read** schema in **both** name and id mode (`BuildDataSchema`, `DeltaReadSource.cs:186`, mode-independent — relabels to physicalName + keeps the `id` metadata); R6's lift is what **puts the stable physicalName on a nested container's group node**, on which the round-4 structural-location mechanism (§2.5) depends | 866a (name) / 866b consumes at depth for id |
 | **R7** | name-mode decode validator | `NestedParquetColumnReader.cs:136` | `ValidateNode` (585a) | **RETAIN (reuse)** — already recursive to any depth; no change (green in §2.1) | — |
-| **R8** | **id thread-through the decode recursion (red-team M6)** | `NestedParquetColumnReader.cs:514-517,704-707,920-929` | `ReadStructAsync`/`ReadListAsync`/`ReadMapAsync` → `DecodeNode` | **LIFT** — the shipped decode **hardcodes `byFieldId: null, interiorIds: null`** when recursing into a nested child (`:514`, `:704`, `:920`), SAFE **only because** id-mode nested-within-nested is rejected upstream (the very gate 866b lifts, comments `:508-512`,`:700-703`,`:914-917`). 866b MUST thread **`byFieldId` verbatim** and the **descended `interiorIds`** through the recursion so deep leaves bind by `field_id`, not positionally, and MUST update those "safe because rejected upstream" comments | 866b |
+| **R8** | **id thread-through the decode recursion (red-team M6)** | `NestedParquetColumnReader.cs:514-517,704-707,920-929` | `ReadStructAsync`/`ReadListAsync`/`ReadMapAsync` → `DecodeNode` | **LIFT** — the shipped decode **hardcodes `byFieldId: null, interiorIds: null`** when recursing into a nested child (`:514`, `:704`, `:920`), SAFE **only because** id-mode nested-within-nested is rejected upstream (the very gate 866b lifts, comments `:508-512`,`:700-703`,`:914-917`). 866b MUST thread **`byFieldId` verbatim**; and thread `interiorIds` **StructField-aware (C1)** — `Descend(selector)` **only within a single array/map container's `nested.ids` scope**, but at a **`StructField` boundary RE-SEED** a fresh `NestedInteriorIds` from each child `StructField`'s **own** `nested.ids` (`ReadStructAsync` iterates the metadata-bearing children at `:425`), **never** inheriting the parent's `interiorIds`. Update the "safe because rejected upstream" comments | 866b |
 | **W1** | id-mode nested-within-nested WRITE reject | `ParquetTypeMapping.cs:141-145,206-207,241-252` | `CreateNestedField`/`RejectNestedWithinNestedId` | **LIFT** — stamp interior leaf `field_id`s at any depth (name/none already recurses per #873); the message already cites **#866** | 866b |
 | **W2** | map-**key**-container reject | `ParquetTypeMapping.cs:261` | `RejectNestedMapKey` | **RETAIN** — a Parquet map key that is a container is fail-closed at every depth (#873 D5; a structural Parquet constraint, not a depth ceiling) | — |
 | **RD1** | rename/drop single-hop descent | `DeltaTableWriter.cs` (#840 `F4b`) | `DescendAndRebuild` | **LIFT for `struct<struct<…>>`** — allow a second+ struct hop (arbitrary struct depth); **RETAIN `F4`** (array/map interior descent stays fail-closed — no logical-name hop) | 866c |
@@ -452,12 +452,32 @@ be dead code:
 - **`byFieldId`** (the one file-global path-keyed footer map, `BuildFieldIdMap`) is threaded **verbatim** into
   every `DecodeNode` recursion — every descendant leaf looks up its own `StructField` id (struct child) or
   interior `nested.ids` id in the same map, containment-checked at its level.
-- **`interiorIds`** (`NestedInteriorIds`, `NestedParquetColumnReader.cs:2107`) is **descended**: it is extended
-  to hold the **full multi-token** `nested.ids` and to expose `Descend(selector)` returning the sub-slice for a
-  nested container's own interior — the outer array's ids descended on `element` yield the inner array's
-  `{element: innerElemId}`. The **hand-off structure** is `ResolvedColumn.ForNested(containerField, byFieldId,
-  interiorIds)` at the top (`ResolveFileFields`), then `byFieldId` + `interiorIds.Descend(selector)` at each
-  recursion. The "safe because rejected upstream" comments are updated when 866b removes the gate.
+- **`interiorIds`** (`NestedInteriorIds`, `NestedParquetColumnReader.cs:2107`) is threaded **StructField-aware,
+  in exactly two cases** — because per **C1 (§2.2)** `nested.ids` live on `StructField`s and **a struct RESETS
+  the id accumulation** (each struct child is a `StructField` that owns its OWN `delta.columnMapping.id` or OWN
+  `nested.ids`):
+  1. **Within a single array/map container's `nested.ids` scope** — an array element that is itself array/map, a
+     map value that is array/map, and deep **no-intervening-struct** chains (`array<array<int>>`,
+     `array<map<…>>`, `map<*,array<…>>`) → carry the **same** `NestedInteriorIds` and `Descend(selector)` into
+     the child (selector = the canonical `element`/`key`/`value` token). The outer array's ids descended on
+     `element` yield the inner array's `{element: innerElemId}`. **`Descend` is scoped to a single container's
+     `nested.ids` and applies ONLY here.**
+  2. **At a `StructField` boundary** — recursing **from any container into a struct**, and **from a struct into
+     each of its children** → **do NOT descend the parent's `interiorIds`** (the parent has no `nested.ids`
+     entry for a struct child's internals — C1 reset). Instead **`ReadStructAsync` RE-SEEDS a fresh scope from
+     each child `StructField`'s OWN metadata** (it already iterates the metadata-bearing `StructField`s at
+     `:425`): a **scalar** child binds by its own `delta.columnMapping.id` (`ResolveStructFieldById`, `:431`);
+     a **container** child (its type contains array/map interiors) builds a **fresh** `NestedInteriorIds` from
+     **that child `StructField`'s OWN `nested.ids`**, then recurses per case 1.
+
+  So: `Descend` never crosses a `StructField` boundary; a `StructField` boundary **always** re-seeds to the
+  child's own id metadata and **never** inherits the parent's `interiorIds`. This is the exact dual of the C1
+  assignment walk (§2.2) — a struct resets, an array/map chain accumulates — so the read mechanism and the id
+  model agree. The **hand-off structure** is `ResolvedColumn.ForNested(containerField, byFieldId, interiorIds)`
+  at the top (`ResolveFileFields`); then within an array/map scope `byFieldId` + `interiorIds.Descend(selector)`,
+  and at a struct boundary `byFieldId` + a `NestedInteriorIds` **re-seeded from the child StructField's own
+  `nested.ids`** (or none, for a scalar child). The "safe because rejected upstream" comments are updated when
+  866b removes the gate.
 
 **INV-PARITY presence stream on the id-mode null-fill (storage B2).** The name-mode `ReadStructAsync` threads a
 per-owner-cell **presence stream** for an absent nullable child — `StructPresenceDefs` → `absentPresenceDefs` →
@@ -700,6 +720,14 @@ array<struct<a:int,b:struct<c:long>>> (depth-3, the M4 present-nested-struct sha
   name mode (`:470-483`), so `BuildStructNullMask`'s cross-field parity guard sees the correct struct presence
   per row and does **not** misfire — asserts per-row parity across the present and null-filled siblings under the
   repeated (array) ancestor, incl. empty and multi-element rows.
+- 8s. **`IdMode_Depth2_StructArray_InnerElementResolvedById_NotPositionally`** (red-team M6 — the StructField
+  re-seed blind spot) — `struct<b: array<int>>` in id mode with a **forged/reordered footer** (inner `element`
+  leaf at a reordered/renamed physical position but carrying its correct `field_id` from **`b`'s own**
+  `nested.ids`): the inner element binds **by `field_id`**, not positionally. This cell **FAILS if
+  `ReadStructAsync` `Descend`s the parent struct's (empty) `interiorIds` for `b` instead of RE-SEEDing a fresh
+  `NestedInteriorIds` from `b`'s own `nested.ids`** (§2.5 case 2, the C1 struct reset). Disjoint witness domain
+  on the inner `int`. Companion **`IdMode_Depth2_StructMap_InnerKeyValueResolvedById_NotPositionally`**
+  (`struct<b: map<string,long>>`) proves the same re-seed for a map-valued struct child.
 
 **Fail-closed invariants over the depth&gt;1 tree (AC-fail-closed)**
 9. **`Depth2_DuplicateFieldIdAnywhereInTree_FailsClosed`** (`BuildFieldIdMap` dup guard, any depth).
@@ -784,7 +812,7 @@ writer; there is **no** unmerged write-path dependency (unlike #676, which was g
 | Acceptance criterion (#866) | §3 cells |
 |---|---|
 | Recursive `(id,physicalName)` assignment for depth&gt;1 leaves; monotonic `maxColumnId`; `RejectNestedWithinNested` lifted | §3.1, §3.2, §3.3, §3.27 |
-| Name-mode + id-mode resolution of depth&gt;1 leaves (id mode via `nested.ids` at each interior level, **threaded through the decode recursion so deep leaves bind by `field_id` not positionally — R8/M6**; `array<struct>`/`map<*,struct>` container-element resolution; present nested container never dropped — presence by structural location, incl. all-children-replaced retaining array lengths; absent-after-add null-fill only on structural absence, **INV-PARITY presence stream threaded — B2**) | §3.4–§3.8, §3.8a–§3.8r |
+| Name-mode + id-mode resolution of depth&gt;1 leaves (id mode via `nested.ids` at each interior level, **threaded through the decode recursion so deep leaves bind by `field_id` not positionally — R8/M6; `Descend` within an array/map scope but RE-SEED from the child's own `nested.ids` at a `StructField` boundary, C1**; `array<struct>`/`map<*,struct>` container-element resolution; present nested container never dropped — presence by structural location, incl. all-children-replaced retaining array lengths; absent-after-add null-fill only on structural absence, **INV-PARITY presence stream threaded — B2**) | §3.4–§3.8, §3.8a–§3.8s |
 | Metadata-only rename/drop of a depth&gt;1 nested field | §3.18 (§3.19–§3.20 boundaries) |
 | Fail-closed invariants (duplicate/missing/range/relabel + `nested.ids` containment + structural-group-id-on-leaf + null-fill no-hole + required-container-absent) over the depth&gt;1 tree; cross-engine interop | §3.9–§3.17, §3.17a, §3.8e–§3.8f, §3.8j, §3.21–§3.22, §3.25 |
 | Update `RejectNestedWithinNested` / retained-reject messages to reference #866 not the closed #585 (three files) | §3.27 |
@@ -944,7 +972,7 @@ so it composes on 866a with no id-mode dependency.
   PASS; the closed-#585→#866 message sweep verified across **all three** files (`ColumnMapping.cs`,
   `ParquetTypeMapping.cs`, `DeltaTableWriter.cs`, §3.27); the id-mode null-fill no-hole cells (§3.8e–§3.8f), the
   **present-nested-container-not-dropped** cells (§3.8h M4, §3.8l/§3.8m M5 — array lengths / struct structure
-  retained when all requested leaves are new), the **id-not-positional deep-binding** cells (§3.8o–§3.8q, R8/M6)
+  retained when all requested leaves are new), the **id-not-positional deep-binding** cells (§3.8o–§3.8q plus the struct-with-array/map-child re-seed §3.8s, R8/M6)
   and the **INV-PARITY** cell (§3.8r, B2), and the single-level companion (§3.8g) green; **#839, #840, #873
   confirmed closed/merged** (they are) and **#866 open** before PASS.
 
@@ -1034,16 +1062,29 @@ so it composes on 866a with no id-mode dependency.
    lifts. Left unfixed, `array<array<int>>` in id mode would parse the multi-token `nested.ids` (R5) then recurse
    into the inner array with `interiorIds: null`, and the inner `int` leaf would bind **positionally/by name**,
    not by its Iceberg `field_id` — a silent id-mode violation (reorder-intolerant) and R5's multi-token parse
-   would be **dead code**. **Fix (866b):** thread the **whole-file `byFieldId` verbatim** and the **descended
-   `interiorIds`** through the recursion. **Id hand-off (which structure carries the descended ids):** the
+   would be **dead code**. **Fix (866b):** thread the **whole-file `byFieldId` verbatim** and the `interiorIds`
+   **StructField-aware (C1)** through the recursion. **Id hand-off (which structure carries the ids):** the
    top-level resolution (`ResolveFileFields`) already carries `byFieldId` + a `NestedInteriorIds` on
    `ResolvedColumn.ForNested`; 866b (a) threads `byFieldId` unchanged into every `DecodeNode` recursion (children
    bind their own `StructField` id / interior `nested.ids` id against the one file-global path-keyed map), and (b)
    extends **`NestedInteriorIds`** (`NestedParquetColumnReader.cs:2107`) to hold the **full multi-token**
-   `nested.ids` and to **descend** — `Descend(selector)` returns the sub-slice for a nested container's own
-   interior (e.g. the outer array's `interiorIds` descended on `element` yields `{element: innerElemId}` for the
-   inner array). The "safe because rejected upstream" comments MUST be updated when 866b removes that gate.
-   §3.8o–§3.8q pin id-not-positional binding at depth (`array<array>`, deep struct chain, `map`-value-array).
+   `nested.ids` and threads it in **exactly two cases**, matching the C1 assignment walk (§2.2):
+   - **within a single array/map container's `nested.ids` scope** (array/map element/value that is itself
+     array/map; deep no-intervening-struct chains) → `Descend(selector)` returns the sub-slice for that
+     container's own interior (the outer array's ids descended on `element` yield `{element: innerElemId}`);
+   - **at a `StructField` boundary** (into a struct, and from a struct into each child) → **do NOT descend** the
+     parent's `interiorIds` (the parent has **no** `nested.ids` entry for a struct child's internals — the C1
+     reset); `ReadStructAsync` **re-seeds** a fresh `NestedInteriorIds` from **each child `StructField`'s OWN**
+     `nested.ids` (iterating the metadata-bearing children at `:425`), a scalar child binding by its own
+     `delta.columnMapping.id`. `Descend` **never** crosses a `StructField` boundary. (An earlier round-5 phrasing
+     said "`Descend(selector)` at each recursion" uniformly — literally wrong at a struct boundary, where
+     `Descend("b")` on a parent struct with no `b` internals would yield empty and drop the inner element to
+     positional binding; the re-seed is the corrected mechanism and matches C1.)
+   The "safe because rejected upstream" comments MUST be updated when 866b removes that gate.
+   **§3.8o–§3.8q** pin id-not-positional binding for **array-scoped** chains (`array<array>`, `array<struct<struct>>`,
+   `map`-value-array) but **NOT** a struct-with-array/map child — **§3.8s** closes that blind spot
+   (`struct<b: array<int>>` / `struct<b: map<…>>`: the inner element/key-value binds by `b`'s **own** `nested.ids`
+   id via the re-seed, not positionally).
 
 ---
 
