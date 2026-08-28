@@ -132,17 +132,19 @@ public sealed class NestedColumnMappingIdContainmentTests
     }
 
     [Fact]
-    public async Task IdMode_ContainerGroupPresentButChildIdAbsentFromSubtree_FailsClosed_NoNameFallback()
+    public async Task IdMode_ContainerPresentButChildIdAbsentFromFooter_NullFills_NoNameFallback()
     {
-        // Child 'v' declares id 999, absent from the footer — must fail closed with NO fall back to matching by
-        // name (which would otherwise silently bind home/v).
+        // 866b: child 'v' declares id 999, absent from the footer — a valid-current id an older file predates.
+        // It NULL-FILLS (nullable) rather than silently binding home/v by name (no name fallback), and rather
+        // than the pre-866b unconditional SchemaMismatch.
         byte[] bytes = await WriteTwoStringStructsAsync(homeFieldId: 5, workFieldId: 6);
 
-        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
-            () => ReadSingleAsync(bytes, One(Container("home", containerId: null, IdField("v", DataTypes.StringType, id: 999)))));
+        ColumnBatch batch = await ReadSingleAsync(
+            bytes, One(Container("home", containerId: null, IdField("v", DataTypes.StringType, id: 999))));
 
-        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
-        Assert.Contains("no name fallback", error.Message, StringComparison.Ordinal);
+        var home = Assert.IsType<StructColumnVector>(batch.Column(0));
+        Assert.True(home.Child(0).IsNull(0)); // null-filled, NOT bound to home's id-5 leaf by name
+        Assert.True(home.Child(0).IsNull(1));
     }
 
     [Fact]

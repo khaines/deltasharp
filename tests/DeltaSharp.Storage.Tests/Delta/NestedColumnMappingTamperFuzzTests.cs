@@ -108,8 +108,8 @@ public sealed class NestedColumnMappingTamperFuzzTests
     }
 
     // =========================================================================================
-    // §3.26 · ID-mode nested-within-nested at the assignment/validation door — shape × door matrix (#866).
-    // NAME/none mode now recurses (866a); the retained fail-closed gate is ID mode until 866b.
+    // §3.26 · ID-mode nested-within-nested at the assignment/validation door — now LIFTED (866b).
+    // NAME/none mode recurses (866a); id mode recurses with multi-token nested.ids (866b).
     // =========================================================================================
 
     public static IEnumerable<object[]> NestedWithinNestedShapes()
@@ -123,62 +123,53 @@ public sealed class NestedColumnMappingTamperFuzzTests
 
     [Theory]
     [MemberData(nameof(NestedWithinNestedShapes))]
-    public void NestedWithinNested_AssignFreshMapping_FailsClosed_866(string shape)
+    public void NestedWithinNested_AssignFreshMapping_Succeeds_866b(string shape)
     {
         StructType logical = NestedWithinNestedLogical(shape);
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.AssignFreshMapping(logical, new SeededPhysicalNameSource("nwn-assign"), ColumnMappingMode.Id));
-        AssertNestedWithinNested(ex);
+        (StructType mapped, long max) = ColumnMapping.AssignFreshMapping(
+            logical, new SeededPhysicalNameSource("nwn-assign"), ColumnMappingMode.Id);
+        Assert.True(max >= 2);
+        Assert.True(ColumnMapping.TryGetId(mapped[0], out _));
+
+        // The freshly-minted id-mode depth>1 schema validates round-trip (no #866 reject).
+        ColumnMapping.ValidateColumnMappingSchema(ColumnMappingMode.Id, mapped, ColumnMapping.IdModeConfiguration(max));
     }
 
     [Theory]
     [MemberData(nameof(NestedWithinNestedShapes))]
-    public void NestedWithinNested_ValidateColumnMappingSchema_FailsClosed_866(string shape)
+    public void NestedWithinNested_ToPhysicalSchema_Succeeds_866b(string shape)
     {
-        // A raw/foreign committed metaData carrying such an ID-mode shape (mapped) fails closed at the load
-        // choke point (the id-mode NWN gate fires first in ValidateMappedLevel's switch).
-        StructType mapped = NestedWithinNestedMapped(shape);
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.ValidateColumnMappingSchema(
-                ColumnMappingMode.Id, mapped, ColumnMapping.IdModeConfiguration(3)));
-        AssertNestedWithinNested(ex);
+        (StructType mapped, _) = ColumnMapping.AssignFreshMapping(
+            NestedWithinNestedLogical(shape), new SeededPhysicalNameSource("nwn-phys"), ColumnMappingMode.Id);
+        StructType physical = ColumnMapping.ToPhysicalSchema(mapped, ColumnMappingMode.Id);
+        Assert.Equal(2, physical.Count);
     }
 
     [Theory]
     [MemberData(nameof(NestedWithinNestedShapes))]
-    public void NestedWithinNested_ToPhysicalSchema_FailsClosed_866(string shape)
+    public void NestedWithinNested_EvolveIdModeMapping_Succeeds_866b(string shape)
     {
-        StructType mapped = NestedWithinNestedMapped(shape);
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.ToPhysicalSchema(mapped, ColumnMappingMode.Id));
-        AssertNestedWithinNested(ex);
-    }
-
-    [Theory]
-    [MemberData(nameof(NestedWithinNestedShapes))]
-    public void NestedWithinNested_EvolveIdModeMapping_FailsClosed_866(string shape)
-    {
-        // Evolve a valid flat ID-mode table by ADDING a nested-within-nested column: fails closed naming #866
-        // before any id is minted (no partial maxColumnId advance).
+        // Evolve a valid flat ID-mode table by ADDING a nested-within-nested column: succeeds, minting the new
+        // column's ids monotonically past the existing maxColumnId (866b).
         var current = new StructType(new[] { MappedLeaf("id", DataTypes.LongType, 1, "col-id", false) });
         var evolved = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, false),
             new StructField("payload", NestedWithinNestedType(shape)),
         });
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.EvolveNameModeMapping(
-                evolved, current, ColumnMapping.IdModeConfiguration(1), new SeededPhysicalNameSource("nwn-evolve"),
-                ColumnMappingMode.Id));
-        AssertNestedWithinNested(ex);
+        (StructType mapped, var config) = ColumnMapping.EvolveNameModeMapping(
+            evolved, current, ColumnMapping.IdModeConfiguration(1), new SeededPhysicalNameSource("nwn-evolve"),
+            ColumnMappingMode.Id);
+        Assert.Equal(2, mapped.Count);
+        ColumnMapping.ValidateColumnMappingSchema(ColumnMappingMode.Id, mapped, config);
     }
 
     [Fact]
-    public void NestedWithinNested_AssignFreshMapping_NoPartialMaxColumnIdAdvance()
+    public void NestedWithinNested_AssignFreshMapping_MonotonicMaxColumnIdAdvance()
     {
-        // The ID-mode reject fires BEFORE any child id is minted: the valid PREFIX ({id, addr:struct<city>})
-        // minted alone yields maxColumnId=3; the same prefix followed by a nested-within-nested column throws
-        // with no partially-advanced id observable (it never returns a maxColumnId at all).
+        // The valid PREFIX ({id, addr:struct<city>}) alone yields maxColumnId=3; the same prefix followed by a
+        // nested-within-nested column advances the counter monotonically past it (866b — no partial state,
+        // deeper leaves counted in pre-order).
         var prefix = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, false),
@@ -188,14 +179,15 @@ public sealed class NestedColumnMappingTamperFuzzTests
             prefix, new SeededPhysicalNameSource("prefix"), ColumnMappingMode.Id);
         Assert.Equal(3L, baseline);
 
-        var poisoned = new StructType(new[]
+        var extended = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, false),
             new StructField("addr", new StructType(new[] { new StructField("city", DataTypes.StringType) })),
             new StructField("payload", NestedWithinNestedType("struct<struct>")),
         });
-        Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.AssignFreshMapping(poisoned, new SeededPhysicalNameSource("prefix"), ColumnMappingMode.Id));
+        (_, long extendedMax) = ColumnMapping.AssignFreshMapping(
+            extended, new SeededPhysicalNameSource("prefix"), ColumnMappingMode.Id);
+        Assert.True(extendedMax > baseline);
     }
 
     [Fact]
@@ -730,17 +722,4 @@ public sealed class NestedColumnMappingTamperFuzzTests
             new StructField("id", DataTypes.LongType, false),
             new StructField("payload", NestedWithinNestedType(shape)),
         });
-
-    private static StructType NestedWithinNestedMapped(string shape) =>
-        new StructType(new[]
-        {
-            MappedLeaf("id", DataTypes.LongType, 1, "col-id", false),
-            new StructField("payload", NestedWithinNestedType(shape), true, Meta(2, "col-payload")),
-        });
-
-    private static void AssertNestedWithinNested(DeltaProtocolException ex)
-    {
-        Assert.Contains("nested type within a nested type", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
-    }
 }

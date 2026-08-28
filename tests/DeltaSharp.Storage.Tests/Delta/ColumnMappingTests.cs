@@ -2971,13 +2971,11 @@ public sealed class ColumnMappingTests : IDisposable
     }
 
     [Fact]
-    public void EvolveIdModeMapping_NestedWithinNestedNewColumn_FailsClosed_866()
+    public void EvolveIdModeMapping_NestedWithinNestedNewColumn_Succeeds_866b()
     {
-        // #676: a NEW single-level struct<scalar> child now evolves successfully (minting only the new child —
-        // see NameMode_EvolveAddStructChild_* below). #866 866a: a NEW NESTED-WITHIN-NESTED column
-        // (e.g. payload: struct<inner: struct<x>>) now evolves under NAME/none mode, but under ID mode it
-        // remains out of scope (#866, retained until 866b) and is rejected fail-closed rather than minted — the
-        // assignment/evolve door refuses it before any id is minted.
+        // #676: a NEW single-level struct<scalar> child evolves successfully. #866 866b: a NEW
+        // NESTED-WITHIN-NESTED column (e.g. payload: struct<inner: struct<x>>) now also evolves under ID mode,
+        // minting the new column's ids monotonically past the existing maxColumnId.
         (StructType current, long maxColumnId) =
             ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed), ColumnMappingMode.Id);
         System.Collections.Immutable.ImmutableSortedDictionary<string, string> config =
@@ -2999,10 +2997,10 @@ public sealed class ColumnMappingTests : IDisposable
                 nullable: true),
         });
 
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.EvolveNameModeMapping(
-                nestedEvolved, current, config, new SeededPhysicalNameSource(EvolveSeed), ColumnMappingMode.Id));
-        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
+        (StructType mapped, var evolvedConfig) = ColumnMapping.EvolveNameModeMapping(
+            nestedEvolved, current, config, new SeededPhysicalNameSource(EvolveSeed), ColumnMappingMode.Id);
+        Assert.Equal(4, mapped.Count);
+        ColumnMapping.ValidateColumnMappingSchema(ColumnMappingMode.Id, mapped, evolvedConfig);
     }
 
     [Fact]

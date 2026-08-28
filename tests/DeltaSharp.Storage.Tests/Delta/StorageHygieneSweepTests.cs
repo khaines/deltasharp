@@ -172,29 +172,24 @@ public sealed class StorageHygieneSweepTests
     [MemberData(nameof(Poisons))]
     public void Door_ColumnMapping_NestedWriteColumnRejected(string poison)
     {
-        // #676: a single-level nested column (struct/array/map of scalars) is now MAPPED, not rejected. #866
-        // 866a: a NESTED-WITHIN-NESTED column now maps under NAME/none mode; under ID mode it stays out of
-        // scope (#866, retained until 866b) and fails closed at the assignment door. The poison is the
-        // CONTAINER name, echoed (sanitized) in the #866 diagnostic via the offending child path.
+        // #676/#866: single-level AND nested-within-nested struct/array/map value columns are now MAPPED (866a
+        // name/none, 866b id). The one retained id-mode fail-closed nested door is a CONTAINER MAP KEY (§2.6).
+        // The poison is the CONTAINER name, echoed (sanitized) in the #866 diagnostic via the offending key path.
         string p = Payload(poison);
         var nested = new StructType(
         [
             new StructField(
                 p,
-                new StructType(
-                [
-                    new StructField(
-                        "inner",
-                        new StructType([new StructField("x", DataTypes.LongType, nullable: true)]),
-                        nullable: true),
-                ]),
+                new MapType(
+                    new StructType([new StructField("x", DataTypes.LongType, nullable: true)]),
+                    DataTypes.LongType),
                 nullable: true),
         ]);
 
         DeltaProtocolException ex = Assert.ThrowsAny<DeltaProtocolException>(
             () => ColumnMapping.AssignFreshMapping(nested, new SeededPhysicalNameSource("unused"), ColumnMappingMode.Id));
 
-        Assert.Contains("nested", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("map key", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
     }
 
@@ -660,31 +655,25 @@ public sealed class StorageHygieneSweepTests
     [MemberData(nameof(Poisons))]
     public void Door_ColumnMapping_NestedWithinNestedValidateRejected(string poison)
     {
-        // #676: ResolvePhysicalNames no longer rejects a single-level nested column — it resolves it. #866
-        // 866a: NAME/none mode now recurses over a depth>1 tree; the still-rejecting validation door for a
-        // NESTED-WITHIN-NESTED shape is ID mode (ColumnMapping.ValidateColumnMappingSchema, commit AND load).
-        // The poison is the CONTAINER name, echoed (sanitized) via the offending child path in the #866
-        // diagnostic.
+        // #866 866b: id-mode nested-within-nested is now LIFTED for struct/array/map value/element interiors.
+        // The one retained id-mode fail-closed nested door is a CONTAINER MAP KEY (§2.6 — a Parquet map key
+        // must be required + scalar). The poison is the CONTAINER name, echoed (sanitized) via the offending
+        // key path in the #866 diagnostic (RejectNestedWithinNested at assignment).
         string p = Payload(poison);
         var schema = new StructType(
         [
             new StructField(
                 p,
-                new StructType(
-                [
-                    new StructField(
-                        "inner",
-                        new StructType([new StructField("x", DataTypes.LongType, nullable: true)]),
-                        nullable: true),
-                ]),
+                new MapType(
+                    new StructType([new StructField("x", DataTypes.LongType, nullable: true)]),
+                    DataTypes.LongType),
                 nullable: true),
         ]);
 
         DeltaProtocolException ex = Assert.ThrowsAny<DeltaProtocolException>(
-            () => ColumnMapping.ValidateColumnMappingSchema(
-                ColumnMappingMode.Id, schema, ColumnMapping.IdModeConfiguration(1)));
+            () => ColumnMapping.AssignFreshMapping(schema, new SeededPhysicalNameSource("hygiene"), ColumnMappingMode.Id));
 
-        Assert.Contains("nested", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("map key", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
     }
 
@@ -1153,13 +1142,12 @@ public sealed class StorageHygieneSweepTests
         string p = Payload(poison);
         DeltaReadException ex = await ReadPoisonedCdcAsync(p, mode);
 
-        // none → EE-08 leaf-type gate; id → the retained id-mode nested-within-nested reject (#866); name →
-        // the recursive depth>1 validator (#866 866a) fails at the interior physicalName-presence guard because
-        // the fixture's inner struct children carry no mapping metadata. All three still render the poison.
+        // none → EE-08 leaf-type gate; id AND name → the recursive depth>1 validator (#866 866a/866b) fails at
+        // the interior physicalName-presence guard because the fixture's inner struct children carry no mapping
+        // metadata. All three still render the poison.
         string expected = mode switch
         {
             "none" => "has leaf type",
-            "id" => "nested type within a nested type",
             _ => "delta.columnMapping.physicalName",
         };
         Assert.Contains(expected, ex.Message, StringComparison.Ordinal);

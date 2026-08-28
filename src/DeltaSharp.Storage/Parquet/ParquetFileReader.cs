@@ -1590,34 +1590,22 @@ internal sealed class ParquetFileReader
                 // binds children by delta.columnMapping.id; array/map bind the interior by nested.ids (#839).
                 if (byFieldId is not null)
                 {
-                    // #839: for an array/map, EXTRACT the interior ids from the request's nested.ids FIRST —
-                    // an id-mode array/map that carries no nested.ids is malformed regardless of the file, so
-                    // it fails closed naming #839 BEFORE the container is resolved (the schema validator also
-                    // requires it; this is defense-in-depth at read). struct<scalars> carries no nested.ids.
+                    // #839/#866 866b: for an array/map, build the MULTI-TOKEN interior-id table from the
+                    // request's nested.ids FIRST — an id-mode array/map that carries no nested.ids is malformed
+                    // regardless of the file, so it fails closed BEFORE the container is resolved (defense in
+                    // depth; the schema validator also requires it). A struct container carries no nested.ids
+                    // (its children own their ids); its interiors re-seed per StructField during decode (C1).
                     NestedParquetColumnReader.NestedInteriorIds? interiorIds = null;
-                    switch (requestedField.DataType)
+                    if (requestedField.DataType is ArrayType or MapType)
                     {
-                        case ArrayType:
-                            if (!ColumnMapping.TryGetArrayElementId(requestedField, name, out long elementId))
-                            {
-                                throw DeltaStorageException.UnsupportedFeature(
-                                    $"Column '{DiagnosticText.Sanitize(name)}' is an array under column-mapping id mode but "
-                                    + $"carries no '{ColumnMapping.NestedIdsKey}' element id; the id-mode nested read fails closed (#839).");
-                            }
+                        if (!ColumnMapping.TryGetNestedIdsMap(requestedField, out IReadOnlyDictionary<string, long> nestedIds))
+                        {
+                            throw DeltaStorageException.UnsupportedFeature(
+                                $"Column '{DiagnosticText.Sanitize(name)}' is a {requestedField.DataType.TypeName} under column-mapping id "
+                                + $"mode but carries no '{ColumnMapping.NestedIdsKey}'; the id-mode nested read fails closed (#839).");
+                        }
 
-                            interiorIds = NestedParquetColumnReader.NestedInteriorIds.ForArray(elementId);
-                            break;
-
-                        case MapType:
-                            if (!ColumnMapping.TryGetMapKeyValueIds(requestedField, name, out long keyId, out long valueId))
-                            {
-                                throw DeltaStorageException.UnsupportedFeature(
-                                    $"Column '{DiagnosticText.Sanitize(name)}' is a map under column-mapping id mode but "
-                                    + $"carries no '{ColumnMapping.NestedIdsKey}' key/value ids; the id-mode nested read fails closed (#839).");
-                            }
-
-                            interiorIds = NestedParquetColumnReader.NestedInteriorIds.ForMap(keyId, valueId);
-                            break;
+                        interiorIds = NestedParquetColumnReader.NestedInteriorIds.FromNestedIds(nestedIds, name);
                     }
 
                     if (!byName.TryGetValue(name, out Field? containerField))
@@ -1653,13 +1641,13 @@ internal sealed class ParquetFileReader
 
                         case ArrayType idArrayType:
                             NestedParquetColumnReader.ValidateArrayShapeById(
-                                containerField, idArrayType, interiorIds!.ElementId!.Value, byFieldId, name);
+                                containerField, idArrayType, interiorIds!, byFieldId, name);
                             resolved[c] = ResolvedColumn.ForNested(containerField, byFieldId, interiorIds);
                             break;
 
                         case MapType idMapType:
                             NestedParquetColumnReader.ValidateMapShapeById(
-                                containerField, idMapType, interiorIds!.KeyId!.Value, interiorIds.ValueId!.Value, byFieldId, name);
+                                containerField, idMapType, interiorIds!, byFieldId, name);
                             resolved[c] = ResolvedColumn.ForNested(containerField, byFieldId, interiorIds);
                             break;
 

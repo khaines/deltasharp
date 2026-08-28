@@ -298,14 +298,12 @@ public sealed class ArrayMapIdModeReadTests
     // -------------------------------------------------------------------------------------------------
 
     [Fact]
-    public async Task IdModeNestedWithinNested_AtDepth2_RejectedUpstream_NotWidened()
+    public async Task IdModeNestedWithinNested_AtDepth2_MismatchedFileShape_FailsClosed()
     {
-        // Cell 18 (primary, (implicit) id-mode preserved): 585b's NAME-mode gate lift must NOT accidentally
-        // open id-mode depth>1. An id-mode nested-within-nested SHAPE (array<array<int>> requested id-mode) is
-        // rejected UPSTREAM at shape validation with UnsupportedFeature ("a nested type within a nested type …
-        // is not supported", the #676/#839 out-of-scope reject in ExpectScalarLeaf) — the read never reaches
-        // the promotion gate. A widened request (array<array<long>>) hits the same upstream reject, proving the
-        // gate lift did not open it.
+        // 866b lifts id-mode depth>1, but reading an array<scalar> FILE under an array<array<long>> request is
+        // a structural shape mismatch that still fails closed: the request's single-token nested.ids marks
+        // col-b.element as a scalar leaf id present in the footer, so the container-element group-id-absent
+        // guard (or the ExpectList shape check) fails closed — never a silent mis-decode.
         StructType writeSchema = new(new[]
         {
             IdArray("col-b", DataTypes.IntegerType, containerId: 2, elementId: 3),
@@ -314,17 +312,13 @@ public sealed class ArrayMapIdModeReadTests
             writeSchema, NestedVectors.IntList((ArrayType)writeSchema.Fields[0].DataType,
                 new int?[]?[] { new int?[] { 10, 20 } }));
 
-        // Requested container binds by physical name 'col-b'; its interior is now itself an array (a widened
-        // nested-within-nested id-mode shape) → upstream UnsupportedFeature, before any promotion.
         StructType readSchema = new(new[]
         {
             IdArray("col-b", new ArrayType(DataTypes.LongType, true), containerId: 2, elementId: 3),
         });
 
-        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+        await Assert.ThrowsAsync<DeltaStorageException>(
             () => ReadSinglePromotedByIdAsync(bytes, readSchema));
-        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
-        Assert.Contains("nested type within a nested type", error.Message, StringComparison.Ordinal);
     }
 
     [Fact]
