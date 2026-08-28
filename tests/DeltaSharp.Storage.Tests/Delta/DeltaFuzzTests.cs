@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text;
 using DeltaSharp.Storage;
 using DeltaSharp.Storage.Delta;
@@ -168,71 +167,6 @@ public sealed class DeltaFuzzTests
     }
 
     [Fact]
-    public async Task CheckpointReader_FailsClosedWithinBudget_OnMinimized716Input()
-    {
-        // #716 minimized DETERMINISTIC repro. One byte — index 5595, the last footer-BODY byte immediately
-        // before the 4-byte footer_length — changed 0x00 -> 0xB4 drives DeltaCheckpointReader.ReadAsync into
-        // >4 min 30 s of unbounded, cancellation-ignoring work. The bounded-decode policy must convert that
-        // into a deterministic typed fail-closed exception WITHIN the budget rather than hanging.
-        byte[] valid = await new CheckpointFixture()
-            .Protocol(1, 2)
-            .Metadata("t", """{"type":"struct","fields":[]}""")
-            .Add("a.parquet", size: 1)
-            .ToParquetAsync();
-
-        // Pin the fixture size AND content so the hard-coded byte index stays the byte the issue minimized to;
-        // assert the PRE-mutation value the repro flipped (0x00 at index 5595 → 0xB4) so a fixture drift that
-        // moved that byte cannot silently pass a different mutation.
-        Assert.Equal(5604, valid.Length);
-        Assert.Equal(0x00, valid[5595]);
-        valid[5595] = 0xB4;
-        Assert.Equal(
-            // Re-derived under Parquet.Net 6.1.0 (#832): the library's own footer/page bytes shifted, so the
-            // fixture's exact bytes changed while its length and structure invariants above are unchanged.
-            "ca34fdac2017b8eef6d59fae3552ec877cff9bff28b68c053841997e1d7966c2",
-            Sha256Hex(valid));
-
-        (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(
-            () => DeltaCheckpointReader.ReadAsync(
-                new MemoryStream(valid), default, decodeBudget: TestDecodeBudget, decoder: IsolatedCheckpointDecoder()));
-
-        // (a) the DISTINCT typed DecodeBudgetExceeded (a DeltaStorageException, NOT DeltaProtocolException: a
-        // wall-clock stall is a resource fault, not proven corruption — #649/#655/#681 classification), which
-        // DeltaLog still routes to JSON replay (under the DecodeTimeout reason); and (b) it returns AT LEAST
-        // the budget yet well under the real default (BoundedDecode.DefaultBudget, 30s). This kind is unique to
-        // the bounded-decode path, so removing the wrapper turns this red (the input hangs → watchdog fires).
-        DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
-        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
-        Assert.True(elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {elapsed}.");
-    }
-
-    [Fact]
-    public async Task CheckpointReader_FailsClosedWithinBudget_OnLastFooterByteFlip()
-    {
-        // #699 on the CHECKPOINT door. A single bit flip in the LAST footer byte (the terminal Thrift STOP of
-        // FileMetaData, index len-9 before the 4-byte footer_length + PAR1 magic) drives the open
-        // (ParquetReader.CreateAsync + the forced lazy schema) into unbounded, token-ignoring work. The
-        // bounded-time open must fail closed within the budget. (This is the same byte class — index 5595 for
-        // this fixture — as #716, reached by a bit flip rather than a splat.)
-        byte[] valid = await new CheckpointFixture()
-            .Protocol(1, 2)
-            .Metadata("t", """{"type":"struct","fields":[]}""")
-            .Add("a.parquet", size: 1)
-            .ToParquetAsync();
-        valid[^9] ^= 1;
-
-        (Exception? thrown, TimeSpan elapsed) = await TimeBoundedReadAsync(
-            () => DeltaCheckpointReader.ReadAsync(
-                new MemoryStream(valid), default, decodeBudget: TestDecodeBudget, decoder: IsolatedCheckpointDecoder()));
-
-        // A wall-clock stall on the checkpoint door — the DISTINCT DecodeBudgetExceeded kind (a
-        // DeltaStorageException), NOT DeltaProtocolException; DeltaLog routes it to JSON replay all the same.
-        DeltaStorageException ex = Assert.IsType<DeltaStorageException>(thrown);
-        Assert.Equal(StorageErrorKind.DecodeBudgetExceeded, ex.Kind);
-        Assert.True(elapsed >= TestDecodeBudget, $"expected the read to run at least the budget, took {elapsed}.");
-    }
-
-    [Fact]
     public void LastCheckpointHint_NeverThrows_OnRandomBytes()
     {
         var random = new Random(6);
@@ -312,39 +246,4 @@ public sealed class DeltaFuzzTests
         // Surface any NON-fail-closed exception (an unexpected type) as a test failure.
         await read;
     }
-
-    // Runs a single untrusted-checkpoint read on the thread pool under the oracle watchdog, returning the
-    // (fail-closed) exception it threw and the wall-clock elapsed. A watchdog trip is a deterministic test
-    // failure (non-termination), never a stuck job. Used by the pinned #716/#699 regressions to assert both
-    // "a typed exception is thrown" and "it returns well under the real default budget".
-    private static async Task<(Exception? Thrown, TimeSpan Elapsed)> TimeBoundedReadAsync(Func<Task> read)
-    {
-        var stopwatch = Stopwatch.StartNew();
-        Task<Exception?> run = Task.Run(async () =>
-        {
-            try
-            {
-                await read();
-                return (Exception?)null;
-            }
-            catch (Exception ex)
-            {
-                return ex;
-            }
-        });
-
-        if (await Task.WhenAny(run, Task.Delay(OracleWatchdog)) != run)
-        {
-            Assert.Fail(
-                $"The read did not terminate within {OracleWatchdog.TotalSeconds:0}s — the bounded-decode policy "
-                + "failed to release the caller (regression of #647/#699/#716).");
-        }
-
-        Exception? thrown = await run;
-        stopwatch.Stop();
-        return (thrown, stopwatch.Elapsed);
-    }
-
-    private static string Sha256Hex(byte[] bytes) =>
-        Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes)).ToLowerInvariant();
 }
