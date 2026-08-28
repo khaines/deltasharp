@@ -13,9 +13,7 @@ namespace DeltaSharp.Storage.Parquet;
 /// pure list/map chain).</param>
 /// <param name="PresentDef">This level's own <see cref="Field.MaxDefinitionLevel"/> — the "element-bearing"
 /// definition level.</param>
-/// <param name="ParentPresentDef">The immediate parent container node's
-/// <see cref="Field.MaxDefinitionLevel"/> (<c>0</c> for the outermost level).</param>
-internal readonly record struct RepeatedLevel(int RepLevel, int PresentDef, int ParentPresentDef);
+internal readonly record struct RepeatedLevel(int RepLevel, int PresentDef);
 
 /// <summary>
 /// The §2.3c/§2.10.3 pre-write level-invariant guard: the last gate between a shredded leaf and bytes on disk.
@@ -44,6 +42,11 @@ internal readonly record struct RepeatedLevel(int RepLevel, int PresentDef, int 
 /// </remarks>
 internal static class NestedLevelGuard
 {
+    /// <summary>The number of definition levels a single repeated container occupies on a pure list/map chain:
+    /// the OPTIONAL outer group plus the REPEATED group (design §2.10.2). Used to derive per-level markers from
+    /// a single-level leaf's own <see cref="Field.MaxDefinitionLevel"/>.</summary>
+    private const int DefinitionLevelsPerRepeatedContainer = 2;
+
     /// <summary>
     /// Validates one leaf's encoded level streams against <paramref name="leaf"/>'s single-level schema
     /// position. The repeated-ancestor chain is DERIVED from the leaf (correct for a single-level nested leaf,
@@ -65,15 +68,15 @@ internal static class NestedLevelGuard
         int containerMaxDef = ContainerMaxDefinitionLevel(leaf);
 
         // A single-level nested leaf has one repeated ancestor at most (maxRep <= 1); a pure-struct leaf has
-        // none. Build the chain for a pure list/map chain: each level adds exactly two definition levels (the
-        // optional outer group + the repeated group). For maxRep == 1 this yields presentDef == containerMaxDef
-        // and parentPresentDef == 0 — the design's single-level markers (§2.10.3-d).
+        // none. Build the chain for a pure list/map chain: each level adds exactly
+        // DefinitionLevelsPerRepeatedContainer definition levels (the optional outer group + the repeated
+        // group). For maxRep == 1 this yields presentDef == containerMaxDef — the design's single-level marker
+        // (§2.10.3-d).
         Span<RepeatedLevel> chain = maxRep <= 8 ? stackalloc RepeatedLevel[maxRep] : new RepeatedLevel[maxRep];
         for (int level = 1; level <= maxRep; level++)
         {
-            int presentDef = containerMaxDef - (2 * (maxRep - level));
-            int parentPresentDef = Math.Max(presentDef - 2, 0);
-            chain[level - 1] = new RepeatedLevel(level, presentDef, parentPresentDef);
+            int presentDef = containerMaxDef - (DefinitionLevelsPerRepeatedContainer * (maxRep - level));
+            chain[level - 1] = new RepeatedLevel(level, presentDef);
         }
 
         ValidateCore(leaf, chain, definitions, repetitions, hasRepetitions, valueCount, rowCount, label);
@@ -205,7 +208,7 @@ internal static class NestedLevelGuard
             for (int v = lo; v <= k; v++)
             {
                 RepeatedLevel level = chain[v - 1];
-                ownerComplete[v] = def < level.ParentPresentDef ? true : def < level.PresentDef;
+                ownerComplete[v] = def < level.PresentDef;
             }
         }
 
@@ -248,10 +251,6 @@ internal static class NestedLevelGuard
         ArgumentNullException.ThrowIfNull(leaf);
         return leaf.MaxDefinitionLevel - (leaf.IsNullable ? 1 : 0);
     }
-
-    /// <summary>The definition level an EMPTY repeated container occupies — one below
-    /// <see cref="ContainerMaxDefinitionLevel"/>. Everything at or below it means "no element exists here".</summary>
-    internal static int EmptyContainerDefinitionLevel(DataField leaf) => ContainerMaxDefinitionLevel(leaf) - 1;
 
     private static DeltaStorageException Corrupt(string label, string detail) =>
         DeltaStorageException.CorruptData(

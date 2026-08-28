@@ -523,7 +523,7 @@ internal static class NestedColumnShredder
         var leaves = new List<LeafPlan>();
         EnumerateLeaves(
             schemaField.DataType, schemaField.Nullable, field, new List<PathStep>(),
-            new List<RepeatedLevel>(), parentPresentDef: 0, label, leaves);
+            new List<RepeatedLevel>(), label, leaves);
 
         foreach (LeafPlan leaf in leaves)
         {
@@ -597,16 +597,14 @@ internal static class NestedColumnShredder
 
     // Walks the (DeltaSharp DataType, Parquet Field) trees in parallel, emitting one LeafPlan per leaf. Each
     // list/map node contributes a repeated level to the chain, read from its OWN footer node
-    // (MaxRepetitionLevel/MaxDefinitionLevel) with the immediate parent container node's MaxDefinitionLevel as
-    // parentPresentDef — the interleave-correct markers the per-level guard needs (§2.10.3). `parentPresentDef`
-    // is the MaxDefinitionLevel of the nearest enclosing group node (0 at the top).
+    // (MaxRepetitionLevel/MaxDefinitionLevel) — the interleave-correct markers the per-level guard needs
+    // (§2.10.3).
     private static void EnumerateLeaves(
         DataType type,
         bool nullable,
         Field pqField,
         List<PathStep> path,
         List<RepeatedLevel> chain,
-        int parentPresentDef,
         string label,
         List<LeafPlan> into)
     {
@@ -620,7 +618,7 @@ internal static class NestedColumnShredder
                         StructField child = structType[i];
                         path.Add(new PathStep(StepKind.Struct, i));
                         EnumerateLeaves(
-                            child.DataType, child.Nullable, ps.Fields[i], path, chain, ps.MaxDefinitionLevel,
+                            child.DataType, child.Nullable, ps.Fields[i], path, chain,
                             label, into);
                         path.RemoveAt(path.Count - 1);
                     }
@@ -631,11 +629,11 @@ internal static class NestedColumnShredder
             case ArrayType array:
                 {
                     PqListField pl = ExpectParquetList(pqField, label);
-                    var level = new RepeatedLevel(pl.MaxRepetitionLevel, pl.MaxDefinitionLevel, parentPresentDef);
+                    var level = new RepeatedLevel(pl.MaxRepetitionLevel, pl.MaxDefinitionLevel);
                     path.Add(new PathStep(StepKind.List, 0));
                     chain.Add(level);
                     EnumerateLeaves(
-                        array.ElementType, array.ContainsNull, pl.Item, path, chain, pl.MaxDefinitionLevel,
+                        array.ElementType, array.ContainsNull, pl.Item, path, chain,
                         label, into);
                     chain.RemoveAt(chain.Count - 1);
                     path.RemoveAt(path.Count - 1);
@@ -645,19 +643,19 @@ internal static class NestedColumnShredder
             case MapType map:
                 {
                     PqMapField pm = ExpectParquetMap(pqField, label);
-                    var level = new RepeatedLevel(pm.MaxRepetitionLevel, pm.MaxDefinitionLevel, parentPresentDef);
+                    var level = new RepeatedLevel(pm.MaxRepetitionLevel, pm.MaxDefinitionLevel);
 
                     path.Add(new PathStep(StepKind.MapKey, 0));
                     chain.Add(level);
                     EnumerateLeaves(
-                        map.KeyType, nullable: false, pm.Key, path, chain, pm.MaxDefinitionLevel, label, into);
+                        map.KeyType, nullable: false, pm.Key, path, chain, label, into);
                     chain.RemoveAt(chain.Count - 1);
                     path.RemoveAt(path.Count - 1);
 
                     path.Add(new PathStep(StepKind.MapValue, 0));
                     chain.Add(level);
                     EnumerateLeaves(
-                        map.ValueType, map.ValueContainsNull, pm.Value, path, chain, pm.MaxDefinitionLevel,
+                        map.ValueType, map.ValueContainsNull, pm.Value, path, chain,
                         label, into);
                     chain.RemoveAt(chain.Count - 1);
                     path.RemoveAt(path.Count - 1);
