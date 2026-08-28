@@ -135,6 +135,7 @@ graph TD
     RSFB["ResolveStructFieldById (:2036) — scalar interior only"]
     RILB["ResolveInteriorLeafById (:2164) — scalar interior only"]
     BFIM["BuildFieldIdMap (:460) — ALREADY depth-agnostic"]
+    DEC["ReadStruct/List/MapAsync → DecodeNode (:514,:704,:920) — HARDCODES byFieldId:null,interiorIds:null"]
   end
   subgraph Write[Id-mode nested write — ParquetTypeMapping.cs]
     CNF["CreateNestedField (:110) — id-mode NWN re-pointed to #866 (:241-252)"]
@@ -147,6 +148,7 @@ graph TD
   BDS -. "#866b: recurse array/map struct interior" .-> Recurse
   RSFB -. "#866b: recurse nested child sub-container" .-> Recurse
   RILB -. "#866b: recurse nested interior" .-> Recurse
+  DEC -. "#866b R8/M6: thread byFieldId + descended interiorIds (else deep leaves bind positionally)" .-> Recurse
   CNF -. "#866b: id-mode NWN write stamping" .-> Recurse
   classDef done fill:#dfd,stroke:#090;
   class VN,BFIM done
@@ -154,9 +156,12 @@ graph TD
 
 Two anchors are already depth-agnostic and need **no** change (green): `BuildFieldIdMap`
 (`ParquetFileReader.cs:460`) path-keys **every** footer leaf at any depth via `EnumerateFooterLeafPaths`; and
-the 585a decode validator/reassembler `ValidateNode`/`DecodeContainer`
-(`NestedParquetColumnReader.cs:136`) already recurses to `MaxNestedReadDepth`. #866 threads column-mapping
-identity through them, not new decode logic.
+the 585a shape validator `ValidateNode` (`NestedParquetColumnReader.cs:136`) already recurses to
+`MaxNestedReadDepth`. **The 585a decode reassembler (`ReadStructAsync`/`ReadListAsync`/`ReadMapAsync`→`DecodeNode`)
+recurses too — but it HARDCODES `byFieldId: null, interiorIds: null` at every recursion boundary** (`:514`,
+`:704`, `:920`), safe today only because id-mode nested-within-nested is rejected upstream. #866b (R8) threads
+column-mapping identity through that recursion so deep leaves bind by `field_id`; this is the one decode-side
+lift, not merely resolver threading (red-team M6).
 
 ### 2.2 The composed identity model at depth&gt;1 (C1 + `nested.ids`, extended)
 
@@ -248,8 +253,9 @@ Every site below is grounded at `origin/main` @ `b0397b0`. **Lift** = recurse/de
 | **R3** | id-mode array/map interior binding | `NestedParquetColumnReader.cs:2192,2212` | `ValidateArrayShapeById`, `ValidateMapShapeById` | **LIFT + DataType-branch (M2 + M5)** — branch on the requested element/value kind: a **container** element/value is **positionally present whenever its enclosing array/map is present** (canonical `element`/`key`/`value`), binds structurally (verify its `P.element`/`P.value` **group** id is absent from footer leaves) and recurses; only a **scalar** interior goes through `ResolveInteriorLeafById` (#839). Fixes the `array<struct>` fail-close (§1's most common shape) | 866b |
 | **R4** | interior-leaf collection | `NestedParquetColumnReader.cs:2131,2142` | `ListInteriorLeaves`, `MapInteriorLeaves` | **LIFT + `TryResolve`** — a nested interior (`Item`/`Value` is a group, structurally present with its enclosing container) descends into its sub-container; a scalar interior binds by id with absent-but-valid nullable → null-fill (§2.5) | 866b |
 | **R5** | `nested.ids` selector parse | `ColumnMapping.cs:621` (`ValidateNestedIds`, `:638-661`) | `ValidateNestedIds` | **LIFT + leaf/group discrimination (M2)** — accept **multi-token** dotted keys (`P.element.element`, `P.value.key`) computed from the **full** declared depth&gt;1 shape; mark each key **leaf** (footer-resolvable) vs **group** (structural-only, e.g. `P.element` of an `array<struct>`); single-token scalar stays #839 | 866b |
-| **R6** | name-mode physical relabel | `ColumnMappingProjection.cs:95,219` | `BuildPhysicalDataType`, `AssertStructCongruent` | **LIFT** — recurse array/map struct interiors to substitute interior struct-child physical names (today struct-only recursion; array/map carried verbatim) | 866a |
-| **R7** | name-mode decode validator/reassembler | `NestedParquetColumnReader.cs:136` | `ValidateNode`/`DecodeContainer` (585a) | **RETAIN (reuse)** — already recursive to any depth; no change (green in §2.1) | — |
+| **R6** | name-mode physical relabel + id-mode read schema | `DeltaReadSource.cs:186`, `ColumnMappingProjection.cs:64,95,219` | `BuildDataSchema`→`BuildPhysicalDataType`, `AssertStructCongruent` | **LIFT** — recurse array/map struct interiors to substitute interior struct-child physical names (today struct-only recursion, `:97` early-returns on non-struct; array/map carried verbatim). This is the **read** schema in **both** name and id mode (`BuildDataSchema`, `DeltaReadSource.cs:186`, mode-independent — relabels to physicalName + keeps the `id` metadata); R6's lift is what **puts the stable physicalName on a nested container's group node**, on which the round-4 structural-location mechanism (§2.5) depends | 866a (name) / 866b consumes at depth for id |
+| **R7** | name-mode decode validator | `NestedParquetColumnReader.cs:136` | `ValidateNode` (585a) | **RETAIN (reuse)** — already recursive to any depth; no change (green in §2.1) | — |
+| **R8** | **id thread-through the decode recursion (red-team M6)** | `NestedParquetColumnReader.cs:514-517,704-707,920-929` | `ReadStructAsync`/`ReadListAsync`/`ReadMapAsync` → `DecodeNode` | **LIFT** — the shipped decode **hardcodes `byFieldId: null, interiorIds: null`** when recursing into a nested child (`:514`, `:704`, `:920`), SAFE **only because** id-mode nested-within-nested is rejected upstream (the very gate 866b lifts, comments `:508-512`,`:700-703`,`:914-917`). 866b MUST thread **`byFieldId` verbatim** and the **descended `interiorIds`** through the recursion so deep leaves bind by `field_id`, not positionally, and MUST update those "safe because rejected upstream" comments | 866b |
 | **W1** | id-mode nested-within-nested WRITE reject | `ParquetTypeMapping.cs:141-145,206-207,241-252` | `CreateNestedField`/`RejectNestedWithinNestedId` | **LIFT** — stamp interior leaf `field_id`s at any depth (name/none already recurses per #873); the message already cites **#866** | 866b |
 | **W2** | map-**key**-container reject | `ParquetTypeMapping.cs:261` | `RejectNestedMapKey` | **RETAIN** — a Parquet map key that is a container is fail-closed at every depth (#873 D5; a structural Parquet constraint, not a depth ceiling) | — |
 | **RD1** | rename/drop single-hop descent | `DeltaTableWriter.cs` (#840 `F4b`) | `DescendAndRebuild` | **LIFT for `struct<struct<…>>`** — allow a second+ struct hop (arbitrary struct depth); **RETAIN `F4`** (array/map interior descent stays fail-closed — no logical-name hop) | 866c |
@@ -394,10 +400,15 @@ locates it:
 `delta.columnMapping.physicalName` (`ColumnMapping.PhysicalNameKey`, `ColumnMapping.cs:123`) on every
 `StructField` at assignment (`AssignMappedField`→`WithMapping`, `:908`); that physicalName **doubles as the
 Parquet column name** at every node depth (`ColumnMapping.cs:204`, `:299-300`), so a Parquet.Net **group** node
-carries the container's physicalName even though it carries no `field_id`. The id-mode **read** schema is the
-**physical** schema (`ToPhysicalSchema(schema, Id)` — renames each field to its physicalName **and** keeps
-`delta.columnMapping.id`), so a requested nested field's `Name` is its physicalName (structural location works
-by name) **and** it carries `delta.columnMapping.id` in metadata (its scalar-leaf descendants still bind by id).
+carries the container's physicalName even though it carries no `field_id`. The id-mode **read** schema is
+built by `ColumnMappingProjection.BuildDataSchema`→`BuildPhysicalDataType` (`DeltaReadSource.cs:186`,
+`ColumnMappingProjection.cs:64,95`) — **not** the write-only `ToPhysicalSchema` (`ColumnMapping.cs:1180`, called
+only from `DeltaWriteTarget.cs`) — which is **mode-independent**: it relabels each field to its physicalName
+**and** preserves the `delta.columnMapping.id` metadata. So a requested nested field's `Name` is its
+physicalName (structural location works by name) **and** it carries `delta.columnMapping.id` in metadata (its
+scalar-leaf descendants still bind by id). **R6's lift of `BuildPhysicalDataType`** (which today early-returns
+on a non-struct, `:97`, leaving array/map interiors unrelabelled) is precisely what puts the stable physicalName
+on a **nested container's group node** — the round-4 structural-location mechanism depends on R6.
 A logical rename changes the logical name only, never the physicalName — so locating the container by
 physicalName is rename-tolerant, and the leaves remain id-bound (rename/reorder-tolerant): this is now a
 **closer** analogue of name-mode #857 (container by stable name, leaves by id) than the round-3 rule was.
@@ -410,8 +421,8 @@ present container — so **no fail-closed hole opens and no present column is dr
 | **scalar leaf** | own leaf id **absent** from footer + **nullable** | **null-fill** that leaf (added-after-write, #857 posture) |
 | **scalar leaf** | own leaf id **absent** from footer + **required** | fail closed `ColumnNotPresentInFile` (a required lane cannot carry nulls) |
 | **scalar leaf** | id **present** but resolves **outside** the container's subtree | fail closed `SchemaMismatch` (containment / mis-attribution) |
-| **container** (struct/array/map) | group node **LOCATED** (struct field by physicalName; array element / map key-value positionally, its enclosing container present) | **read structure (lengths/rep/def) + recurse** — bind descendant scalar leaves by id, null-fill only absent+nullable leaves recursively; **NEVER null-fill a present container** (even if ALL currently-requested leaves are new — M5) |
-| **container** | group node **ABSENT** (struct-field physicalName not in file, or enclosing array/map absent) + **nullable** | null-fill whole subtree (`BuildAllNullSubtree`) |
+| **container** (struct/array/map) | group node **LOCATED** (struct field by physicalName; array element / map key-value positionally, its enclosing container present) | **read structure (lengths/rep/def) + recurse** — bind descendant scalar leaves by id, null-fill only absent+nullable leaves recursively **threading the INV-PARITY `StructPresenceDefs`→`fieldDefs` stream (B2)**; **NEVER null-fill a present container** (even if ALL currently-requested leaves are new — M5) |
+| **container** | group node **ABSENT** (struct-field physicalName not in file, or enclosing array/map absent) + **nullable** | null-fill whole subtree (`BuildAllNullSubtree`) **threading the INV-PARITY presence stream so a null-filled sibling under a repeated ancestor keeps per-row parity (B2, §3.8r)** |
 | **container** | group node **ABSENT** + **required** | fail closed `ColumnNotPresentInFile` |
 | **any** | a **group** id (`P.element`/`P.value`/a container's own id) found **on a footer leaf** | fail closed `SchemaMismatch` (a group id is structural-only, §3.17a — no conflict: group ids are never a presence signal) |
 
@@ -427,6 +438,36 @@ group presence/absence as a signal). Because `ResolveStructFieldById`/`ResolveIn
 **shared** resolvers used at single-level (#676/#839) **and** recursively at depth&gt;1, this fix closes the
 pre-existing **single-level** id-mode gap as a natural consequence — §3 pins a single-level companion regression
 cell (§3.8g).
+
+**Id thread-through the decode recursion (red-team M6 — the resolver parses ids; the DECODER must consume them
+at depth).** R1–R5 (`ResolveFileFields` + `ValidateNestedIds`) parse and scope the ids, but the 585a **decode
+reassembler** is what actually binds leaves — and the shipped decode **strips column-mapping identity at every
+recursion boundary**: `ReadStructAsync` (`NestedParquetColumnReader.cs:514-517`), `ReadListAsync` (`:704-707`),
+and `ReadMapAsync` (`:920-929`) all recurse `DecodeNode(..., byFieldId: null, interiorIds: null, …)`, which the
+in-code comments (`:508-512`, `:700-703`, `:914-917`) note is safe **only because id-mode nested-within-nested
+is rejected upstream** — the gate 866b lifts. So 866b (**R8**) MUST thread identity through the recursion, or an
+`array<array<int>>` inner leaf would bind **positionally**, not by `field_id`, and R5's multi-token parse would
+be dead code:
+
+- **`byFieldId`** (the one file-global path-keyed footer map, `BuildFieldIdMap`) is threaded **verbatim** into
+  every `DecodeNode` recursion — every descendant leaf looks up its own `StructField` id (struct child) or
+  interior `nested.ids` id in the same map, containment-checked at its level.
+- **`interiorIds`** (`NestedInteriorIds`, `NestedParquetColumnReader.cs:2107`) is **descended**: it is extended
+  to hold the **full multi-token** `nested.ids` and to expose `Descend(selector)` returning the sub-slice for a
+  nested container's own interior — the outer array's ids descended on `element` yield the inner array's
+  `{element: innerElemId}`. The **hand-off structure** is `ResolvedColumn.ForNested(containerField, byFieldId,
+  interiorIds)` at the top (`ResolveFileFields`), then `byFieldId` + `interiorIds.Descend(selector)` at each
+  recursion. The "safe because rejected upstream" comments are updated when 866b removes the gate.
+
+**INV-PARITY presence stream on the id-mode null-fill (storage B2).** The name-mode `ReadStructAsync` threads a
+per-owner-cell **presence stream** for an absent nullable child — `StructPresenceDefs` → `absentPresenceDefs` →
+`fieldDefs[i]` (`NestedParquetColumnReader.cs:470-483`, `:1826-1860`) — so `BuildStructNullMask`'s cross-field
+parity guard (INV-PARITY) sees the **same** struct presence a present sibling reports. The current id-mode
+struct branch (`:431-444`) reads a scalar leaf and `continue`s **before** that synthesis. 866b's id-mode
+null-fill — **both** the structurally-absent-container whole-subtree fill (`BuildAllNullSubtree`) **and** the
+per-leaf-absent fill inside a **present** container — MUST thread the **same** `StructPresenceDefs`→`fieldDefs`
+stream as name mode, so a null-filled child/leaf that is a **sibling of present fields under a repeated
+ancestor** (`array<struct<present:int, absent:int>>`) does not misfire the parity guard (§3.8r asserts this).
 
 **Residual (id-authoritative, same as #676/#839).** Once every ancestor group is provenance-verified and each
 id-selected leaf is type-validated, a forged footer that permutes `field_id` stamps across **same-typed**
@@ -612,7 +653,8 @@ array<struct<a:int,b:struct<c:long>>> (depth-3, the M4 present-nested-struct sha
   **genuinely added-after-write**: `b`'s **group node is structurally ABSENT** from the old file (its
   physicalName is not a field of the element struct in the footer) + `b` nullable → `b` null-fills the whole
   subtree (`BuildAllNullSubtree`), `a` intact. **Precondition is the container's group node being structurally
-  absent — NOT merely that all requested descendant leaves are absent (M5).**
+  absent — NOT merely that all requested descendant leaves are absent (M5).** The whole-subtree null-fill threads
+  the INV-PARITY presence stream (B2, §3.8r).
 - 8j. **`IdMode_Depth3_RequiredNestedStructStructurallyAbsent_FailsClosed`** — same shape with `b` **required**
   and its group node structurally absent → `ColumnNotPresentInFile` (a required container cannot null-fill).
 - 8k. **`IdMode_Depth3_PartiallyPresentNestedStruct_NullFillsOnlyAbsentNullableLeaf`** — `b`'s group node
@@ -630,11 +672,34 @@ array<struct<a:int,b:struct<c:long>>> (depth-3, the M4 present-nested-struct sha
 - 8m. **`IdMode_StructField_Container_AllChildrenReplaced_StructPresent_NullFillsLeaves`** — struct-field
   companion: `struct<s: struct<a:int>>` evolved to `struct<s: struct<b:int>>`, old file holds `s` + `s.a`; `s`
   located by `physicalName` (present) → reads `s`'s presence/null structure, `b` null-filled per row (`s` is
-  **not** null-filled whole even though `b` is its only requested child and is absent).
+  **not** null-filled whole even though `b` is its only requested child and is absent). The per-leaf null-fill
+  threads the INV-PARITY presence stream (B2, §3.8r).
 - 8n. **`IdMode_Container_StructurallyAbsent_NullFillsSubtree`** — the genuine-absence companion: a nullable
   container struct field whose **group node** is entirely absent from the file (its physicalName is not present)
   → whole-subtree null-fill (`BuildAllNullSubtree`); the required variant → `ColumnNotPresentInFile`. Pins that
   whole-subtree null-fill fires **only** on structural absence.
+
+**Id threads through the DECODE recursion — bound by `field_id`, not positionally (red-team M6, R8 — all 866b)**
+- 8o. **`IdMode_Depth2_ArrayArray_InnerElementResolvedById_NotPositionally`** — `array<array<int>>` in id mode
+  with a **forged/reordered footer** (inner `element` leaf written at a reordered/renamed physical position but
+  carrying its correct `nested.ids` `field_id`) reads the inner values correctly **by `field_id`**. This cell
+  **FAILS if ids are dropped at the recursion boundary** (`DecodeNode(interiorIds: null)`, the current `:704`)
+  — i.e. it fails if the inner leaf binds positionally. Disjoint witness domains distinguish id-binding from
+  positional binding.
+- 8p. **`IdMode_Depth3_ArrayStructStruct_DeepLeafResolvedById_NotPositionally`** — deep struct chain
+  `array<struct<b: struct<c:long>>>`: `c` binds by its `StructField` id threaded via `byFieldId` through the
+  `ReadListAsync`→`ReadStructAsync`→`ReadStructAsync` recursion (proves `byFieldId` is threaded, not nulled at
+  `:514`/`:704`); a reordered sibling with a disjoint witness domain proves non-positional binding.
+- 8q. **`IdMode_MapValueArray_IdThreadsThroughMapValueIntoInnerArray`** — `map<string, array<long>>`: the id
+  threads through the **map value** into the inner array (`ReadMapAsync`→`ReadListAsync`), so the inner `long`
+  element binds by its multi-token `nested.ids` id (`P.value.element`), not positionally (proves the `:920` map
+  recursion threads `byFieldId` + descended `interiorIds`).
+- 8r. **`IdMode_NullFilledSibling_UnderRepeatedAncestor_ParityHolds`** (storage B2, INV-PARITY) —
+  `array<struct<present:int, absent:int>>` in id mode where `absent` is added-after-write (null-filled): the
+  null-filled sibling threads the **same** per-owner-cell `StructPresenceDefs`→`fieldDefs` presence stream as
+  name mode (`:470-483`), so `BuildStructNullMask`'s cross-field parity guard sees the correct struct presence
+  per row and does **not** misfire — asserts per-row parity across the present and null-filled siblings under the
+  repeated (array) ancestor, incl. empty and multi-element rows.
 
 **Fail-closed invariants over the depth&gt;1 tree (AC-fail-closed)**
 9. **`Depth2_DuplicateFieldIdAnywhereInTree_FailsClosed`** (`BuildFieldIdMap` dup guard, any depth).
@@ -719,7 +784,7 @@ writer; there is **no** unmerged write-path dependency (unlike #676, which was g
 | Acceptance criterion (#866) | §3 cells |
 |---|---|
 | Recursive `(id,physicalName)` assignment for depth&gt;1 leaves; monotonic `maxColumnId`; `RejectNestedWithinNested` lifted | §3.1, §3.2, §3.3, §3.27 |
-| Name-mode + id-mode resolution of depth&gt;1 leaves (id mode via `nested.ids` at each interior level; `array<struct>`/`map<*,struct>` container-element resolution; present nested container never dropped — presence by structural location, incl. all-children-replaced retaining array lengths; absent-after-add null-fill only on structural absence) | §3.4–§3.8, §3.8a–§3.8n |
+| Name-mode + id-mode resolution of depth&gt;1 leaves (id mode via `nested.ids` at each interior level, **threaded through the decode recursion so deep leaves bind by `field_id` not positionally — R8/M6**; `array<struct>`/`map<*,struct>` container-element resolution; present nested container never dropped — presence by structural location, incl. all-children-replaced retaining array lengths; absent-after-add null-fill only on structural absence, **INV-PARITY presence stream threaded — B2**) | §3.4–§3.8, §3.8a–§3.8r |
 | Metadata-only rename/drop of a depth&gt;1 nested field | §3.18 (§3.19–§3.20 boundaries) |
 | Fail-closed invariants (duplicate/missing/range/relabel + `nested.ids` containment + structural-group-id-on-leaf + null-fill no-hole + required-container-absent) over the depth&gt;1 tree; cross-engine interop | §3.9–§3.17, §3.17a, §3.8e–§3.8f, §3.8j, §3.21–§3.22, §3.25 |
 | Update `RejectNestedWithinNested` / retained-reject messages to reference #866 not the closed #585 (three files) | §3.27 |
@@ -731,15 +796,15 @@ writer; there is **no** unmerged write-path dependency (unlike #676, which was g
 - **Workload:** schema-transform at commit and read-open — O(number of nodes in the schema tree), typically
   tens of nodes, bounded by `MaxNestedReadDepth`. No per-row cost; the recursive id-mode containment check is
   O(leaves) path comparisons over the already-open footer; the inverse relabel re-types vectors without copying
-  child buffers (§2.5). The 585a decode per-row cost is unchanged (this design adds identity threading, not
-  decode work).
+  child buffers (§2.5). The 585a decode per-row cost is unchanged — the R8 id thread-through replaces a
+  positional/name match with an O(1) `field_id` dict lookup per leaf (no extra passes, no per-row allocation).
 - **Targets:** assignment/resolution add &lt; 1% to a create/read-open on a realistic depth-2 wide-nested
   schema; zero allocation per data row.
 - **Memory:** one metadata-annotated schema copy per transform (bounded by schema size); recursion depth ≤
   `MaxNestedReadDepth` (64) with the DoS bound checked before any descent.
 - **Regression gate:** a 50-node depth-2 nested-schema assign+resolve micro-benchmark stays within the
-  schema-transform noise floor; the per-batch 585a decode path is untouched (asserted by a decode-throughput
-  regression pin).
+  schema-transform noise floor; the per-batch 585a decode reassembly is unchanged except for the O(1)-per-leaf
+  R8 id-threading (asserted by a decode-throughput regression pin).
 
 ---
 
@@ -867,11 +932,20 @@ so it composes on 866a with no id-mode dependency.
   the **structural location of the container's own group node** (struct field by stable `physicalName`; array/map
   interior positionally): a located container **always** reads its structure + per-leaf null-fills, only a
   structurally-absent nullable container null-fills its subtree (§2.5 disposition table + §3.8h–§3.8n).
+  (k) **the 585a decode reassembler strips column-mapping identity at every recursion boundary** (`byFieldId:
+  null, interiorIds: null` at `:514`/`:704`/`:920`), so a deep leaf would bind **positionally**, not by
+  `field_id` — reorder-intolerant silent id-mode violation, and R5's multi-token parse dead — mitigated by R8
+  threading `byFieldId` verbatim + descended `interiorIds` through `DecodeNode` (§2.5, §3.8o–§3.8q, red-team M6).
+  (l) **an id-mode nested null-fill that skips the INV-PARITY presence stream** misfires
+  `BuildStructNullMask`'s cross-field parity guard for a null-filled sibling of present fields under a repeated
+  ancestor — mitigated by threading `StructPresenceDefs`→`fieldDefs` identically to name mode (§2.5, §3.8r,
+  storage B2).
 - **Launch checklist:** unit + integration (§3) green on both TFMs; `dotnet format`; determinism ban; DCO; RFL
   PASS; the closed-#585→#866 message sweep verified across **all three** files (`ColumnMapping.cs`,
   `ParquetTypeMapping.cs`, `DeltaTableWriter.cs`, §3.27); the id-mode null-fill no-hole cells (§3.8e–§3.8f), the
   **present-nested-container-not-dropped** cells (§3.8h M4, §3.8l/§3.8m M5 — array lengths / struct structure
-  retained when all requested leaves are new), and the single-level companion (§3.8g) green; **#839, #840, #873
+  retained when all requested leaves are new), the **id-not-positional deep-binding** cells (§3.8o–§3.8q, R8/M6)
+  and the **INV-PARITY** cell (§3.8r, B2), and the single-level companion (§3.8g) green; **#839, #840, #873
   confirmed closed/merged** (they are) and **#866 open** before PASS.
 
 ---
@@ -932,20 +1006,44 @@ so it composes on 866a with no id-mode dependency.
    name mode: a **struct-field** container is located by its stable `delta.columnMapping.physicalName`
    (`ColumnMapping.PhysicalNameKey`, `ColumnMapping.cs:123`, stamped at `AssignMappedField`→`WithMapping` `:908`;
    the physicalName **is** the Parquet group-node name, `:204`,`:299-300`, and the id-mode read schema
-   `ToPhysicalSchema(schema, Id)` carries it as the field `Name` while keeping `delta.columnMapping.id` for
-   leaves) — so location is rename-tolerant and leaves stay id-bound; an **array element / map key-value** is
-   canonical/positional (present with its enclosing container). A **located** container **always** reads its
-   structure (lengths/rep/def) + recurses (scalar leaves by id, per-leaf null-fill); only a **structurally-absent**
-   nullable container null-fills its subtree (required → `ColumnNotPresentInFile`). This is now a **closer**
-   analogue of name-mode #857 than the round-3 descendant-leaf rule. **585a decode is confirmed correct given a
-   structural binding** — decode is name/positional; the bug was purely in the id-mode **resolution** layer's
-   bind-vs-null-fill decision, and the id-mode recurse retains `byFieldId` so deep scalar leaves still bind by id.
+   `BuildDataSchema`→`BuildPhysicalDataType` (`DeltaReadSource.cs:186`, `ColumnMappingProjection.cs:64,95` — the
+   mode-independent read relabel, **not** the write-only `ToPhysicalSchema`) carries it as the field `Name`
+   while keeping `delta.columnMapping.id` for leaves) — so location is rename-tolerant and leaves stay id-bound;
+   an **array element / map key-value** is canonical/positional (present with its enclosing container). A
+   **located** container **always** reads its structure (lengths/rep/def) + recurses (scalar leaves by id,
+   per-leaf null-fill); only a **structurally-absent** nullable container null-fills its subtree (required →
+   `ColumnNotPresentInFile`). This is now a **closer** analogue of name-mode #857 than the round-3
+   descendant-leaf rule. **585a decode is confirmed correct given a
+   structural binding** — decode reassembly is name/positional; the resolution-layer bug was the bind-vs-null-fill
+   decision. **But (red-team M6) the shipped id-mode decode recursion is NOT yet correct at depth:** it hardcodes
+   `byFieldId: null, interiorIds: null` when recursing into a nested child (`:514`, `:704`, `:920`) — safe today
+   only because id-mode nested-within-nested is rejected upstream — so 866b MUST thread `byFieldId` + the
+   descended `interiorIds` through the recursion (R8, §9.8) or deep leaves bind positionally, not by id.
    §3.8c–§3.8n pin the positive present-nested-struct read (§3.8h, M4), the array-lengths-retained
    all-children-replaced case (§3.8l, the M5 pin) and its struct-field companion (§3.8m), the structural-absence
    whole-subtree null-fill (§3.8i/§3.8n), the required-absent fail-close (§3.8j), the partial per-leaf null-fill
-   (§3.8k), the no-hole cells (§3.8e–§3.8f), and the single-level companion (§3.8g). **Companion note:** because
-   the fix lands in the shared single-level resolver, reviewers should confirm the single-level null-fill is
-   asserted (§3.8g), not merely inherited.
+   (§3.8k, threading the INV-PARITY presence stream, B2), the no-hole cells (§3.8e–§3.8f), and the single-level
+   companion (§3.8g). **Companion note:** because the fix lands in the shared single-level resolver, reviewers
+   should confirm the single-level null-fill is asserted (§3.8g), not merely inherited.
+8. **Id thread-through the decode recursion — RESOLVED (866b, R8/R7-LIFT; red-team M6).** The §2.4 R7 "no
+   change" claim was **wrong**: the 585a decode reassembler is recursive but **strips column-mapping identity at
+   every recursion boundary** — `ReadStructAsync` (`NestedParquetColumnReader.cs:514-517`), `ReadListAsync`
+   (`:704-707`), `ReadMapAsync` (`:920-929`) all recurse `DecodeNode(..., byFieldId: null, interiorIds: null, …)`.
+   The in-code comments (`:508-512`, `:700-703`, `:914-917`) state this nulling is safe **only because** an
+   id-mode nested-within-nested shape is rejected **upstream** before decode recurses — exactly the gate 866b
+   lifts. Left unfixed, `array<array<int>>` in id mode would parse the multi-token `nested.ids` (R5) then recurse
+   into the inner array with `interiorIds: null`, and the inner `int` leaf would bind **positionally/by name**,
+   not by its Iceberg `field_id` — a silent id-mode violation (reorder-intolerant) and R5's multi-token parse
+   would be **dead code**. **Fix (866b):** thread the **whole-file `byFieldId` verbatim** and the **descended
+   `interiorIds`** through the recursion. **Id hand-off (which structure carries the descended ids):** the
+   top-level resolution (`ResolveFileFields`) already carries `byFieldId` + a `NestedInteriorIds` on
+   `ResolvedColumn.ForNested`; 866b (a) threads `byFieldId` unchanged into every `DecodeNode` recursion (children
+   bind their own `StructField` id / interior `nested.ids` id against the one file-global path-keyed map), and (b)
+   extends **`NestedInteriorIds`** (`NestedParquetColumnReader.cs:2107`) to hold the **full multi-token**
+   `nested.ids` and to **descend** — `Descend(selector)` returns the sub-slice for a nested container's own
+   interior (e.g. the outer array's `interiorIds` descended on `element` yields `{element: innerElemId}` for the
+   inner array). The "safe because rejected upstream" comments MUST be updated when 866b removes that gate.
+   §3.8o–§3.8q pin id-not-positional binding at depth (`array<array>`, deep struct chain, `map`-value-array).
 
 ---
 
