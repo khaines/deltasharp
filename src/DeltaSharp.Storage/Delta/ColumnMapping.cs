@@ -101,8 +101,9 @@ internal sealed class SeededPhysicalNameSource : IColumnPhysicalNameSource
 /// <para><b>Scope (#676).</b> Column mapping attaches to <see cref="StructField"/>s at every depth (C1):
 /// a <c>struct&lt;scalars&gt;</c> is mapped recursively (name + id mode); an <c>array&lt;scalar&gt;</c>/
 /// <c>map&lt;scalar,scalar&gt;</c> receives a top-level id only (name mode; id-mode array/map is deferred to
-/// #839). Nested-within-nested (array&lt;struct&gt;, struct&lt;struct&gt;, …) is deferred to #585 and rejected
-/// fail-closed at the assignment/validation door (<see cref="RejectNestedWithinNested"/>).</para>
+/// #839). Nested-within-nested (array&lt;struct&gt;, struct&lt;struct&gt;, …) is supported for NAME/none mode
+/// (#866 866a — recursive assignment/validation over the depth&gt;1 tree); ID-mode nested-within-nested stays
+/// fail-closed at the assignment/validation door (<see cref="RejectNestedWithinNested"/>) until #866 866b.</para>
 /// </summary>
 internal static class ColumnMapping
 {
@@ -450,12 +451,14 @@ internal static class ColumnMapping
         EnsureNoCaseInsensitiveDuplicateColumns(schema);
     }
 
-    // Validates one struct LEVEL of a mapped schema and recurses into nested struct children (#676). Each
-    // StructField at this level must carry a valid (id, physicalName); ids are unique globally (via the shared
-    // <paramref name="ids"/> set) and within the maxColumnId ceiling; physicalNames are unique within this
-    // sibling set. An array/map interior carries no mapping (C1). Fail-closed doors, in most-specific-first
-    // order: a nested-within-nested interior (#585); an id-mode array/map column (#839); a foreign nested.ids
-    // key; an unsafe physical name; a duplicate physical name / id; a missing/out-of-range/over-ceiling id.
+    // Validates one struct LEVEL of a mapped schema and recurses into nested interiors (#676 single-level,
+    // extended to depth>1 by #866 866a for name/none mode). Each StructField at this level must carry a valid
+    // (id, physicalName); ids are unique globally (via the shared <paramref name="ids"/> set) and within the
+    // maxColumnId ceiling; physicalNames are unique within this sibling set. An array/map interior carries no
+    // mapping itself (C1) but its interior StructFields are validated recursively (name/none mode). Fail-closed
+    // doors, in most-specific-first order: an ID-mode nested-within-nested interior (#866); an id-mode
+    // array/map column (#839); a foreign nested.ids key; an unsafe physical name; a duplicate physical name /
+    // id; a missing/out-of-range/over-ceiling id.
     private static void ValidateMappedLevel(
         StructType level, ColumnMappingMode mode, string? parentPath, bool isTopLevel,
         HashSet<long> ids, long maxColumnId)
@@ -465,9 +468,12 @@ internal static class ColumnMapping
         {
             string path = parentPath is null ? field.Name : parentPath + "." + field.Name;
 
-            // Nested-within-nested (#585) — the most specific defect for a container whose interior is itself
-            // nested (array<struct>, struct<struct>, map<_,struct>, array<array>, …). Checked first so such a
-            // shape is reported as #585 regardless of mode, BEFORE the id-mode array/map (#839) gate.
+            // Nested-within-nested (#866, 866a) — a container whose interior is itself nested
+            // (array<struct>, struct<struct>, map<_,struct>, array<array>, …). Name/none mode RECURSES over
+            // the depth>1 tree (the interior StructFields are validated by ValidateMappedInterior below); ID
+            // mode RETAINS the fail-closed reject until 866b lifts the id-mode arm (mode-gated, design §2.4
+            // G1). Checked first so an id-mode nested-within-nested shape is reported BEFORE the id-mode
+            // array/map (#839) gate.
             switch (field.DataType)
             {
                 case StructType nestedStruct:
@@ -480,26 +486,38 @@ internal static class ColumnMapping
                                 + $"at least one field."));
                     }
 
-                    foreach (StructField child in nestedStruct)
+                    if (mode == ColumnMappingMode.Id)
                     {
-                        RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                        foreach (StructField child in nestedStruct)
+                        {
+                            RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                        }
                     }
 
                     break;
                 case ArrayType array:
-                    RejectNestedWithinNested(array.ElementType, path + ".element");
+                    if (mode == ColumnMappingMode.Id)
+                    {
+                        RejectNestedWithinNested(array.ElementType, path + ".element");
+                    }
+
                     break;
                 case MapType map:
-                    RejectNestedWithinNested(map.KeyType, path + ".key");
-                    RejectNestedWithinNested(map.ValueType, path + ".value");
+                    if (mode == ColumnMappingMode.Id)
+                    {
+                        RejectNestedWithinNested(map.KeyType, path + ".key");
+                        RejectNestedWithinNested(map.ValueType, path + ".value");
+                    }
+
                     break;
             }
 
             string physical = PhysicalName(field, mode);
 
-            // #839: nested.ids handling — LIFTED gate + mode-gated parse/validate (design §2.4). The
-            // nested-within-nested (#585) reject above already fired for a container whose interior is itself
-            // nested, so any array/map reaching here has a SCALAR interior.
+            // #839: nested.ids handling — LIFTED gate + mode-gated parse/validate (design §2.4). Under ID
+            // mode the nested-within-nested (#866) reject above already fired for a container whose interior
+            // is itself nested, so any id-mode array/map reaching here has a SCALAR interior; name/none mode
+            // mints no nested.ids (its depth>1 interior is validated by ValidateMappedInterior below).
             //  * mode == Id && array/map: a valid delta.columnMapping.nested.ids is REQUIRED — parse + validate
             //    it (ValidateNestedIds below, after the container id is validated so uniqueness spans interior
             //    vs top-level). A plain id-mode array/map with NO nested.ids stays fail-closed (its interior has
@@ -601,10 +619,35 @@ internal static class ColumnMapping
                 ValidateNestedIds(field.DataType, path, physical, nestedIdsValue!, ids, maxColumnId);
             }
 
-            if (field.DataType is StructType recurse)
-            {
-                ValidateMappedLevel(recurse, mode, path, isTopLevel: false, ids, maxColumnId);
-            }
+            // #866 (866a): recurse into the field's nested interior to validate StructFields at depth>1
+            // (name/none mode). A struct interior validates directly; an array/map interior descends its
+            // element/key/value to reach an interior struct. ID mode fails closed above at depth>1, so this
+            // carries only name/none depth>1 struct interiors (and the pre-existing single-level struct
+            // recursion, unchanged).
+            ValidateMappedInterior(field.DataType, path, mode, ids, maxColumnId);
+        }
+    }
+
+    // Recurses a mapped field's nested INTERIOR to validate the StructFields reachable within it at depth>1
+    // (#866, 866a). A struct interior is validated as its own level (each child's id/physicalName, per-level
+    // physicalName uniqueness, the shared global id set + ceiling); an array/map interior descends its
+    // element/key/value token to reach a deeper interior struct. Name/none mode only — an id-mode
+    // nested-within-nested shape fails closed at the ValidateMappedLevel door before this is reached.
+    private static void ValidateMappedInterior(
+        DataType type, string path, ColumnMappingMode mode, HashSet<long> ids, long maxColumnId)
+    {
+        switch (type)
+        {
+            case StructType structType:
+                ValidateMappedLevel(structType, mode, path, isTopLevel: false, ids, maxColumnId);
+                break;
+            case ArrayType array:
+                ValidateMappedInterior(array.ElementType, path + "." + ElementSelector, mode, ids, maxColumnId);
+                break;
+            case MapType map:
+                ValidateMappedInterior(map.KeyType, path + "." + KeySelector, mode, ids, maxColumnId);
+                ValidateMappedInterior(map.ValueType, path + "." + ValueSelector, mode, ids, maxColumnId);
+                break;
         }
     }
 
@@ -881,9 +924,11 @@ internal static class ColumnMapping
     /// preserved. Returns the mapped schema and the resulting <c>maxColumnId</c> (N — a count of assigned
     /// <see cref="StructField"/>s).
     /// </summary>
-    /// <exception cref="DeltaProtocolException">A nested-within-nested shape (e.g. <c>array&lt;struct&gt;</c>,
-    /// <c>struct&lt;struct&gt;</c>, <c>map&lt;_,struct&gt;</c>) — deferred to #585 — or a zero-field mapped
-    /// struct is encountered; both fail closed before any id is minted for the offending column.</exception>
+    /// <exception cref="DeltaProtocolException">An ID-mode nested-within-nested shape (e.g.
+    /// <c>array&lt;struct&gt;</c>, <c>struct&lt;struct&gt;</c>, <c>map&lt;_,struct&gt;</c>) — retained
+    /// fail-closed until #866 866b lifts the id-mode arm — or a zero-field mapped struct is encountered; both
+    /// fail closed before any id is minted for the offending column. Name/none mode recurses over the depth&gt;1
+    /// tree (#866 866a).</exception>
     public static (StructType Schema, long MaxColumnId) AssignFreshMapping(
         StructType schema, IColumnPhysicalNameSource nameSource, ColumnMappingMode mode = ColumnMappingMode.Name)
     {
@@ -915,14 +960,16 @@ internal static class ColumnMapping
         return WithMapping(field, mappedType, id, physicalName, nestedIds);
     }
 
-    // Recurses the single-level nested surface (#676, design §2.2): a struct recurses into its scalar
-    // children (each a StructField that is assigned its own id/physicalName); an array/map carries NO interior
-    // StructField (its element/key/value are not StructFields, C1). In ID mode (#839) the array/map interior
-    // ids are minted here — array element = ++nextId; map key = ++nextId then value = ++nextId (key-then-value,
-    // pre-order after the container) — and returned via <paramref name="nestedIds"/> as the
-    // delta.columnMapping.nested.ids value keyed by the container's physical name. Name/none mode mints none
-    // (nestedIds is null). A nested-within-nested interior fails closed naming #585 BEFORE any child id is
-    // minted, so a partial maxColumnId advance can never leak past the reject.
+    // Recurses the nested surface (#676 single-level, extended to depth>1 by #866 866a for name/none mode,
+    // design §2.2): a struct recurses into its children (each a StructField assigned its own id/physicalName);
+    // an array/map carries NO interior StructField itself (its element/key/value are not StructFields, C1) but
+    // in NAME/none mode recurses into its interior so an interior struct's StructFields are minted. In ID mode
+    // (#839) the array/map interior scalar ids are minted here — array element = ++nextId; map key = ++nextId
+    // then value = ++nextId (key-then-value, pre-order after the container) — and returned via
+    // <paramref name="nestedIds"/> as the delta.columnMapping.nested.ids value keyed by the container's
+    // physical name. Name/none mode mints none (nestedIds is null). An ID-mode nested-within-nested interior
+    // fails closed naming #866 BEFORE any child id is minted, so a partial maxColumnId advance can never leak
+    // past the reject; name/none mode recurses instead.
     private static DataType AssignMappedType(
         DataType type, string path, string containerPhysical, IColumnPhysicalNameSource nameSource,
         ColumnMappingMode mode, ref long nextId, out MetadataValue? nestedIds)
@@ -943,28 +990,39 @@ internal static class ColumnMapping
                 var mappedChildren = new List<StructField>(structType.Count);
                 foreach (StructField child in structType)
                 {
-                    RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    if (mode == ColumnMappingMode.Id)
+                    {
+                        RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    }
+
                     mappedChildren.Add(AssignMappedField(child, path + "." + child.Name, nameSource, mode, ref nextId));
                 }
 
                 return new StructType(mappedChildren);
             case ArrayType array:
-                RejectNestedWithinNested(array.ElementType, path + ".element");
                 if (mode == ColumnMappingMode.Id)
                 {
+                    RejectNestedWithinNested(array.ElementType, path + ".element");
                     long elementId = ++nextId;
                     nestedIds = BuildNestedIds(new[]
                     {
                         new KeyValuePair<string, long>(containerPhysical + "." + ElementSelector, elementId),
                     });
+                    return type;
                 }
 
-                return type;
+                // #866 (866a): name/none mode recurses into the element so an interior struct's StructFields
+                // each get their own (id, physicalName). A scalar element returns verbatim (single-level,
+                // unchanged); name mode mints no nested.ids.
+                DataType mappedElement = AssignMappedType(
+                    array.ElementType, path + "." + ElementSelector, containerPhysical + "." + ElementSelector,
+                    nameSource, mode, ref nextId, out _);
+                return new ArrayType(mappedElement, array.ContainsNull);
             case MapType map:
-                RejectNestedWithinNested(map.KeyType, path + ".key");
-                RejectNestedWithinNested(map.ValueType, path + ".value");
                 if (mode == ColumnMappingMode.Id)
                 {
+                    RejectNestedWithinNested(map.KeyType, path + ".key");
+                    RejectNestedWithinNested(map.ValueType, path + ".value");
                     long keyId = ++nextId;
                     long valueId = ++nextId;
                     nestedIds = BuildNestedIds(new[]
@@ -972,9 +1030,18 @@ internal static class ColumnMapping
                         new KeyValuePair<string, long>(containerPhysical + "." + KeySelector, keyId),
                         new KeyValuePair<string, long>(containerPhysical + "." + ValueSelector, valueId),
                     });
+                    return type;
                 }
 
-                return type;
+                // #866 (866a): name/none mode recurses into the key then the value so interior struct
+                // StructFields get their own (id, physicalName); scalar interiors return verbatim.
+                DataType mappedKey = AssignMappedType(
+                    map.KeyType, path + "." + KeySelector, containerPhysical + "." + KeySelector,
+                    nameSource, mode, ref nextId, out _);
+                DataType mappedValue = AssignMappedType(
+                    map.ValueType, path + "." + ValueSelector, containerPhysical + "." + ValueSelector,
+                    nameSource, mode, ref nextId, out _);
+                return new MapType(mappedKey, mappedValue, map.ValueContainsNull);
             default:
                 return type;
         }
@@ -1013,8 +1080,8 @@ internal static class ColumnMapping
     /// (#572): the current configuration's mode key is preserved verbatim.
     /// </summary>
     /// <exception cref="DeltaProtocolException">The current schema's <c>maxColumnId</c> is missing/malformed,
-    /// a retained column-mapped column carries no id, or an evolved field is a nested-within-nested type
-    /// (#585) / a zero-field mapped struct.</exception>
+    /// a retained column-mapped column carries no id, or an evolved field is an ID-mode nested-within-nested
+    /// type (#866, retained until 866b) / a zero-field mapped struct.</exception>
     public static (StructType Schema, ImmutableSortedDictionary<string, string> Configuration) EvolveNameModeMapping(
         StructType evolvedSchema,
         StructType currentMappedSchema,
@@ -1122,11 +1189,12 @@ internal static class ColumnMapping
     private static bool SameNestedKind(DataType a, DataType b) =>
         (a is ArrayType && b is ArrayType) || (a is MapType && b is MapType);
 
-    // Recurses the single-level nested surface during an evolve (#676). A struct matches each evolved child
-    // against the existing struct's SAME-named child (only when the existing field is itself a struct — a
-    // type change retires the old children); an array/map carries no interior StructField (its interior
-    // nested.ids in id mode is resolved by ResolveEvolveNestedIds on the container). Nested-within-nested
-    // fails closed naming #585 before any id is minted.
+    // Recurses the nested surface during an evolve (#676 single-level, extended to depth>1 by #866 866a for
+    // name/none mode). A struct matches each evolved child against the existing struct's SAME-named child
+    // (only when the existing field is itself a struct — a type change retires the old children); in NAME/none
+    // mode an array/map recurses into its interior so an interior struct's new StructFields mint fresh ids and
+    // existing ones are preserved. An ID-mode nested-within-nested interior fails closed naming #866 before any
+    // id is minted (retained until 866b).
     private static DataType EvolveMappedType(
         DataType evolvedType, DataType? existingType, string path,
         IColumnPhysicalNameSource nameSource, ColumnMappingMode mode, ref long nextId)
@@ -1147,7 +1215,11 @@ internal static class ColumnMapping
                 var children = new List<StructField>(structType.Count);
                 foreach (StructField child in structType)
                 {
-                    RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    if (mode == ColumnMappingMode.Id)
+                    {
+                        RejectNestedWithinNested(child.DataType, path + "." + child.Name);
+                    }
+
                     StructField? existingChild =
                         existingStruct is not null && existingStruct.TryGetField(child.Name, out StructField ec)
                             ? ec
@@ -1157,12 +1229,30 @@ internal static class ColumnMapping
 
                 return new StructType(children);
             case ArrayType array:
-                RejectNestedWithinNested(array.ElementType, path + ".element");
-                return evolvedType;
+                if (mode == ColumnMappingMode.Id)
+                {
+                    RejectNestedWithinNested(array.ElementType, path + ".element");
+                    return evolvedType;
+                }
+
+                DataType evolvedElement = EvolveMappedType(
+                    array.ElementType, (existingType as ArrayType)?.ElementType, path + "." + ElementSelector,
+                    nameSource, mode, ref nextId);
+                return new ArrayType(evolvedElement, array.ContainsNull);
             case MapType map:
-                RejectNestedWithinNested(map.KeyType, path + ".key");
-                RejectNestedWithinNested(map.ValueType, path + ".value");
-                return evolvedType;
+                if (mode == ColumnMappingMode.Id)
+                {
+                    RejectNestedWithinNested(map.KeyType, path + ".key");
+                    RejectNestedWithinNested(map.ValueType, path + ".value");
+                    return evolvedType;
+                }
+
+                var existingMap = existingType as MapType;
+                DataType evolvedKey = EvolveMappedType(
+                    map.KeyType, existingMap?.KeyType, path + "." + KeySelector, nameSource, mode, ref nextId);
+                DataType evolvedValue = EvolveMappedType(
+                    map.ValueType, existingMap?.ValueType, path + "." + ValueSelector, nameSource, mode, ref nextId);
+                return new MapType(evolvedKey, evolvedValue, map.ValueContainsNull);
             default:
                 return evolvedType;
         }
@@ -1487,8 +1577,9 @@ internal static class ColumnMapping
     // physical file is field_id-free — #523 AC3, byte-unchanged output); in id mode it carries ONLY its
     // delta.columnMapping.id so the Parquet writer stamps the field_id an id-mode reader resolves by (#572).
     // For a nested struct the same rule recurses per child (#676, design §2.2): child physical names + ids come
-    // from the mapped struct, matched by logical name, in WRITE order; array/map interiors ride verbatim (their
-    // element/key/value are not StructFields, C1). Nested-within-nested fails closed naming #585.
+    // from the mapped struct, matched by logical name, in WRITE order; in NAME/none mode array/map interiors
+    // recurse so an interior struct's children are relabelled to their physical names (#866 866a). An ID-mode
+    // nested-within-nested interior fails closed naming #866 (retained until 866b).
     private static StructField ToPhysicalField(
         StructField writeField, StructField mappedField, ColumnMappingMode mode, string logicalPath)
     {
@@ -1534,9 +1625,11 @@ internal static class ColumnMapping
     }
 
     // Recursively relabels a write DataType to its physical shape: a struct relabels each child (name only,
-    // + id in id mode) matched against the mapped struct by logical name, in WRITE order; an array/map carries
-    // its interior verbatim (no interior mapping, C1). A struct child absent from the mapped struct — or a
-    // nested-within-nested interior (#585) — fails closed.
+    // + id in id mode) matched against the mapped struct by logical name, in WRITE order; in NAME/none mode an
+    // array/map recurses into its interior so an interior struct's children are relabelled to their physical
+    // names (#866 866a — mode-independent name substitution at depth>1). A struct child absent from the mapped
+    // struct fails closed; an ID-mode nested-within-nested interior fails closed naming #866 (retained until
+    // 866b — an id-mode depth>1 schema can never reach here because the assign/validate door rejects it).
     private static DataType ToPhysicalType(
         DataType writeType, DataType mappedType, ColumnMappingMode mode, string logicalPath)
     {
@@ -1555,7 +1648,11 @@ internal static class ColumnMapping
                 var children = new List<StructField>(writeStruct.Count);
                 foreach (StructField writeChild in writeStruct)
                 {
-                    RejectNestedWithinNested(writeChild.DataType, logicalPath + "." + writeChild.Name);
+                    if (mode == ColumnMappingMode.Id)
+                    {
+                        RejectNestedWithinNested(writeChild.DataType, logicalPath + "." + writeChild.Name);
+                    }
+
                     if (!mappedStruct.TryGetField(writeChild.Name, out StructField mappedChild))
                     {
                         throw DeltaProtocolException.Inconsistent(
@@ -1571,12 +1668,45 @@ internal static class ColumnMapping
 
                 return new StructType(children);
             case ArrayType array:
-                RejectNestedWithinNested(array.ElementType, logicalPath + ".element");
-                return writeType;
+                if (mode == ColumnMappingMode.Id)
+                {
+                    RejectNestedWithinNested(array.ElementType, logicalPath + ".element");
+                    return writeType;
+                }
+
+                if (mappedType is not ArrayType mappedArray)
+                {
+                    throw DeltaProtocolException.Inconsistent(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Column '{DiagnosticText.Sanitize(logicalPath)}' is an array in the write schema but not in the "
+                            + $"{ModeName(mode)}-mode table schema; the write is rejected fail-closed."));
+                }
+
+                return new ArrayType(
+                    ToPhysicalType(array.ElementType, mappedArray.ElementType, mode, logicalPath + "." + ElementSelector),
+                    array.ContainsNull);
             case MapType map:
-                RejectNestedWithinNested(map.KeyType, logicalPath + ".key");
-                RejectNestedWithinNested(map.ValueType, logicalPath + ".value");
-                return writeType;
+                if (mode == ColumnMappingMode.Id)
+                {
+                    RejectNestedWithinNested(map.KeyType, logicalPath + ".key");
+                    RejectNestedWithinNested(map.ValueType, logicalPath + ".value");
+                    return writeType;
+                }
+
+                if (mappedType is not MapType mappedMap)
+                {
+                    throw DeltaProtocolException.Inconsistent(
+                        string.Create(
+                            CultureInfo.InvariantCulture,
+                            $"Column '{DiagnosticText.Sanitize(logicalPath)}' is a map in the write schema but not in the "
+                            + $"{ModeName(mode)}-mode table schema; the write is rejected fail-closed."));
+                }
+
+                return new MapType(
+                    ToPhysicalType(map.KeyType, mappedMap.KeyType, mode, logicalPath + "." + KeySelector),
+                    ToPhysicalType(map.ValueType, mappedMap.ValueType, mode, logicalPath + "." + ValueSelector),
+                    map.ValueContainsNull);
             default:
                 return writeType;
         }
@@ -1619,11 +1749,12 @@ internal static class ColumnMapping
         return new StructField(field.Name, mappedType, field.Nullable, FieldMetadata.FromValues(entries));
     }
 
-    // Fail-closed guard for the nested-within-nested boundary (#676 scope, design §1): the enabled surface is
-    // single-level — a struct of scalars, an array of a scalar, a map of scalar→scalar. A struct child, array
-    // element, or map key/value that is ITSELF a struct/array/map (array<struct>, struct<struct>,
-    // map<_,struct>, array<array>, …) is deferred to #585 and rejected here, at the assignment/validation
-    // door, BEFORE any interior id is minted — so a reject never leaves a partial maxColumnId advance.
+    // Fail-closed guard for the ID-mode nested-within-nested boundary (#866, design §1/§2.4 G5): NAME/none
+    // mode maps depth>1 nested columns recursively (866a); ID mode maps a single level only. A struct child,
+    // array element, or map key/value that is ITSELF a struct/array/map (array<struct>, struct<struct>,
+    // map<_,struct>, array<array>, …) is retained fail-closed for ID mode here — at the assignment/validation
+    // door, BEFORE any interior id is minted, so a reject never leaves a partial maxColumnId advance — until
+    // #866 866b lifts the id-mode arm. All call sites are id-mode-gated (§2.4); name/none mode recurses instead.
     private static void RejectNestedWithinNested(DataType interior, string path)
     {
         if (interior is StructType or ArrayType or MapType)
@@ -1632,9 +1763,10 @@ internal static class ColumnMapping
                 string.Create(
                     CultureInfo.InvariantCulture,
                     $"Column '{DiagnosticText.Sanitize(path)}' is a nested type within a nested type "
-                    + $"('{interior.TypeName}'); nested-within-nested column mapping is deferred to #585. This build "
-                    + $"maps single-level nested columns only (a struct of scalars, an array of a scalar, a map of "
-                    + $"scalar to scalar)."));
+                    + $"('{interior.TypeName}') under column-mapping id mode; id-mode nested-within-nested column "
+                    + $"mapping is not yet supported (#866). This build maps id-mode nested columns at a single level "
+                    + $"only (a struct of scalars, an array of a scalar, a map of scalar to scalar); name/none mode "
+                    + $"supports depth>1."));
         }
     }
 }

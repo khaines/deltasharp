@@ -57,8 +57,8 @@ internal static class ParquetTypeMapping
     /// <c>SimpleString</c> is a bounded literal) is retained by construction.
     /// </summary>
     /// <remarks>
-    /// Fail-closed boundaries (design §2.4a/§2.6), all <b>before any byte is written</b>: a nested type
-    /// nested WITHIN one of the three shapes (→ #585); a <c>nullable:false</c> nested container (Parquet.Net
+    /// Fail-closed boundaries (design §2.4a/§2.6), all <b>before any byte is written</b>: an ID-MODE nested type
+    /// nested WITHIN one of the three shapes (→ #866; name/none mode recurses); a <c>nullable:false</c> nested container (Parquet.Net
     /// 6.1.0 exposes no public <c>Field.IsNullable</c> setter, so every container is OPTIONAL on the wire and
     /// honoring the declaration is impossible — #730 divergence refused); a zero-field struct; and a nested
     /// column carrying column-mapping metadata (nested leaf <c>field_id</c> stamping is deferred to #676,
@@ -377,7 +377,7 @@ internal static class ParquetTypeMapping
         {
             throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for {context}: a nested type within a nested type ('{child.DataType.TypeName}') is not "
-                + "supported (deferred, #585).");
+                + "supported at this leaf lane (#866; name/none depth>1 is built by the recursive nested node builder).");
         }
 
         if (idMode && !ColumnMapping.TryGetId(child, out _))
@@ -406,7 +406,8 @@ internal static class ParquetTypeMapping
     }
 
     // Builds one nested LEAF field (an array element, a map key/value). A nested child that
-    // is itself nested is the #585 boundary and fails closed here — before any bytes. In name/none mode the
+    // is itself nested is the #866 boundary and fails closed here — before any bytes (name/none depth>1 is
+    // built by the recursive nested node builder, so this is a backstop). In name/none mode the
     // leaf carries NO field_id (design §2.5/F9 / C1): array/map interiors are not StructFields. In id mode
     // (#839) the interior <paramref name="fieldId"/> — derived from the container's delta.columnMapping.nested.ids
     // — is stamped onto the LEAF (range-guarded [1, int.MaxValue]) so an id-mode reader binds the interior by
@@ -421,7 +422,7 @@ internal static class ParquetTypeMapping
             // column label identifying WHICH column is at fault).
             throw DeltaStorageException.UnsupportedFeature(
                 $"Parquet mapping for {context}: a nested type within a nested type ('{type.TypeName}') is not "
-                + "supported (deferred, #585).");
+                + "supported at this leaf lane (#866; name/none depth>1 is built by the recursive nested node builder).");
         }
 
         DataField leaf;
@@ -610,9 +611,9 @@ internal static class ParquetTypeMapping
     /// any finite depth up to <see cref="NestedParquetColumnReader.MaxNestedReadDepth"/>. What STILL fails
     /// closed here (fail-closed parity, design §2.6): an unsupported scalar leaf at any depth (<c>void</c>,
     /// <c>decimal</c> precision &gt; 28, or an unmapped physical type), a zero-field struct at any depth, and
-    /// a schema nesting deeper than the recursion-depth bound. This does not widen the <b>writer</b>'s scope:
-    /// the write door (<see cref="CreateField"/>) still rejects nested-within-nested (585a is a READ-side
-    /// increment).
+    /// a schema nesting deeper than the recursion-depth bound. The <b>writer</b> door
+    /// (<see cref="CreateField"/>) builds name/none nested-within-nested shapes recursively (#873) and retains
+    /// the id-mode nested-within-nested reject (#866, until 866b).
     /// </summary>
     /// <exception cref="DeltaStorageException">The requested column's type (or a nested leaf type) has no
     /// supported Parquet read mapping (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>

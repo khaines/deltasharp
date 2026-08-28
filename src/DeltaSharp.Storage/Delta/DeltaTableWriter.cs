@@ -714,8 +714,8 @@ internal sealed class DeltaTableWriter
     /// <see cref="DeltaReadScope.WholeTable"/>; <c>delta.columnMapping.maxColumnId</c> is unchanged.
     /// </summary>
     /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
-    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #585), or a second struct hop (F4b,
-    /// #585); or the target name ordinally collides with a sibling at its parent level (F6a).</exception>
+    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #866), or a second struct hop (F4b,
+    /// #866); or the target name ordinally collides with a sibling at its parent level (F6a).</exception>
     internal async Task<DeltaCommitResult> RenameColumnAsync(
         IReadOnlyList<string> path, string toName, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
@@ -790,8 +790,8 @@ internal sealed class DeltaTableWriter
     /// child. Commits a lone <c>metaData</c> action under <see cref="DeltaReadScope.WholeTable"/>.
     /// </summary>
     /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
-    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #585), or a second struct hop (F4b,
-    /// #585); or the target is a top-level partition column (F7).</exception>
+    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #866), or a second struct hop (F4b,
+    /// #866); or the target is a top-level partition column (F7).</exception>
     internal async Task<DeltaCommitResult> DropColumnAsync(
         IReadOnlyList<string> path, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
@@ -847,10 +847,10 @@ internal sealed class DeltaTableWriter
     // substituting exactly the target StructField (rename) or omitting it (drop). Siblings are carried by
     // REFERENCE (untouched); the target is selected by ReferenceEquals identity (no name re-match). NEVER parses
     // or composes a dotted string. `path.Count >= 1` is guaranteed by the caller (F1 checked at the door).
-    // Exposed `internal` (not private) SOLELY so the F4b single-hop gate — unconstructible via a loaded snapshot
-    // today because the load-time C1 gate ColumnMapping.RejectNestedWithinNested pre-empts a struct<struct<…>>
-    // schema (§2.4, §3.12) — can be exercised directly against a hand-built StructType that bypasses the load
-    // door. When #585 relaxes that load gate the same gate becomes load-bearing through the door.
+    // Exposed `internal` (not private) originally so the F4b single-hop gate could be exercised directly; as of
+    // #866 866a a NAME-mode struct<struct<…>> schema IS loadable, so the F4b gate is now reachable through the
+    // rename/drop door too (a depth>1 struct child rename/drop fails closed naming #866 until 866c lifts it).
+    // #866 866b relaxes the id-mode C1 load gate; 866c lifts this F4b single-hop gate for struct chains.
     internal static StructType DescendAndRebuild(
         StructType schema, IReadOnlyList<string> path, SchemaChangeOp op, string? toName)
     {
@@ -907,7 +907,7 @@ internal sealed class DeltaTableWriter
 
         // Intermediate segment: it MUST resolve to a StructType child (you cannot address a child of a
         // non-struct), and under the single-level scope ONLY the top-level column (depth == 0) may be a struct
-        // intermediate — a SECOND struct hop is fail-closed naming #585 (F4b).
+        // intermediate — a SECOND struct hop is fail-closed naming #866 (F4b, lifted by 866c).
         switch (field.DataType)
         {
             case StructType childStruct:
@@ -916,8 +916,8 @@ internal sealed class DeltaTableWriter
                     // F4b: a struct<struct<…>> intermediate — caught by NEITHER F3 (scalar) NOR F4 (array/map).
                     throw new InvalidOperationException(
                         $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is a "
-                        + "nested-within-nested struct; nested-within-nested rename/drop is not supported "
-                        + "(#585); only a single-level nested child is addressable.");
+                        + "nested-within-nested struct; nested-within-nested rename/drop is not supported yet "
+                        + "(#866); only a single-level nested child is addressable.");
                 }
 
                 StructType rebuiltChild = RebuildLevel(childStruct, path, depth + 1, op, toName);
@@ -927,10 +927,10 @@ internal sealed class DeltaTableWriter
             case ArrayType:
             case MapType:
                 // F4: descending into an array element / map key/value interior — a non-addressable node (C1),
-                // out of scope, fail-closed naming #585.
+                // out of scope, fail-closed naming #866.
                 throw new InvalidOperationException(
                     $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is an "
-                    + "array/map; rename/drop of an array element / map key/value is not supported (#585).");
+                    + "array/map; rename/drop of an array element / map key/value is not supported (#866).");
 
             default:
                 // F3: a scalar intermediate — cannot address a child of a scalar.
