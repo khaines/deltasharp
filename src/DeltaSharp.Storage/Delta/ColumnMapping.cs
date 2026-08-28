@@ -884,6 +884,24 @@ internal static class ColumnMapping
         return maxColumnId;
     }
 
+    /// <summary>
+    /// The stable physical identity used to STAMP/STRIP a <c>delta.columnMapping.nested.ids</c> key prefix and
+    /// to locate a column-mapped container/struct-child in a file footer: the declared
+    /// <c>delta.columnMapping.physicalName</c> when present, else the field's own name (#866 866b). Unlike
+    /// <see cref="PhysicalName"/> this NEVER throws when the physicalName metadata is absent — a bare id-only
+    /// schema (id metadata but no physicalName, e.g. a hand-authored unit fixture or a #839 leaf) stamped its
+    /// nested.ids keys by the field name, so falling back to the name keeps stamp↔read symmetric. Using this
+    /// (rather than <c>field.Name</c>) makes id-mode interior binding rename-tolerant: a renamed container's
+    /// physicalName is stable, so its physical-prefixed nested.ids keys still resolve BY ID.
+    /// </summary>
+    public static string PhysicalNameOrName(StructField field)
+    {
+        ArgumentNullException.ThrowIfNull(field);
+        return field.Metadata.TryGetString(PhysicalNameKey, out string? physical) && physical.Length > 0
+            ? physical
+            : field.Name;
+    }
+
     /// <summary>The physical Parquet name of <paramref name="field"/> under <paramref name="mode"/>: the
     /// declared <c>delta.columnMapping.physicalName</c> in <b>both</b> <c>name</c> and <c>id</c> mode, else
     /// (<c>none</c> mode) the field's own (logical) name. A column-mapped field (name or id) missing a physical
@@ -1263,7 +1281,7 @@ internal static class ColumnMapping
         DataType mappedType = EvolveMappedType(
             evolvedField.DataType, existingField?.DataType, path, nameSource, mode, ref nextId, depth);
         MetadataValue? nestedIds = ResolveEvolveNestedIds(
-            evolvedField.DataType, existingField, physicalName, mode, ref nextId);
+            evolvedField.DataType, existingField, physicalName, path, mode, ref nextId, depth);
         return WithMapping(evolvedField, mappedType, id, physicalName, nestedIds);
     }
 
@@ -1275,7 +1293,8 @@ internal static class ColumnMapping
     // interior contributes its GROUP id here and STOPS (its children are StructFields evolved by
     // EvolveMappedType). Name/none mode, and any non-array/map type, carry no nested.ids.
     private static MetadataValue? ResolveEvolveNestedIds(
-        DataType evolvedType, StructField? existingField, string physicalName, ColumnMappingMode mode, ref long nextId)
+        DataType evolvedType, StructField? existingField, string physicalName, string path,
+        ColumnMappingMode mode, ref long nextId, int depth)
     {
         if (mode != ColumnMappingMode.Id || evolvedType is not (ArrayType or MapType))
         {
@@ -1294,12 +1313,12 @@ internal static class ColumnMapping
         {
             // A CONTAINER map KEY is fail-closed at every depth in id mode (§2.6).
             RejectNestedWithinNested(map.KeyType, physicalName + "." + KeySelector);
-            MintInteriorChain(map.KeyType, physicalName + "." + KeySelector, ref nextId, entries);
-            MintInteriorChain(map.ValueType, physicalName + "." + ValueSelector, ref nextId, entries);
+            MintInteriorChain(map.KeyType, physicalName + "." + KeySelector, path + "." + KeySelector, ref nextId, entries, depth + 1);
+            MintInteriorChain(map.ValueType, physicalName + "." + ValueSelector, path + "." + ValueSelector, ref nextId, entries, depth + 1);
         }
         else if (evolvedType is ArrayType array)
         {
-            MintInteriorChain(array.ElementType, physicalName + "." + ElementSelector, ref nextId, entries);
+            MintInteriorChain(array.ElementType, physicalName + "." + ElementSelector, path + "." + ElementSelector, ref nextId, entries, depth + 1);
         }
 
         return BuildNestedIds(entries);
@@ -1309,20 +1328,23 @@ internal static class ColumnMapping
     // (§2.2). The selector id is minted FIRST (a scalar's is the leaf field_id; a container's is the
     // structural-only GROUP id). An array/map interior recurses to accumulate deeper tokens; a STRUCT interior
     // STOPS (its children are StructFields evolved separately by EvolveMappedType — never accumulated here);
-    // a scalar interior STOPS.
+    // a scalar interior STOPS. Depth is checked BEFORE descent (StackOverflow DoS guard, parity with
+    // AssignInteriorType/CreateIdNestedNode — RFL-2 defense-in-depth).
     private static void MintInteriorChain(
-        DataType interiorType, string selectorKey, ref long nextId, List<KeyValuePair<string, long>> entries)
+        DataType interiorType, string selectorKey, string logicalPath, ref long nextId,
+        List<KeyValuePair<string, long>> entries, int depth)
     {
+        EnsureMappingDepth(depth, logicalPath);
         long id = ++nextId;
         entries.Add(new KeyValuePair<string, long>(selectorKey, id));
         switch (interiorType)
         {
             case ArrayType array:
-                MintInteriorChain(array.ElementType, selectorKey + "." + ElementSelector, ref nextId, entries);
+                MintInteriorChain(array.ElementType, selectorKey + "." + ElementSelector, logicalPath + "." + ElementSelector, ref nextId, entries, depth + 1);
                 break;
             case MapType map:
-                MintInteriorChain(map.KeyType, selectorKey + "." + KeySelector, ref nextId, entries);
-                MintInteriorChain(map.ValueType, selectorKey + "." + ValueSelector, ref nextId, entries);
+                MintInteriorChain(map.KeyType, selectorKey + "." + KeySelector, logicalPath + "." + KeySelector, ref nextId, entries, depth + 1);
+                MintInteriorChain(map.ValueType, selectorKey + "." + ValueSelector, logicalPath + "." + ValueSelector, ref nextId, entries, depth + 1);
                 break;
             default:
                 break;

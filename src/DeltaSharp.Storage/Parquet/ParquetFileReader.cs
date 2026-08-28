@@ -1595,6 +1595,10 @@ internal sealed class ParquetFileReader
                     // regardless of the file, so it fails closed BEFORE the container is resolved (defense in
                     // depth; the schema validator also requires it). A struct container carries no nested.ids
                     // (its children own their ids); its interiors re-seed per StructField during decode (C1).
+                    // The nested.ids keys are STAMPED with the stable PHYSICAL name, so they are STRIPPED with
+                    // the physical name too (never the possibly-renamed logical field.Name) — rename-tolerant,
+                    // and it forecloses the silent positional-fallback bypass (#866 866b RFL-2).
+                    string physicalName = ColumnMapping.PhysicalNameOrName(requestedField);
                     NestedParquetColumnReader.NestedInteriorIds? interiorIds = null;
                     if (requestedField.DataType is ArrayType or MapType)
                     {
@@ -1605,10 +1609,12 @@ internal sealed class ParquetFileReader
                                 + $"mode but carries no '{ColumnMapping.NestedIdsKey}'; the id-mode nested read fails closed (#839).");
                         }
 
-                        interiorIds = NestedParquetColumnReader.NestedInteriorIds.FromNestedIds(nestedIds, name);
+                        interiorIds = NestedParquetColumnReader.NestedInteriorIds.FromNestedIds(nestedIds, physicalName);
                     }
 
-                    if (!byName.TryGetValue(name, out Field? containerField))
+                    // The container GROUP node is bound by its stable PHYSICAL name (rename-stable, §2.5 step 1),
+                    // never the logical field.Name.
+                    if (!byName.TryGetValue(physicalName, out Field? containerField))
                     {
                         throw DeltaStorageException.ColumnNotPresentInFile(name);
                     }

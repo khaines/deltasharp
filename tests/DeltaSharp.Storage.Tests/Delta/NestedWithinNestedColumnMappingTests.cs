@@ -667,6 +667,59 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
             () => ColumnMapping.AssignFreshMapping(schema, new SeededPhysicalNameSource("mk"), ColumnMappingMode.Id));
     }
 
+    // §3.8e/§3.8j/§3.8n — REQUIRED-absent depth>1 fail-closed cells are pinned at the READER level (clean
+    // ColumnNotPresentInFile) in NestedIdModeRenameDiscriminationTests; through the full scan path a
+    // required-added column is caught earlier by the schema-evolution guard (also fail-closed).
+
+    // §3.8m — struct-field container M5 companion: struct<s: struct<a>> evolved to struct<s: struct<b>>, old
+    // file holds s + s.a; s is located by its physicalName (PRESENT) so its per-row presence structure is read
+    // and `b` is null-filled per row — `s` is NOT null-filled whole even though `b` is its only requested child.
+    [Fact]
+    public async Task IdMode_StructField_AllChildrenReplaced_StructPresent_NullFillsLeaves_M5()
+    {
+        var oldInner = new StructType(new[] { new StructField("a", DataTypes.LongType, nullable: true) });
+        var oldSchema = new StructType(new[] { new StructField("s", oldInner, nullable: true) });
+        var aVec = Long(10L, 11L);
+        var sVec = new StructColumnVector(oldInner, new ColumnVector[] { aVec }, new[] { false, false });
+        (StructType oldMapped, long oldMax) =
+            await WriteIdMappedFileAndV0Async(oldSchema, new ManagedColumnBatch(oldSchema, new ColumnVector[] { sVec }, 2));
+
+        // Replace `a` with a fresh nullable `b` (struct `s` unchanged/present).
+        StructType newMapped = ReplaceStructFieldChild(oldMapped, "s", "b", oldMax + 1);
+        await CommitMetadataIdAsync(newMapped, oldMax + 1, version: 1);
+
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rs = (StructColumnVector)read.Column(0);
+        Assert.False(rs.IsNull(0)); // s PRESENT (not null-filled whole)
+        Assert.False(rs.IsNull(1));
+        Assert.True(rs.Child("b").IsNull(0)); // b null-filled per row (a dropped)
+        Assert.True(rs.Child("b").IsNull(1));
+    }
+
+    // ---- required-absent / evolve mapped-schema builders (id mode) ----
+
+    private static DeltaSharp.Types.FieldMetadata IdMeta(long id) =>
+        DeltaSharp.Types.FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.PhysicalNameKey, MetadataValue.String("col-" + id.ToString(CultureInfo.InvariantCulture))),
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
+        });
+
+    private static StructType ReplaceStructFieldChild(StructType mapped, string structColumn, string newChild, long id)
+    {
+        var fields = mapped.Select(f =>
+        {
+            if (f.Name != structColumn)
+            {
+                return f;
+            }
+
+            var inner = new StructType(new[] { new StructField(newChild, DataTypes.LongType, nullable: true, IdMeta(id)) });
+            return new StructField(f.Name, inner, f.Nullable, f.Metadata);
+        }).ToList();
+        return new StructType(fields);
+    }
+
     // ---- id-mode test vector builders ----
 
     private static ListColumnVector ArrayStructAB(ArrayType type, IReadOnlyList<(long? A, long? C)[]> rows)
