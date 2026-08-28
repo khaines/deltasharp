@@ -1,3 +1,4 @@
+using DeltaSharp.Analysis;
 using DeltaSharp.Plans.Expressions;
 using DeltaSharp.Types;
 
@@ -33,6 +34,10 @@ public static class Functions
     /// <param name="columnName">The column name, or <c>"*"</c>/<c>"t.*"</c> for a star.</param>
     /// <returns>An unresolved column reference.</returns>
     /// <exception cref="ArgumentException"><paramref name="columnName"/> is null or empty.</exception>
+    /// <exception cref="AnalysisException"><paramref name="columnName"/> is a dotted name (attribute or star)
+    /// with an empty or whitespace-only part (e.g. <c>"s."</c>, <c>".x"</c>, <c>"a..b"</c>, <c>"s. "</c>, or the
+    /// star forms <c>".*"</c>/<c>"t..*"</c>) — normalised to the single name-resolution failure shape
+    /// (#590).</exception>
     public static Column Col(string columnName)
     {
         ArgumentException.ThrowIfNullOrEmpty(columnName);
@@ -45,12 +50,37 @@ public static class Functions
         if (columnName.EndsWith(".*", StringComparison.Ordinal))
         {
             string[] target = columnName[..^2].Split('.');
+
+            // Same empty/blank-part guard as the attribute path below (`.*`, `t..*`, `..*`): the star's
+            // qualifier target must not contain a blank part, or UnresolvedStar's identifier invariant would
+            // surface the exact raw ArgumentException #590 eliminates. A blank target part goes here, not to a
+            // resolvable star.
+            if (Array.Exists(target, string.IsNullOrWhiteSpace))
+            {
+                throw AnalysisException.InvalidColumnName(columnName);
+            }
+
             return new Column(new UnresolvedStar(target));
         }
 
         if (columnName.Contains('.', StringComparison.Ordinal))
         {
-            return new Column(new UnresolvedAttribute(columnName.Split('.')));
+            string[] parts = columnName.Split('.');
+
+            // A dotted name with an empty OR whitespace-only part (`s.`, `.x`, `a..b`, `s. `, "s.\t") is an
+            // invalid column reference. The UnresolvedAttribute identifier invariant would surface it as a raw
+            // ArgumentException; normalise it here to an AnalysisException so EVERY column name-resolution
+            // failure shares one shape (#590), never a stray ArgumentException a caller catching
+            // AnalysisException would miss. IsNullOrWhiteSpace rejects only ENTIRELY-blank parts: a field name
+            // with real content and internal/surrounding spaces (e.g. `s.a b` → part "a b") is NOT rejected and
+            // still resolves. A column name that literally contains a dot is out of scope here — it must be
+            // backtick-quoted through the SQL door (this API always treats a dot as a name-part separator).
+            if (Array.Exists(parts, string.IsNullOrWhiteSpace))
+            {
+                throw AnalysisException.InvalidColumnName(columnName);
+            }
+
+            return new Column(new UnresolvedAttribute(parts));
         }
 
         return new Column(new UnresolvedAttribute(columnName));

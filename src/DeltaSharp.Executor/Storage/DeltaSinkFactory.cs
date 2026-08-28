@@ -297,19 +297,22 @@ internal sealed class DeltaLocalSink : ILocalSink, IWriteConstraintEnforcer
             catch (AnalysisException ex)
                 when (constraint.Kind == DeltaConstraintKind.Check
                     && (ex.Kind == AnalysisErrorKind.UnresolvedColumn
-                        || ex.Kind == AnalysisErrorKind.UnresolvedStructField)
+                        || ex.Kind == AnalysisErrorKind.NoSuchStructField
+                        || ex.Kind == AnalysisErrorKind.InvalidExtractBase)
                     && ex.Reference is not null)
             {
                 // A SURVIVING CHECK references a column the write schema no longer resolves — an
                 // overwriteSchema (or future ALTER) dropped/renamed the TOP-LEVEL column
-                // (UnresolvedColumn), or a NESTED field the CHECK reads was dropped/renamed or its base
-                // struct retyped away from a struct (UnresolvedStructField, #600). Collect it (aggregated
-                // per column, normalizing a nested reference `s.f` to its top-level column `s`) and surface
-                // the Delta parity error after the pass, instead of the raw analyzer failure. Only named
-                // CHECK constraints are reported: a column invariant is attached to its own field and cannot
-                // be DROP CONSTRAINT'd, and a new write-schema invariant that fails to resolve is a
-                // different, non-reclassified error. An INCOMPATIBLE top-level retype of a referenced column
-                // (e.g. int->string under `id > 0`) surfaces here as the comparison's DataTypeMismatch — which
+                // (UnresolvedColumn), or a NESTED field the CHECK reads was dropped/renamed
+                // (NoSuchStructField) or its base struct was retyped away from a struct (InvalidExtractBase)
+                // — the two STRUCTURAL-absence nested cases the #590 split routes to distinct Spark error
+                // classes (#600). Collect it (aggregated per column, normalizing a nested reference `s.f` to
+                // its top-level column `s`) and surface the Delta parity error after the pass, instead of the
+                // raw analyzer failure. Only named CHECK constraints are reported: a column invariant is
+                // attached to its own field and cannot be DROP CONSTRAINT'd, and a new write-schema invariant
+                // that fails to resolve is a different, non-reclassified error. An INCOMPATIBLE top-level
+                // retype of a referenced column (e.g. int->string under `id > 0`) surfaces here as the
+                // comparison's DataTypeMismatch — which
                 // is NOT one of the reclassified kinds, so it stays fail-closed but un-reclassified (a genuine
                 // type error, matching Delta's canChangeDataType-first ordering). When a prior schema IS available
                 // (an overwriteSchema replacement) the #619 pre-pass already handled drops/renames and COMPATIBLE

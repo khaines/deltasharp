@@ -753,7 +753,7 @@ internal sealed class DeltaTableWriter
         // #616 (F10): refuse fail-closed if a surviving named CHECK still depends on the renamed field (its
         // predicate would no longer resolve against the post-rename schema — a dangling-CHECK brick). The
         // enforcer resolves each CHECK's user SQL against the post-ALTER schema, so a NESTED reference
-        // (address.zip) surfaces as UnresolvedStructField → DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE.
+        // (address.zip) surfaces as NoSuchStructField → DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE.
         EnsureNoDependentConstraints(snapshot, renamedSchema, constraintEnforcer, "ALTER TABLE RENAME COLUMN");
 
         return await CommitSchemaChangeAsync(snapshot, renamedSchema, updatedPartitions, cancellationToken)
@@ -824,7 +824,7 @@ internal sealed class DeltaTableWriter
 
         // #616 (F10): refuse fail-closed if a surviving named CHECK still depends on the dropped field — the
         // enforcer resolves each CHECK's user SQL against the post-drop schema, so a nested reference is
-        // caught (UnresolvedStructField → DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE).
+        // caught (NoSuchStructField/InvalidExtractBase → DELTA_CONSTRAINT_DEPENDENT_COLUMN_CHANGE).
         EnsureNoDependentConstraints(snapshot, droppedSchema, constraintEnforcer, "ALTER TABLE DROP COLUMN");
 
         return await CommitSchemaChangeAsync(snapshot, droppedSchema, partitionColumns: null, cancellationToken)
