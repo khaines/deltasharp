@@ -275,7 +275,8 @@ internal static class DeltaSchemaEnforcer
         // here (each carrying its Delta `fieldPath`) so they attach to THIS field's metadata below (#546).
         var nestedChanges = new List<NestedTypeChange>();
         DataType mergedType = MergeType(
-            tableField.DataType, writeField.DataType, mode, path, typeWideningEnabled, depth, nestedChanges);
+            tableField.DataType, writeField.DataType, mode, path, typeWideningEnabled, depth,
+            fieldPathPrefix: null, nestedChanges);
 
         if (tableField.DataType.Equals(mergedType))
         {
@@ -312,6 +313,7 @@ internal static class DeltaSchemaEnforcer
         string path,
         bool typeWideningEnabled,
         int depth,
+        string? fieldPathPrefix,
         List<NestedTypeChange>? nestedChanges)
     {
         if (tableType.Equals(writeType))
@@ -336,18 +338,19 @@ internal static class DeltaSchemaEnforcer
                     throw DeltaSchemaMismatchException.NullabilityViolation(path + ".element");
                 }
 
-                // The element is one level deeper. A scalar element widening at a TOP-LEVEL array column is
-                // APPLIED and recorded on the enclosing field with `fieldPath` = "element" (#546); a deeper
-                // (nested-within-nested) element widening stays fail-closed.
+                // The element is one level deeper. A scalar element widening at ANY depth is APPLIED (585b
+                // lifted the depth cap) and recorded on the enclosing field with the accumulated `fieldPath`
+                // chain — `Combine(prefix, "element")` (e.g. "element" at depth 1, "element.element" at
+                // depth 2), oldest-/outermost-first (#546 base, #860 chain).
                 DataType mergedElement = MergeCollectionElement(
                     tableArray.ElementType, writeArray.ElementType, mode, path + ".element",
-                    typeWideningEnabled, depth + 1, "element", nestedChanges);
+                    typeWideningEnabled, depth + 1, Combine(fieldPathPrefix, "element"), nestedChanges);
                 return new ArrayType(mergedElement, tableArray.ContainsNull);
 
             case (MapType tableMap, MapType writeMap):
                 DataType mergedKey = MergeCollectionElement(
                     tableMap.KeyType, writeMap.KeyType, mode, path + ".key",
-                    typeWideningEnabled, depth + 1, "key", nestedChanges);
+                    typeWideningEnabled, depth + 1, Combine(fieldPathPrefix, "key"), nestedChanges);
                 if (!tableMap.ValueContainsNull && writeMap.ValueContainsNull)
                 {
                     throw DeltaSchemaMismatchException.NullabilityViolation(path + ".value");
@@ -355,7 +358,7 @@ internal static class DeltaSchemaEnforcer
 
                 DataType mergedValue = MergeCollectionElement(
                     tableMap.ValueType, writeMap.ValueType, mode, path + ".value",
-                    typeWideningEnabled, depth + 1, "value", nestedChanges);
+                    typeWideningEnabled, depth + 1, Combine(fieldPathPrefix, "value"), nestedChanges);
                 return new MapType(mergedKey, mergedValue, tableMap.ValueContainsNull);
 
             default:
@@ -401,15 +404,17 @@ internal static class DeltaSchemaEnforcer
 
     // Merges a collection leaf — an array <c>element</c> or a map <c>key</c>/<c>value</c> — one level inside a
     // container. A SCALAR leaf may have a schema-evolution-eligible widening APPLIED when the feature is
-    // enabled AND it sits at a top-level collection column (<paramref name="elementDepth"/> ≤ 1); the applied
-    // change is recorded on the ENCLOSING field's `delta.typeChanges` with <paramref name="fieldPath"/>
-    // (`"element"`/`"key"`/`"value"`, Delta PROTOCOL.md "Type Change Metadata") via
-    // <paramref name="nestedChanges"/> (#546). A NON-widening scalar change stays fail-closed exactly as the
-    // scalar path (TypeWideningUnsupported for a would-be/deferred widening, IncompatibleType otherwise). A
-    // NESTED leaf (struct/array/map — a nested-within-nested shape) recurses back through <see cref="MergeType"/>
-    // for additive-column evolution and nullability checks, but with widening DEFERRED (its scalar arm rejects
-    // a deep widening because <paramref name="elementDepth"/> ≥ 2), so nested-within-nested widening remains
-    // fail-closed — matching #571's reader, which cannot promote it.
+    // enabled AT ANY DEPTH (585b lifted the #546 <c>elementDepth ≤ 1</c> cap); the applied change is recorded
+    // on the ENCLOSING field's `delta.typeChanges` with the accumulated <paramref name="fieldPath"/> chain
+    // (`"element"` / `"key"` / `"value"` tokens joined by `.`, outermost-first — Delta PROTOCOL.md "Type Change
+    // Metadata") via <paramref name="nestedChanges"/> (#546 base, #860 chain). A NON-widening scalar change
+    // stays fail-closed exactly as the scalar path (TypeWideningUnsupported for a would-be widening,
+    // IncompatibleType otherwise). A NESTED leaf (struct/array/map — a nested-within-nested shape) recurses
+    // back through <see cref="MergeType"/>, threading the accumulated <paramref name="fieldPath"/> as the new
+    // prefix AND the SAME <paramref name="nestedChanges"/> accumulator, so a deeper array/map interior widening
+    // accumulates its full chain rather than being dropped (585b). A struct child re-enters
+    // <see cref="MergeStruct"/> → <see cref="MergeField"/>, which starts a FRESH fieldPath namespace and
+    // records the child's own change on the inner StructField (no `fieldPath`).
     private static DataType MergeCollectionElement(
         DataType tableType,
         DataType writeType,
@@ -427,14 +432,16 @@ internal static class DeltaSchemaEnforcer
 
         if (tableType is StructType or ArrayType or MapType || writeType is StructType or ArrayType or MapType)
         {
-            // A nested-within-nested leaf: recurse for additive evolution / nullability only. Widening is
-            // deferred (the scalar arm rejects it at elementDepth ≥ 2), and any leaf change it does apply
-            // (a new nested-struct field) attaches to the deeper StructField directly, not via nestedChanges.
+            // A nested-within-nested leaf: recurse, threading the accumulated fieldPath chain as the new prefix
+            // AND the SAME nestedChanges accumulator so a deeper array/map interior widening records its full
+            // chain instead of being dropped (585b). A struct child re-enters MergeField (fresh accumulator),
+            // so its own change attaches to the deeper StructField directly, excluded from any ancestor chain.
             return MergeType(
-                tableType, writeType, mode, path, typeWideningEnabled, elementDepth, nestedChanges: null);
+                tableType, writeType, mode, path, typeWideningEnabled, elementDepth,
+                fieldPathPrefix: fieldPath, nestedChanges: nestedChanges);
         }
 
-        if (elementDepth <= 1 && typeWideningEnabled && TypeWidening.IsSchemaEvolutionWidening(tableType, writeType))
+        if (typeWideningEnabled && TypeWidening.IsSchemaEvolutionWidening(tableType, writeType))
         {
             nestedChanges?.Add(new NestedTypeChange(fieldPath, tableType, writeType));
             return writeType;

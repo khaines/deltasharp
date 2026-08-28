@@ -1,40 +1,43 @@
 # Nested-within-nested Parquet support — recursive decode (585a) + depth&gt;1 widening (585b)
 
-> **Status:** Draft — **decomposed into two sub-increments.** Issue
-> [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:open --> is **size:XL** and the
-> implement-work-item skill rejects XL, so this design splits it into two clearly-delineated, independently
-> shippable increments:
+> **Status:** 585a **shipped** (PR #856); 585b **BUILD-READY** (#546 merged, PR #864 — this worktree off
+> `2002540`). Issue [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:closed -->
+> was **size:XL** and the implement-work-item skill rejects XL, so this design splits it into two
+> clearly-delineated, independently shippable increments:
 >
 > - **585a — recursive DECODE (buildable NOW, off `origin/main`).** Scope items 1, 3 (fail-closed parity),
 >   4 (tests). Extends `NestedParquetColumnReader`'s rep/def reassembly to arbitrary nesting depth
 >   (recursive container reconstruction into the [#570](https://github.com/khaines/deltasharp/issues/570) <!-- issue-state:closed -->
 >   nested `ColumnVector`s), lifting the `EnsureReadSupported` / `ValidateShape` nested-within-nested reject
 >   for READ. **Does NOT depend on #546.**
-> - **585b — depth&gt;1 WIDENING (BLOCKED on the still-OPEN [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:open -->).**
->   Scope item 2. Extends #546's per-leaf widening + `fieldPath` emission (`DeltaSchemaEnforcer`) to leaves
->   at depth &gt; 1 with the correct nested `fieldPath` chain (`element`, `key`, `value`, …) per Delta
->   PROTOCOL.md "Type Change Metadata". **#546 (nested array-element/map key-value widening at depth ≤ 1) is
->   OPEN**, so **585b is deferred until #546 merges** — this design specifies it as the *next* increment
->   **without implementing it**.
+> - **585b — depth&gt;1 WIDENING (UNBLOCKED — [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:closed -->
+>   MERGED, PR #864).** Scope item 2. Extends #546's per-leaf widening + `fieldPath` emission
+>   (`DeltaSchemaEnforcer`) + read-promotion (`NestedParquetColumnReader`) to leaves at depth &gt; 1 with the
+>   correct nested `fieldPath` **chain** (`element`, `key`, `value`, … joined by `.`) per Delta PROTOCOL.md
+>   "Type Change Metadata". #546 merged into `origin/main` (this worktree branches off `2002540`), so **585b
+>   is now BUILD-READY** — §2.5 is a build-ready design reconciled against the ACTUAL merged #546 code, not a
+>   forward-looking spec. Tracked as [#860](https://github.com/khaines/deltasharp/issues/860) <!-- issue-state:open -->
+>   (585 auto-closed on 585a's merge; 585b needs its own tracking issue).
 >
-> **Rollout sequencing (§8):** 585a ships now, off `origin/main`; 585b lands after #546 merges. The design
-> covers both; only 585a is buildable today.
+> **Rollout sequencing (§8):** 585a shipped (PR #856). 585b is buildable now that #546 is merged; it is
+> feature-gated behind the existing `typeWidening` table feature (§8).
 >
-> **Issue:** [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:open --> — increment 3
-> follow-up to [#571](https://github.com/khaines/deltasharp/issues/571) <!-- issue-state:closed --> (single-level
-> nested decode) and #546 (nested widening). Tracked from the #546 GO report (deferral 1).
+> **Issue:** [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:closed --> (585a; 585
+> auto-closed on merge) — 585b tracked as [#860](https://github.com/khaines/deltasharp/issues/860) <!-- issue-state:open -->,
+> increment 3 follow-up to [#571](https://github.com/khaines/deltasharp/issues/571) <!-- issue-state:closed -->
+> (single-level nested decode) and #546 (nested widening). Tracked from the #546 GO report (deferral 1).
 > **Author:** delta-storage-format-engineer (orchestrated).
 > **Reviewers:** delta-storage-format-engineer, dotnet-vectorized-columnar-compute-engineer,
 > reliability-test-chaos-engineer, cloud-native-security-sme, cloud-native-site-reliability-engineer.
-> **Last Updated:** 2026-08-21.
+> **Last Updated:** 2026-08-27 (585b promoted to BUILD-READY, reconciled to merged #546 code).
 > **Related:** #570 (nested `ColumnVector`s — the recursion target), #571/#584 (single-level nested decode
 > — the reassembly 585a generalizes), #834/#842 (single-level nested **write** — the depth-2 fixture writer),
-> [#676](https://github.com/khaines/deltasharp/issues/676) <!-- issue-state:open --> (nested column mapping —
-> the parallel nested surface), #546 (nested widening depth ≤ 1 — **585b's blocking dependency**),
+> [#676](https://github.com/khaines/deltasharp/issues/676) <!-- issue-state:closed --> (nested column mapping —
+> the parallel nested surface), #546 (nested widening depth ≤ 1 — **585b's base, MERGED**),
 > [#535](https://github.com/khaines/deltasharp/issues/535) <!-- issue-state:closed --> (type-widening
 > read-promotion — the allowlist 585b reuses), #730 (nullability→repetition), #813 (required-nested-leaf null
-> reject), [#839](https://github.com/khaines/deltasharp/issues/839) <!-- issue-state:open --> (array/map
-> id-mode nested — adjacent, out of scope).
+> reject), [#839](https://github.com/khaines/deltasharp/issues/839) <!-- issue-state:closed --> (array/map
+> id-mode nested — adjacent, out of scope; **fail-closed contract PRESERVED**).
 
 ---
 
@@ -60,7 +63,7 @@ This design lifts both restrictions, **decomposed** so the XL issue ships in two
 | Increment | Scope items | Depends on | Buildable |
 |---|---|---|---|
 | **585a — recursive DECODE** | 1 (recursive reassembly), 3 (fail-closed parity), 4 (decode tests) | #570/#571/#584 (**closed/merged**), #834/#842 write path for depth-2 fixtures | **Yes, now, off `origin/main`** |
-| **585b — depth&gt;1 WIDENING** | 2 (per-leaf widening + nested `fieldPath` at depth &gt; 1) | **#546 (OPEN)** | **No — deferred until #546 merges** |
+| **585b — depth&gt;1 WIDENING** | 2 (per-leaf widening + nested `fieldPath` at depth &gt; 1) | **#546 (MERGED, PR #864)** | **Yes — BUILD-READY off `2002540`** |
 
 **Why 585a is unblocked.** The recursive decode target — the #570 nested vectors — already represents
 arbitrary depth: `ListColumnVector.Elements`, `MapColumnVector.Keys`/`Values`, and
@@ -78,13 +81,15 @@ are hard-wired to the top repeated level and mis-decode nested repeated levels (
 and risk framing (§8) reflects that: 585a is a targeted rewrite of the repeated-container counter, not a pure
 parameter-threading generalization.
 
-**Why 585b is blocked.** 585b extends #546's per-leaf widening + `fieldPath` emission (`DeltaSchemaEnforcer`,
-`TypeWidening`) to depth &gt; 1. #546 is the increment that (a) threads `allowWidenApply` through the
-array/map arms of `MergeType`, and (b) teaches `AppendTypeChange` to emit a `fieldPath` for a
-collection-interior widening. That machinery does not exist on `origin/main` today (`MergeType` passes
-`allowWidenApply: false` into every array/map arm — `DeltaSchemaEnforcer.cs:306/318/324`; `AppendTypeChange`
-omits `fieldPath` entirely — `:391-393`). 585b has nothing to extend until #546 merges. **This design
-specifies 585b (§2.5) so the next increment is well-defined, but does not design it as buildable now.**
+**Why 585b is now UNBLOCKED (#546 MERGED, PR #864).** 585b extends #546's per-leaf widening + `fieldPath`
+emission (`DeltaSchemaEnforcer`) and read-promotion (`NestedParquetColumnReader`) to depth &gt; 1. #546 —
+now on `origin/main` (this worktree is off `2002540`) — delivered (a) the `List<NestedTypeChange>? nestedChanges`
+accumulator threaded through `MergeType`'s array/map arms (via `MergeCollectionElement`) recording a
+single-token `fieldPath`, and (b) the `promoteLeaf`-gated, **depth-agnostic** read-promotion arm
+(`ValidateLeafPhysicalType`/`ReadScalarLeafAsync`). 585b is a **narrow gate-lift + fieldPath-chain
+accumulation** over that machinery — three enforcer edits + four reader gate-lifts (§2.5), **not** a
+re-implementation. *(Note: the earlier SPEC-ONLY framing described the base as an `allowWidenApply` boolean and
+put read-promote in `ParquetFileReader.cs`; both were drifted — see the §2.5 spec-vs-code reconciliation.)*
 
 **Requirements traceability:** EPIC-05 nested Parquet support (`storage-delta-architecture.md` §2.9).
 **Scope boundary (explicit):** 585a lifts the nested-within-nested READ reject for the shapes the #570
@@ -272,8 +277,10 @@ instead:
   recursively.
 - A **non-canonical map** (`key_value` children not exactly named `key`/`value`, or a nullable key) at any
   depth — the transposition guard, applied recursively (§2.6).
-- **Widening** of any nested leaf — `ValidateLeafPhysicalType` (`:1298`) stays an **exact** physical-type
-  match at every depth (no promotion). Enabling promotion at nested leaves is **585b** (§2.5).
+- **Widening** of any nested leaf — under 585a, `ValidateLeafPhysicalType` (`:2286`) stays an **exact**
+  physical-type match at every depth because `promoteLeaf` is gated to depth ≤ 1 (`ValidateChild:250`);
+  **585b lifts that gate** to enable promotion at nested leaves (§2.5). *(Line ref reconciled: the
+  merged code places `ValidateLeafPhysicalType` at `:2286`, not the earlier draft's `:1298`.)*
 - Any schema nesting **deeper than the recursion-depth bound** `MaxNestedReadDepth` (§2.6) — fail closed
   `UnsupportedFeature` (never a stack-overflow crash).
 - The #570 vectors represent every finite-depth `struct`/`array`/`map` tree of the enabled scalars (§2.7), so
@@ -385,58 +392,205 @@ vector is `[7, null, 9]` with a per-leaf null mask marking index 1. The **four-w
 -parameterized (or single-pass) reconstruction yields it; the released `BuildRepeatedStructure` fails at
 both levels.
 
-### 2.5 585b — depth&gt;1 widening (SPEC ONLY; deferred until #546 merges)
+### 2.5 585b — depth&gt;1 widening (BUILD-READY; [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:closed --> MERGED)
 
-> **585b is BLOCKED on [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:open -->
-> and is NOT buildable now.** This section specifies the *next* increment so the boundary is well-defined; it
-> is intentionally not a build-ready design.
+> **585b is UNBLOCKED and BUILD-READY.** #546 merged (PR #864) into `origin/main` (this worktree is off
+> `2002540`). This section is reconciled against the **actual merged #546 code** — the earlier SPEC-ONLY line
+> references had drifted (see the **Spec-vs-code reconciliation** callout below). Tracked as
+> [#860](https://github.com/khaines/deltasharp/issues/860) <!-- issue-state:open -->.
 
-**What #546 delivers (the base 585b extends).** #546 enables type-widening at container **depth ≤ 1**:
-- **Append-apply.** `DeltaSchemaEnforcer.MergeType` (`:280+`) threads `allowWidenApply` into the array/map
-  arms so a sanctioned same-family widening of a **direct** element/key/value scalar of a top-level
-  container evolves the table schema, and `AppendTypeChange` (`:388+`) emits a `delta.typeChanges` entry
-  **with a `fieldPath`** naming the collection interior (today it omits `fieldPath` and applies only to a
-  `StructField`'s own scalar type — `:391-393`).
-- **Read-promote.** The scan path promotes a physically-narrower nested leaf to the requested wider type at
-  depth ≤ 1, reusing `TypeWidening.IsSanctionedWidening` + the decimal-fit guard
-  (`ParquetFileReader.cs:1741/2089`).
+**What #546 actually delivered (the base 585b extends), reconciled to merged code.** #546 enables
+type-widening at container **depth ≤ 1** via two halves:
 
-**What 585b adds.** Extend both to **leaves at depth &gt; 1**:
-1. **Nested `fieldPath` chain (Delta PROTOCOL.md "Type Change Metadata").** A `delta.typeChanges` entry for a
-   collection-interior widening carries a `fieldPath` that navigates from the enclosing `StructField` to the
+- **Append-apply (`DeltaSchemaEnforcer.cs`).** The applied-widening plumbing is **not** a boolean
+  `allowWidenApply` (the pre-#546 spec's name) — it is a `List<NestedTypeChange>? nestedChanges` **accumulator**
+  threaded through `MergeType` (`:308`) into the array/map arms via `MergeCollectionElement` (`:413`). A
+  `NestedTypeChange` (`:157`) is a `readonly record struct (string FieldPath, DataType From, DataType To)`.
+  `MergeCollectionElement` applies a sanctioned same-family widening of a **direct** element/key/value scalar
+  of a top-level container and records it with a **single** `fieldPath` token, but only under the
+  `elementDepth <= 1` gate (`:437`); a **nested-within-nested** interior leaf recurses back through
+  `MergeType(..., nestedChanges: null)` (`:433`), so any deeper change is **dropped** (fail-closed at the
+  `elementDepth <= 1` scalar gate → `TypeWideningUnsupported`). `MergeField` (`:262`) drains `nestedChanges`
+  into the enclosing field's metadata via `AppendTypeChange(existing, from, to, string? fieldPath)` (`:486`),
+  which already emits `"fieldPath"` when non-null (`:494-496`). A struct field's own scalar widening is
+  recorded on the `StructField` directly with `fieldPath: null` (`MergeField:295`).
+- **Read-promote (`NestedParquetColumnReader.cs`, NOT `ParquetFileReader.cs`).** #546's nested read-promotion
+  landed in the **nested** reader (the flat `ParquetFileReader` handles only top-level scalar columns).
+  `ValidateLeafPhysicalType` (`:2286`) **already has** a `promoteLeaf`-gated widening-tolerant arm
+  (`:2289-2292`), and `ReadScalarLeafAsync` (`:1129`) **already has** the per-leaf value-promotion logic
+  (`:1138-1145`, delegating to `ReadPromotedLeafAsync`) — both reusing `TypeWidening.IsSanctionedWidening`
+  (incl. the integral→decimal fit guard) exactly as the flat path does. Promotion is **gated by a composed
+  `promoteLeaf`**: `allowTypeWideningPromotion && depth <= 1` on the validate side (`ValidateChild:250`) and
+  `allowTypeWideningPromotion && depth == 0 && byFieldId is null` on the decode side (`DecodeStruct:521`,
+  `DecodeList:716`, `DecodeMap:804`). Both encodings mean the same thing — *a leaf directly under a single
+  top-level container* (validate `depth` is the child's own container depth, decode `depth` is the container's
+  own depth; child-depth `≤ 1` ⇔ container-depth `== 0`).
+
+> **⚠ Spec-vs-code reconciliation (drift the earlier SPEC-ONLY §2.5 got wrong — verified in this worktree).**
+> | Earlier §2.5 / §10 claim | Actual merged #546 code |
+> |---|---|
+> | Read-promote lives in `ParquetFileReader.cs:1741/2089` | Nested read-promote lives in `NestedParquetColumnReader.cs` (`ValidateLeafPhysicalType:2286`, `ReadScalarLeafAsync:1129`, `ReadPromotedLeafAsync`); `ParquetFileReader` is the **flat** path only |
+> | 585a keeps `ValidateLeafPhysicalType` EXACT; 585b must **add** a widening-tolerant arm | The widening-tolerant arm **already exists** (`:2289-2292`), `promoteLeaf`-gated and **depth-agnostic**. 585b does **not** add an arm — it only **lifts the gate** feeding `promoteLeaf` |
+> | Applied-widening plumbing is a boolean `allowWidenApply` | It is a `List<NestedTypeChange>? nestedChanges` accumulator + single-token `fieldPath`; there is no `allowWidenApply` symbol |
+> | `AppendTypeChange` "omits `fieldPath` entirely" and must gain a `fieldPath` param | `AppendTypeChange(…, string? fieldPath)` **already** emits `fieldPath`; `NestedTypeChange` already carries it. **No signature change is needed** — a chain like `element.element` is just a longer string |
+> | `ValidateLeafPhysicalType:1298`, `MergeType:280`, `AppendTypeChange:388` | Drifted line refs → `:2286`, `:308`, `:486` (this worktree); the id-mode fail-closed contract (below) was not mentioned at all |
+
+**What 585b adds — the delta over merged #546.** Because the widening *machinery* (allowlist, value
+promotion, `fieldPath` emission, `NestedTypeChange`) already exists and is depth-agnostic, 585b is a **narrow
+gate-lift + fieldPath-chain accumulation**, not new machinery:
+
+1. **The `fieldPath` chain (Delta PROTOCOL.md "Type Change Metadata").** A `delta.typeChanges` entry for a
+   collection-interior widening carries a `fieldPath` navigating from the enclosing `StructField` to the
    widened leaf using the fixed tokens **`element`** (array element), **`key`** (map key), **`value`** (map
-   value), joined by `.`, oldest change first. Struct fields do **not** appear in `fieldPath` — a struct
-   child gets its **own** `delta.typeChanges` on its `StructField` (no path). Examples:
+   value), joined by `.`, **oldest-first / outermost-first**. Struct fields never appear in a `fieldPath` — a
+   struct child re-enters `MergeField`, which starts a **fresh** `fieldPath` namespace and records the child's
+   own change on the inner `StructField` (no path). The token table (verified against the merge trace below):
 
-   | Column type | Widened leaf | `fieldPath` |
-   |---|---|---|
-   | `array<array<int→long>>` | inner element | `element.element` |
-   | `map<string, array<int→long>>` | array value's element | `value.element` |
-   | `array<map<string, int→long>>` | map element's value | `element.value` |
-   | `map<map<int→long, string>, string>` | key-map's key | `key.key` |
-   | `struct<xs: array<int→long>>` | `xs` element | `element` **on the `xs` StructField's typeChanges** |
+   | Column type | Widened leaf | `fieldPath` | Attached to |
+   |---|---|---|---|
+   | `array<array<int→long>>` | inner element | `element.element` | the array field |
+   | `map<string, array<int→long>>` | value-array element | `value.element` | the map field |
+   | `array<map<string, int→long>>` | element-map value | `element.value` | the array field |
+   | `map<array<int→long>, string>` | key-array element (map **key** widened) | `key.element` | the map field |
+   | `array<map<int→long, string>>` | element-map key (map **key** widened) | `element.key` | the array field |
+   | `array<array<array<int→long>>>` (depth-3) | innermost element | `element.element.element` | the array field |
+   | `map<string, array<array<int→long>>>` (depth-3) | inner-inner element | `value.element.element` | the map field |
+   | `struct<xs: array<int→long>>` | `xs` element | `element` | the **`xs`** StructField |
+   | `array<struct<a: int→long>>` | element-struct field `a` | *(none — `fieldPath: null`)* | the inner **`a`** StructField |
 
-   585b builds the `fieldPath` by accumulating the `element`/`key`/`value` token at each array/map arm of the
-   recursive `MergeType` descent, and emits it via a `fieldPath`-aware `AppendTypeChange` (the #546 signature
-   extension — a `string? fieldPath` parameter — extended to a **chain**, not a single token).
-2. **Allowlist + decimal-fit reuse (unchanged).** 585b changes only **where** widening applies (deeper
-   leaves) and the **fieldPath** emitted. The eligibility predicates are reused verbatim:
-   `TypeWidening.IsSchemaEvolutionWidening` (append-apply subset) and `TypeWidening.IsSanctionedWidening`
-   (read-promote superset) — `TypeWidening.cs:174/53` — including the grow-only-decimal fit guard. No new
-   widening is sanctioned; a cross-family or non-fitting change at any depth still fails closed
-   `TypeWideningUnsupported`.
-3. **Read-promote at nested leaves.** `ValidateLeafPhysicalType` (`NestedParquetColumnReader.cs:1298`), which
-   585a keeps **exact**, gains a widening-tolerant arm mirroring the flat `IsSanctionedWidening` gate, so a
-   physically-narrower nested-within-nested leaf promotes to the requested wider type during recursive
-   decode. **585a decode + 585b promotion compose cleanly:** 585a reconstructs the nested structure with
-   exact-typed leaves; 585b relaxes the per-leaf type match to the allowlist and inserts the same value
-   promotion the flat path uses.
+   > **Note (map-key chains).** Map **key** widening is sanctioned (mirroring #546's top-level
+   > `Reconcile_MapKeyWidening`, `fieldPath="key"`), so `key`-prefixed chains are valid — but a `key.key` chain
+   > (a map whose key is itself a map) is **unreachable**: DeltaSharp's `MapType` prohibits a map-typed key
+   > (`SchemaValidationException: Map key type 'map' is not supported`). The constructible depth-2 map-key
+   > chains are therefore `key.element` (`map<array<int→long>,string>`) and `element.key`
+   > (`array<map<int→long,string>>`), both exercised in §3.2.
 
-**The dependency edge.** 585b's append-apply half **cannot be built until #546 lands** because it extends
-#546's `allowWidenApply` plumbing and `fieldPath`-aware `AppendTypeChange`; on `origin/main` those don't
-exist (`MergeType` passes `allowWidenApply: false` into every array/map arm, `AppendTypeChange` emits no
-`fieldPath`). Attempting 585b first would mean re-implementing #546 inside 585b — a scope merge the
-decomposition exists to avoid. **585b is therefore sequenced strictly after #546 (§8).**
+2. **Allowlist + decimal-fit reuse (verbatim, NO new sanction).** The eligibility predicates are unchanged:
+   `TypeWidening.IsSchemaEvolutionWidening` (`:174`, append-apply subset — same-family + `date→timestamp_ntz`)
+   and `TypeWidening.IsSanctionedWidening` (`:53`, read-promote superset — adds cross-family #535), including
+   the grow-only-decimal / integral→decimal fit guard. 585b changes only **where** widening applies (any
+   depth) and the **fieldPath** emitted (a chain). A cross-family or non-fitting change at any depth still
+   fails closed `TypeWideningUnsupported`; a truly-unrelated change still fails `IncompatibleType`.
+
+**The fieldPath-chain accumulation algorithm (append half).** Thread an accumulated prefix through
+`MergeType` and combine one token per array/map descent; the struct boundary resets it:
+
+```
+Combine(prefix, token) = prefix is null ? token : prefix + "." + token   // "." join, outermost-first
+
+MergeField(tableField, writeField, depth):
+    nestedChanges = []                                  // FRESH per StructField ⇒ struct children excluded from any ancestor chain
+    merged = MergeType(tableField.DataType, writeField.DataType, depth,
+                       fieldPathPrefix: null, nestedChanges)     // this field roots its OWN fieldPath namespace
+    ...
+    if scalar→scalar: AppendTypeChange(meta, from, merged, fieldPath: null)   // struct field's own change, no path
+    else: foreach c in nestedChanges: AppendTypeChange(meta, c.From, c.To, c.FieldPath)
+
+MergeType(table, write, depth, fieldPathPrefix, nestedChanges):
+    case (Struct, Struct):  return MergeStruct(fieldDepth: depth+1)          // NO prefix propagation — struct resets (each child = fresh MergeField)
+    case (Array,  Array):   elementPath = Combine(fieldPathPrefix, "element")
+                            return MergeCollectionElement(elem, depth+1, fieldPath: elementPath, nestedChanges)
+    case (Map,    Map):     keyPath   = Combine(fieldPathPrefix, "key")
+                            valuePath = Combine(fieldPathPrefix, "value")
+                            return MergeCollectionElement(key,   depth+1, fieldPath: keyPath,   nestedChanges) , …value…
+    default (scalar/kind-mismatch): existing depth<=1 gate UNCHANGED (governs pure struct-nested scalars, see D9)
+
+MergeCollectionElement(table, write, elementDepth, fieldPath, nestedChanges):
+    if table.Equals(write): return table
+    if nested-container(Struct|Array|Map):
+        return MergeType(table, write, elementDepth,
+                         fieldPathPrefix: fieldPath,        // 585b: was implicitly none — thread the accumulated chain as the new prefix
+                         nestedChanges: nestedChanges)      // 585b: was `null` — thread the SAME accumulator (deep changes no longer dropped)
+    if typeWideningEnabled && IsSchemaEvolutionWidening(table, write):     // 585b: dropped the `elementDepth <= 1 &&` cap
+        nestedChanges?.Add(new NestedTypeChange(fieldPath, table, write))  // fieldPath is now the FULL chain
+        return write
+    if IsSanctionedWidening(table, write): throw TypeWideningUnsupported     // reused verbatim
+    throw IncompatibleType                                                   // reused verbatim
+```
+
+Worked trace — `array<array<int→long>>`: `MergeField(depth=0)` → `MergeType(prefix=null)` → Array arm
+`elementPath = "element"` → `MergeCollectionElement(fieldPath="element", elementDepth=1)` → nested container →
+`MergeType(prefix="element")` → inner Array arm `elementPath = Combine("element","element") = "element.element"`
+→ `MergeCollectionElement(fieldPath="element.element", elementDepth=2)` → scalar, gate lifted → records
+`NestedTypeChange("element.element", int, long)`. `struct<xs: array<int→long>>`: the top struct routes through
+`MergeStruct`→`MergeField(xs, prefix=null)`, so `xs`'s element chain restarts at `"element"` and attaches to
+the **`xs`** StructField (the struct boundary excludes it from any outer chain). ✔ matches the table.
+
+**Exact enforcer changes (`DeltaSchemaEnforcer.cs`) — three edits, no signature change to `AppendTypeChange`/`NestedTypeChange`:**
+
+| # | Site | Change |
+|---|---|---|
+| E1 | `MergeType` (`:308`) + its call in `MergeField` (`:277`) | Add a `string? fieldPathPrefix` parameter (passed `null` at the `MergeField` call site). In the **Array** arm (`:342`) pass `fieldPath: Combine(prefix, "element")`; in the **Map** arm (`:348/:356`) pass `Combine(prefix, "key")`/`Combine(prefix, "value")`. **Struct** arm (`:333`) unchanged (resets via `MergeStruct`→`MergeField`). Default scalar arm (`:380`) `depth <= 1` gate **unchanged** (D9). |
+| E2 | `MergeCollectionElement` nested-container branch (`:433`) | Change `MergeType(..., nestedChanges: null)` → `MergeType(..., fieldPathPrefix: fieldPath, nestedChanges: nestedChanges)` — thread the accumulated chain **and** the same accumulator (deep changes accumulate instead of being dropped). |
+| E3 | `MergeCollectionElement` scalar apply gate (`:437`) | Lift `elementDepth <= 1 && typeWideningEnabled && IsSchemaEvolutionWidening(...)` → `typeWideningEnabled && IsSchemaEvolutionWidening(...)`. `elementDepth` stays a parameter (still forwarded as `MergeType`'s `depth` in E2). The recorded `NestedTypeChange` now carries the full chain string. `AppendTypeChange`/`NestedTypeChange`/`MergeField`'s drain loop are **unchanged**. |
+
+**Exact reader changes (`NestedParquetColumnReader.cs`) — four one-token gate lifts; the widening arm + value promotion already exist:**
+
+| # | Site | Change |
+|---|---|---|
+| R1 | `ValidateChild` (`:250`) | `promoteLeaf = allowTypeWideningPromotion && depth <= 1` → `promoteLeaf = allowTypeWideningPromotion` (drop `&& depth <= 1`). |
+| R2 | `DecodeStruct` scalar child (`:521`) | `... && depth == 0 && byFieldId is null` → `... && byFieldId is null` (drop `&& depth == 0`). |
+| R3 | `DecodeList` scalar element (`:716`) | drop `&& depth == 0` (keep `&& byFieldId is null`). |
+| R4 | `DecodeMap` scalar key/value (`:804`) | drop `&& depth == 0` (keep `&& byFieldId is null`). |
+| R5 | **Driving-leaf reads** in `DecodeStruct` (struct-presence probe), `DecodeList`, `DecodeMap` (key + value) | **Implementation-discovered gap.** These read a *discarded* driving leaf for its def/rep **structure only**, previously at `FirstScalarType(requested.X)` — the *requested* (now possibly **widened**) first-scalar type. Under 585b a widened deep leaf makes `requested` (e.g. `long`) differ from the narrow physical leaf (`int`), so a driving read at the requested wide type would **fault the raw typed decode**. Fix: read each driving leaf at its **own physical type** (`ParquetTypeMapping.ToDataType(drivingLeaf)`) with `promoteLeaf: false` — def/rep are type-agnostic, so structure is identical and no promotion/fault occurs. `FirstScalarType` is removed (its only callers were these driving reads). |
+
+`ValidateLeafPhysicalType`'s widening arm (`:2289-2292`), `ReadScalarLeafAsync`'s value promotion
+(`:1138-1145`), and `ReadPromotedLeafAsync` are **reused verbatim** — they are already `promoteLeaf`-gated and
+depth-agnostic (the value path already threads the correct `presentFloor` for a nested element, `:728`). Once
+`promoteLeaf` is `true` at a deep leaf, promotion Just Works: 585a rebuilds the structure, 585b relaxes the
+per-leaf exact-match to the allowlist and inserts the **same** value promotion the depth≤1 path uses. The
+**driving-leaf reads (R5)** are the one place the widened `requested` type leaks into a structural read, so they
+must read at the physical type — the rest of the promotion machinery is untouched.
+
+**PRESERVED — the id-mode fail-closed contract (do NOT wire id-mode nested-leaf promotion; #546 §9 O1 /
+[#839](https://github.com/khaines/deltasharp/issues/839) <!-- issue-state:closed -->, out of 585b scope).**
+The reader gate lifts R1–R4 keep the `&& byFieldId is null` conjunct, and every id-mode leaf site keeps
+`promoteLeaf: false` hardcoded — unchanged by 585b:
+- `ResolveStructFieldById` → `ValidateLeafPhysicalType(..., promoteLeaf: false)` (`:2031`); `DecodeStruct`'s
+  id-mode branch reads with `promoteLeaf: false` (`:436`).
+- id-mode array/map interior branches (`DecodeList:719`, `DecodeMap:834/:864`) and the up-front `…ById` interior
+  validators (`ValidateListShapeById`-family `:2173`, `ValidateMapShapeById`-family `:2196/:2199`) all pass
+  `promoteLeaf: false`.
+- Deeper name-mode recursion already nulls `byFieldId` (`DecodeStruct:505`, `DecodeList:690`, `DecodeMap:901/:907`),
+  so `&& byFieldId is null` is only decisive at the top-level entry: an id-mode column never promotes at any
+  depth, a name-mode column now promotes at any depth. Id-mode nested-leaf widening remains a **deliberate
+  fail-closed non-promotion**, tracked elsewhere — an id-mode narrow leaf under a widened schema fails closed
+  `SchemaMismatch`, exactly as under #546.
+
+**Recursion-depth bound interaction (585a `MaxNestedReadDepth = 64`, §2.6).** 585b adds **no** new bound and
+**no** new recursion. Read-promotion is a per-leaf value decision taken *inside* the recursive decode that is
+already bounded by `MaxNestedReadDepth` (checked at `ValidateNode`/`DecodeNode` entry, `:141`/`:335`), so a
+leaf deeper than 64 fails closed `UnsupportedFeature` **before** any promotion is even considered. On the
+append side the merge walks the same log/footer-capped schema trees (§2.6). The chain string grows one token
+(`≤` `".value"`, 6 chars) per level, bounded by the same depth cap — no unbounded `fieldPath`.
+
+**Fail-closed parity at every depth (unchanged from 585a + reused #546 allowlist).** Every unsanctioned change
+stays fail-closed at every depth: cross-family on append (`IsSchemaEvolutionWidening` false → falls to
+`IsSanctionedWidening` → `TypeWideningUnsupported`), non-fitting decimal (fit guard inside the predicate),
+narrowing / cross-kind (`IncompatibleType`), and — critically — the **parity invariant**: the reader's
+name-mode gate lift is **uniform (any leaf, any depth)** while the enforcer only auto-applies array/map
+interior widenings, so **for a NAME-mode table reader coverage ⊇ enforcer coverage** — anything the enforcer
+commits is name-mode read-promotable, so 585b never mints an unreadable name-mode table (the failure mode §6
+calls out).
+
+> **⚠ id-mode caveat (pre-existing #546, tracked in [#870](https://github.com/khaines/deltasharp/issues/870)).**
+> The `reader ⊇ enforcer` invariant holds **only in name mode**. The enforcer receives only
+> `SchemaEvolutionMode`, never `ColumnMappingMode`, so it auto-applies a nested-collection widening regardless
+> of column-mapping mode — but an **id-mode** nested leaf is deliberately never read-promoted (`promoteLeaf:
+> false`, #839/#546 §9 O1). On an id-mode table with `typeWidening` enabled, the enforcer can therefore commit
+> a nested widening the id-mode reader fails closed on (an unreadable table for pre-widening files). This is
+> **pre-existing #546 behavior at depth 1** and is **not introduced by 585b**: 585b extends only name-mode
+> promotion to depth>1, and id-mode nested-within-nested shapes are rejected upstream (`UnsupportedFeature`),
+> so no *new* unreadable-table surface is added. The proper write-side guard (enforcer must not apply a nested
+> widening under id mode) is tracked in #870; 585b's read-side id-mode fail-closed is pinned by
+> `IdMode_Depth1_NarrowScalarLeaf_WideRequest_GateOpen_FailsClosed_SchemaMismatch`.
+
+**Cross-engine / protocol note (Delta PROTOCOL.md "Type Change Metadata").** The emitted `fieldPath` grammar —
+`element` / `key` / `value` tokens joined by `.`, struct fields excluded (they carry their own per-field
+`typeChanges`), outermost-first — is exactly Spark/Delta-Kernel's nested type-change path grammar, so a table
+DeltaSharp evolves at depth &gt; 1 round-trips through the log JSON (`SchemaJson` serialize/parse) and reads
+identically in Spark/Delta-Kernel. The end-to-end append test asserts the chain survives the log-JSON
+round-trip (§3.2), and the tokens match the protocol verbatim — no DeltaSharp-private path syntax.
 
 ### 2.6 Fail-closed parity, the recursion-depth bound, and recursive guards (585a)
 
@@ -518,10 +672,10 @@ remains a defense-in-depth backstop for the monotonicity/over-length cases).
 | #570 nested `ColumnVector`s (`Struct`/`List`/`Map`) | **CLOSED / merged** | recursion target — already represents arbitrary depth (§2.7) |
 | #571/#584 single-level nested decode | **CLOSED / merged (PR #584)** | the reassembly 585a generalizes: `BuildStructNullMask` + the leaf structural-level guards are already parameterized and reused verbatim; the repeated-container counter (`BuildRepeatedStructure`) is **rewritten** for ≥ 2 repeated ancestors (§2.2) |
 | #834/#842 single-level nested **write** | **merged (PR #842)** | writes depth-1 nested; **does not write depth-2**, so depth-2+ round-trip fixtures need a synthesized-footer harness (§3) |
-| #546 nested widening (depth ≤ 1) | **OPEN** | **585b's blocking dependency** — the `allowWidenApply` + `fieldPath` machinery 585b extends |
+| #546 nested widening (depth ≤ 1) | **CLOSED / merged (PR #864)** | **585b's base — now unblocked** — the `nestedChanges` accumulator + single-token `fieldPath` (`DeltaSchemaEnforcer`) and the `promoteLeaf`-gated widening arm (`NestedParquetColumnReader.ValidateLeafPhysicalType`/`ReadScalarLeafAsync`) 585b lifts to depth &gt; 1 |
 | #535 type-widening read-promotion | **CLOSED** | the `IsSanctionedWidening` allowlist + decimal-fit guard 585b reuses unchanged |
-| #676 nested column mapping | **OPEN (feature landed via PR #846; tracking issue open)** | parallel nested surface; nested-within-nested column-mapping stays out of scope |
-| #839 array/map id-mode nested | **OPEN** | adjacent id-mode deferral; not in 585a/585b scope |
+| #676 nested column mapping | **CLOSED (PR #846)** | parallel nested surface; nested-within-nested column-mapping stays out of scope |
+| #839 array/map id-mode nested | **CLOSED** | adjacent id-mode; 585b **preserves** the id-mode fail-closed non-promotion contract (§2.5, §9 O1) — not extended |
 
 ### 2.9 Tenant / storage-backend considerations
 
@@ -607,19 +761,90 @@ from disjoint value domains so a positional mis-bind cannot pass on equal values
     against a regression that lowers the read cap below the write cap and silently over-rejects deep
     writable schemas.
 
-### 3.2 · 585b — depth&gt;1 widening (SPECIFIED, PENDING #546)
+### 3.2 · 585b — depth&gt;1 widening (BUILD-READY; [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:closed --> MERGED)
 
-> These tests are **specified but marked `[Pending("#546")]`** — they are not authored until #546 merges and
-> 585b lands. They mirror the #546 increment-2 append/read suites, lifted to depth &gt; 1.
+> These tests are **buildable now** (`[Pending("#546")]` is removed — #546 merged). They mirror the #546
+> increment-2 append/read suites lifted to depth &gt; 1, and pin the discrepancy fixes (§2.5): the widening
+> machinery is reused verbatim, only the gate lifts and the `fieldPath` **chain** are new.
 
-- `Widen_ArrayOfArrayElement_IntToLong_AppendApplies_EmitsFieldPath_element_element`.
-- `Widen_MapValueArrayElement_IntToLong_EmitsFieldPath_value_element`.
-- `Widen_ArrayOfMapValue_IntToLong_EmitsFieldPath_element_value`.
-- `Widen_StructChildArrayElement_EmitsElementFieldPath_OnChildStructField`.
-- `ReadPromote_NarrowNestedLeaf_AtDepth2_PromotesToRequestedWiderType`.
-- `Widen_CrossFamily_AtDepth2_FailsClosed_TypeWideningUnsupported` (allowlist unchanged).
-- `Widen_DecimalGrowBeyondFit_AtDepth2_FailsClosed` (decimal-fit guard reused).
-- `TypeChanges_FieldPathChain_MatchesProtocolTokens` (`element`/`key`/`value`, struct children excluded).
+**Harness (585b).** Two mechanisms, mirroring #546's end-to-end pattern and 585a's depth-2 fixture harness:
+- **Append-apply / fieldPath cells** exercise the real write door two ways: (i) a unit assertion at
+  `DeltaSchemaEnforcer` (mirrors `DeltaSchemaEnforcerTests`) that merging the narrow + wide schemas yields the
+  widened merged schema **and** the enclosing field's `delta.typeChanges` carries the expected `fieldPath`
+  chain; (ii) an **end-to-end** append via the real `DeltaSchemaEvolutionWriter` (mirrors
+  `Append_WidenArrayElement_WhenFeatureEnabled_CommitsElementFieldPath_AndPromotesOnRead`,
+  `DeltaSchemaEvolutionWriterTests.cs:620`) that commits, reloads the log, and asserts the `fieldPath` chain
+  survives the `SchemaJson` serialize/parse round-trip — a genuine **write→read** through the writer/log even
+  though the depth-2 **data** file is authored by the synthesized-footer harness (the nested writer #834/#842
+  writes only depth-1; §3).
+- **Read-promote cells** read a **hand-authored narrow depth-2 Parquet file** (synthesized-footer harness, the
+  §3 primary) through `ParquetFileReader.ReadAsync` → `DecodeNode` with `allowTypeWideningPromotion: true`
+  under a **wide** requested type, asserting each narrow leaf promotes into the wide vector with exact
+  value/null-structure identity — the read-through-across-a-widen the flat path proves at
+  `ParquetTypeWideningPromotionTests`, now per nested leaf.
+
+**Append-apply + fieldPath-chain cells** (each asserts the merged schema **and** the exact `fieldPath`; the
+end-to-end variants also assert log-JSON round-trip):
+1. `Widen_ArrayOfArrayElement_IntToLong_AppendApplies_EmitsFieldPath_element_element`.
+2. `Widen_MapValueArrayElement_IntToLong_EmitsFieldPath_value_element`.
+3. `Widen_ArrayOfMapValue_IntToLong_EmitsFieldPath_element_value`.
+4. `Widen_MapKeyArrayElement_IntToLong_EmitsFieldPath_key_element` (`map<array<int→long>,string>` — map **key**
+   widened, `key.element`) and `Widen_ArrayOfMapKey_IntToLong_EmitsFieldPath_element_key`
+   (`array<map<int→long,string>>` — map **key** widened, `element.key`). Map-key widening at depth&gt;1 on both
+   the outermost (`key.`) and innermost (`.key`) sides; `key.key` is not constructible (map-typed keys are
+   rejected by `MapType`, see §2.5 note).
+5. `Widen_ArrayOfArrayOfArrayElement_Depth3_EmitsFieldPath_element_element_element` — depth-3 chain (pins the
+   accumulator, not a two-token special-case).
+6. `Widen_StructChildArrayElement_EmitsElementFieldPath_OnChildStructField` — `struct<xs:array<int→long>>`:
+   `fieldPath="element"` attached to the **`xs`** StructField (the struct boundary resets the chain).
+7. `Widen_ArrayOfStructField_RecordsChildStructFieldTypeChange_NoFieldPath` — `array<struct<a:int→long>>`:
+   the change lands on the inner **`a`** StructField with **no** `fieldPath` (struct children excluded).
+8. `Widen_Depth2_CommitsAndReloads_FieldPathChainSurvivesLogJsonRoundTrip` — end-to-end via
+   `DeltaSchemaEvolutionWriter`, reload + assert `element.element`.
+
+**Read-promote cells** (hand-authored narrow depth-2/3 file, wide requested type, promotion on):
+9. `ReadPromote_ArrayOfArray_NarrowIntElement_PromotesToLong_AtDepth2`.
+10. `ReadPromote_MapValueArray_NarrowIntElement_PromotesToLong` (`value.element`).
+11. `ReadPromote_StructChildArray_NarrowElement_PromotesToLong` (public-API-observable gate lift R1/R3).
+12. `ReadPromote_Depth3_ArrayOfArrayOfArray_NarrowElement_Promotes` (composes with `MaxNestedReadDepth`).
+13. `ReadPromote_NarrowNestedLeaf_NullAndEmptyStructure_Preserved_AcrossWiden` — promotion preserves the
+    null-list / empty-list / null-element distinctions (585a structure + 585b value promotion compose).
+
+**Fail-closed parity cells** (allowlist reused unchanged; each asserts the exact exception):
+
+| # | Scenario | Expected |
+|---|---|---|
+| 14 | `Widen_CrossFamily_IntToDouble_AtDepth2_AppendFailsClosed` (`array<array<int→double>>`, feature ON) | `TypeWideningUnsupported` — cross-family is read-promotable but **not** schema-evolution-eligible at any depth |
+| 15 | `Widen_DecimalGrowBeyondFit_AtDepth2_FailsClosed` (`map<string,array<decimal(10,2)→decimal(9,2)>>`) | `TypeWideningUnsupported` — fit guard inside `IsSchemaEvolutionWidening`, reused |
+| 16 | `Widen_NarrowingOrCrossKind_AtDepth2_FailsClosed` (`array<array<long→int>>` / `array<array<int→string>>`) | `IncompatibleType` |
+| 17 | `Widen_AtDepth2_FeatureDisabled_FailsClosed` (feature OFF) | `TypeWideningUnsupported` — no auto-apply without the `typeWidening` feature |
+| 18 | `ReadPromote_IdModeNestedLeaf_AtDepth2_StaysFailClosed` (id-mode `array<array<int>>`, wide request) | `SchemaMismatch` — **PRESERVED** id-mode non-promotion (`byFieldId is null` conjunct; §2.5, §9 O1) |
+| 19 | `ReadPromote_SchemaDeeperThanMaxNestedReadDepth_FailsClosed_BeforePromotion` (widen at depth &gt; 64) | `UnsupportedFeature` — depth bound fires at shape resolution, before any promotion |
+| 20 | `ReadPromote_UnsanctionedPhysicalMismatch_AtDepth2_FailsClosed` (narrow leaf not in the allowlist) | `SchemaMismatch` — exact-match still required when the pair is not a sanctioned widening |
+
+**Regression / parity**
+21. `Widen_Depth1_ByteIdentical_After585b` — the #546 depth-1 append + read-promote cells
+    (`element`/`key`/`value` single token, `array<int→long>` / `map<string,int→long>`) are byte/behaviour
+    **unchanged** (the gate lift preserves `Combine(null, token) == token` and `depth<=1` still promotes).
+22. `Widen_ReaderCoverageSupersetOfEnforcer_NoUnreadableTable` — property cell: for every shape the enforcer
+    auto-applies (array/map interior at any depth), the reader promotes the corresponding narrow file; pins
+    the reader ⊇ enforcer safety invariant (§2.5 fail-closed parity, §6 unreadable-table-minting mitigation).
+
+**AC → test-cell oracle (deterministic; every #860 AC maps to at least one killing cell):**
+
+| #860 Acceptance criterion | Killing cell(s) | Mechanism |
+|---|---|---|
+| AC1 — depth-2+ nested leaf **read-promotes** an older narrow file into the wide vector | 9, 10, 11, 12, 13 | read-through of a hand-authored narrow depth-2/3 file across a widen (gate lifts R1–R4) |
+| AC2 — wider-typed append at depth &gt; 1 **applies**, emitting the correct nested `fieldPath` chain | 1, 2, 3, 4, 5, 6, 7, 8 | enforcer merge unit + end-to-end `DeltaSchemaEvolutionWriter` commit + log-JSON round-trip (E1–E3) |
+| AC3 — allowlist + decimal-fit reused unchanged; every unsanctioned change at every depth stays fail-closed | 14, 15, 16, 17, 20; property 22 | `IsSchemaEvolutionWidening`/`IsSanctionedWidening` + fit guard reused verbatim; reader ⊇ enforcer |
+| AC4 — tests mirror the #546 increment-2 suite for depth-2+ shapes (the former `[Pending]` cells) | 1–13, 21 | direct depth-2/3 lift of the #546 append/read suites; 21 pins depth-1 byte-identity |
+| (implicit) id-mode fail-closed **preserved**; depth-bound composes | 18, 19 | `byFieldId is null` conjunct retained; `MaxNestedReadDepth` fires before promotion |
+
+Same-typed-sibling nested leaves draw from **disjoint value domains** so a positional mis-bind cannot pass on
+equal values (parity with §3.1). Cell 11 is the **public-API-observable** proof of the decode gate lift
+(`struct<xs:array>` element promotes end-to-end); the pure struct-nested **scalar** decode gate (`:521`) stays
+a defense-in-depth site shadowed by `ValidateShape` (§2.5, D9) and has no independent killing decode cell by
+construction — its observable effect is the validate-side lift R1 (cell 11's up-front validation).
 
 ---
 
@@ -688,14 +913,24 @@ graph LR
 | **Tampering** | crafted def/rep at a **deep** level | phantom inner element / mis-classified present-vs-null at depth | `BuildRepeatedStructure` state-transition + `BuildStructNullMask` cross-field parity + `ValidateParallelRepetition/Definition`, run at **every** level against that level's thresholds → `CorruptData` |
 | **Tampering** | descendant leaf declares wrong max levels | repeated primitive posing as struct rows / phantom optional ancestor at depth | `ValidateLeafStructuralLevels` at each level against the **immediate parent** node's `MaxRep`/`MaxDef` → `CorruptData` |
 | **Tampering** | inner `map<T,T>` required value | Parquet.Net positional key/value bind → silent transposition at a **nested** map | recursive Ordinal `key`/`value` canonical-name guard (map-only) + required-key guard on **every** map node → `SchemaMismatch` |
-| **Spoofing** | nested leaf physical type ≠ requested | wrong-typed value read at depth | recursive exact-match `ValidateLeafPhysicalType` (585a) → `SchemaMismatch`; promotion only via the unchanged allowlist (585b) |
+| **Spoofing** | nested leaf physical type ≠ requested | wrong-typed value read at depth | recursive `ValidateLeafPhysicalType` → `SchemaMismatch` on an unsanctioned pair; a **sanctioned** narrower leaf promotes losslessly only when `promoteLeaf` is set (585b name-mode, any depth) via the **unchanged** `IsSanctionedWidening` allowlist + fit guard — id-mode never promotes |
+| **Tampering** (585b) | forged `delta.typeChanges` / malformed `fieldPath` chain in a foreign log | a crafted `fieldPath` (unknown token, wrong depth, cross-family `fromType→toType`) drives a bogus read-promote or an unreadable table | `fieldPath` is **advisory metadata**, never a decode key — the reader promotes by comparing the **actual file physical type** to the requested schema through `IsSanctionedWidening`, so a forged `fieldPath` cannot force a non-sanctioned promotion; a non-sanctioned `fromType→toType` fails closed `SchemaMismatch`. On append the enforcer only ever **emits** the chain from its own merge, never trusts an inbound one |
 | **Elevation** | unsupported scalar smuggled into a deep leaf | `void`/`decimal>28`/unmapped decodes | recursive scalar allowlist (`CreateScalarField`) at every leaf → `UnsupportedFeature` |
-| **Info disclosure** | fail-closed message on a nested request | raw foreign nested names recursed into `SimpleString` | bounded `DescribeType` + sanitized paths at every level (#683/#686/#705) |
+| **Info disclosure** | fail-closed message on a nested request | raw foreign nested names / fieldPath recursed into `SimpleString` | bounded `DescribeType` + sanitized paths at every level (#683/#686/#705); the emitted `fieldPath` is composed only from the fixed `element`/`key`/`value` tokens (no foreign name) |
 
-**Residual:** nested-leaf **widening** is out of 585a (exact match), enabled only by 585b under the unchanged
-allowlist — so no widening residual exists until 585b lands. The single-level residuals (advisory nested
-nullability per #570; foreign legacy-shaped lists readable) are unchanged and propagate recursively. Column
-mapping of nested-within-nested (`nested.ids`, array/map id mode) stays out of scope (#676/#839), fail-closed.
+**Residual (585a + 585b):** nested-leaf **widening** is now enabled by 585b under the **unchanged** allowlist
+(`IsSanctionedWidening` read / `IsSchemaEvolutionWidening` append) at any name-mode depth; the residual is the
+**reader ⊇ enforcer** over-permissiveness (the reader promotes some shapes the enforcer never commits — e.g.
+pure struct-nested scalars, D9) which is **safe** (over-permissive read never corrupts, and cannot mint an
+unreadable table since, **in name mode**, the enforcer commits a strict subset). **Unreadable-table-minting**
+in **name mode** — the one failure mode where apply could outrun read-promote — is closed by that same
+invariant (§2.5, §3.2-22). **In id mode** the invariant does NOT hold (the enforcer is column-mapping-mode-
+agnostic while the id-mode reader never promotes): the enforcer can commit a nested widening the id-mode reader
+fails closed on. This is **pre-existing #546 behavior at depth 1**, tracked in
+[#870](https://github.com/khaines/deltasharp/issues/870) and **not introduced by 585b** (id-mode
+nested-within-nested is rejected upstream, so 585b adds no new id-mode unreadable surface). Id-mode
+nested-leaf widening stays **fail-closed on read** (PRESERVED, #839); the single-level residuals (advisory
+nested nullability per #570; foreign legacy-shaped lists readable) propagate recursively.
 
 ---
 
@@ -720,13 +955,17 @@ mapping of nested-within-nested (`nested.ids`, array/map id mode) stays out of s
    `EnsureReadSupported`/`ValidateShape` nested-within-nested reject (revert to single-level scope); data
    already written is unaffected (this is a read-decode change only). Existing single-level and flat reads
    are byte/behavior-unchanged (§3.1-23).
-2. **585b lands after [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:open -->
-   merges.** 585b extends #546's `allowWidenApply` + `fieldPath`-aware `AppendTypeChange` to depth &gt; 1;
-   it cannot be built until that machinery exists on `main`. When #546 merges, 585b is the next increment:
-   it enables append-apply widening + read-promotion at nested-within-nested leaves under the **unchanged**
-   allowlist, emitting the nested `fieldPath` chain (§2.5). **Kill-switch:** widening is gated behind the
-   existing `typeWidening` table-feature flag; a defect → disable the feature (nested leaves fall back to the
-   585a exact-match decode, which stays correct).
+2. **585b is BUILD-READY now that [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:closed -->
+   is MERGED (PR #864).** 585b is a **narrow gate-lift + fieldPath-chain accumulation** over #546's already-merged
+   machinery (the `nestedChanges` accumulator + single-token `fieldPath` on the enforcer; the
+   `promoteLeaf`-gated, depth-agnostic widening arm on the reader) — **not** new widening machinery (§2.5).
+   Three enforcer edits (E1–E3) + four reader gate-lifts (R1–R4); `AppendTypeChange`/`NestedTypeChange`/
+   `ValidateLeafPhysicalType`/`ReadScalarLeafAsync` are reused unchanged. It enables append-apply + read-promotion
+   at nested-within-nested leaves under the **unchanged** allowlist, emitting the nested `fieldPath` chain, and
+   **preserves** the id-mode fail-closed non-promotion contract (§2.5). **Kill-switch:** widening is gated
+   behind the existing `typeWidening` table-feature flag; a defect → disable the feature (nested leaves fall
+   back to the 585a exact-match decode, which stays correct). The reader ⊇ enforcer coverage invariant (§2.5)
+   guarantees no unreadable-table minting even under a partial rollout.
 
 **Risk register:**
 - (a) recursive mis-decode at depth → **wrong data** — mitigated by per-level structural guards run at every
@@ -745,12 +984,30 @@ mapping of nested-within-nested (`nested.ids`, array/map id mode) stays out of s
 - (c) recursive map transposition → key/value swap at a nested map — recursive canonical-name guard + §3.1-16.
 - (d) accidental widening under 585a → silent promotion at a nested leaf — 585a keeps exact match; §3.1-22
   pins it fail-closed until 585b.
-- (e) 585b built before #546 → scope merge / duplicated widening machinery — **prevented by sequencing**:
-  585b is not started until #546 merges (§2.5 dependency edge).
+- (e) 585b apply/read **parity gap** → the enforcer commits a widening the reader cannot promote (unreadable
+  table) — prevented **in name mode** by the **reader ⊇ enforcer** coverage invariant: the name-mode reader
+  gate lift (R1–R4) is uniform (any leaf, any depth) while the enforcer auto-applies only array/map interior
+  widenings, so everything committed is name-mode read-promotable (§2.5 fail-closed parity; §3.2-22). **In id
+  mode the invariant does NOT hold** — the enforcer is column-mapping-mode-agnostic (`SchemaEvolutionMode`
+  only) while the id-mode reader never promotes, so it can commit a nested widening the id-mode reader fails
+  closed on. This is **pre-existing #546 (depth-1), tracked in #870**, and **not introduced by 585b** (id-mode
+  nested-within-nested is rejected upstream). The write-side id-mode guard is #870's scope.
+- (f) 585b built against the **drifted** SPEC-ONLY §2.5 line-refs → wrong edit sites / re-implemented existing
+  machinery — prevented by the §2.5 spec-vs-code reconciliation table (read-promote is in
+  `NestedParquetColumnReader.cs` not `ParquetFileReader.cs`; the widening arm already exists; the accumulator
+  is `nestedChanges` not `allowWidenApply`) — verify every line-ref in the worktree before editing.
+- (g) id-mode nested-leaf promotion accidentally wired → out-of-scope behaviour change (#839) — prevented by
+  retaining the `&& byFieldId is null` conjunct in R2–R4 and the hardcoded `promoteLeaf: false` at every
+  id-mode site (§2.5 PRESERVED contract; §3.2-18).
 
 **Launch checklist (585a):** unit + integration (§3.1) green on both TFMs; `dotnet format`; determinism ban;
-DCO; RFL PASS; **#546 verified OPEN and 585b's `[Pending("#546")]` tests present but skipped**; the
-single-level byte-identical regression (§3.1-23) green.
+DCO; RFL PASS; the single-level byte-identical regression (§3.1-23) green. *(585a shipped, PR #856.)*
+
+**Launch checklist (585b):** enforcer edits E1–E3 + reader gate-lifts R1–R4 only (no change to
+`AppendTypeChange`/`NestedTypeChange`/`ValidateLeafPhysicalType`/`ReadScalarLeafAsync`); unit + integration
+(§3.2) green on both TFMs; the depth-1 byte-identical regression (§3.2-21) green; the reader ⊇ enforcer
+property (§3.2-22) green; the id-mode fail-closed cell (§3.2-18) green; `dotnet format`; determinism ban; DCO;
+RFL PASS; **every §2.5/§10 line-ref re-verified against the worktree** (the SPEC-ONLY refs had drifted).
 
 ---
 
@@ -783,33 +1040,57 @@ single-level byte-identical regression (§3.1-23) green.
    only on schemas already at/over the write/log caps. Mechanism unchanged: fail closed typed
    `UnsupportedFeature` checked at `DecodeNode`/`ValidateShape` entry before any allocation/descent — never a
    `StackOverflowException`.
-4. **585b `fieldPath` chain — RESOLVED (spec, §2.5): `element`/`key`/`value` tokens joined by `.`**, struct
-   children excluded (they carry their own `StructField` `typeChanges`), oldest-first — per Delta PROTOCOL.md
-   "Type Change Metadata". Implementation deferred to 585b (post-#546).
-5. **585b allowlist — RESOLVED (spec): reuse `IsSanctionedWidening` (read) / `IsSchemaEvolutionWidening`
-   (append) + the decimal-fit guard unchanged.** 585b changes only *where* widening applies and the
-   *fieldPath* emitted, never *what* is sanctioned.
+4. **585b `fieldPath` chain — RESOLVED & BUILD-READY (§2.5): `element`/`key`/`value` tokens joined by `.`**,
+   struct children excluded (they carry their own `StructField` `typeChanges`), outermost-first — per Delta
+   PROTOCOL.md "Type Change Metadata". Built by threading a `string? fieldPathPrefix` through `MergeType` and
+   combining one token per array/map descent (enforcer edit E1); the struct boundary resets the chain because
+   each `StructField` re-enters `MergeField` with a fresh accumulator. No `AppendTypeChange`/`NestedTypeChange`
+   signature change — the existing `string? fieldPath` field already carries an arbitrary chain string.
+5. **585b allowlist — RESOLVED & BUILD-READY: reuse `IsSanctionedWidening` (read) / `IsSchemaEvolutionWidening`
+   (append) + the decimal-fit guard unchanged.** 585b changes only *where* widening applies (any depth) and the
+   *fieldPath* emitted (a chain), never *what* is sanctioned. Verified: both predicates are already invoked by
+   the merged #546 code the gate lifts reuse.
 6. **Depth-2 write fixtures — RESOLVED: synthesized-footer harness (§3).** The #834/#842 writer writes only
    depth-1; depth-2+ round-trip fixtures use `ParquetSerializer`/`ParquetFileWriter` explicit-level writes,
    the same differential harness #834 established, plus `internal` crafted-stream unit fixtures for the
-   corruption guards.
-7. **585b dependency — RESOLVED: BLOCKED on #546 (open).** 585b extends #546's `allowWidenApply` +
-   `fieldPath`-aware `AppendTypeChange`; not buildable until #546 lands (§2.5, §8). Sequenced strictly after.
+   corruption guards. 585b read-promote cells reuse this to author narrow depth-2/3 files (§3.2).
+7. **585b dependency — RESOLVED: UNBLOCKED, #546 MERGED (PR #864).** 585b is a narrow gate-lift +
+   fieldPath-chain accumulation over #546's merged machinery, not new machinery: enforcer edits E1–E3 +
+   reader gate-lifts R1–R4 (§2.5). Buildable now off `origin/main` (`2002540`).
+8. **Spec-vs-code drift — RESOLVED (§2.5 reconciliation table).** The earlier SPEC-ONLY §2.5/§10 line-refs
+   were verified against the merged code and corrected: (a) nested read-promote lives in
+   `NestedParquetColumnReader.cs`, **not** `ParquetFileReader.cs`; (b) `ValidateLeafPhysicalType`'s
+   widening-tolerant arm **already exists** and is depth-agnostic — 585b lifts the gate, it does **not** add
+   an arm; (c) the applied-widening plumbing is a `List<NestedTypeChange>? nestedChanges` accumulator +
+   single-token `fieldPath`, **not** a boolean `allowWidenApply`; (d) `AppendTypeChange(…, string? fieldPath)`
+   already emits `fieldPath` — no signature change. Every builder MUST re-verify §2.5/§10 line-refs in the
+   worktree before editing.
+9. **Pure struct-nested SCALAR apply gate — RESOLVED (D9): LEAVE `MergeType` default-arm `depth <= 1`
+   UNCHANGED.** 585b lifts only the `MergeCollectionElement` `elementDepth <= 1` gate (array/map interiors —
+   the fieldPath-chain cases). A pure struct-nested scalar (e.g. `struct<struct<a:int→long>>`) has **no**
+   `fieldPath` (struct children carry their own `StructField` `typeChanges`) and is out of 585b's fieldPath
+   scope, so its append-apply stays fail-closed. The reader's name-mode gate lift (R1) is uniform, so the
+   reader **will** promote such a leaf — a **safe over-permissive read** (reader ⊇ enforcer): the enforcer
+   never commits it, so the shape only arises via external migration, where the reader tolerating it is
+   defense-in-depth, never unreadable-table minting. Deep pure-struct-scalar append-apply is a separate,
+   distinctly-tracked concern.
 
 ---
 
 ## 10 · References
 
-- Issue [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:open --> (this design);
-  follows [#571](https://github.com/khaines/deltasharp/issues/571) <!-- issue-state:closed --> (single-level
-  decode) and [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:open --> (nested
-  widening depth ≤ 1 — **585b's blocking dependency**).
+- Issue [#585](https://github.com/khaines/deltasharp/issues/585) <!-- issue-state:closed --> (this design —
+  585a shipped, auto-closed on merge); 585b tracked as
+  [#860](https://github.com/khaines/deltasharp/issues/860) <!-- issue-state:open -->. Follows
+  [#571](https://github.com/khaines/deltasharp/issues/571) <!-- issue-state:closed --> (single-level decode)
+  and [#546](https://github.com/khaines/deltasharp/issues/546) <!-- issue-state:closed --> (nested widening
+  depth ≤ 1 — **585b's base, now MERGED, PR #864**).
 - Recursion target: [#570](https://github.com/khaines/deltasharp/issues/570) <!-- issue-state:closed -->
   nested `ColumnVector`s. Allowlist reuse: [#535](https://github.com/khaines/deltasharp/issues/535) <!-- issue-state:closed -->
   type-widening read-promotion. Parallel nested surface:
-  [#676](https://github.com/khaines/deltasharp/issues/676) <!-- issue-state:open --> nested column mapping;
-  adjacent deferral [#839](https://github.com/khaines/deltasharp/issues/839) <!-- issue-state:open -->
-  (array/map id-mode nested).
+  [#676](https://github.com/khaines/deltasharp/issues/676) <!-- issue-state:closed --> nested column mapping;
+  adjacent [#839](https://github.com/khaines/deltasharp/issues/839) <!-- issue-state:closed -->
+  (array/map id-mode nested — 585b **preserves** its fail-closed non-promotion contract).
 - `docs/engineering/design/storage-delta-architecture.md` §2.9. Companion designs:
   `docs/engineering/design/nested-parquet-write.md` (#834, the depth-1 write path + level-stream tables),
   `docs/engineering/design/nested-column-mapping.md` (#676, the nested `StructField` model).
@@ -819,10 +1100,21 @@ single-level byte-identical regression (§3.1-23) green.
   `src/DeltaSharp.Storage/Parquet/NestedParquetColumnReader.cs`: `ValidateShape` (`:97`), `ReadAsync` (`:198`),
   `ReadStructAsync` (`:238`), `BuildStructNullMask` (`:298`), `ReadListAsync` (`:360`), `ReadMapAsync` (`:414`),
   `BuildRepeatedStructure` (`:511`), `ExpectScalarLeaf` (`:1217`), `ResolveStructField` (`:1113`),
-  `IsDirectLeafChild` (`:1183`), `ValidateLeafStructuralLevels` (`:1274`), `ValidateLeafPhysicalType` (`:1298`),
+  `IsDirectLeafChild` (`:1183`), `ValidateLeafStructuralLevels` (`:1274`),
   `EnsureRequiredMapKey` (`:1077`), `EnsureCanonicalMapChildNames` (`:1098`), `CollectLeafFields` (`:169`).
-  `src/DeltaSharp.Storage/Delta/DeltaSchemaEnforcer.cs`: `MergeType` array/map arms (`:294-322`),
-  `AppendTypeChange` `fieldPath` omission (`:388-393`) — the 585b extension points.
+  **585b reader extension points (this worktree, `2002540` — RE-VERIFY before editing):** the name-mode
+  promote gate at `ValidateChild` (`:250`, R1) and `DecodeStruct`/`DecodeList`/`DecodeMap` (`:521`/`:716`/`:804`,
+  R2–R4) — lift the `depth <= 1` / `depth == 0` cap (keep `&& byFieldId is null`). Reused **verbatim** (do NOT
+  edit): the widening arm `ValidateLeafPhysicalType` (`:2286`, arm `:2289-2292`), value promotion
+  `ReadScalarLeafAsync` (`:1129`, `:1138-1145`) → `ReadPromotedLeafAsync`. PRESERVED id-mode `promoteLeaf: false`:
+  `ResolveStructFieldById` (`:2031`), `DecodeStruct` id-branch (`:436`), interior id-branches
+  (`:719`/`:834`/`:864`), `…ById` validators (`:2173`/`:2196`/`:2199`).
+  `src/DeltaSharp.Storage/Delta/DeltaSchemaEnforcer.cs` — **585b enforcer extension points (RE-VERIFY):**
+  `MergeType` (`:308`, array arm `:342` / map arms `:348`/`:356`) — add `string? fieldPathPrefix`, combine the
+  `element`/`key`/`value` token (E1); `MergeCollectionElement` (`:413`) — thread `nestedChanges` + the chain
+  through the nested-container recursion (`:433`, E2) and lift the `elementDepth <= 1` scalar gate (`:437`, E3);
+  `MergeField` drain loop (`:295-302`), `AppendTypeChange` (`:486`), `NestedTypeChange` record (`:157`) —
+  **unchanged**. Default-arm scalar gate `depth <= 1` (`:380`) — **unchanged** (D9).
   `src/DeltaSharp.Storage/Delta/TypeWidening.cs`: `IsSanctionedWidening` (`:53`),
   `IsSchemaEvolutionWidening` (`:174`) — the reused allowlist.
   `src/DeltaSharp.Engine/Columnar/`: `StructColumnVector.cs` (`:85`), `ListColumnVector.cs` (`:80`),

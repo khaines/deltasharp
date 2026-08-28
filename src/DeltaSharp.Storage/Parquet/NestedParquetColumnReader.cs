@@ -104,8 +104,8 @@ internal static class NestedParquetColumnReader
     /// Structurally validates that <paramref name="fileField"/> matches the requested nested
     /// <paramref name="requestedType"/> to ARBITRARY DEPTH (585a): the correct container kind at every level,
     /// every requested leaf present with an EXACT physical-type match OR — when
-    /// <paramref name="allowTypeWideningPromotion"/> is set AND the leaf sits at container depth ≤ 1 — a
-    /// Delta-sanctioned NARROWER widening the read path promotes per leaf (#546), and every per-level
+    /// <paramref name="allowTypeWideningPromotion"/> is set (name/none mode, any depth — 585b lifted the #546
+    /// depth cap) — a Delta-sanctioned NARROWER widening the read path promotes per leaf (#546), and every per-level
     /// structural guard (canonical/required map key, leaf structural-level consistency) applied recursively —
     /// WITHOUT reading any data page, so a schema disagreement fails before any batch is yielded (mirrors the
     /// flat path's up-front validation).
@@ -233,10 +233,11 @@ internal static class NestedParquetColumnReader
     // a scalar child routes to the exact-physical-type + structural-level leaf guard; a nested child recurses
     // (guarded by MaxNestedReadDepth at ValidateNode entry). `parentMaxRep`/`parentMaxDef` are the IMMEDIATE
     // parent container node's own levels — the thresholds the leaf structural-level guard needs at any depth.
-    // `depth` is THIS child's own container depth (its parent's depth + 1), so the #546 promotion gate for a
-    // scalar leaf is `allowTypeWideningPromotion && depth <= 1` — a leaf directly under one top-level container
-    // (the exact shapes #571's reader promotes); a deeper (nested-within-nested) leaf keeps the exact-match
-    // requirement (fail-closed), composing the read gate with 585a's recursive descent (design §2.4).
+    // `depth` is THIS child's own container depth (its parent's depth + 1). 585b lifted the #546 depth cap on
+    // the name-mode promotion gate: a name-mode scalar leaf is promotion-eligible at ANY depth
+    // (`allowTypeWideningPromotion`), so a nested-within-nested narrow leaf under a widened schema promotes,
+    // composing the read gate with 585a's recursive descent (design §2.5, R1). Id-mode leaves are validated by
+    // the separate `Validate*ShapeById` helpers (hardcoded `promoteLeaf: false`) and never reach here.
     private static void ValidateChild(
         Field fileChild, DataType requested, int parentMaxRep, int parentMaxDef, string context, int depth,
         bool allowTypeWideningPromotion)
@@ -247,7 +248,7 @@ internal static class NestedParquetColumnReader
         }
         else
         {
-            bool promoteLeaf = allowTypeWideningPromotion && depth <= 1;
+            bool promoteLeaf = allowTypeWideningPromotion;
             _ = ExpectScalarLeaf(fileChild, requested, parentMaxRep, parentMaxDef, context, promoteLeaf);
         }
     }
@@ -489,11 +490,13 @@ internal static class NestedParquetColumnReader
                 // Its driving-leaf def (clamped at structMaxDef, one per owner cell) reports the STRUCT's
                 // presence — feed that to the cross-field null-mask parity guard.
                 DataField drivingLeaf = FirstDataField(childNode);
-                DataType deepScalar = FirstScalarType(field.DataType);
-                // The driving leaf is read only for its def/rep structure (the child vector is discarded), and
-                // it is deeper than depth ≤ 1 — never promote it.
+                // 585b (R5): read the driving leaf for STRUCTURE ONLY (def/rep) as its OWN physical type
+                // (ParquetTypeMapping.ToDataType — the StructPresenceDefs pattern), not the requested (possibly
+                // widened) first-scalar type; a widened driving read would fault the raw typed decode. def/rep
+                // are type-agnostic (design §2.5 driving-leaf gap).
+                DataType drivingType = ParquetTypeMapping.ToDataType(drivingLeaf);
                 (_, int[]? drivingDef, int[]? drivingRep, int drivingNumValues) = await ReadScalarLeafAsync(
-                    rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                    rowGroup, drivingLeaf, drivingType, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
                     .ConfigureAwait(false);
                 fieldDefs[i] = ExtractOwnerCellDefs(
                     drivingDef, drivingRep, drivingNumValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, childContext);
@@ -501,6 +504,13 @@ internal static class NestedParquetColumnReader
                 // A struct is TRANSPARENT to repetition: its children share the struct's OWN owner cells and
                 // parent boundary (even a null-struct row yields a null child cell). So recurse with the
                 // struct's parentMaxRep/parentMaxDef UNCHANGED — NOT structMaxRep/structMaxDef.
+                //
+                // 585b defense-in-depth (#868 Issue 2): this deeper recursion nulls `byFieldId`, so the R2/R3/R4
+                // `promoteLeaf` gate's `&& byFieldId is null` conjunct is VACUOUSLY TRUE below. That is SAFE
+                // because an id-mode nested-within-nested SHAPE is rejected UPSTREAM at ValidateShape /
+                // ExpectScalarLeaf (UnsupportedFeature, "a nested type within a nested type … is not supported")
+                // BEFORE decode ever recurses here — so an id-mode read never reaches a deep name-mode promote.
+                // (585b removed the prior `depth == 0` layer; the upstream shape gate is the sufficient guard.)
                 children[i] = await DecodeNode(
                     rowGroup, childNode, field.DataType, rowCount, childContext, budget, byFieldId: null,
                     interiorIds: null, depth + 1, parentMaxRep, parentMaxDef, allowTypeWideningPromotion,
@@ -508,17 +518,13 @@ internal static class NestedParquetColumnReader
                 continue;
             }
 
-            // A scalar struct field. The #546 promotion gate composes 585a's container depth: a scalar child of
-            // a TOP-LEVEL struct (depth == 0) sits at container depth 1 (promotable); a struct nested inside
-            // another container is decoded at depth ≥ 1, so its scalar fields sit at depth ≥ 2 and stay
-            // exact-match (fail-closed) — the decode-path mirror of ValidateChild's `depth <= 1` (design §2.4).
-            // DEFENSE-IN-DEPTH INVARIANT: ValidateShape/ValidateChild runs BEFORE decode and already rejects a
-            // depth ≥ 2 promotable-but-narrow leaf, so this decode-time `depth == 0` component is not reachable
-            // via the public read path (ParquetFileReader.ReadAsync) — it has no independent killing test by
-            // construction and exists only to keep the decode self-consistent if a future refactor were to move
-            // or bypass the up-front validation (design §2.4 / §3.3, RFL-864 R1 Quality F1). `byFieldId is null`
-            // for symmetry with the list/map sites (id-mode never promotes; the id-mode branch already `continue`d).
-            bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
+            // A scalar struct field. 585b lifted the #546 depth cap on the name-mode promotion gate: a name-mode
+            // scalar child promotes at ANY depth (design §2.5, R2). The `byFieldId is null` conjunct is
+            // RETAINED so id-mode never promotes (an id-mode struct child already `continue`d above); a deeper
+            // name-mode recursion nulls `byFieldId`, so this conjunct is decisive only at the top-level entry.
+            // The up-front ValidateShape/ValidateChild (R1) runs before decode and already admits the same
+            // leaves, so this decode-side lift keeps the decode self-consistent with validation (design §2.5).
+            bool promoteLeaf = allowTypeWideningPromotion && byFieldId is null;
             DataField scalarLeaf = ExpectScalarLeaf(
                 childNode, field.DataType, structMaxRep, structMaxDef, childContext, promoteLeaf);
             int scalarPresentFloor = underRepeatedAncestor ? parentMaxDef : 0;
@@ -673,10 +679,15 @@ internal static class NestedParquetColumnReader
             // DRIVING leaf (first leaf under fileList.Item), then recurse into the element type. The driving
             // leaf's raw (def, rep) fully describe this repeated level's structure (design §2.2 DecodeList).
             DataField drivingLeaf = FirstDataField(fileList.Item);
-            DataType deepScalar = FirstScalarType(requested.ElementType);
-            // Driving leaf read for structure only (child vector discarded), and it is deeper than depth ≤ 1.
+            // 585b (R5): the driving leaf is read for STRUCTURE ONLY (def/rep — the child vector is discarded),
+            // so read it as its OWN physical type (ParquetTypeMapping.ToDataType), NOT the requested (possibly
+            // WIDENED) first-scalar type — the same pattern StructPresenceDefs uses. Under 585b the requested
+            // element may widen a deep leaf; a driving read at the requested wide type against the narrower
+            // physical leaf would fault the raw typed decode. def/rep are type-agnostic, so the physical read
+            // yields identical structure without promotion (design §2.5 driving-leaf gap).
+            DataType drivingType = ParquetTypeMapping.ToDataType(drivingLeaf);
             (_, def, rep, numValues) = await ReadScalarLeafAsync(
-                rowGroup, drivingLeaf, deepScalar, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
+                rowGroup, drivingLeaf, drivingType, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
                 .ConfigureAwait(false);
             EnsureRepeatedSlotFloor(numValues, ownerCells, columnName, "element");
 
@@ -686,6 +697,10 @@ internal static class NestedParquetColumnReader
                 def, rep, numValues, listMaxDef, listMaxRep, parentMaxDef, parentMaxRep, ownerCells,
                 nestedOffsets, nestedNulls, columnName);
 
+            // 585b defense-in-depth (#868 Issue 2): the nested-element recurse nulls `byFieldId`, so the R3
+            // `promoteLeaf` gate's `&& byFieldId is null` conjunct is vacuously true below — SAFE because an
+            // id-mode nested-within-nested shape is rejected UPSTREAM (UnsupportedFeature) before decode
+            // recurses here (see the DecodeStruct site for the full rationale).
             elements = await DecodeNode(
                 rowGroup, fileList.Item, requested.ElementType, elemCount, elementContext, budget, byFieldId: null,
                 interiorIds: null, depth + 1, listMaxRep, listMaxDef, allowTypeWideningPromotion, cancellationToken)
@@ -707,13 +722,11 @@ internal static class NestedParquetColumnReader
         // mode (nested-within-nested id mode is rejected upstream), so this is the only id-mode element path —
         // the recursive branch above is never entered when byFieldId/interiorIds are present.
         //
-        // The #546 promotion gate composes 585a's container depth: a scalar element of a TOP-LEVEL array
-        // (depth == 0) sits at container depth 1 (promotable); an array nested inside another container is
-        // decoded at depth ≥ 1, so its scalar element sits at depth ≥ 2 and stays exact-match — the decode-path
-        // mirror of ValidateChild's `depth <= 1` (design §2.4). Id-mode leaves keep promoteLeaf false (§9 O1).
-        // DEFENSE-IN-DEPTH: shadowed by the up-front ValidateChild gate (no independent public-API test by
-        // construction) — see the struct site above / design §3.3 (RFL-864 R1 Quality F1).
-        bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
+        // 585b lifted the #546 depth cap on the name-mode promotion gate: a name-mode scalar element promotes
+        // at ANY depth, so a nested-within-nested narrow element promotes across a widen (design §2.5, R3). The
+        // `byFieldId is null` conjunct is RETAINED so an id-mode element never promotes (§9 O1); deeper
+        // name-mode recursion nulls `byFieldId`, so it is decisive only at the top-level entry.
+        bool promoteLeaf = allowTypeWideningPromotion && byFieldId is null;
         DataField elementLeaf = byFieldId is not null && interiorIds?.ElementId is long elementId
             ? ExpectScalarLeaf(
                 ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext),
@@ -795,13 +808,11 @@ internal static class NestedParquetColumnReader
         bool nestedKey = requested.KeyType is ArrayType or MapType or StructType;
         bool nestedValue = requested.ValueType is ArrayType or MapType or StructType;
 
-        // The #546 promotion gate composes 585a's container depth: a scalar key/value of a TOP-LEVEL map
-        // (depth == 0) sits at container depth 1 (promotable); a map nested inside another container is decoded
-        // at depth ≥ 1, so its scalar key/value sits at depth ≥ 2 and stays exact-match — the decode-path
-        // mirror of ValidateChild's `depth <= 1` (design §2.4). Id-mode leaves keep promoteLeaf false (§9 O1).
-        // DEFENSE-IN-DEPTH: shadowed by the up-front ValidateChild gate (no independent public-API test by
-        // construction) — see the struct site / design §3.3 (RFL-864 R1 Quality F1).
-        bool promoteLeaf = allowTypeWideningPromotion && depth == 0 && byFieldId is null;
+        // 585b lifted the #546 depth cap on the name-mode promotion gate: a name-mode scalar key/value promotes
+        // at ANY depth (design §2.5, R4). The `byFieldId is null` conjunct is RETAINED so an id-mode key/value
+        // never promotes (§9 O1); deeper name-mode recursion nulls `byFieldId`, so it is decisive only at the
+        // top-level entry.
+        bool promoteLeaf = allowTypeWideningPromotion && byFieldId is null;
 
         // Keys drive the entry structure (the key subtree's driving leaf). A required key's max definition level
         // equals the map's own level, so every referenced key slot carries a real value — keys are never null,
@@ -813,8 +824,10 @@ internal static class NestedParquetColumnReader
         if (nestedKey)
         {
             DataField keyDriving = FirstDataField(fileMap.Key);
-            DataType keyDeep = FirstScalarType(requested.KeyType);
-            // Driving leaf read for structure only (child vector discarded), deeper than depth ≤ 1.
+            // 585b (R5): driving leaf read for STRUCTURE ONLY — read as its own physical type
+            // (ParquetTypeMapping.ToDataType), not the requested (possibly widened) first-scalar type
+            // (design §2.5 driving-leaf gap).
+            DataType keyDeep = ParquetTypeMapping.ToDataType(keyDriving);
             (_, keyDef, keyRep, keyNumValues) = await ReadScalarLeafAsync(
                 rowGroup, keyDriving, keyDeep, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
                 .ConfigureAwait(false);
@@ -847,7 +860,10 @@ internal static class NestedParquetColumnReader
         if (nestedValue)
         {
             DataField valueDriving = FirstDataField(fileMap.Value);
-            DataType valueDeep = FirstScalarType(requested.ValueType);
+            // 585b (R5): driving leaf read for STRUCTURE ONLY — read as its own physical type
+            // (ParquetTypeMapping.ToDataType), not the requested (possibly widened) first-scalar type
+            // (design §2.5 driving-leaf gap).
+            DataType valueDeep = ParquetTypeMapping.ToDataType(valueDriving);
             (_, valueDef, valueRep, _) = await ReadScalarLeafAsync(
                 rowGroup, valueDriving, valueDeep, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
                 .ConfigureAwait(false);
@@ -896,6 +912,10 @@ internal static class NestedParquetColumnReader
         int entryCount = BuildRepeatedStructure(
             keyDef, keyRep, keyNumValues, mapMaxDef, mapMaxRep, parentMaxDef, parentMaxRep, ownerCells, offsets, nulls, columnName);
 
+        // 585b defense-in-depth (#868 Issue 2): the key/value recurses below null `byFieldId`, so the R4
+        // `promoteLeaf` gate's `&& byFieldId is null` conjunct is vacuously true — SAFE because an id-mode
+        // nested-within-nested shape is rejected UPSTREAM (UnsupportedFeature) before decode recurses here
+        // (see the DecodeStruct site for the full rationale).
         ColumnVector keys = nestedKey
             ? await DecodeNode(
                 rowGroup, fileMap.Key, requested.KeyType, entryCount, $"map column '{columnName}' key", budget,
@@ -1965,34 +1985,6 @@ internal static class NestedParquetColumnReader
         }
     }
 
-    // The scalar leaf type along the requested type's first-child path — the parallel of FirstDataField on the
-    // REQUESTED side (array -> ElementType, map -> KeyType, struct -> field[0], scalar -> itself). ValidateShape
-    // guarantees this path corresponds slot-for-slot to FirstDataField's, so the driving leaf reads back as this
-    // scalar type. Used only to satisfy ReadScalarLeafAsync's physical dispatch when reading a driving leaf
-    // whose materialized child is DISCARDED (only its levels are consumed).
-    private static DataType FirstScalarType(DataType type)
-    {
-        while (true)
-        {
-            switch (type)
-            {
-                case ArrayType array:
-                    type = array.ElementType;
-                    break;
-                case MapType map:
-                    type = map.KeyType;
-                    break;
-                case StructType structType when structType.Count > 0:
-                    type = structType[0].DataType;
-                    break;
-                case ArrayType or MapType or StructType:
-                    throw DeltaStorageException.CorruptData(
-                        "A nested requested type has no reachable scalar leaf to drive its structure.");
-                default:
-                    return type;
-            }
-        }
-    }
 
     // Resolves a struct child in ID mode (#676 §2.5): binds by the child's delta.columnMapping.id within the
     // resolved container — NEVER by name. The child's id is looked up in the path-keyed footer field-id map

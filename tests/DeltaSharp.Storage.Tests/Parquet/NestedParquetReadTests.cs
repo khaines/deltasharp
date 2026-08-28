@@ -201,6 +201,58 @@ public sealed class NestedParquetReadTests
         public List<List<int?>?>? Outer { get; set; }
     }
 
+    // array<array<array<int>>> — depth-3 element chain (585b depth-3 read-promote cell 12).
+    private sealed class ArrayOfArrayOfArrayRow
+    {
+        public int Id { get; set; }
+
+        public List<List<List<int?>?>?>? Outer { get; set; }
+    }
+
+    // array<map<int,string>> — an int-KEYED map inside an array, for the depth>1 map-KEY read-promote cell
+    // (fieldPath "element.key"). map<map<…>> ("key.key") is not constructible — MapType forbids map-typed keys.
+    private sealed class ArrayOfIntMapRow
+    {
+        public int Id { get; set; }
+
+        public List<Dictionary<int, string?>?>? Arr { get; set; }
+    }
+
+    // array<array<float>> — float leaf at depth 2 (585b float→double read-promote across families).
+    private sealed class ArrayOfArrayFloatRow
+    {
+        public int Id { get; set; }
+
+        public List<List<float?>?>? Outer { get; set; }
+    }
+
+    // array<array<date>> — DateOnly (Parquet DATE physical) at depth 2 (585b date→timestamp_ntz read-promote).
+    private sealed class ArrayOfArrayDateRow
+    {
+        public int Id { get; set; }
+
+        public List<List<DateOnly?>?>? Outer { get; set; }
+    }
+
+    // array<array<decimal(10,2)>> — decimal leaf at depth 2 (585b grow-only decimal read-promote). The
+    // [ParquetDecimal] attribute on the nested list property stamps the leaf's physical precision/scale.
+    private sealed class ArrayOfArrayDecimalRow
+    {
+        public int Id { get; set; }
+
+        [ParquetDecimal(10, 2)]
+        public List<List<decimal?>?>? Outer { get; set; }
+    }
+
+    // array<map<int,int>> — an int→int map inside an array, for the depth>1 BOTH-key-AND-value widen cell
+    // (fieldPaths "element.key" + "element.value"). Disjoint key/value domains so a mis-bind surfaces.
+    private sealed class ArrayOfKvMapRow
+    {
+        public int Id { get; set; }
+
+        public List<Dictionary<int, int?>?>? Arr { get; set; }
+    }
+
     private sealed class SoA
     {
         public List<int?>? Xs { get; set; }
@@ -3294,16 +3346,19 @@ public sealed class NestedParquetReadTests
     // ----- #546 O3 (design §3.3): the depth-composed gate is NOT a plain bool -----
 
     [Fact]
-    public async Task Array_OfStruct_InnerFieldWidening_AtDepth2_WhenEnabled_FailsClosed()
+    public async Task Array_OfStruct_InnerFieldWidening_AtDepth2_WhenEnabled_PromotesOverPermissively()
     {
-        // O3 (design §3.3, required-for-merge): 585a can DECODE array<struct<a:int>>, but #546 only widens a
-        // scalar leaf at container depth ≤ 1. A leaf inside a nested-within-nested shape (array<struct<a:int>>,
-        // the struct field 'A' sits at depth 2) requested as array<struct<a:long>> must NOT be promoted even
-        // with the gate OPEN — it stays fail-closed (SchemaMismatch), proving `promoteLeaf` is composed with
-        // 585a's container depth, not a plain depth-agnostic bool. (Pairs with the write-side AC7.)
+        // 585b (design §2.5 D9 "safe over-permissive read"): the reader's name-mode promotion gate is now
+        // UNIFORM (R1–R5, any depth), so a struct field inside an array element (array<struct<a:int>>, the
+        // field 'A' at container depth 2) requested as array<struct<a:long>> with the gate OPEN now PROMOTES
+        // int→long — even though the ENFORCER does NOT auto-apply this shape on append (D9 keeps the struct
+        // default-arm gated; see DeltaSchemaEnforcerTests.Reconcile_WideningInsideArrayOfStruct_*). reader ⊇
+        // enforcer: the enforcer never commits it, so the reader tolerating it is defense-in-depth, never
+        // unreadable-table minting. Disjoint A values so a positional mis-bind would surface as a value miss.
         var rows = new List<NestedListRow>
         {
-            new() { Id = 1, Items = new List<Inner> { new() { A = 10, B = "x" } } },
+            new() { Id = 1, Items = new List<Inner> { new() { A = 11, B = "x" }, new() { A = 22, B = "y" } } },
+            new() { Id = 2, Items = null },
         };
         byte[] bytes = await WriteAsync(rows);
 
@@ -3317,10 +3372,14 @@ public sealed class NestedParquetReadTests
             new StructField("Items", DataTypes.CreateArrayType(innerLong, containsNull: true), nullable: true),
         });
 
-        // Gate OPEN: the depth-2 leaf is still exact-match, so INT32 ≠ requested INT64 → SchemaMismatch.
-        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
-            () => ReadSinglePromotedAsync(bytes, requested));
-        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Items"));
+        var s0 = Assert.IsType<StructColumnVector>(arr.ElementsAt(0));
+        ColumnVector a = s0.Child("A");
+        Assert.Equal(DataTypes.LongType, a.Type); // promoted lane
+        Assert.Equal(11L, a.GetValue<long>(0));
+        Assert.Equal(22L, a.GetValue<long>(1));
+        Assert.True(arr.IsNull(1)); // null list preserved through promotion
     }
 
     [Fact]
@@ -3414,6 +3473,487 @@ public sealed class NestedParquetReadTests
         long expectedMicros = (t1.Ticks - DateTime.UnixEpoch.Ticks) / TimeSpan.TicksPerMicrosecond;
         Assert.Equal(expectedMicros, e0.GetValue<long>(0));
         Assert.True(e0.IsNull(1));
+    }
+
+    // ===== #860 (585b): depth>1 nested read-promotion (design §3.2 read-promote cells) ================
+    // Harness: hand-author a NARROW depth-2/3 file via the production ParquetSerializer, read it back through
+    // ParquetFileReader.ReadAsync -> NestedParquetColumnReader with allowTypeWideningPromotion:true under a WIDE
+    // requested type, asserting each narrow leaf promotes with exact value + null-structure identity. Same-typed
+    // sibling leaves draw from DISJOINT value domains so a positional mis-bind surfaces as a value mismatch.
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_NarrowIntElement_PromotesToLong_AtDepth2()
+    {
+        // Cell 9 (AC1): array<array<int>> file read under array<array<long>> — the inner element promotes
+        // int→long at container depth 2 (R3 + R5 driving-leaf), preserving the two-level grouping.
+        var rows = new List<ArrayOfArrayRow>
+        {
+            new() { Id = 1, Outer = new List<List<int?>?> { new() { 10, 20 }, new() { 30 } } },
+            new() { Id = 2, Outer = new List<List<int?>?> { new() { int.MaxValue, null, int.MinValue } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(DataTypes.LongType, inner.Elements.Type);
+        Assert.Equal("[[10,20],[30]]", Describe(outer, 0));
+        Assert.Equal("[[2147483647,null,-2147483648]]", Describe(outer, 1));
+    }
+
+    [Fact]
+    public async Task ReadPromote_MapValueArray_NarrowIntElement_PromotesToLong()
+    {
+        // Cell 10 (AC1): map<string, array<int>> file read under map<string, array<long>> — the value-array
+        // element promotes int→long (fieldPath value.element on the append side; here the read leaf at R3/R5).
+        var rows = new List<MapOfArrayRow>
+        {
+            new()
+            {
+                Id = 1,
+                M = new Dictionary<string, List<int?>?>(StringComparer.Ordinal)
+                {
+                    ["k1"] = new List<int?> { 100, 200 },
+                    ["k2"] = new List<int?> { 300, null },
+                },
+            },
+            new() { Id = 2, M = null },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(
+                    DataTypes.StringType,
+                    DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true),
+                    valueContainsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var m = Assert.IsType<MapColumnVector>(batch.Column("M"));
+        Assert.True(m.IsNull(1)); // null map preserved
+        ColumnVector keys = m.KeysAt(0);
+        var vals = Assert.IsType<ListColumnVector>(m.ValuesAt(0));
+        var byKey = new Dictionary<string, string>(StringComparer.Ordinal);
+        for (int i = 0; i < m.EntryLength(0); i++)
+        {
+            byKey[Utf8(keys, i)] = Describe(vals, i);
+        }
+
+        Assert.Equal(DataTypes.LongType, ((ListColumnVector)m.ValuesAt(0)).Elements.Type);
+        Assert.Equal("[100,200]", byKey["k1"]);
+        Assert.Equal("[300,null]", byKey["k2"]);
+    }
+
+    [Fact]
+    public async Task ReadPromote_StructChildArray_NarrowElement_PromotesToLong()
+    {
+        // Cell 11 (AC1) — the PUBLIC-API-observable proof of the validate/decode gate lifts (R1/R3): a
+        // struct<xs:array<int>> file read under struct<xs:array<long>> promotes the xs-array element int→long
+        // end-to-end (the struct boundary is transparent to repetition), preserving null/empty structure.
+        var rows = new List<SoARow>
+        {
+            new() { Id = 0, S = null },
+            new() { Id = 1, S = new SoA { Xs = null } },
+            new() { Id = 2, S = new SoA { Xs = new List<int?>() } },
+            new() { Id = 3, S = new SoA { Xs = new List<int?> { 7, null, 9 } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "S",
+                DataTypes.CreateStructType(new[]
+                {
+                    DataTypes.CreateStructField(
+                        "Xs", DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true), nullable: true),
+                }),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var s = Assert.IsType<StructColumnVector>(batch.Column("S"));
+        var xs = Assert.IsType<ListColumnVector>(s.Child("Xs"));
+        Assert.Equal(DataTypes.LongType, xs.Elements.Type);
+        Assert.True(s.IsNull(0));                 // null struct
+        Assert.Equal("null", Describe(xs, 1));    // present struct, null array
+        Assert.Equal("[]", Describe(xs, 2));      // present struct, empty array
+        Assert.Equal("[7,null,9]", Describe(xs, 3)); // promoted long elements + null element preserved
+    }
+
+    [Fact]
+    public async Task ReadPromote_Depth3_ArrayOfArrayOfArray_NarrowElement_Promotes()
+    {
+        // Cell 12 (AC1): array<array<array<int>>> file read under array<array<array<long>>> — the innermost
+        // element promotes at container depth 3 (composes with MaxNestedReadDepth; the accumulator/gate is not
+        // a two-level special-case).
+        var rows = new List<ArrayOfArrayOfArrayRow>
+        {
+            new()
+            {
+                Id = 1,
+                Outer = new List<List<List<int?>?>?>
+                {
+                    new List<List<int?>?> { new List<int?> { 1, 2 }, new List<int?> { 3 } },
+                    new List<List<int?>?> { new List<int?>() },
+                },
+            },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(
+                        DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true), containsNull: true),
+                    containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var mid = Assert.IsType<ListColumnVector>(outer.Elements);
+        var inner = Assert.IsType<ListColumnVector>(mid.Elements);
+        Assert.Equal(DataTypes.LongType, inner.Elements.Type);
+        Assert.Equal("[[[1,2],[3]],[[]]]", Describe(outer, 0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_NarrowNestedLeaf_NullAndEmptyStructure_Preserved_AcrossWiden()
+    {
+        // Cell 13 (AC1): promotion PRESERVES the null-outer / empty-outer / empty-inner / null-element
+        // distinctions across the widen (585a structure reconstruction + 585b value promotion compose):
+        // array<array<int→long>>. (Null INNER lists are a separate 585a-decode concern, out of 585b scope.)
+        var rows = new List<ArrayOfArrayRow>
+        {
+            new() { Id = 0, Outer = null },
+            new() { Id = 1, Outer = new List<List<int?>?>() },
+            new() { Id = 2, Outer = new List<List<int?>?> { new(), new() } },
+            new() { Id = 3, Outer = new List<List<int?>?> { new() { 5, null }, new() { 6 } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.LongType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        // Self-contained: assert the promoted lane type directly (not merely relying on an unpromoted read
+        // throwing) — the inner elements materialize at the requested LONG width.
+        Assert.Equal(DataTypes.LongType, Assert.IsType<ListColumnVector>(outer.Elements).Elements.Type);
+        Assert.Equal("null", Describe(outer, 0));       // null outer list
+        Assert.Equal("[]", Describe(outer, 1));         // empty outer list
+        Assert.Equal("[[],[]]", Describe(outer, 2));    // two empty inner lists
+        Assert.Equal("[[5,null],[6]]", Describe(outer, 3)); // promoted values + null element preserved
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfMapValue_And_MapOfMapValue_Promote_ReaderSupersetOfEnforcer()
+    {
+        // Cell 22 (AC3 property): the reader promotes every shape the enforcer auto-applies (array/map interior
+        // at any depth), so it never mints an unreadable table. Here the two remaining fieldPath-chain read
+        // shapes: array<map<string,int>> (element.value) and map<string, map<string,int>> (value.value).
+        var arrOfMap = new List<ArrayOfMapRow>
+        {
+            new()
+            {
+                Id = 1,
+                Arr = new List<Dictionary<string, int?>?>
+                {
+                    new Dictionary<string, int?>(StringComparer.Ordinal) { ["a"] = 1, ["b"] = null },
+                },
+            },
+        };
+        byte[] arrBytes = await WriteAsync(arrOfMap);
+        var arrRequested = new StructType(new[]
+        {
+            new StructField(
+                "Arr",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType, valueContainsNull: true),
+                    containsNull: true),
+                nullable: true),
+        });
+        ColumnBatch arrBatch = await ReadSinglePromotedAsync(arrBytes, arrRequested);
+        var arr = Assert.IsType<ListColumnVector>(arrBatch.Column("Arr"));
+        var elemMap = Assert.IsType<MapColumnVector>(arr.ElementsAt(0));
+        Assert.Equal(DataTypes.LongType, elemMap.ValuesAt(0).Type);
+
+        var mapOfMap = new List<MapOfMapRow>
+        {
+            new()
+            {
+                Id = 1,
+                M = new Dictionary<string, Dictionary<string, int?>?>(StringComparer.Ordinal)
+                {
+                    ["outer"] = new Dictionary<string, int?>(StringComparer.Ordinal) { ["inner"] = 77 },
+                },
+            },
+        };
+        byte[] mapBytes = await WriteAsync(mapOfMap);
+        var mapRequested = new StructType(new[]
+        {
+            new StructField(
+                "M",
+                DataTypes.CreateMapType(
+                    DataTypes.StringType,
+                    DataTypes.CreateMapType(DataTypes.StringType, DataTypes.LongType, valueContainsNull: true),
+                    valueContainsNull: true),
+                nullable: true),
+        });
+        ColumnBatch mapBatch = await ReadSinglePromotedAsync(mapBytes, mapRequested);
+        var m = Assert.IsType<MapColumnVector>(mapBatch.Column("M"));
+        var innerMap = Assert.IsType<MapColumnVector>(m.ValuesAt(0));
+        Assert.Equal(DataTypes.LongType, innerMap.ValuesAt(0).Type);
+        Assert.Equal(77L, innerMap.ValuesAt(0).GetValue<long>(0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_FloatToDouble_Depth2()
+    {
+        // Cell 9-float (AC1/AC3): same-family float→double at depth 2 (array<array<float>> → array<array<double>>).
+        var rows = new List<ArrayOfArrayFloatRow>
+        {
+            new() { Id = 1, Outer = new List<List<float?>?> { new() { 1.5f, null, -2.25f }, new() { 4.5f } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.DoubleType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(DataTypes.DoubleType, inner.Elements.Type);
+        Assert.Equal("[[1.5,null,-2.25],[4.5]]", Describe(outer, 0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_DateToTimestampNtz_Depth2()
+    {
+        // Cell 9-date (AC1/AC3): temporal date→timestamp_ntz (#533) at depth 2 — each epoch-day widens to
+        // epoch-micros at midnight of the date, nulls preserved.
+        var d1 = new DateOnly(2021, 3, 15);
+        var d2 = new DateOnly(1970, 1, 1);
+        var rows = new List<ArrayOfArrayDateRow>
+        {
+            new() { Id = 1, Outer = new List<List<DateOnly?>?> { new() { d1, null }, new() { d2 } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.TimestampNtzType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(DataTypes.TimestampNtzType, inner.Elements.Type);
+
+        const long MicrosPerDay = 86_400L * 1_000_000L;
+        long epochDay1 = d1.DayNumber - new DateOnly(1970, 1, 1).DayNumber;
+        ColumnVector e0 = inner.ElementsAt(0);
+        Assert.Equal(epochDay1 * MicrosPerDay, e0.GetValue<long>(0));
+        Assert.True(e0.IsNull(1)); // null element preserved
+        ColumnVector e1 = inner.ElementsAt(1);
+        Assert.Equal(0L, e1.GetValue<long>(0)); // 1970-01-01 → 0 micros
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfArray_DecimalGrowOnly_Fits_Depth2()
+    {
+        // Cell 9-decimal (AC1/AC3): same-family grow-only decimal(10,2) → decimal(12,2) (integer digits grow
+        // 8→10, scale equal) at depth 2 — a sanctioned widening, rescaled losslessly per leaf.
+        var rows = new List<ArrayOfArrayDecimalRow>
+        {
+            new() { Id = 1, Outer = new List<List<decimal?>?> { new() { 12.34m, null, -0.05m }, new() { 9.99m } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var wide = DataTypes.CreateDecimalType(12, 2);
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(DataTypes.CreateArrayType(wide, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var outer = Assert.IsType<ListColumnVector>(batch.Column("Outer"));
+        var inner = Assert.IsType<ListColumnVector>(outer.Elements);
+        Assert.Equal(wide, inner.Elements.Type);
+        ColumnVector e0 = inner.ElementsAt(0);
+        Assert.Equal(12.34m, ParquetTypeMapping.ReadDecimal(e0, wide, 0));
+        Assert.True(e0.IsNull(1));
+        Assert.Equal(-0.05m, ParquetTypeMapping.ReadDecimal(e0, wide, 2));
+        Assert.Equal(9.99m, ParquetTypeMapping.ReadDecimal(inner.ElementsAt(1), wide, 0));
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfMap_KeyAndValue_IntToLong_Depth2()
+    {
+        // Cell 10c (AC1/AC2): a map inside an array with BOTH key AND value widened int→long at depth 2
+        // (element.key + element.value). Disjoint key/value domains so a key/value transposition would surface.
+        var rows = new List<ArrayOfKvMapRow>
+        {
+            new()
+            {
+                Id = 1,
+                Arr = new List<Dictionary<int, int?>?>
+                {
+                    new Dictionary<int, int?> { [10] = 1000, [20] = 2000 },
+                },
+            },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateMapType(DataTypes.LongType, DataTypes.LongType, valueContainsNull: true),
+                    containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        var m = Assert.IsType<MapColumnVector>(arr.ElementsAt(0));
+        ColumnVector keys = m.KeysAt(0);
+        ColumnVector vals = m.ValuesAt(0);
+        Assert.Equal(DataTypes.LongType, keys.Type);
+        Assert.Equal(DataTypes.LongType, vals.Type);
+        var read = new Dictionary<long, long>();
+        for (int i = 0; i < m.EntryLength(0); i++)
+        {
+            read[keys.GetValue<long>(i)] = vals.GetValue<long>(i);
+        }
+
+        Assert.Equal(1000L, read[10L]);
+        Assert.Equal(2000L, read[20L]);
+    }
+
+    [Fact]
+    public async Task ReadPromote_ArrayOfMapKey_NarrowIntKey_PromotesToLong_AtDepth2()
+    {
+        // Cell 10b (AC1) — the map-KEY side at depth>1: array<map<int,string>> file read under
+        // array<map<long,string>> promotes the map KEY int→long at container depth 2 (DecodeMap key promotion
+        // under an array ancestor, R4/R5). int→long key widening is injective (no key collisions). This
+        // complements the value-side cells and mirrors #546's top-level Reconcile_MapKeyWidening.
+        var rows = new List<ArrayOfIntMapRow>
+        {
+            new()
+            {
+                Id = 1,
+                Arr = new List<Dictionary<int, string?>?>
+                {
+                    new Dictionary<int, string?> { [10] = "a", [20] = "b" },
+                },
+            },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Arr",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateMapType(DataTypes.LongType, DataTypes.StringType, valueContainsNull: true),
+                    containsNull: true),
+                nullable: true),
+        });
+
+        ColumnBatch batch = await ReadSinglePromotedAsync(bytes, requested);
+        var arr = Assert.IsType<ListColumnVector>(batch.Column("Arr"));
+        var elemMap = Assert.IsType<MapColumnVector>(arr.ElementsAt(0));
+        ColumnVector keys = elemMap.KeysAt(0);
+        Assert.Equal(DataTypes.LongType, keys.Type);
+        var read = new Dictionary<long, string>();
+        for (int i = 0; i < elemMap.EntryLength(0); i++)
+        {
+            read[keys.GetValue<long>(i)] = Utf8(elemMap.ValuesAt(0), i);
+        }
+
+        Assert.Equal("a", read[10L]);
+        Assert.Equal("b", read[20L]);
+    }
+
+    [Fact]
+    public async Task ReadPromote_UnsanctionedPhysicalMismatch_AtDepth2_FailsClosed()
+    {
+        // Cell 20 (AC3): exact-match is still required when the pair is NOT a sanctioned widening — an
+        // array<array<int>> file requested as array<array<string>> with the gate OPEN fails closed
+        // SchemaMismatch (int→string is never a widening), at any depth.
+        var rows = new List<ArrayOfArrayRow>
+        {
+            new() { Id = 1, Outer = new List<List<int?>?> { new() { 1 } } },
+        };
+        byte[] bytes = await WriteAsync(rows);
+
+        var requested = new StructType(new[]
+        {
+            new StructField(
+                "Outer",
+                DataTypes.CreateArrayType(
+                    DataTypes.CreateArrayType(DataTypes.StringType, containsNull: true), containsNull: true),
+                nullable: true),
+        });
+
+        DeltaStorageException ex = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedAsync(bytes, requested));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, ex.Kind);
+    }
+
+    [Fact]
+    public void ReadPromote_SchemaDeeperThanMaxNestedReadDepth_FailsClosed_BeforePromotion()
+    {
+        // Cell 19 ((implicit) depth-bound composes): a widen requested deeper than MaxNestedReadDepth is
+        // rejected at shape resolution (EnsureReadSupported) as UnsupportedFeature — BEFORE any promotion is
+        // considered. The innermost leaf is a widen TARGET (long), proving the depth bound fires regardless of
+        // the type-widening request.
+        DataType overDeep = DataTypes.LongType;
+        for (int i = 0; i < NestedParquetColumnReader.MaxNestedReadDepth + 1; i++)
+        {
+            overDeep = DataTypes.CreateArrayType(overDeep, containsNull: true);
+        }
+
+        DeltaStorageException error = Assert.Throws<DeltaStorageException>(
+            () => ParquetTypeMapping.EnsureReadSupported(new StructField("Deep", overDeep, nullable: true)));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
     }
 
     private static async Task<byte[]> WriteAsync<T>(IReadOnlyList<T> rows)

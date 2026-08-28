@@ -294,6 +294,66 @@ public sealed class ArrayMapIdModeReadTests
     }
 
     // -------------------------------------------------------------------------------------------------
+    // #860 (585b) · PRESERVED id-mode fail-closed non-promotion (design §2.5 / §9 O1)
+    // -------------------------------------------------------------------------------------------------
+
+    [Fact]
+    public async Task IdModeNestedWithinNested_AtDepth2_RejectedUpstream_NotWidened()
+    {
+        // Cell 18 (primary, (implicit) id-mode preserved): 585b's NAME-mode gate lift must NOT accidentally
+        // open id-mode depth>1. An id-mode nested-within-nested SHAPE (array<array<int>> requested id-mode) is
+        // rejected UPSTREAM at shape validation with UnsupportedFeature ("a nested type within a nested type …
+        // is not supported", the #676/#839 out-of-scope reject in ExpectScalarLeaf) — the read never reaches
+        // the promotion gate. A widened request (array<array<long>>) hits the same upstream reject, proving the
+        // gate lift did not open it.
+        StructType writeSchema = new(new[]
+        {
+            IdArray("col-b", DataTypes.IntegerType, containerId: 2, elementId: 3),
+        });
+        byte[] bytes = await WriteAsync(
+            writeSchema, NestedVectors.IntList((ArrayType)writeSchema.Fields[0].DataType,
+                new int?[]?[] { new int?[] { 10, 20 } }));
+
+        // Requested container binds by physical name 'col-b'; its interior is now itself an array (a widened
+        // nested-within-nested id-mode shape) → upstream UnsupportedFeature, before any promotion.
+        StructType readSchema = new(new[]
+        {
+            IdArray("col-b", new ArrayType(DataTypes.LongType, true), containerId: 2, elementId: 3),
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedByIdAsync(bytes, readSchema));
+        Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
+        Assert.Contains("nested type within a nested type", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task IdMode_Depth1_NarrowScalarLeaf_WideRequest_GateOpen_FailsClosed_SchemaMismatch()
+    {
+        // Cell 18b (light pin): the genuine id-mode widening-REFUSED-via-SchemaMismatch case is a DEPTH-1
+        // scalar-interior container. An id-mode array<int> element requested (by the same nested.id) as
+        // array<long> with the gate OPEN fails closed SchemaMismatch — the id-mode element leaf uses
+        // promoteLeaf:false hardcoded and R3 retains `&& byFieldId is null`, so id-mode NEVER promotes
+        // (heavily covered by the merged #675 CDF suite; pinned once here at the reader-unit level).
+        StructType writeSchema = new(new[]
+        {
+            IdArray("col-b", DataTypes.IntegerType, containerId: 2, elementId: 3),
+        });
+        byte[] bytes = await WriteAsync(
+            writeSchema, NestedVectors.IntList((ArrayType)writeSchema.Fields[0].DataType,
+                new int?[]?[] { new int?[] { 10, 20 } }));
+
+        StructType readSchema = new(new[]
+        {
+            IdArray("col-b", DataTypes.LongType, containerId: 2, elementId: 3),
+        });
+
+        DeltaStorageException error = await Assert.ThrowsAsync<DeltaStorageException>(
+            () => ReadSinglePromotedByIdAsync(bytes, readSchema));
+        Assert.Equal(StorageErrorKind.SchemaMismatch, error.Kind);
+    }
+
+    // -------------------------------------------------------------------------------------------------
     // Fixtures
     // -------------------------------------------------------------------------------------------------
 
@@ -381,6 +441,23 @@ public sealed class ArrayMapIdModeReadTests
         await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
             stream, requested, keepRowGroup: null, nullFillMissingColumns: false,
             allowTypeWideningPromotion: false, resolveByFieldId: true, CancellationToken.None))
+        {
+            Assert.Null(only);
+            only = b;
+        }
+
+        return Assert.IsAssignableFrom<ColumnBatch>(only);
+    }
+
+    // Reads an id-mode column with the type-widening promotion gate OPEN (#860 cell 18) — proves an id-mode
+    // nested leaf stays fail-closed even when the gate is open (the `byFieldId is null` conjunct is decisive).
+    private static async Task<ColumnBatch> ReadSinglePromotedByIdAsync(byte[] bytes, StructType requested)
+    {
+        using var stream = new MemoryStream(bytes, writable: false);
+        ColumnBatch? only = null;
+        await foreach (ColumnBatch b in new ParquetFileReader().ReadAsync(
+            stream, requested, keepRowGroup: null, nullFillMissingColumns: false,
+            allowTypeWideningPromotion: true, resolveByFieldId: true, CancellationToken.None))
         {
             Assert.Null(only);
             only = b;
