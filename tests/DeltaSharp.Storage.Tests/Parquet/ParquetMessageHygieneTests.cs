@@ -332,10 +332,10 @@ public sealed class ParquetMessageHygieneTests
     public void CreateField_NestedColumn_EchoesBoundedKindNotRecursiveSimpleString()
     {
         // The write-door mapping guard: same SimpleString hazard, reached through ParquetTypeMapping.CreateField.
-        // Since #841 a single-level struct-of-scalars is WRITABLE, so the poison rides a shape that still
-        // fails closed — a struct whose LAST field is itself a struct (the #585 nested-within-nested
-        // boundary). The 5,000 sibling fields make an unbounded render (which would recurse into every one of
-        // them) impossible to miss.
+        // #873 LIFTED the #585 nested-within-nested reject (struct-of-struct now maps), so the poison rides a
+        // shape that STILL fails closed — a struct whose LAST field is a map whose KEY is a container (#873 D5,
+        // nested map key). The 5,000 sibling fields make an unbounded render (which would recurse into every
+        // one of them) impossible to miss.
         var fields = new StructField[5_000];
         for (int i = 0; i < fields.Length - 1; i++)
         {
@@ -347,7 +347,9 @@ public sealed class ParquetMessageHygieneTests
 
         fields[^1] = new StructField(
             string.Create(CultureInfo.InvariantCulture, $"deep{FullInjectionCorpus}"),
-            DataTypes.CreateStructType(new[] { new StructField("y", DataTypes.IntegerType, nullable: true) }),
+            DataTypes.CreateMapType(
+                DataTypes.CreateStructType(new[] { new StructField("y", DataTypes.IntegerType, nullable: true) }),
+                DataTypes.LongType),
             nullable: true);
 
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(

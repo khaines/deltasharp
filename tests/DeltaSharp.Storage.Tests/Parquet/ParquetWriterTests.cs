@@ -1283,33 +1283,19 @@ public sealed class ParquetWriterTests
         Assert.Contains("struct", acceptedNames, StringComparer.Ordinal);
         Assert.DoesNotContain("void", acceptedNames, StringComparer.Ordinal);
 
-        // The residual refusals (§2.4a/§2.6 + the nested-within-nested defer, message "deferred, #585"
-        // now tracked by #873): each of the THREE named object arms individually — array<array>,
-        // map<string,array>, struct<x:struct> — plus a zero-field struct and a non-nullable nested
-        // container. Each object arm is probed on its own so a future writer that starts accepting ONE
-        // (e.g. array elements) while still refusing another (e.g. map values or struct fields) is
-        // caught rather than masked by a single representative. Asserted through the same real-write
-        // probe the acceptance set is derived from, so the boundary is measured on both sides rather
-        // than described on one.
-        await AssertWriterRefusesAsync(
-            new StructField(
-                "probe", DataTypes.CreateArrayType(DataTypes.CreateArrayType(DataTypes.LongType)),
-                nullable: true));
+        // The residual refusals (§2.4a/§2.6 + #873 D5): #873 LIFTED the #585 nested-within-nested defer for
+        // name/none-mode shapes (array<array>, map<string,array>, struct<x:struct> are now WRITTEN and
+        // round-tripped by NestedParquetWriteTests), so the residual write-door refusals are: a map whose KEY
+        // is a container (nested map key — permanently unreadable, §2.10.6), a zero-field struct, and a
+        // non-nullable nested container. Each is probed on its own so a future writer that starts accepting
+        // one while still refusing another is caught rather than masked. Asserted through the same real-write
+        // probe the acceptance set is derived from, so the boundary is measured on both sides.
         await AssertWriterRefusesAsync(
             new StructField(
                 "probe",
-                DataTypes.CreateMapType(DataTypes.StringType, DataTypes.CreateArrayType(DataTypes.LongType)),
-                nullable: true));
-        await AssertWriterRefusesAsync(
-            new StructField(
-                "probe",
-                DataTypes.CreateStructType(new[]
-                {
-                    new StructField(
-                        "x",
-                        DataTypes.CreateStructType(new[] { new StructField("y", DataTypes.LongType, nullable: true) }),
-                        nullable: true),
-                }),
+                DataTypes.CreateMapType(
+                    DataTypes.CreateStructType(new[] { new StructField("k", DataTypes.LongType, nullable: true) }),
+                    DataTypes.LongType),
                 nullable: true));
         await AssertWriterRefusesAsync(
             new StructField("probe", DataTypes.CreateStructType(Array.Empty<StructField>()), nullable: true));

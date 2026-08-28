@@ -1583,16 +1583,21 @@ public sealed class StorageHygieneSweepTests
         // only the KIND. Since #841 a single-level struct-of-scalars is WRITABLE, so the poison is carried on
         // the shape that still fails closed: a nested type within a nested type (#585). The mapping must
         // still name neither the offending child nor any of the 40 poisoned sibling names.
-        var deeplyNested = new StructType([new StructField("deep", nested, nullable: true)]);
+        // (2) …and the shapes that STILL fail closed (post-#873) are intercepted before those arms, by an arm
+        // that renders only the KIND. #873 LIFTED the #585 nested-within-nested reject for name/none-mode
+        // shapes (struct-of-struct now maps), so the poison is carried on a shape that remains unwritable: a
+        // map whose KEY is a container (#873 D5). The mapping must still name neither the offending child nor
+        // any of the 40 poisoned sibling names.
+        DataType nestedKeyMap = DataTypes.CreateMapType(nested, DataTypes.LongType);
         DeltaStorageException mapping = Assert.ThrowsAny<DeltaStorageException>(
             () => ParquetTypeMapping.CreateField(
-                new StructField("c", deeplyNested, nullable: true), honorReferenceNullability: false));
-        Assert.Contains("a nested type within a nested type", mapping.Message, StringComparison.Ordinal);
+                new StructField("c", nestedKeyMap, nullable: true), honorReferenceNullability: false));
+        Assert.Contains("a map whose key is a container", mapping.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("' of type '", mapping.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(mapping.Message, p);
 
-        // The in-scope struct-of-scalars, by contrast, now MAPS — and its poisoned child names travel only
-        // into the Parquet schema (where they are data, not diagnostics), never into a message.
+        // The in-scope struct-of-scalars, by contrast, maps — and its poisoned child names travel only into
+        // the Parquet schema (where they are data, not diagnostics), never into a message.
         Assert.NotNull(
             ParquetTypeMapping.CreateField(
                 new StructField("c", nested, nullable: true), honorReferenceNullability: false));
