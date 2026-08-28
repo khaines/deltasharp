@@ -714,8 +714,10 @@ internal sealed class DeltaTableWriter
     /// <see cref="DeltaReadScope.WholeTable"/>; <c>delta.columnMapping.maxColumnId</c> is unchanged.
     /// </summary>
     /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
-    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #866), or a second struct hop (F4b,
-    /// #866); or the target name ordinally collides with a sibling at its parent level (F6a).</exception>
+    /// absent (F2) or resolves to a scalar (F3) or array/map interior (F4, #866 — retained fail-closed); the
+    /// path nests deeper than the segment-depth ceiling (#866 866c); or the target name ordinally collides with
+    /// a sibling at its parent level (F6a). A struct-of-struct chain at any depth is supported (F4b lifted,
+    /// #866 866c).</exception>
     internal async Task<DeltaCommitResult> RenameColumnAsync(
         IReadOnlyList<string> path, string toName, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
@@ -725,7 +727,8 @@ internal sealed class DeltaTableWriter
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
 
         // Guard ordering (§2.5/§3): (1) RequireNameMode (F5) FIRST, so an id-mode fixture cannot pass a later
-        // guard vacuously; (2) empty-path (F1); (3) segment descent (F2/F3/F4/F4b) with F6a collision at the
+        // guard vacuously; (2) empty-path (F1); (3) segment descent (F2/F3/F4; struct-of-struct chains recurse,
+        // F4b lifted #866 866c) with F6a collision at the
         // target's parent level; (4) partition parity; (5) commit-time F6b/F10.
         RequireNameMode(snapshot);
         if (path.Count == 0)
@@ -790,8 +793,9 @@ internal sealed class DeltaTableWriter
     /// child. Commits a lone <c>metaData</c> action under <see cref="DeltaReadScope.WholeTable"/>.
     /// </summary>
     /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
-    /// absent (F2) or resolves to a scalar (F3), array/map interior (F4, #866), or a second struct hop (F4b,
-    /// #866); or the target is a top-level partition column (F7).</exception>
+    /// absent (F2) or resolves to a scalar (F3) or array/map interior (F4, #866 — retained fail-closed); the
+    /// path nests deeper than the segment-depth ceiling (#866 866c); or the target is a top-level partition
+    /// column (F7). A struct-of-struct chain at any depth is supported (F4b lifted, #866 866c).</exception>
     internal async Task<DeltaCommitResult> DropColumnAsync(
         IReadOnlyList<string> path, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
@@ -800,7 +804,7 @@ internal sealed class DeltaTableWriter
         Snapshot snapshot = await _log.LoadSnapshotAsync(version: null, cancellationToken).ConfigureAwait(false);
 
         // Guard ordering (§2.5/§3): (1) RequireNameMode (F5) FIRST; (2) empty-path (F1); (3) segment descent
-        // (F2/F3/F4/F4b); (4) partition guard (F7/F8); (5) commit-time F10.
+        // (F2/F3/F4; struct-of-struct chains recurse, F4b lifted #866 866c); (4) partition guard (F7/F8); (5) commit-time F10.
         RequireNameMode(snapshot);
         if (path.Count == 0)
         {
@@ -848,9 +852,12 @@ internal sealed class DeltaTableWriter
     // REFERENCE (untouched); the target is selected by ReferenceEquals identity (no name re-match). NEVER parses
     // or composes a dotted string. `path.Count >= 1` is guaranteed by the caller (F1 checked at the door).
     // Exposed `internal` (not private) originally so the F4b single-hop gate could be exercised directly; as of
-    // #866 866a a NAME-mode struct<struct<…>> schema IS loadable, so the F4b gate is now reachable through the
-    // rename/drop door too (a depth>1 struct child rename/drop fails closed naming #866 until 866c lifts it).
-    // #866 866b relaxes the id-mode C1 load gate; 866c lifts this F4b single-hop gate for struct chains.
+    // #866 866a a NAME-mode struct<struct<…>> schema IS loadable, so the F4b gate is reachable through the
+    // rename/drop door too. #866 866c LIFTS the F4b single-hop ceiling for STRUCT chains: a struct<struct<…>>
+    // intermediate at any depth now RECURSES (RD1), rebuilding the whole struct spine metadata-only (ids /
+    // physicalNames preserved verbatim on rename; the target logical field omitted on drop). RETAINED
+    // fail-closed: F4 (array/map interior — no logical-name hop through an element/key/value, C1, §9) and the
+    // id-mode gate (RequireNameMode, RD2). #866 866b relaxes the id-mode C1 load gate for reads/writes.
     internal static StructType DescendAndRebuild(
         StructType schema, IReadOnlyList<string> path, SchemaChangeOp op, string? toName)
     {
@@ -863,8 +870,25 @@ internal sealed class DeltaTableWriter
                 $"Cannot {OpVerb(op)}: an empty column path addresses no field.");
         }
 
+        // StackOverflow DoS guard (#866 866c): the F4b lift makes the struct-spine descent recursive to
+        // arbitrary depth (bounded by the caller-supplied segment count). A path longer than the shared
+        // MaxSegmentPathDepth ceiling is rejected fail-closed BEFORE any descent — never a
+        // StackOverflowException — parity with the assign/validate/read/write caps (all = 64).
+        if (path.Count > MaxSegmentPathDepth)
+        {
+            throw new InvalidOperationException(
+                $"Cannot {OpVerb(op)}: the column path nests deeper than the supported limit of "
+                + $"{MaxSegmentPathDepth} segments; a deeper path is rejected fail-closed.");
+        }
+
         return RebuildLevel(schema, path, depth: 0, op, toName);
     }
+
+    // Shared depth ceiling for segment-array descent (#866 866c), matching ColumnMapping.MaxNestedMappingDepth /
+    // NestedParquetColumnReader.MaxNestedReadDepth (= 64) so a schema loadable/readable by those caps is also
+    // rename/drop-addressable, and a maliciously deep path is rejected deterministically, never a
+    // StackOverflowException.
+    internal const int MaxSegmentPathDepth = 64;
 
     private static StructType RebuildLevel(
         StructType current, IReadOnlyList<string> path, int depth, SchemaChangeOp op, string? toName)
@@ -906,28 +930,26 @@ internal sealed class DeltaTableWriter
         }
 
         // Intermediate segment: it MUST resolve to a StructType child (you cannot address a child of a
-        // non-struct), and under the single-level scope ONLY the top-level column (depth == 0) may be a struct
-        // intermediate — a SECOND struct hop is fail-closed naming #866 (F4b, lifted by 866c).
+        // non-struct). #866 866c (RD1): a STRUCT intermediate at ANY depth recurses (the F4b single-hop ceiling
+        // is lifted for struct chains) — the whole struct spine is rebuilt metadata-only. RETAINED fail-closed:
+        // F4 (array/map interior — no logical-name hop through an element/key/value, C1) and F3 (scalar).
         switch (field.DataType)
         {
             case StructType childStruct:
-                if (depth >= 1)
-                {
-                    // F4b: a struct<struct<…>> intermediate — caught by NEITHER F3 (scalar) NOR F4 (array/map).
-                    throw new InvalidOperationException(
-                        $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is a "
-                        + "nested-within-nested struct; nested-within-nested rename/drop is not supported yet "
-                        + "(#866); only a single-level nested child is addressable.");
-                }
-
+                // Struct-of-struct descent (#866 866c): recurse into the child struct and rebuild this level's
+                // field with the rebuilt child. ids/physicalNames are carried in each ancestor's Metadata
+                // verbatim (only the deepest target's Name changes on rename, or the target is omitted on drop).
                 StructType rebuiltChild = RebuildLevel(childStruct, path, depth + 1, op, toName);
                 var rebuiltField = new StructField(field.Name, rebuiltChild, field.Nullable, field.Metadata);
                 return RebuildWithReplacement(current, field, rebuiltField);
 
             case ArrayType:
             case MapType:
-                // F4: descending into an array element / map key/value interior — a non-addressable node (C1),
-                // out of scope, fail-closed naming #866.
+                // F4: descending into an array element / map key/value interior — a non-addressable node (C1:
+                // an array element / map key/value is not a StructField, so it has no logical-name hop), out of
+                // scope at every depth (§9), fail-closed naming #866. This includes the array<struct> leaf case
+                // (a struct child under an array element is a StructField but is unreachable by a segment array
+                // because the array element itself has no name hop).
                 throw new InvalidOperationException(
                     $"Cannot {OpVerb(op)} {RenderPath(path)}: segment {RenderPath(path, depth + 1)} is an "
                     + "array/map; rename/drop of an array element / map key/value is not supported (#866).");

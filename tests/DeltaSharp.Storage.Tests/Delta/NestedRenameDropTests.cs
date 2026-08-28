@@ -648,28 +648,38 @@ public sealed class NestedRenameDropTests : IDisposable
     }
 
     [Fact]
-    public void StructWithinStructIntermediate_FailsClosed_Naming866_F4b()
+    public void StructWithinStructIntermediate_Depth2_RecursesMetadataOnly_866c()
     {
-        // A SECOND struct hop (struct<struct<…>> intermediate) is caught by NEITHER F3 (scalar) NOR F4
-        // (array/map). As of #866 866a a NAME-mode struct<struct<…>> schema IS loadable, so this gate is now
-        // reachable through the rename/drop door too; the test targets the door's single-hop gate DIRECTLY with
-        // a hand-built StructType (§2.4/§3.12). Depth>1 struct rename/drop is lifted by 866c.
-        var schema = new StructType(new[]
-        {
-            new StructField("a", new StructType(new[]
-            {
-                new StructField("b", new StructType(new[]
-                {
-                    new StructField("c", DataTypes.LongType),
-                })),
-            })),
-        });
+        // #866 866c LIFTS the F4b single-hop ceiling: a struct<struct<…>> intermediate at any depth now
+        // RECURSES (RD1). A depth-3 chain a→b→c, renaming the deepest leaf `c`→`x`, rebuilds the whole struct
+        // spine metadata-only: the target's DataType/Nullable/Metadata are carried verbatim (only Name changes)
+        // and every untouched sibling is carried by reference. Targets the door helper DIRECTLY with a
+        // hand-built StructType (§2.4/§3.18).
+        var leaf = new StructField("c", DataTypes.LongType);
+        var innerStruct = new StructType(new[] { leaf });
+        var inner = new StructField("b", innerStruct);
+        var outer = new StructField("a", new StructType(new[] { inner }));
+        var sibling = new StructField("keep", DataTypes.StringType);
+        var schema = new StructType(new[] { outer, sibling });
 
-        var ex = Assert.Throws<InvalidOperationException>(() => DeltaTableWriter.DescendAndRebuild(
-            schema, new[] { "a", "b", "c" }, DeltaTableWriter.SchemaChangeOp.Rename, "x"));
-        Assert.Contains("nested-within-nested", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("single-level nested child", ex.Message, StringComparison.Ordinal);
+        StructType rebuilt = DeltaTableWriter.DescendAndRebuild(
+            schema, new[] { "a", "b", "c" }, DeltaTableWriter.SchemaChangeOp.Rename, "x");
+
+        // The deep leaf is renamed; DataType verbatim; siblings preserved; the untouched top-level sibling is
+        // carried BY REFERENCE (no rebuild of an unrelated spine).
+        var rA = (StructType)rebuilt["a"].DataType;
+        var rB = (StructType)rA["b"].DataType;
+        Assert.True(rB.TryGetField("x", out StructField renamed));
+        Assert.False(rB.TryGetField("c", out _));
+        Assert.Equal(DataTypes.LongType, renamed.DataType);
+        Assert.Same(sibling, rebuilt[1]); // untouched top-level sibling carried by reference
+
+        // Drop of the deepest leaf omits exactly it, leaving the (now empty) inner struct.
+        StructType dropped = DeltaTableWriter.DescendAndRebuild(
+            schema, new[] { "a", "b", "c" }, DeltaTableWriter.SchemaChangeOp.Drop, null);
+        var dB = (StructType)((StructType)dropped["a"].DataType)["b"].DataType;
+        Assert.False(dB.TryGetField("c", out _));
+        Assert.Empty(dB);
     }
 
     [Fact]
@@ -1030,22 +1040,21 @@ public sealed class NestedRenameDropTests : IDisposable
                     break;
                 }
 
-            case 7: // F4b struct-within-struct intermediate (hand-built, bypasses load gate)
+            case 7: // struct-within-struct intermediate — #866 866c LIFTS F4b: a depth-2 struct chain recurses
                 {
+                    var leaf = new StructField("leaf", DataTypes.LongType);
                     var nested = new StructType(new[]
                     {
                     new StructField("outer", new StructType(new[]
                     {
-                        new StructField("inner", new StructType(new[]
-                        {
-                            new StructField("leaf", DataTypes.LongType),
-                        })),
+                        new StructField("inner", new StructType(new[] { leaf })),
                     })),
                 });
-                    var ex = Assert.Throws<InvalidOperationException>(() => DeltaTableWriter.DescendAndRebuild(
-                        nested, new[] { "outer", "inner", "leaf" }, DeltaTableWriter.SchemaChangeOp.Drop, null));
-                    Assert.Contains("nested-within-nested", ex.Message, StringComparison.Ordinal);
-                    Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
+                    StructType rebuilt = DeltaTableWriter.DescendAndRebuild(
+                        nested, new[] { "outer", "inner", "leaf" }, DeltaTableWriter.SchemaChangeOp.Drop, null);
+                    var rInner = (StructType)((StructType)rebuilt["outer"].DataType)["inner"].DataType;
+                    Assert.False(rInner.TryGetField("leaf", out _)); // deep leaf dropped metadata-only
+                    Assert.Empty(rInner);
                     break;
                 }
 
