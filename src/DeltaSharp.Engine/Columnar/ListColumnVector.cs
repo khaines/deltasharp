@@ -301,10 +301,13 @@ public sealed class ListColumnVector : MutableColumnVector
     /// <param name="logicalType">The logical array type to re-label onto the shared element child.</param>
     /// <exception cref="ArgumentNullException"><paramref name="logicalType"/> is null.</exception>
     /// <exception cref="ArgumentException">The element type is not congruent with <paramref name="logicalType"/>.</exception>
-    public ListColumnVector RelabelTo(ArrayType logicalType)
+    public ListColumnVector RelabelTo(ArrayType logicalType) => RelabelTo(logicalType, 0);
+
+    // Depth-bounded recursive relabel (StackOverflow DoS guard threaded from NestedRelabel, #866 866a).
+    internal ListColumnVector RelabelTo(ArrayType logicalType, int depth)
     {
         ArgumentNullException.ThrowIfNull(logicalType);
-        ColumnVector relabelledChild = NestedRelabel.To(_child, logicalType.ElementType);
+        ColumnVector relabelledChild = NestedRelabel.To(_child, logicalType.ElementType, depth + 1);
         SealForView();
         return new ListColumnVector(logicalType, relabelledChild, _offsets, _validity, _offset, _length, _nullCount);
     }

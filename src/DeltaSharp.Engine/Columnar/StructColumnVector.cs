@@ -210,7 +210,11 @@ public sealed class StructColumnVector : MutableColumnVector
     /// <exception cref="ArgumentException">The field count or a child's <see cref="ColumnVector.Type"/> is not
     /// congruent with <paramref name="logicalType"/> — the caller (the column-mapping projection) validates
     /// congruence and fails closed with a typed storage error before this backstop is reached.</exception>
-    public StructColumnVector RelabelTo(StructType logicalType)
+    public StructColumnVector RelabelTo(StructType logicalType) => RelabelTo(logicalType, 0);
+
+    // Depth-bounded recursive relabel (the depth is threaded from NestedRelabel so a StackOverflow DoS on the
+    // public RelabelTo API fails closed with a typed exception, #866 866a).
+    internal StructColumnVector RelabelTo(StructType logicalType, int depth)
     {
         ArgumentNullException.ThrowIfNull(logicalType);
         if (logicalType.Count != _children.Length)
@@ -226,7 +230,7 @@ public sealed class StructColumnVector : MutableColumnVector
         var relabelled = new ColumnVector[_children.Length];
         for (int i = 0; i < _children.Length; i++)
         {
-            relabelled[i] = NestedRelabel.To(_children[i], logicalType[i].DataType);
+            relabelled[i] = NestedRelabel.To(_children[i], logicalType[i].DataType, depth + 1);
         }
 
         // Zero-copy: share the (possibly re-typed) children, validity buffer, and window — only the logical

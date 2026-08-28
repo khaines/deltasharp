@@ -436,6 +436,84 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
     }
 
     // ==================================================================================================
+    // StackOverflow DoS guard — the new depth>1 recursions are bounded (#866 866a, red-team)
+    // ==================================================================================================
+
+    [Fact]
+    public void Dos_DeepStructSchema_NearCapSucceeds_OverCapFailsClosed_AllPaths()
+    {
+        // A directly-constructed in-memory schema nested deeper than the cap must fail closed with a TYPED
+        // exception on EVERY new recursion (assign / validate / physical / read), never a StackOverflowException.
+        const int nearCap = 55;   // within the 64-level cap
+        const int overCap = 200;  // well past the cap
+
+        // --- assignment (AssignMappedType) ---
+        (StructType nearMapped, long nearMax) = ColumnMapping.AssignFreshMapping(
+            DeepLogicalStruct(nearCap), new SeededPhysicalNameSource("dos-assign"), ColumnMappingMode.Name);
+        Assert.Throws<DeltaProtocolException>(() => ColumnMapping.AssignFreshMapping(
+            DeepLogicalStruct(overCap), new SeededPhysicalNameSource("dos-assign-over"), ColumnMappingMode.Name));
+
+        // --- validation (ValidateMappedInterior / ValidateMappedLevel) ---
+        ColumnMapping.ValidateColumnMappingSchema(
+            ColumnMappingMode.Name, nearMapped, ColumnMapping.NameModeConfiguration(nearMax));
+        Assert.Throws<DeltaProtocolException>(() => ColumnMapping.ValidateColumnMappingSchema(
+            ColumnMappingMode.Name, DeepMappedStruct(overCap), ColumnMapping.NameModeConfiguration(overCap + 2)));
+
+        // --- physical schema (ToPhysicalType) ---
+        _ = ColumnMapping.ToPhysicalSchema(nearMapped, ColumnMappingMode.Name);
+        Assert.Throws<DeltaProtocolException>(() => ColumnMapping.ToPhysicalSchema(
+            DeepMappedStruct(overCap), ColumnMappingMode.Name));
+
+        // --- read schema build (ColumnMappingProjection.BuildPhysicalDataType) ---
+        StructType overMapped = DeepMappedStruct(overCap);
+        string[] overNames = ColumnMappingProjection.ResolvePhysicalNames(overMapped, ColumnMappingMode.Name);
+        Assert.Throws<DeltaStorageException>(() => ColumnMappingProjection.BuildDataSchema(
+            overMapped, overNames, System.Collections.Immutable.ImmutableArray<string>.Empty));
+
+        // the near-cap read schema builds fine
+        string[] nearNames = ColumnMappingProjection.ResolvePhysicalNames(nearMapped, ColumnMappingMode.Name);
+        _ = ColumnMappingProjection.BuildDataSchema(
+            nearMapped, nearNames, System.Collections.Immutable.ImmutableArray<string>.Empty);
+    }
+
+    // A logical struct nested `depth` levels deep: { c1: struct<c2: struct< … struct<leaf:long> >> }.
+    private static StructType DeepLogicalStruct(int depth)
+    {
+        DataType inner = new StructType(new[] { new StructField("leaf", DataTypes.LongType, nullable: true) });
+        for (int i = depth; i >= 1; i--)
+        {
+            inner = new StructType(new[] { new StructField("c" + i.ToString(CultureInfo.InvariantCulture), inner, nullable: true) });
+        }
+
+        return (StructType)inner;
+    }
+
+    // The same shape, hand-mapped: each StructField carries a unique (id, physicalName) so it is a valid
+    // NAME-mode mapped schema (except for its illegal depth), exercising the validate/physical/read guards
+    // without going through the (depth-guarded) assignment path.
+    private static StructType DeepMappedStruct(int depth)
+    {
+        long id = depth + 2;
+        StructField field = new(
+            "leaf", DataTypes.LongType, nullable: true, MappingMeta(id));
+        for (int i = depth; i >= 1; i--)
+        {
+            var s = new StructType(new[] { field });
+            field = new StructField("c" + i.ToString(CultureInfo.InvariantCulture), s, nullable: true, MappingMeta(i));
+        }
+
+        return new StructType(new[] { field });
+    }
+
+    private static DeltaSharp.Types.FieldMetadata MappingMeta(long id) =>
+        DeltaSharp.Types.FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
+            new KeyValuePair<string, MetadataValue>(
+                ColumnMapping.PhysicalNameKey, MetadataValue.String("col-" + id.ToString(CultureInfo.InvariantCulture))),
+        });
+
+    // ==================================================================================================
     // Harness
     // ==================================================================================================
 
@@ -588,9 +666,7 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
         return v;
     }
 
-    // Builds an array<struct<childLong>> where each element struct has exactly ONE nullable long child (the
-    // element struct type is type.ElementType). Used by the evolve/null-fill cells whose OLD element is a
-    // single-child struct.
+    // Builds a nullable string leaf vector.
     private static MutableColumnVector Str(params string?[] values)
     {
         MutableColumnVector v = ColumnVectors.Create(DataTypes.StringType, values.Length);
@@ -602,6 +678,7 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
         return v;
     }
 
+    // Builds an array<long> (scalar element) vector.
     private static ListColumnVector ArrayOfScalarLong(ArrayType type, IReadOnlyList<long?[]?> rows)
     {
         MutableColumnVector elements = ColumnVectors.Create(DataTypes.LongType, 16);
@@ -627,6 +704,9 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
         return new ListColumnVector(type, elements, offsets, nulls);
     }
 
+    // Builds an array<struct<childLong>> where each element struct has exactly ONE nullable long child (the
+    // element struct type is type.ElementType). Used by the evolve/null-fill cells whose OLD element is a
+    // single-child struct.
     private static ListColumnVector ArrayOfSingleLong(ArrayType type, IReadOnlyList<long?[]?> rows)
     {
         var elemType = (StructType)type.ElementType;

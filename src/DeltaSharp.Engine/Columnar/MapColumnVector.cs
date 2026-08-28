@@ -350,11 +350,14 @@ public sealed class MapColumnVector : MutableColumnVector
     /// <param name="logicalType">The logical map type to re-label onto the shared key/value children.</param>
     /// <exception cref="ArgumentNullException"><paramref name="logicalType"/> is null.</exception>
     /// <exception cref="ArgumentException">A key/value type is not congruent with <paramref name="logicalType"/>.</exception>
-    public MapColumnVector RelabelTo(MapType logicalType)
+    public MapColumnVector RelabelTo(MapType logicalType) => RelabelTo(logicalType, 0);
+
+    // Depth-bounded recursive relabel (StackOverflow DoS guard threaded from NestedRelabel, #866 866a).
+    internal MapColumnVector RelabelTo(MapType logicalType, int depth)
     {
         ArgumentNullException.ThrowIfNull(logicalType);
-        ColumnVector relabelledKeys = NestedRelabel.To(_keys, logicalType.KeyType);
-        ColumnVector relabelledValues = NestedRelabel.To(_values, logicalType.ValueType);
+        ColumnVector relabelledKeys = NestedRelabel.To(_keys, logicalType.KeyType, depth + 1);
+        ColumnVector relabelledValues = NestedRelabel.To(_values, logicalType.ValueType, depth + 1);
         SealForView();
         return new MapColumnVector(
             logicalType, relabelledKeys, relabelledValues, _offsets, _validity, _offset, _length, _nullCount);

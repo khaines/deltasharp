@@ -12,12 +12,28 @@ namespace DeltaSharp.Engine.Columnar;
 /// </summary>
 internal static class NestedRelabel
 {
+    /// <summary>The maximum number of nested type levels the relabel recursion descends before failing closed,
+    /// matching the storage read/write caps (64). A defense-in-depth StackOverflow guard on the public vector
+    /// <c>RelabelTo</c> API; in the production read path the projection's congruence check (also 64-capped)
+    /// fires first.</summary>
+    internal const int MaxRelabelDepth = 64;
+
     /// <summary>Relabels <paramref name="column"/> to <paramref name="logicalType"/>, recursing into nested
     /// interiors. A column already carrying the logical type (none mode / no rename) is returned unchanged.</summary>
-    public static ColumnVector To(ColumnVector column, DataType logicalType)
+    public static ColumnVector To(ColumnVector column, DataType logicalType) => To(column, logicalType, 0);
+
+    // Depth-bounded recursive relabel. The depth is checked BEFORE any descent, so an over-deep congruent
+    // vector fails closed with a typed exception rather than a StackOverflowException.
+    internal static ColumnVector To(ColumnVector column, DataType logicalType, int depth)
     {
         ArgumentNullException.ThrowIfNull(column);
         ArgumentNullException.ThrowIfNull(logicalType);
+        if (depth > MaxRelabelDepth)
+        {
+            throw new NotSupportedException(
+                $"Cannot relabel a column nested deeper than the supported limit of {MaxRelabelDepth} type levels.");
+        }
+
         if (column.Type.Equals(logicalType))
         {
             return column;
@@ -25,9 +41,9 @@ internal static class NestedRelabel
 
         return column switch
         {
-            StructColumnVector s when logicalType is StructType st => s.RelabelTo(st),
-            ListColumnVector l when logicalType is ArrayType at => l.RelabelTo(at),
-            MapColumnVector m when logicalType is MapType mt => m.RelabelTo(mt),
+            StructColumnVector s when logicalType is StructType st => s.RelabelTo(st, depth),
+            ListColumnVector l when logicalType is ArrayType at => l.RelabelTo(at, depth),
+            MapColumnVector m when logicalType is MapType mt => m.RelabelTo(mt, depth),
             _ => throw new ArgumentException(
                 $"Cannot relabel a '{column.Type.SimpleString}' column to '{logicalType.SimpleString}'; the types "
                 + "are not structurally congruent.", nameof(logicalType)),

@@ -146,6 +146,14 @@ internal static class ColumnMapping
     private const string NameMode = "name";
     private const string IdMode = "id";
 
+    // The maximum number of nested type levels the in-memory mapping recursions (assign / validate / evolve /
+    // physical) will descend before failing closed with a typed exception, matching the write/read type-level
+    // caps (ParquetTypeMapping.MaxNestedWriteDepth / NestedParquetColumnReader.MaxNestedReadDepth = 64) so a
+    // schema assignable/validatable in memory is also writable and readable. Checked BEFORE any descent so a
+    // maliciously deep directly-constructed schema is rejected deterministically, never a StackOverflowException
+    // (the log-parse path is separately capped by SchemaJson.MaxDepth on the JSON bracket depth).
+    internal const int MaxNestedMappingDepth = 64;
+
     /// <summary>Parses <c>delta.columnMapping.mode</c> from a table's <paramref name="configuration"/>
     /// (absent/empty ⇒ <see cref="ColumnMappingMode.None"/>). An unrecognized value is an inconsistent
     /// table property — fail closed rather than guess a mode.</summary>
@@ -442,7 +450,7 @@ internal static class ColumnMapping
         // <parentPhysical>.<childPhysical>, so sibling uniqueness suffices). Fail closed at load AND commit
         // BEFORE any column resolves.
         var ids = new HashSet<long>();
-        ValidateMappedLevel(schema, mode, parentPath: null, isTopLevel: true, ids, maxColumnId);
+        ValidateMappedLevel(schema, mode, parentPath: null, isTopLevel: true, ids, maxColumnId, depth: 1);
 
         // #676: run the recursive case-insensitive sibling-collision guard from THIS load choke point too, so
         // a foreign mapped table with a nested case-insensitive collision (struct<city,CITY>) fails closed at
@@ -461,7 +469,7 @@ internal static class ColumnMapping
     // id; a missing/out-of-range/over-ceiling id.
     private static void ValidateMappedLevel(
         StructType level, ColumnMappingMode mode, string? parentPath, bool isTopLevel,
-        HashSet<long> ids, long maxColumnId)
+        HashSet<long> ids, long maxColumnId, int depth)
     {
         var physicalNames = new HashSet<string>(StringComparer.Ordinal);
         foreach (StructField field in level)
@@ -624,7 +632,7 @@ internal static class ColumnMapping
             // element/key/value to reach an interior struct. ID mode fails closed above at depth>1, so this
             // carries only name/none depth>1 struct interiors (and the pre-existing single-level struct
             // recursion, unchanged).
-            ValidateMappedInterior(field.DataType, path, mode, ids, maxColumnId);
+            ValidateMappedInterior(field.DataType, path, mode, ids, maxColumnId, depth + 1);
         }
     }
 
@@ -632,21 +640,23 @@ internal static class ColumnMapping
     // (#866, 866a). A struct interior is validated as its own level (each child's id/physicalName, per-level
     // physicalName uniqueness, the shared global id set + ceiling); an array/map interior descends its
     // element/key/value token to reach a deeper interior struct. Name/none mode only — an id-mode
-    // nested-within-nested shape fails closed at the ValidateMappedLevel door before this is reached.
+    // nested-within-nested shape fails closed at the ValidateMappedLevel door before this is reached. The
+    // depth is checked BEFORE descending (StackOverflow DoS guard, #866 866a).
     private static void ValidateMappedInterior(
-        DataType type, string path, ColumnMappingMode mode, HashSet<long> ids, long maxColumnId)
+        DataType type, string path, ColumnMappingMode mode, HashSet<long> ids, long maxColumnId, int depth)
     {
+        EnsureMappingDepth(depth, path);
         switch (type)
         {
             case StructType structType:
-                ValidateMappedLevel(structType, mode, path, isTopLevel: false, ids, maxColumnId);
+                ValidateMappedLevel(structType, mode, path, isTopLevel: false, ids, maxColumnId, depth);
                 break;
             case ArrayType array:
-                ValidateMappedInterior(array.ElementType, path + "." + ElementSelector, mode, ids, maxColumnId);
+                ValidateMappedInterior(array.ElementType, path + "." + ElementSelector, mode, ids, maxColumnId, depth + 1);
                 break;
             case MapType map:
-                ValidateMappedInterior(map.KeyType, path + "." + KeySelector, mode, ids, maxColumnId);
-                ValidateMappedInterior(map.ValueType, path + "." + ValueSelector, mode, ids, maxColumnId);
+                ValidateMappedInterior(map.KeyType, path + "." + KeySelector, mode, ids, maxColumnId, depth + 1);
+                ValidateMappedInterior(map.ValueType, path + "." + ValueSelector, mode, ids, maxColumnId, depth + 1);
                 break;
         }
     }
@@ -939,7 +949,7 @@ internal static class ColumnMapping
         var mapped = new List<StructField>(schema.Count);
         foreach (StructField field in schema)
         {
-            mapped.Add(AssignMappedField(field, field.Name, nameSource, mode, ref nextId));
+            mapped.Add(AssignMappedField(field, field.Name, nameSource, mode, ref nextId, depth: 1));
         }
 
         return (new StructType(mapped), nextId);
@@ -951,12 +961,13 @@ internal static class ColumnMapping
     // mode an array/map container additionally mints its interior element/key/value ids (§2.3) and carries a
     // delta.columnMapping.nested.ids value; name/none mode mints none.
     private static StructField AssignMappedField(
-        StructField field, string path, IColumnPhysicalNameSource nameSource, ColumnMappingMode mode, ref long nextId)
+        StructField field, string path, IColumnPhysicalNameSource nameSource, ColumnMappingMode mode,
+        ref long nextId, int depth)
     {
         long id = ++nextId;
         string physicalName = nameSource.NextPhysicalName();
         DataType mappedType = AssignMappedType(
-            field.DataType, path, physicalName, nameSource, mode, ref nextId, out MetadataValue? nestedIds);
+            field.DataType, path, physicalName, nameSource, mode, ref nextId, out MetadataValue? nestedIds, depth);
         return WithMapping(field, mappedType, id, physicalName, nestedIds);
     }
 
@@ -972,8 +983,9 @@ internal static class ColumnMapping
     // past the reject; name/none mode recurses instead.
     private static DataType AssignMappedType(
         DataType type, string path, string containerPhysical, IColumnPhysicalNameSource nameSource,
-        ColumnMappingMode mode, ref long nextId, out MetadataValue? nestedIds)
+        ColumnMappingMode mode, ref long nextId, out MetadataValue? nestedIds, int depth)
     {
+        EnsureMappingDepth(depth, path);
         nestedIds = null;
         switch (type)
         {
@@ -995,7 +1007,7 @@ internal static class ColumnMapping
                         RejectNestedWithinNested(child.DataType, path + "." + child.Name);
                     }
 
-                    mappedChildren.Add(AssignMappedField(child, path + "." + child.Name, nameSource, mode, ref nextId));
+                    mappedChildren.Add(AssignMappedField(child, path + "." + child.Name, nameSource, mode, ref nextId, depth + 1));
                 }
 
                 return new StructType(mappedChildren);
@@ -1016,7 +1028,7 @@ internal static class ColumnMapping
                 // unchanged); name mode mints no nested.ids.
                 DataType mappedElement = AssignMappedType(
                     array.ElementType, path + "." + ElementSelector, containerPhysical + "." + ElementSelector,
-                    nameSource, mode, ref nextId, out _);
+                    nameSource, mode, ref nextId, out _, depth + 1);
                 return new ArrayType(mappedElement, array.ContainsNull);
             case MapType map:
                 if (mode == ColumnMappingMode.Id)
@@ -1037,10 +1049,10 @@ internal static class ColumnMapping
                 // StructFields get their own (id, physicalName); scalar interiors return verbatim.
                 DataType mappedKey = AssignMappedType(
                     map.KeyType, path + "." + KeySelector, containerPhysical + "." + KeySelector,
-                    nameSource, mode, ref nextId, out _);
+                    nameSource, mode, ref nextId, out _, depth + 1);
                 DataType mappedValue = AssignMappedType(
                     map.ValueType, path + "." + ValueSelector, containerPhysical + "." + ValueSelector,
-                    nameSource, mode, ref nextId, out _);
+                    nameSource, mode, ref nextId, out _, depth + 1);
                 return new MapType(mappedKey, mappedValue, map.ValueContainsNull);
             default:
                 return type;
@@ -1099,7 +1111,7 @@ internal static class ColumnMapping
         foreach (StructField field in evolvedSchema)
         {
             StructField? existing = currentMappedSchema.TryGetField(field.Name, out StructField match) ? match : null;
-            mapped.Add(EvolveMappedField(field, existing, field.Name, nameSource, mode, ref nextId));
+            mapped.Add(EvolveMappedField(field, existing, field.Name, nameSource, mode, ref nextId, depth: 1));
         }
 
         ImmutableSortedDictionary<string, string> configuration =
@@ -1119,7 +1131,7 @@ internal static class ColumnMapping
     // whose type CHANGED, mints fresh interior ids (old interior identities retired, never re-parented).
     private static StructField EvolveMappedField(
         StructField evolvedField, StructField? existingField, string path,
-        IColumnPhysicalNameSource nameSource, ColumnMappingMode mode, ref long nextId)
+        IColumnPhysicalNameSource nameSource, ColumnMappingMode mode, ref long nextId, int depth)
     {
         long id;
         string physicalName;
@@ -1142,7 +1154,7 @@ internal static class ColumnMapping
         }
 
         DataType mappedType = EvolveMappedType(
-            evolvedField.DataType, existingField?.DataType, path, nameSource, mode, ref nextId);
+            evolvedField.DataType, existingField?.DataType, path, nameSource, mode, ref nextId, depth);
         MetadataValue? nestedIds = ResolveEvolveNestedIds(
             evolvedField.DataType, existingField, physicalName, mode, ref nextId);
         return WithMapping(evolvedField, mappedType, id, physicalName, nestedIds);
@@ -1197,8 +1209,9 @@ internal static class ColumnMapping
     // id is minted (retained until 866b).
     private static DataType EvolveMappedType(
         DataType evolvedType, DataType? existingType, string path,
-        IColumnPhysicalNameSource nameSource, ColumnMappingMode mode, ref long nextId)
+        IColumnPhysicalNameSource nameSource, ColumnMappingMode mode, ref long nextId, int depth)
     {
+        EnsureMappingDepth(depth, path);
         switch (evolvedType)
         {
             case StructType structType:
@@ -1224,7 +1237,7 @@ internal static class ColumnMapping
                         existingStruct is not null && existingStruct.TryGetField(child.Name, out StructField ec)
                             ? ec
                             : null;
-                    children.Add(EvolveMappedField(child, existingChild, path + "." + child.Name, nameSource, mode, ref nextId));
+                    children.Add(EvolveMappedField(child, existingChild, path + "." + child.Name, nameSource, mode, ref nextId, depth + 1));
                 }
 
                 return new StructType(children);
@@ -1237,7 +1250,7 @@ internal static class ColumnMapping
 
                 DataType evolvedElement = EvolveMappedType(
                     array.ElementType, (existingType as ArrayType)?.ElementType, path + "." + ElementSelector,
-                    nameSource, mode, ref nextId);
+                    nameSource, mode, ref nextId, depth + 1);
                 return new ArrayType(evolvedElement, array.ContainsNull);
             case MapType map:
                 if (mode == ColumnMappingMode.Id)
@@ -1249,9 +1262,9 @@ internal static class ColumnMapping
 
                 var existingMap = existingType as MapType;
                 DataType evolvedKey = EvolveMappedType(
-                    map.KeyType, existingMap?.KeyType, path + "." + KeySelector, nameSource, mode, ref nextId);
+                    map.KeyType, existingMap?.KeyType, path + "." + KeySelector, nameSource, mode, ref nextId, depth + 1);
                 DataType evolvedValue = EvolveMappedType(
-                    map.ValueType, existingMap?.ValueType, path + "." + ValueSelector, nameSource, mode, ref nextId);
+                    map.ValueType, existingMap?.ValueType, path + "." + ValueSelector, nameSource, mode, ref nextId, depth + 1);
                 return new MapType(evolvedKey, evolvedValue, map.ValueContainsNull);
             default:
                 return evolvedType;
@@ -1278,7 +1291,7 @@ internal static class ColumnMapping
         var physical = new List<StructField>(schema.Count);
         foreach (StructField field in schema)
         {
-            physical.Add(ToPhysicalField(field, field, mode, field.Name));
+            physical.Add(ToPhysicalField(field, field, mode, field.Name, depth: 1));
         }
 
         return new StructType(physical);
@@ -1326,7 +1339,7 @@ internal static class ColumnMapping
             // output. In id mode the id is carried so the staged Parquet stamps the field_id. For a nested
             // struct the same rule recurses per child (#676): the child's physical name + id come from the
             // table mapping, its type/nullability from the write field.
-            fields.Add(ToPhysicalField(field, tableField, mode, field.Name));
+            fields.Add(ToPhysicalField(field, tableField, mode, field.Name, depth: 1));
         }
 
         return new StructType(fields);
@@ -1581,10 +1594,10 @@ internal static class ColumnMapping
     // recurse so an interior struct's children are relabelled to their physical names (#866 866a). An ID-mode
     // nested-within-nested interior fails closed naming #866 (retained until 866b).
     private static StructField ToPhysicalField(
-        StructField writeField, StructField mappedField, ColumnMappingMode mode, string logicalPath)
+        StructField writeField, StructField mappedField, ColumnMappingMode mode, string logicalPath, int depth)
     {
         string physicalName = PhysicalName(mappedField, mode);
-        DataType physicalType = ToPhysicalType(writeField.DataType, mappedField.DataType, mode, logicalPath);
+        DataType physicalType = ToPhysicalType(writeField.DataType, mappedField.DataType, mode, logicalPath, depth);
 
         if (mode != ColumnMappingMode.Id)
         {
@@ -1631,8 +1644,9 @@ internal static class ColumnMapping
     // struct fails closed; an ID-mode nested-within-nested interior fails closed naming #866 (retained until
     // 866b — an id-mode depth>1 schema can never reach here because the assign/validate door rejects it).
     private static DataType ToPhysicalType(
-        DataType writeType, DataType mappedType, ColumnMappingMode mode, string logicalPath)
+        DataType writeType, DataType mappedType, ColumnMappingMode mode, string logicalPath, int depth)
     {
+        EnsureMappingDepth(depth, logicalPath);
         switch (writeType)
         {
             case StructType writeStruct:
@@ -1663,7 +1677,7 @@ internal static class ColumnMapping
                                 + $"the write is rejected fail-closed."));
                     }
 
-                    children.Add(ToPhysicalField(writeChild, mappedChild, mode, logicalPath + "." + writeChild.Name));
+                    children.Add(ToPhysicalField(writeChild, mappedChild, mode, logicalPath + "." + writeChild.Name, depth + 1));
                 }
 
                 return new StructType(children);
@@ -1684,7 +1698,7 @@ internal static class ColumnMapping
                 }
 
                 return new ArrayType(
-                    ToPhysicalType(array.ElementType, mappedArray.ElementType, mode, logicalPath + "." + ElementSelector),
+                    ToPhysicalType(array.ElementType, mappedArray.ElementType, mode, logicalPath + "." + ElementSelector, depth + 1),
                     array.ContainsNull);
             case MapType map:
                 if (mode == ColumnMappingMode.Id)
@@ -1704,8 +1718,8 @@ internal static class ColumnMapping
                 }
 
                 return new MapType(
-                    ToPhysicalType(map.KeyType, mappedMap.KeyType, mode, logicalPath + "." + KeySelector),
-                    ToPhysicalType(map.ValueType, mappedMap.ValueType, mode, logicalPath + "." + ValueSelector),
+                    ToPhysicalType(map.KeyType, mappedMap.KeyType, mode, logicalPath + "." + KeySelector, depth + 1),
+                    ToPhysicalType(map.ValueType, mappedMap.ValueType, mode, logicalPath + "." + ValueSelector, depth + 1),
                     map.ValueContainsNull);
             default:
                 return writeType;
@@ -1767,6 +1781,22 @@ internal static class ColumnMapping
                     + $"mapping is not yet supported (#866). This build maps id-mode nested columns at a single level "
                     + $"only (a struct of scalars, an array of a scalar, a map of scalar to scalar); name/none mode "
                     + $"supports depth>1."));
+        }
+    }
+
+    // Fail-closed DoS guard for the in-memory mapping recursions (#866 866a): a directly-constructed schema
+    // nested deeper than MaxNestedMappingDepth type levels is rejected with a typed DeltaProtocolException
+    // BEFORE the recursion descends further — never a StackOverflowException. Called at the top of each nested
+    // descent (assign / validate / evolve / physical), so no partial descent leaks past the bound.
+    private static void EnsureMappingDepth(int depth, string path)
+    {
+        if (depth > MaxNestedMappingDepth)
+        {
+            throw DeltaProtocolException.Unsupported(
+                string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"Column '{DiagnosticText.Sanitize(path)}' nests deeper than the supported column-mapping limit "
+                    + $"of {MaxNestedMappingDepth} type levels; the schema is rejected fail-closed."));
         }
     }
 }
