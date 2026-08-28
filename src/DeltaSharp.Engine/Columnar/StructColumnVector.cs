@@ -195,13 +195,15 @@ public sealed class StructColumnVector : MutableColumnVector
 
     /// <summary>
     /// Returns a <b>zero-copy</b> re-typed view of this struct vector under <paramref name="logicalType"/>,
-    /// reusing the existing child vectors and validity buffer (#676 — the column-mapping name-mode read-exit
-    /// inverse relabel). The supplied type must be structurally <b>congruent</b> with this vector's own type:
-    /// equal field count, in the same order, each child's declared <see cref="ColumnVector.Type"/> equal to
-    /// the corresponding <paramref name="logicalType"/> child's <see cref="StructField.DataType"/> — differing
-    /// only in the field <b>names</b> (and per-field metadata) being substituted at this level. It maps a
-    /// physically-read struct (whose fields carry physical names) back to its logical schema without copying
-    /// any child buffer. The window (<see cref="Offset"/>/<see cref="Length"/>) and null mask are preserved.
+    /// reusing the existing child vectors and validity buffer (#676 single-level, extended to depth&gt;1 by
+    /// #866 866a — the column-mapping name-mode read-exit inverse relabel). The supplied type must be
+    /// structurally <b>congruent</b> with this vector's own type: equal field count, in the same order, each
+    /// child's <see cref="ColumnVector.Type"/> congruent with the corresponding <paramref name="logicalType"/>
+    /// child's <see cref="StructField.DataType"/> — differing only in the field <b>names</b> (and per-field
+    /// metadata) being substituted at every depth (a nested struct/array/map child is relabelled recursively).
+    /// It maps a physically-read struct (whose fields carry physical names) back to its logical schema without
+    /// copying any child buffer. The window (<see cref="Offset"/>/<see cref="Length"/>) and null mask are
+    /// preserved.
     /// </summary>
     /// <param name="logicalType">The logical struct type to re-label onto the shared children.</param>
     /// <exception cref="ArgumentNullException"><paramref name="logicalType"/> is null.</exception>
@@ -218,21 +220,20 @@ public sealed class StructColumnVector : MutableColumnVector
                 + $"({logicalType.Count} field(s)); the field counts differ.", nameof(logicalType));
         }
 
+        // Recurse: each child is relabelled to its logical child type (a nested struct/array/map child
+        // substitutes its own interior names; a scalar child whose type genuinely mismatches throws — a
+        // backstop). The re-typed children share the source buffers; only the logical TYPE changes.
+        var relabelled = new ColumnVector[_children.Length];
         for (int i = 0; i < _children.Length; i++)
         {
-            if (!_children[i].Type.Equals(logicalType[i].DataType))
-            {
-                throw new ArgumentException(
-                    $"Cannot relabel field {i} to '{logicalType[i].DataType.SimpleString}'; the child vector has "
-                    + $"type '{_children[i].Type.SimpleString}'.", nameof(logicalType));
-            }
+            relabelled[i] = NestedRelabel.To(_children[i], logicalType[i].DataType);
         }
 
-        // Zero-copy: share the children, validity buffer, and window — only the logical struct TYPE (its field
-        // names + per-field metadata) changes. Seal the source so the shared buffers cannot be mutated out
-        // from under the returned view (mirrors Slice).
+        // Zero-copy: share the (possibly re-typed) children, validity buffer, and window — only the logical
+        // struct TYPE (its field names + per-field metadata) changes. Seal the source so the shared buffers
+        // cannot be mutated out from under the returned view (mirrors Slice).
         SealForView();
-        return new StructColumnVector(logicalType, _children, _validity, _offset, _length, _nullCount);
+        return new StructColumnVector(logicalType, relabelled, _validity, _offset, _length, _nullCount);
     }
 
     /// <inheritdoc/>

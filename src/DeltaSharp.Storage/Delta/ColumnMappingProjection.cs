@@ -88,29 +88,38 @@ internal static class ColumnMappingProjection
         return new StructType(dataFields);
     }
 
-    // Recursively relabels a logical DataType to its physical shape for the READ data schema (#676): a struct
-    // relabels each child to its own delta.columnMapping.physicalName (falling back to the logical name when
-    // absent — none mode / OPTIMIZE), carrying each child's metadata through; an array/map interior rides
-    // verbatim (no interior mapping, C1). Single-level scope, so recursion depth is bounded.
+    // Recursively relabels a logical DataType to its physical shape for the READ data schema (#676 single-level,
+    // extended to depth>1 by #866 866a): a struct relabels each child to its own delta.columnMapping.physicalName
+    // (falling back to the logical name when absent — none mode / OPTIMIZE), carrying each child's metadata
+    // through (so the id rides for id-mode leaves); an array/map interior recurses so an interior struct's
+    // children are likewise relabelled to their physicalName (this is what puts the stable physicalName on a
+    // nested container's group node, design §2.5). In none mode / OPTIMIZE (physical == logical) the recursion
+    // is an identity because no child carries a physicalName. Recursion depth is bounded by the schema tree.
     private static DataType BuildPhysicalDataType(DataType type)
     {
-        if (type is not StructType structType)
+        switch (type)
         {
-            return type;
-        }
+            case StructType structType:
+                var children = new List<StructField>(structType.Count);
+                foreach (StructField child in structType)
+                {
+                    string childPhysical =
+                        child.Metadata.TryGetString(ColumnMapping.PhysicalNameKey, out string? p) && p.Length > 0
+                            ? p
+                            : child.Name;
+                    children.Add(new StructField(
+                        childPhysical, BuildPhysicalDataType(child.DataType), child.Nullable, child.Metadata));
+                }
 
-        var children = new List<StructField>(structType.Count);
-        foreach (StructField child in structType)
-        {
-            string childPhysical =
-                child.Metadata.TryGetString(ColumnMapping.PhysicalNameKey, out string? p) && p.Length > 0
-                    ? p
-                    : child.Name;
-            children.Add(new StructField(
-                childPhysical, BuildPhysicalDataType(child.DataType), child.Nullable, child.Metadata));
+                return new StructType(children);
+            case ArrayType array:
+                return new ArrayType(BuildPhysicalDataType(array.ElementType), array.ContainsNull);
+            case MapType map:
+                return new MapType(
+                    BuildPhysicalDataType(map.KeyType), BuildPhysicalDataType(map.ValueType), map.ValueContainsNull);
+            default:
+                return type;
         }
-
-        return new StructType(children);
     }
 
     /// <summary>
@@ -187,33 +196,42 @@ internal static class ColumnMappingProjection
         return new ManagedColumnBatch(tableSchema, columns, rowCount);
     }
 
-    // Re-types a physically-read column back to its LOGICAL type (#676, the name-mode read-exit inverse
-    // relabel). Only a nested STRUCT needs relabelling — its physical children carry physical names that must
-    // be substituted for the logical names — and only when the read type actually differs (name mode). An
-    // array/map/scalar column, or a struct already carrying the logical type (none mode), passes through
-    // unchanged. The physical struct type is validated for ORDERED congruence against the logical type (equal
-    // count, same order, per-child DataType congruent recursively, equal nullability) and fails closed as a
-    // typed DeltaStorageException.SchemaMismatch (sanitized path) BEFORE the batch is constructed — never a
-    // bare ArgumentException from the zero-copy re-type, and never echoing a raw physical field name.
+    // Re-types a physically-read column back to its LOGICAL type (#676 single-level, extended to depth>1 by
+    // #866 866a — the name-mode read-exit inverse relabel). A nested STRUCT/ARRAY/MAP carrying physical field
+    // names has them substituted for the logical names, zero-copy, recursively (an array<struct>/map<*,struct>
+    // interior struct is relabelled too). A scalar column, or a nested type already carrying the logical type
+    // (none mode), passes through unchanged. The physical type is validated for ORDERED congruence against the
+    // logical type (equal count, same order, per-child DataType congruent recursively, equal nullability) and
+    // fails closed as a typed DeltaStorageException.SchemaMismatch (sanitized path) BEFORE the batch is
+    // constructed — never a bare ArgumentException from the zero-copy re-type, and never echoing a raw physical
+    // field name.
     private static ColumnVector RelabelDataColumn(ColumnVector column, DataType logicalType, string logicalName)
     {
-        if (logicalType is not StructType logicalStruct || column is not StructColumnVector structColumn)
+        // Only a nested column can carry physical field names needing substitution; a scalar passes through.
+        // When the read type already equals logical (none mode / no rename), nothing to relabel.
+        if (logicalType is not (StructType or ArrayType or MapType) || column.Type.Equals(logicalType))
         {
             return column;
         }
 
-        if (structColumn.Type.Equals(logicalStruct))
-        {
-            return column;
-        }
-
-        AssertStructCongruent(structColumn.Type, logicalStruct, logicalName);
-        return structColumn.RelabelTo(logicalStruct);
+        AssertDataTypeCongruent(column.Type, logicalType, logicalName);
+        return RelabelColumn(column, logicalType);
     }
+
+    // Zero-copy re-type dispatch onto the logical nested type. Each vector's RelabelTo shares its child
+    // buffers / validity / window and recurses into nested interiors, changing only the logical TYPE (field
+    // names + per-field metadata). Congruence is validated by AssertDataTypeCongruent BEFORE this is reached.
+    private static ColumnVector RelabelColumn(ColumnVector column, DataType logicalType) => column switch
+    {
+        StructColumnVector s when logicalType is StructType st => s.RelabelTo(st),
+        ListColumnVector l when logicalType is ArrayType at => l.RelabelTo(at),
+        MapColumnVector m when logicalType is MapType mt => m.RelabelTo(mt),
+        _ => column,
+    };
 
     // Validates that a physically-read struct type is congruent with its logical struct type — the same field
     // count, in the same order, each child's DataType congruent (recursively, name-independently for a nested
-    // struct; DataType.Equals for a scalar/array/map), and each child's nullability equal — so a positional
+    // struct/array/map; DataType.Equals for a scalar), and each child's nullability equal — so a positional
     // zero-copy re-type is sound. A COUNT-ONLY check is deliberately avoided: it would silently relabel a
     // reordered or type-mismatched physical struct. Fail closed with a sanitized-path SchemaMismatch.
     private static void AssertStructCongruent(DataType physical, StructType logical, string path)
@@ -236,16 +254,51 @@ internal static class ColumnMappingProjection
                     + "child nullability does not match the logical schema; the read is rejected fail-closed.");
             }
 
-            if (logicalChild.DataType is StructType logicalNested)
-            {
-                AssertStructCongruent(physicalChild.DataType, logicalNested, path + "." + logicalChild.Name);
-            }
-            else if (!physicalChild.DataType.Equals(logicalChild.DataType))
-            {
-                throw DeltaStorageException.SchemaMismatch(
-                    $"Column '{DiagnosticText.Sanitize(path + "." + logicalChild.Name)}': the physically-read struct "
-                    + "child type does not match the logical schema; the read is rejected fail-closed.");
-            }
+            AssertDataTypeCongruent(physicalChild.DataType, logicalChild.DataType, path + "." + logicalChild.Name);
+        }
+    }
+
+    // Validates a physically-read DataType is congruent with its logical DataType at depth>1 (#866 866a): a
+    // struct recurses per child (AssertStructCongruent); an array/map recurses into its element/key/value
+    // (preserving containsNull); a scalar requires DataType.Equals. Fail closed with a sanitized-path
+    // SchemaMismatch — never echoing a raw physical field name.
+    private static void AssertDataTypeCongruent(DataType physical, DataType logical, string path)
+    {
+        switch (logical)
+        {
+            case StructType logicalStruct:
+                AssertStructCongruent(physical, logicalStruct, path);
+                break;
+            case ArrayType logicalArray:
+                if (physical is not ArrayType physicalArray || physicalArray.ContainsNull != logicalArray.ContainsNull)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"Column '{DiagnosticText.Sanitize(path)}': the physically-read array shape does not match the "
+                        + "logical schema (kind or element-nullability); the read is rejected fail-closed.");
+                }
+
+                AssertDataTypeCongruent(physicalArray.ElementType, logicalArray.ElementType, path + ".element");
+                break;
+            case MapType logicalMap:
+                if (physical is not MapType physicalMap || physicalMap.ValueContainsNull != logicalMap.ValueContainsNull)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"Column '{DiagnosticText.Sanitize(path)}': the physically-read map shape does not match the "
+                        + "logical schema (kind or value-nullability); the read is rejected fail-closed.");
+                }
+
+                AssertDataTypeCongruent(physicalMap.KeyType, logicalMap.KeyType, path + ".key");
+                AssertDataTypeCongruent(physicalMap.ValueType, logicalMap.ValueType, path + ".value");
+                break;
+            default:
+                if (!physical.Equals(logical))
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"Column '{DiagnosticText.Sanitize(path)}': the physically-read type does not match the "
+                        + "logical schema; the read is rejected fail-closed.");
+                }
+
+                break;
         }
     }
 }
