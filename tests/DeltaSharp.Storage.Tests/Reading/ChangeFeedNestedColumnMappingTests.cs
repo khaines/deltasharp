@@ -992,15 +992,14 @@ public sealed class ChangeFeedNestedColumnMappingTests
     }
 
     /// <summary>
-    /// A nested-within-nested CDF table (<c>array&lt;struct&gt;</c>, #585) is fail-closed at the load/read door
-    /// under both name and id mode — never a silent skip of the interior struct.
+    /// A nested-within-nested CDF table (<c>array&lt;struct&gt;</c>) under ID mode (#866) is fail-closed at the
+    /// load/read door — never a silent skip of the interior struct. NAME/none mode now loads it (866a), so only
+    /// the retained id-mode gate is asserted here.
     /// </summary>
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task NestedWithinNested_CdfTable_FailsClosedAtLoadDoor_585(bool idMode)
+    [Fact]
+    public async Task NestedWithinNested_IdModeCdfTable_FailsClosedAtLoadDoor_866()
     {
-        ColumnMappingMode mode = idMode ? ColumnMappingMode.Id : ColumnMappingMode.Name;
+        const ColumnMappingMode mode = ColumnMappingMode.Id;
         var logical = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, nullable: false),
@@ -1012,7 +1011,7 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
         using NestedCdfTable table = NestedCdfTable.FromMapped(NewRoot(), mode, logical, MappedNestedWithinNested(), maxColumnId: 2);
         await table.CreateRawMetadataAsync();
-        await AssertLoadFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(0), "#585", "nested type within a nested type");
+        await AssertLoadFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(0), "#866", "nested type within a nested type");
     }
 
     // ------------------------------------------------------------------------------------------------

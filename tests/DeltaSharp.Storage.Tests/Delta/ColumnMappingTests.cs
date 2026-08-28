@@ -2971,16 +2971,17 @@ public sealed class ColumnMappingTests : IDisposable
     }
 
     [Fact]
-    public void EvolveNameModeMapping_NestedWithinNestedNewColumn_FailsClosed_585()
+    public void EvolveIdModeMapping_NestedWithinNestedNewColumn_FailsClosed_866()
     {
         // #676: a NEW single-level struct<scalar> child now evolves successfully (minting only the new child —
-        // see NameMode_EvolveAddStructChild_* below). A NEW NESTED-WITHIN-NESTED column (e.g.
-        // payload: struct<inner: struct<x>>) remains out of scope (#585) and is rejected fail-closed rather
-        // than minted — the assignment/evolve door refuses it before any id is minted.
+        // see NameMode_EvolveAddStructChild_* below). #866 866a: a NEW NESTED-WITHIN-NESTED column
+        // (e.g. payload: struct<inner: struct<x>>) now evolves under NAME/none mode, but under ID mode it
+        // remains out of scope (#866, retained until 866b) and is rejected fail-closed rather than minted — the
+        // assignment/evolve door refuses it before any id is minted.
         (StructType current, long maxColumnId) =
-            ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed));
+            ColumnMapping.AssignFreshMapping(FlatSchema, new SeededPhysicalNameSource(Seed), ColumnMappingMode.Id);
         System.Collections.Immutable.ImmutableSortedDictionary<string, string> config =
-            ColumnMapping.NameModeConfiguration(maxColumnId);
+            ColumnMapping.IdModeConfiguration(maxColumnId);
         var nestedEvolved = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, nullable: false),
@@ -3000,8 +3001,8 @@ public sealed class ColumnMappingTests : IDisposable
 
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
             () => ColumnMapping.EvolveNameModeMapping(
-                nestedEvolved, current, config, new SeededPhysicalNameSource(EvolveSeed)));
-        Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+                nestedEvolved, current, config, new SeededPhysicalNameSource(EvolveSeed), ColumnMappingMode.Id));
+        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]

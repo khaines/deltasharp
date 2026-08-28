@@ -172,9 +172,10 @@ public sealed class StorageHygieneSweepTests
     [MemberData(nameof(Poisons))]
     public void Door_ColumnMapping_NestedWriteColumnRejected(string poison)
     {
-        // #676: a single-level nested column (struct/array/map of scalars) is now MAPPED, not rejected. A
-        // NESTED-WITHIN-NESTED column remains out of scope (#585) and fails closed at the assignment door. The
-        // poison is the CONTAINER name, echoed (sanitized) in the #585 diagnostic via the offending child path.
+        // #676: a single-level nested column (struct/array/map of scalars) is now MAPPED, not rejected. #866
+        // 866a: a NESTED-WITHIN-NESTED column now maps under NAME/none mode; under ID mode it stays out of
+        // scope (#866, retained until 866b) and fails closed at the assignment door. The poison is the
+        // CONTAINER name, echoed (sanitized) in the #866 diagnostic via the offending child path.
         string p = Payload(poison);
         var nested = new StructType(
         [
@@ -191,7 +192,7 @@ public sealed class StorageHygieneSweepTests
         ]);
 
         DeltaProtocolException ex = Assert.ThrowsAny<DeltaProtocolException>(
-            () => ColumnMapping.AssignFreshMapping(nested, new SeededPhysicalNameSource("unused")));
+            () => ColumnMapping.AssignFreshMapping(nested, new SeededPhysicalNameSource("unused"), ColumnMappingMode.Id));
 
         Assert.Contains("nested", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
@@ -659,10 +660,11 @@ public sealed class StorageHygieneSweepTests
     [MemberData(nameof(Poisons))]
     public void Door_ColumnMapping_NestedWithinNestedValidateRejected(string poison)
     {
-        // #676: ResolvePhysicalNames no longer rejects a single-level nested column — it resolves it. The
-        // still-rejecting validation door is ColumnMapping.ValidateColumnMappingSchema (commit AND load), which
-        // fails closed on a NESTED-WITHIN-NESTED shape (#585). The poison is the CONTAINER name, echoed
-        // (sanitized) via the offending child path in the #585 diagnostic.
+        // #676: ResolvePhysicalNames no longer rejects a single-level nested column — it resolves it. #866
+        // 866a: NAME/none mode now recurses over a depth>1 tree; the still-rejecting validation door for a
+        // NESTED-WITHIN-NESTED shape is ID mode (ColumnMapping.ValidateColumnMappingSchema, commit AND load).
+        // The poison is the CONTAINER name, echoed (sanitized) via the offending child path in the #866
+        // diagnostic.
         string p = Payload(poison);
         var schema = new StructType(
         [
@@ -680,7 +682,7 @@ public sealed class StorageHygieneSweepTests
 
         DeltaProtocolException ex = Assert.ThrowsAny<DeltaProtocolException>(
             () => ColumnMapping.ValidateColumnMappingSchema(
-                ColumnMappingMode.Name, schema, ColumnMapping.NameModeConfiguration(1)));
+                ColumnMappingMode.Id, schema, ColumnMapping.IdModeConfiguration(1)));
 
         Assert.Contains("nested", ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
@@ -1137,13 +1139,13 @@ public sealed class StorageHygieneSweepTests
     // the guard fire UNCONDITIONALLY, rendering the whole nested type into the message.
     //
     // REACHABILITY, established by execution rather than by reading: the nested-within-nested metadata column
-    // only SURVIVES to EE-08 under column-mapping mode NONE. Under name/id mode, ValidateColumnMappingSchema —
-    // called at snapshot load (DeltaLog.LoadSnapshotAsync) BEFORE the change feed is consulted — rejects a
-    // nested-within-nested shape (#585, "is a nested type within a nested type") fail-closed, so EE-08 never
-    // sees one and only the NONE branch of the leaf-type comparison is reachable with a struct. (#676 changed
-    // the boundary: a SINGLE-LEVEL struct<scalars> now resolves; the still-rejected shape is
-    // nested-within-nested.) Both outcomes are pinned here: if that upstream guard is ever relaxed, the name/id
-    // rows start reporting the EE-08 message and the hygiene assertion still holds them.
+    // only reaches EE-08 under column-mapping mode NONE. Under name/id mode, ValidateColumnMappingSchema —
+    // called at snapshot load (DeltaLog.LoadSnapshotAsync) BEFORE the change feed is consulted — rejects the
+    // fixture fail-closed: id mode on the nested-within-nested shape (#866, "nested type within a nested
+    // type"), and name mode because the INNER struct children carry no mapping metadata so the recursive
+    // depth>1 validator (#866 866a) fails at the physicalName-presence guard ("delta.columnMapping.physicalName")
+    // — so EE-08 never sees a struct under a mapped mode. (#676 changed the boundary: a SINGLE-LEVEL
+    // struct<scalars> now resolves; #866 866a lets name mode recurse depth>1.) Both outcomes are pinned here.
     [Theory]
     [MemberData(nameof(PoisonsByMappingMode))]
     public async Task Door_ChangeFeed_Ee08NestedMetadataColumn(string poison, string mode)
@@ -1151,10 +1153,16 @@ public sealed class StorageHygieneSweepTests
         string p = Payload(poison);
         DeltaReadException ex = await ReadPoisonedCdcAsync(p, mode);
 
-        Assert.Contains(
-            mode == "none" ? "has leaf type" : "is a nested",
-            ex.Message,
-            StringComparison.Ordinal);
+        // none → EE-08 leaf-type gate; id → the retained id-mode nested-within-nested reject (#866); name →
+        // the recursive depth>1 validator (#866 866a) fails at the interior physicalName-presence guard because
+        // the fixture's inner struct children carry no mapping metadata. All three still render the poison.
+        string expected = mode switch
+        {
+            "none" => "has leaf type",
+            "id" => "nested type within a nested type",
+            _ => "delta.columnMapping.physicalName",
+        };
+        Assert.Contains(expected, ex.Message, StringComparison.Ordinal);
         AssertNeutralizedAndBounded(ex.Message, p);
     }
 
@@ -1235,10 +1243,11 @@ public sealed class StorageHygieneSweepTests
         DeltaReadException leaf = await ReadPoisonedCdcAsync(p, "name", topLevelColumn: p, omitColumnFromBody: true);
         Assert.Contains("not a safe path segment", leaf.Message, StringComparison.Ordinal);
 
-        // (b) The STRUCT-declared shape — the one the EE-08 leaf-type arm uses. A nested mapped column is
-        // rejected even earlier, by the leaf-only guard, so it never reaches the path-segment check.
+        // (b) The STRUCT-declared shape — the top-level column's poisoned PHYSICAL name is caught by the same
+        // top-level unsafe-path-segment guard BEFORE the depth>1 validator (#866 866a) recurses into the
+        // struct, so this too is stopped at load, never reaching EE-08.
         DeltaReadException nested = await ReadPoisonedCdcAsync(p, "name", topLevelColumn: p, omitColumnFromBody: false);
-        Assert.Contains("is a nested", nested.Message, StringComparison.Ordinal);
+        Assert.Contains("not a safe path segment", nested.Message, StringComparison.Ordinal);
 
         // Neither EE-08 echo is reachable in a mapped mode with a poisoned name: that is the disproof.
         foreach (DeltaReadException ex in new[] { leaf, nested })
@@ -1948,11 +1957,12 @@ public sealed class StorageHygieneSweepTests
 
         // A wide struct so the pre-fix render is a FLOOD, not merely an echo: 200 filler leaves plus the
         // poisoned one. Rendering this type recursively is exactly the unbounded behavior under test. #676: the
-        // poisoned member is itself a NESTED struct (making the top-level column a nested-within-nested shape),
-        // which is the shape still rejected fail-closed under the new contract (#585) — a single-level
-        // struct<scalars> now resolves. In none mode this reaches the EE-08 leaf-type gate ("has leaf type",
-        // which renders the whole type, poison and all); in a mapped mode ValidateColumnMappingSchema rejects
-        // the nested-within-nested shape at snapshot load ("is a nested type within a nested type").
+        // poisoned member is itself a NESTED struct (making the top-level column a nested-within-nested shape).
+        // In none mode this reaches the EE-08 leaf-type gate ("has leaf type", which renders the whole type,
+        // poison and all); in ID mode ValidateColumnMappingSchema rejects the nested-within-nested shape at
+        // snapshot load (#866, "nested type within a nested type"); in NAME mode the depth>1 validator (#866
+        // 866a) recurses and fails at the interior physicalName-presence guard (the inner children carry no
+        // mapping metadata), still fail-closed and still rendering the poison.
         var nested = new List<StructField>(201)
         {
             new(poison, new StructType([new StructField("x", DataTypes.LongType, nullable: true)]), nullable: true),

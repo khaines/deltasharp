@@ -610,7 +610,7 @@ public sealed class NestedRenameDropTests : IDisposable
     }
 
     [Fact]
-    public async Task IntermediateSegmentIsArray_FailsClosed_Naming585_F4()
+    public async Task IntermediateSegmentIsArray_FailsClosed_Naming866_F4()
     {
         var schema = new StructType(new[]
         {
@@ -625,11 +625,11 @@ public sealed class NestedRenameDropTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => new DeltaTableWriter(backend).DropColumnAsync(new[] { "tags", "element" }));
         Assert.Contains("array element / map key/value", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public async Task IntermediateSegmentIsMap_FailsClosed_Naming585_F4()
+    public async Task IntermediateSegmentIsMap_FailsClosed_Naming866_F4()
     {
         var schema = new StructType(new[]
         {
@@ -644,17 +644,16 @@ public sealed class NestedRenameDropTests : IDisposable
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(
             () => new DeltaTableWriter(backend).RenameColumnAsync(new[] { "props", "value" }, "x"));
         Assert.Contains("array element / map key/value", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void StructWithinStructIntermediate_FailsClosed_Naming585_F4b()
+    public void StructWithinStructIntermediate_FailsClosed_Naming866_F4b()
     {
         // A SECOND struct hop (struct<struct<…>> intermediate) is caught by NEITHER F3 (scalar) NOR F4
-        // (array/map). This cell is UNCONSTRUCTIBLE via a loaded snapshot today — the load-time C1 gate
-        // ColumnMapping.RejectNestedWithinNested rejects the struct<struct<…>> schema before it can be loaded
-        // — so the test targets the door's single-hop gate DIRECTLY with a hand-built StructType that bypasses
-        // the load door (§2.4/§3.12). A companion loaded-snapshot integration cell is deferred: pending #585.
+        // (array/map). As of #866 866a a NAME-mode struct<struct<…>> schema IS loadable, so this gate is now
+        // reachable through the rename/drop door too; the test targets the door's single-hop gate DIRECTLY with
+        // a hand-built StructType (§2.4/§3.12). Depth>1 struct rename/drop is lifted by 866c.
         var schema = new StructType(new[]
         {
             new StructField("a", new StructType(new[]
@@ -669,7 +668,7 @@ public sealed class NestedRenameDropTests : IDisposable
         var ex = Assert.Throws<InvalidOperationException>(() => DeltaTableWriter.DescendAndRebuild(
             schema, new[] { "a", "b", "c" }, DeltaTableWriter.SchemaChangeOp.Rename, "x"));
         Assert.Contains("nested-within-nested", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
         Assert.Contains("single-level nested child", ex.Message, StringComparison.Ordinal);
     }
 
@@ -1046,7 +1045,7 @@ public sealed class NestedRenameDropTests : IDisposable
                     var ex = Assert.Throws<InvalidOperationException>(() => DeltaTableWriter.DescendAndRebuild(
                         nested, new[] { "outer", "inner", "leaf" }, DeltaTableWriter.SchemaChangeOp.Drop, null));
                     Assert.Contains("nested-within-nested", ex.Message, StringComparison.Ordinal);
-                    Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+                    Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
                     break;
                 }
 
@@ -1072,7 +1071,7 @@ public sealed class NestedRenameDropTests : IDisposable
                     var ex = Assert.Throws<InvalidOperationException>(() => DeltaTableWriter.DescendAndRebuild(
                         arr, new[] { "tags", "element" }, DeltaTableWriter.SchemaChangeOp.Drop, null));
                     Assert.Contains("array element / map key/value", ex.Message, StringComparison.Ordinal);
-                    Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+                    Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
                     break;
                 }
         }
