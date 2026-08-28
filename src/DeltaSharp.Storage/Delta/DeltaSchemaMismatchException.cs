@@ -150,6 +150,29 @@ internal sealed class DeltaSchemaMismatchException : Exception
             "the logical schema without enablement would make the table's existing Parquet files unreadable, " +
             "so it is rejected fail-closed.");
 
+    /// <summary>The write would widen a <b>nested</b> scalar leaf — an array <c>element</c>, a map
+    /// <c>key</c>/<c>value</c>, or a <b>struct child</b> (depth ≥ 1) — under a column-mapping <c>id</c>-mode
+    /// table. Delta sanctions the widening AND the table enabled type widening, but the id-mode nested reader
+    /// resolves such a leaf by its <c>field_id</c> with promotion hardcoded OFF (#839/#546 §9 O1 — the
+    /// <c>ResolveStructFieldById</c> / <c>delta.columnMapping.nested.ids</c> read paths pass
+    /// <c>promoteLeaf: false</c>) and CANNOT read-promote a pre-widening narrow data file, so applying the
+    /// widening would mint a table whose EXISTING Parquet files are unreadable. A top-level scalar column is
+    /// exempt (the flat reader promotes it by <c>field_id</c> on the promotion gate alone). Classified as
+    /// <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/> (fail-closed) with an HONEST
+    /// id-mode-specific message — deliberately NOT the generic "the table has not enabled type widening"
+    /// reason, which is factually wrong here (#870).</summary>
+    public static DeltaSchemaMismatchException TypeWideningUnsupportedInColumnMappingIdMode(
+        string path, DataType tableType, DataType writeType) =>
+        new(
+            DeltaSchemaMismatchKind.TypeWideningUnsupported,
+            path,
+            $"The type change '{DiagnosticText.DescribeType(tableType)}'→'{DiagnosticText.DescribeType(writeType)}' for column '{DiagnosticText.Sanitize(path)}' is a Delta-sanctioned " +
+            "widening of a NESTED leaf (an array element, a map key/value, or a struct child) under a " +
+            "column-mapping 'id'-mode table. The id-mode reader resolves such a leaf by its field_id and does " +
+            "NOT promote a narrower physical type, so applying this widening would make the table's existing " +
+            "Parquet files unreadable. It is rejected fail-closed (a top-level scalar column, which the reader " +
+            "DOES promote by field_id, is unaffected).");
+
     /// <summary>The write would widen a <b>partition</b> column's type, which Delta <i>does</i> sanction
     /// WITHOUT a table rewrite (partition values are stored as strings in the log / directory names), but this
     /// build DEFERS partition-column widening (#537). Classified as <see cref="DeltaSchemaMismatchKind.TypeWideningUnsupported"/>

@@ -132,7 +132,8 @@ internal static class DeltaSchemaEnforcer
         StructType writeSchema,
         SchemaEvolutionMode mode,
         IReadOnlyCollection<string>? partitionColumns = null,
-        bool typeWideningEnabled = false)
+        bool typeWideningEnabled = false,
+        ColumnMappingMode columnMappingMode = ColumnMappingMode.None)
     {
         ArgumentNullException.ThrowIfNull(tableSchema);
         ArgumentNullException.ThrowIfNull(writeSchema);
@@ -142,7 +143,8 @@ internal static class DeltaSchemaEnforcer
             : null;
 
         StructType merged = MergeStruct(
-            tableSchema, writeSchema, mode, parentPath: null, partitions, typeWideningEnabled, fieldDepth: 0);
+            tableSchema, writeSchema, mode, parentPath: null, partitions, typeWideningEnabled,
+            columnMappingMode, fieldDepth: 0);
 
         // Value-equality: reordering columns or omitting nullable ones yields a schema equal to the table's,
         // so no metadata change is emitted. Only a genuine additive change returns a non-null merged schema.
@@ -168,6 +170,7 @@ internal static class DeltaSchemaEnforcer
         string? parentPath,
         IReadOnlySet<string>? partitionColumns,
         bool typeWideningEnabled,
+        ColumnMappingMode columnMappingMode,
         int fieldDepth)
     {
         var mergedFields = new List<StructField>(tableStruct.Count);
@@ -217,7 +220,8 @@ internal static class DeltaSchemaEnforcer
                         path, tableField.DataType, writeField.DataType);
                 }
 
-                mergedFields.Add(MergeField(tableField, writeField, mode, path, typeWideningEnabled, fieldDepth));
+                mergedFields.Add(MergeField(
+                    tableField, writeField, mode, path, typeWideningEnabled, columnMappingMode, fieldDepth));
             }
             else
             {
@@ -262,7 +266,7 @@ internal static class DeltaSchemaEnforcer
 
     private static StructField MergeField(
         StructField tableField, StructField writeField, SchemaEvolutionMode mode, string path,
-        bool typeWideningEnabled, int depth)
+        bool typeWideningEnabled, ColumnMappingMode columnMappingMode, int depth)
     {
         // Nullability: the table's constraint is authoritative and never tightened or relaxed by a write.
         // A nullable write into a required table column would carry null into a column that forbids it.
@@ -275,7 +279,7 @@ internal static class DeltaSchemaEnforcer
         // here (each carrying its Delta `fieldPath`) so they attach to THIS field's metadata below (#546).
         var nestedChanges = new List<NestedTypeChange>();
         DataType mergedType = MergeType(
-            tableField.DataType, writeField.DataType, mode, path, typeWideningEnabled, depth,
+            tableField.DataType, writeField.DataType, mode, path, typeWideningEnabled, columnMappingMode, depth,
             fieldPathPrefix: null, nestedChanges);
 
         if (tableField.DataType.Equals(mergedType))
@@ -312,6 +316,7 @@ internal static class DeltaSchemaEnforcer
         SchemaEvolutionMode mode,
         string path,
         bool typeWideningEnabled,
+        ColumnMappingMode columnMappingMode,
         int depth,
         string? fieldPathPrefix,
         List<NestedTypeChange>? nestedChanges)
@@ -330,7 +335,7 @@ internal static class DeltaSchemaEnforcer
                 // scalar arm below rejects a widening fail-closed.
                 return MergeStruct(
                     tableStruct, writeStruct, mode, path, partitionColumns: null, typeWideningEnabled,
-                    fieldDepth: depth + 1);
+                    columnMappingMode, fieldDepth: depth + 1);
 
             case (ArrayType tableArray, ArrayType writeArray):
                 if (!tableArray.ContainsNull && writeArray.ContainsNull)
@@ -344,13 +349,15 @@ internal static class DeltaSchemaEnforcer
                 // depth 2), oldest-/outermost-first (#546 base, #860 chain).
                 DataType mergedElement = MergeCollectionElement(
                     tableArray.ElementType, writeArray.ElementType, mode, path + ".element",
-                    typeWideningEnabled, depth + 1, Combine(fieldPathPrefix, "element"), nestedChanges);
+                    typeWideningEnabled, columnMappingMode, depth + 1, Combine(fieldPathPrefix, "element"),
+                    nestedChanges);
                 return new ArrayType(mergedElement, tableArray.ContainsNull);
 
             case (MapType tableMap, MapType writeMap):
                 DataType mergedKey = MergeCollectionElement(
                     tableMap.KeyType, writeMap.KeyType, mode, path + ".key",
-                    typeWideningEnabled, depth + 1, Combine(fieldPathPrefix, "key"), nestedChanges);
+                    typeWideningEnabled, columnMappingMode, depth + 1, Combine(fieldPathPrefix, "key"),
+                    nestedChanges);
                 if (!tableMap.ValueContainsNull && writeMap.ValueContainsNull)
                 {
                     throw DeltaSchemaMismatchException.NullabilityViolation(path + ".value");
@@ -358,7 +365,8 @@ internal static class DeltaSchemaEnforcer
 
                 DataType mergedValue = MergeCollectionElement(
                     tableMap.ValueType, writeMap.ValueType, mode, path + ".value",
-                    typeWideningEnabled, depth + 1, Combine(fieldPathPrefix, "value"), nestedChanges);
+                    typeWideningEnabled, columnMappingMode, depth + 1, Combine(fieldPathPrefix, "value"),
+                    nestedChanges);
                 return new MapType(mergedKey, mergedValue, tableMap.ValueContainsNull);
 
             default:
@@ -380,9 +388,28 @@ internal static class DeltaSchemaEnforcer
                 // reject block below (fail-closed as TypeWideningUnsupported), same as when the feature is
                 // disabled. A deeper (nested-within-nested, depth ≥ 2) scalar likewise stays fail-closed:
                 // #571's reader cannot promote it, so applying it would mint an unreadable table (#546).
-                if (depth <= 1 && typeWideningEnabled && TypeWidening.IsSchemaEvolutionWidening(tableType, writeType))
+                if (typeWideningEnabled && TypeWidening.IsSchemaEvolutionWidening(tableType, writeType))
                 {
-                    return writeType;
+                    // #870 id-mode guard: a widening BELOW the top level (depth ≥ 1 — a struct child, or a
+                    // nested-within-nested scalar) under a column-mapping `id`-mode table would mint an
+                    // UNREADABLE table. The id-mode nested reader resolves such a leaf by its field_id with
+                    // promotion hardcoded OFF (#839/#546 §9 O1: ResolveStructFieldById / the nested id path use
+                    // promoteLeaf:false), so it CANNOT read-promote a pre-widening narrow file — verified by a
+                    // read probe (struct<int>→struct<long> id-mode fails closed SchemaMismatch). A TOP-LEVEL
+                    // scalar (depth 0) is exempt: the FLAT reader (ValidateFileField) promotes it purely on the
+                    // `allowTypeWideningPromotion` gate — no field_id conjunct — so id-mode reads and promotes
+                    // it, and blocking it would over-reject a genuinely-readable widen. name/none mode is
+                    // unaffected (columnMappingMode != Id), preserving #546/#860 behavior byte-for-byte.
+                    if (columnMappingMode == ColumnMappingMode.Id && depth >= 1)
+                    {
+                        throw DeltaSchemaMismatchException.TypeWideningUnsupportedInColumnMappingIdMode(
+                            path, tableType, writeType);
+                    }
+
+                    if (depth <= 1)
+                    {
+                        return writeType;
+                    }
                 }
 
                 if (TypeWidening.IsSanctionedWidening(tableType, writeType))
@@ -421,6 +448,7 @@ internal static class DeltaSchemaEnforcer
         SchemaEvolutionMode mode,
         string path,
         bool typeWideningEnabled,
+        ColumnMappingMode columnMappingMode,
         int elementDepth,
         string fieldPath,
         List<NestedTypeChange>? nestedChanges)
@@ -437,12 +465,25 @@ internal static class DeltaSchemaEnforcer
             // chain instead of being dropped (585b). A struct child re-enters MergeField (fresh accumulator),
             // so its own change attaches to the deeper StructField directly, excluded from any ancestor chain.
             return MergeType(
-                tableType, writeType, mode, path, typeWideningEnabled, elementDepth,
+                tableType, writeType, mode, path, typeWideningEnabled, columnMappingMode, elementDepth,
                 fieldPathPrefix: fieldPath, nestedChanges: nestedChanges);
         }
 
         if (typeWideningEnabled && TypeWidening.IsSchemaEvolutionWidening(tableType, writeType))
         {
+            // #870 id-mode guard: an array-element / map key-value scalar widening under a column-mapping
+            // `id`-mode table would mint an UNREADABLE table. The id-mode nested reader binds this interior
+            // leaf by its `delta.columnMapping.nested.ids` field_id with promotion hardcoded OFF (#839/#546
+            // §9 O1, promoteLeaf:false), so it CANNOT read-promote a pre-widening narrow file — verified by a
+            // read probe (array<int>→array<long> id-mode fails closed SchemaMismatch, matching the pinned
+            // ArrayMapIdModeReadTests.IdMode_Depth1_… case). Fail closed on WRITE rather than apply a widening
+            // the reader cannot honor. name/none mode is unaffected, preserving #546/#860 behavior exactly.
+            if (columnMappingMode == ColumnMappingMode.Id)
+            {
+                throw DeltaSchemaMismatchException.TypeWideningUnsupportedInColumnMappingIdMode(
+                    path, tableType, writeType);
+            }
+
             nestedChanges?.Add(new NestedTypeChange(fieldPath, tableType, writeType));
             return writeType;
         }
