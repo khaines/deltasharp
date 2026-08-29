@@ -304,8 +304,9 @@ public class StructColumnVectorTests
     [Fact]
     public void NullField_IsAllowed_NullabilityAdvisory()
     {
-        // #577: struct field nullability is ADVISORY. A null value in a non-nullable field is represented,
-        // not rejected — consistent with DeltaSharp's Spark-parity advisory-nullability convention.
+        // #577 (RESOLVED — advisory retained as the formal contract): struct field nullability is ADVISORY.
+        // A null value in a non-nullable field is represented, not rejected — consistent with DeltaSharp's
+        // Spark-parity advisory-nullability convention (uniform with list-element and map-value nullability).
         var schema = new StructType(new[] { new StructField("id", IntegerType.Instance, nullable: false) });
         var s = new StructColumnVector(schema, capacity: 4);
         ((MutableColumnVector)s.Child(0)).AppendNull();

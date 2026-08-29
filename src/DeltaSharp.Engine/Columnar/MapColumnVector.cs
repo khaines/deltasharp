@@ -20,7 +20,10 @@ namespace DeltaSharp.Engine.Columnar;
 /// fail-closed over the <b>referenced</b> key range (a non-zero <c>offsets[0]</c> or a dangling tail
 /// leaves some keys unreferenced and unchecked). <b>Value</b> nullability follows
 /// <see cref="MapType.ValueContainsNull"/> <i>advisorily</i> and is <b>not</b> enforced here — matching
-/// the codebase's advisory-nullability convention (Spark parity; a conscious future change per #577).
+/// the codebase's advisory-nullability convention (Spark parity; resolved per #577 to keep advisory
+/// nullability as the formal contract rather than enforce it — only the structural key invariant is
+/// enforced). This is uniform with <see cref="StructColumnVector"/> field nullability and
+/// <see cref="ListColumnVector"/> element nullability, and the flat <c>CreateDataFrame</c> path.
 /// </para>
 /// <para>
 /// <b>Building.</b> The mutable builder (<see cref="ColumnVectors.Create(DataType,int)"/> or the

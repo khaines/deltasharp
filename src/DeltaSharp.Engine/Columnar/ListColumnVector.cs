@@ -18,6 +18,18 @@ namespace DeltaSharp.Engine.Columnar;
 /// apart.
 /// </para>
 /// <para>
+/// <b>Element nullability is advisory (the formal contract, resolved per #577).</b> The
+/// <see cref="ArrayType.ContainsNull"/> <c>= false</c> flag is <b>not</b> enforced by this
+/// representation: a null element in a non-nullable list is <i>represented</i>, not rejected — matching
+/// the codebase's advisory-nullability convention and Spark's semantics (<c>containsNull</c> is a
+/// planning hint, not a runtime constraint). This mirrors <see cref="StructColumnVector"/> field
+/// nullability (<see cref="StructField.Nullable"/>) and <see cref="MapColumnVector"/> value nullability
+/// (<see cref="MapType.ValueContainsNull"/>), and the flat <c>CreateDataFrame</c> ingestion path. A
+/// caller needing a hard non-null guarantee must validate at its own trust boundary. (#577 was resolved
+/// to keep advisory nullability as the contract rather than enforce it; only a structural invariant — a
+/// <see cref="MapColumnVector"/> key — is enforced.)
+/// </para>
+/// <para>
 /// <b>Building.</b> The mutable builder (<see cref="ColumnVectors.Create(DataType,int)"/> or the
 /// <see cref="ListColumnVector(ArrayType,int)"/> ctor) owns a mutable element child. To append a row,
 /// append that row's elements into <see cref="Elements"/> (cast to <see cref="MutableColumnVector"/>)
