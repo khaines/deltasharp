@@ -184,7 +184,6 @@ public sealed class ChangeFeedNestedColumnMappingTests
         }
     }
 
-
     /// <summary>
     /// Struct id mode. The same history under id mode, where each nested child leaf binds by <c>field_id</c>
     /// within the container. Change-row value fidelity (disjoint a/b domains) AND the end snapshot's nested
