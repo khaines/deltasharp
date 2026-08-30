@@ -277,8 +277,8 @@ public sealed class NestedWithinNestedRejectTests
         var leaf = (PqDataField)innerList.Item;
         var chain = new[]
         {
-            new RepeatedLevel(outer.MaxRepetitionLevel, outer.MaxDefinitionLevel, 0),
-            new RepeatedLevel(innerList.MaxRepetitionLevel, innerList.MaxDefinitionLevel, outer.MaxDefinitionLevel),
+            new RepeatedLevel(outer.MaxRepetitionLevel, outer.MaxDefinitionLevel),
+            new RepeatedLevel(innerList.MaxRepetitionLevel, innerList.MaxDefinitionLevel),
         };
         return (leaf, chain);
     }

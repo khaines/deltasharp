@@ -1207,8 +1207,8 @@ internal sealed class DeltaTableWriter
         // leaves the enforcer's behavior byte-identical.
         ColumnMappingMode columnMappingMode = ColumnMapping.ResolveMode(readSnapshot.Metadata.Configuration);
         return DeltaSchemaEnforcer.Reconcile(
-            readSnapshot.Schema, writeSchema, evolutionMode, partitionColumns, typeWideningEnabled,
-            columnMappingMode);
+            readSnapshot.Schema, writeSchema, evolutionMode, columnMappingMode, partitionColumns,
+            typeWideningEnabled);
     }
 
     // #616: before an ALTER that changes the LOGICAL schema (DROP/RENAME COLUMN) commits, refuse fail-closed

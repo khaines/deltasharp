@@ -1927,8 +1927,10 @@ internal static class NestedParquetColumnReader
     // fail-closed, consistent with its sibling defense-in-depth guards. The catch is scoped to the allocation
     // call and to UnsupportedTypeException ONLY, so an unrelated fault still propagates (no over-catch). The
     // raw cause is retained as the inner for server-side diagnostics (N3). `context` is a pre-sanitized
-    // diagnostic label; DescribeType renders the bounded leaf KIND (never a recursive foreign SimpleString),
-    // matching the sibling unsupported-leaf messages in this file.
+    // diagnostic label that names the offending POSITION (a "nested leaf '…'" at the present-decode site, or a
+    // struct-field/column path at the absent-child site); DescribeType renders the bounded TYPE KIND — which
+    // may be a CONTAINER (array/map) at the absent-child site, not only a scalar leaf — never a recursive
+    // foreign SimpleString.
     private static MutableColumnVector CreateLeafVector(DataType type, int capacity, string context)
     {
         try
@@ -1938,7 +1940,7 @@ internal static class NestedParquetColumnReader
         catch (UnsupportedTypeException ex)
         {
             throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet nested read for {context}: the leaf type '{DiagnosticText.DescribeType(type)}' has no "
+                $"Parquet nested read for {context}: the type '{DiagnosticText.DescribeType(type)}' has no "
                 + "supported column vector.", ex);
         }
     }

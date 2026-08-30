@@ -523,7 +523,7 @@ internal static class NestedColumnShredder
         var leaves = new List<LeafPlan>();
         EnumerateLeaves(
             schemaField.DataType, schemaField.Nullable, field, new List<PathStep>(),
-            new List<RepeatedLevel>(), parentPresentDef: 0, label, leaves);
+            new List<RepeatedLevel>(), label, leaves);
 
         foreach (LeafPlan leaf in leaves)
         {
@@ -597,16 +597,14 @@ internal static class NestedColumnShredder
 
     // Walks the (DeltaSharp DataType, Parquet Field) trees in parallel, emitting one LeafPlan per leaf. Each
     // list/map node contributes a repeated level to the chain, read from its OWN footer node
-    // (MaxRepetitionLevel/MaxDefinitionLevel) with the immediate parent container node's MaxDefinitionLevel as
-    // parentPresentDef — the interleave-correct markers the per-level guard needs (§2.10.3). `parentPresentDef`
-    // is the MaxDefinitionLevel of the nearest enclosing group node (0 at the top).
+    // (MaxRepetitionLevel/MaxDefinitionLevel) — the interleave-correct markers the per-level guard needs
+    // (§2.10.3).
     private static void EnumerateLeaves(
         DataType type,
         bool nullable,
         Field pqField,
         List<PathStep> path,
         List<RepeatedLevel> chain,
-        int parentPresentDef,
         string label,
         List<LeafPlan> into)
     {
@@ -620,7 +618,7 @@ internal static class NestedColumnShredder
                         StructField child = structType[i];
                         path.Add(new PathStep(StepKind.Struct, i));
                         EnumerateLeaves(
-                            child.DataType, child.Nullable, ps.Fields[i], path, chain, ps.MaxDefinitionLevel,
+                            child.DataType, child.Nullable, ps.Fields[i], path, chain,
                             label, into);
                         path.RemoveAt(path.Count - 1);
                     }
@@ -631,11 +629,11 @@ internal static class NestedColumnShredder
             case ArrayType array:
                 {
                     PqListField pl = ExpectParquetList(pqField, label);
-                    var level = new RepeatedLevel(pl.MaxRepetitionLevel, pl.MaxDefinitionLevel, parentPresentDef);
+                    var level = new RepeatedLevel(pl.MaxRepetitionLevel, pl.MaxDefinitionLevel);
                     path.Add(new PathStep(StepKind.List, 0));
                     chain.Add(level);
                     EnumerateLeaves(
-                        array.ElementType, array.ContainsNull, pl.Item, path, chain, pl.MaxDefinitionLevel,
+                        array.ElementType, array.ContainsNull, pl.Item, path, chain,
                         label, into);
                     chain.RemoveAt(chain.Count - 1);
                     path.RemoveAt(path.Count - 1);
@@ -645,19 +643,19 @@ internal static class NestedColumnShredder
             case MapType map:
                 {
                     PqMapField pm = ExpectParquetMap(pqField, label);
-                    var level = new RepeatedLevel(pm.MaxRepetitionLevel, pm.MaxDefinitionLevel, parentPresentDef);
+                    var level = new RepeatedLevel(pm.MaxRepetitionLevel, pm.MaxDefinitionLevel);
 
                     path.Add(new PathStep(StepKind.MapKey, 0));
                     chain.Add(level);
                     EnumerateLeaves(
-                        map.KeyType, nullable: false, pm.Key, path, chain, pm.MaxDefinitionLevel, label, into);
+                        map.KeyType, nullable: false, pm.Key, path, chain, label, into);
                     chain.RemoveAt(chain.Count - 1);
                     path.RemoveAt(path.Count - 1);
 
                     path.Add(new PathStep(StepKind.MapValue, 0));
                     chain.Add(level);
                     EnumerateLeaves(
-                        map.ValueType, map.ValueContainsNull, pm.Value, path, chain, pm.MaxDefinitionLevel,
+                        map.ValueType, map.ValueContainsNull, pm.Value, path, chain,
                         label, into);
                     chain.RemoveAt(chain.Count - 1);
                     path.RemoveAt(path.Count - 1);
@@ -736,7 +734,7 @@ internal static class NestedColumnShredder
                     }
 
                     int ordinal = step.StructOrdinal;
-                    ColumnVector child = ResolveChild(() => sv.Child(ordinal), label, "struct field");
+                    ColumnVector child = ResolveStructChild(sv, ordinal, label);
                     return CountCell(path, stepIndex + 1, child, row, label);
                 }
 
@@ -749,7 +747,7 @@ internal static class NestedColumnShredder
                         return 1;
                     }
 
-                    ColumnVector elements = ResolveChild(() => lv.Elements, label, "array element");
+                    ColumnVector elements = ResolveListElements(lv, label);
                     long sum = 0;
                     for (int e = 0; e < length; e++)
                     {
@@ -769,10 +767,7 @@ internal static class NestedColumnShredder
                     }
 
                     bool keys = step.Kind == StepKind.MapKey;
-                    MapColumnVector current = mv;
-                    ColumnVector child = keys
-                        ? ResolveChild(() => current.Keys, label, "map key")
-                        : ResolveChild(() => current.Values, label, "map value");
+                    ColumnVector child = ResolveMapChild(mv, keys, label);
                     long sum = 0;
                     for (int e = 0; e < length; e++)
                     {
@@ -846,7 +841,7 @@ internal static class NestedColumnShredder
                     }
 
                     int ordinal = step.StructOrdinal;
-                    ColumnVector child = ResolveChild(() => sv.Child(ordinal), label, "struct field");
+                    ColumnVector child = ResolveStructChild(sv, ordinal, label);
                     EmitLeafLevels(
                         leaf, stepIndex + 1, child, row, entryRep, defBase + 1, parentRep, label, def, rep,
                         ref slot);
@@ -874,7 +869,7 @@ internal static class NestedColumnShredder
                         return;
                     }
 
-                    ColumnVector elements = ResolveChild(() => lv.Elements, label, "array element");
+                    ColumnVector elements = ResolveListElements(lv, label);
                     for (int e = 0; e < length; e++)
                     {
                         int childEntryRep = e == 0 ? entryRep : thisRep;
@@ -908,10 +903,7 @@ internal static class NestedColumnShredder
                     }
 
                     bool keys = step.Kind == StepKind.MapKey;
-                    MapColumnVector current = mv;
-                    ColumnVector child = keys
-                        ? ResolveChild(() => current.Keys, label, "map key")
-                        : ResolveChild(() => current.Values, label, "map value");
+                    ColumnVector child = ResolveMapChild(mv, keys, label);
                     for (int e = 0; e < length; e++)
                     {
                         int childEntryRep = e == 0 ? entryRep : thisRep;
@@ -973,7 +965,7 @@ internal static class NestedColumnShredder
                         }
 
                         int ordinal = step.StructOrdinal;
-                        ColumnVector child = ResolveChild(() => sv.Child(ordinal), label, "struct field");
+                        ColumnVector child = ResolveStructChild(sv, ordinal, label);
                         return VisitCell(path, stepIndex + 1, child, row, ref visitor, label);
                     }
 
@@ -991,7 +983,7 @@ internal static class NestedColumnShredder
                             return 0;
                         }
 
-                        ColumnVector elements = ResolveChild(() => lv.Elements, label, "array element");
+                        ColumnVector elements = ResolveListElements(lv, label);
                         int c = 0;
                         for (int e = 0; e < length; e++)
                         {
@@ -1016,10 +1008,7 @@ internal static class NestedColumnShredder
                         }
 
                         bool keys = step.Kind == StepKind.MapKey;
-                        MapColumnVector current = mv;
-                        ColumnVector child = keys
-                            ? ResolveChild(() => current.Keys, label, "map key")
-                            : ResolveChild(() => current.Values, label, "map value");
+                        ColumnVector child = ResolveMapChild(mv, keys, label);
                         int c = 0;
                         for (int e = 0; e < length; e++)
                         {
@@ -2264,9 +2253,53 @@ internal static class NestedColumnShredder
         }
         catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
         {
-            throw DeltaStorageException.UnsupportedFeature(
-                $"Parquet nested write for column '{label}': the {context} child could not be resolved from "
-                + "the nested vector.");
+            throw ChildResolveFailure(label, context);
         }
     }
+
+    // Closure-free duals of ResolveChild for the recursive walkers (CountCell/EmitLeafLevels/VisitCell), which
+    // resolve a child per struct-cell / per non-empty container per row — so a per-call Func<ColumnVector>
+    // closure would allocate at row/element scale on the hot path. These access the child property directly
+    // inside the SAME try/catch, with identical error semantics (same NotSupported/InvalidOperation filter and
+    // the same ChildResolveFailure message).
+    private static ColumnVector ResolveStructChild(StructColumnVector sv, int ordinal, string label)
+    {
+        try
+        {
+            return sv.Child(ordinal);
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
+        {
+            throw ChildResolveFailure(label, "struct field");
+        }
+    }
+
+    private static ColumnVector ResolveListElements(ListColumnVector lv, string label)
+    {
+        try
+        {
+            return lv.Elements;
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
+        {
+            throw ChildResolveFailure(label, "array element");
+        }
+    }
+
+    private static ColumnVector ResolveMapChild(MapColumnVector mv, bool keys, string label)
+    {
+        try
+        {
+            return keys ? mv.Keys : mv.Values;
+        }
+        catch (Exception ex) when (ex is NotSupportedException or InvalidOperationException)
+        {
+            throw ChildResolveFailure(label, keys ? "map key" : "map value");
+        }
+    }
+
+    private static DeltaStorageException ChildResolveFailure(string label, string context) =>
+        DeltaStorageException.UnsupportedFeature(
+            $"Parquet nested write for column '{label}': the {context} child could not be resolved from "
+            + "the nested vector.");
 }
