@@ -77,6 +77,36 @@ public sealed class NestedRenameDropTests : IDisposable
             schema, new ColumnVector[] { Long(new long?[] { 1L, 2L }), address }, 2);
     }
 
+    // A {id:long, address:struct<city:string, geo:struct<zip:long, lat:long>>} table — a DEPTH-2 nested child
+    // (address.geo.zip). Disjoint domains so a mis-bind is visible: id ∈ [1..], zip ∈ [90000..], lat ∈ [40..].
+    private static StructType AddressGeoSchema() => new(new[]
+    {
+        new StructField("id", DataTypes.LongType, nullable: false),
+        new StructField("address", new StructType(new[]
+        {
+            new StructField("city", DataTypes.StringType, nullable: true),
+            new StructField("geo", new StructType(new[]
+            {
+                new StructField("zip", DataTypes.LongType, nullable: true),
+                new StructField("lat", DataTypes.LongType, nullable: true),
+            }), nullable: true),
+        }), nullable: true),
+    });
+
+    private static ManagedColumnBatch AddressGeoBatch(StructType schema)
+    {
+        var addressType = (StructType)schema["address"].DataType;
+        var geoType = (StructType)addressType["geo"].DataType;
+        var geo = new StructColumnVector(
+            geoType,
+            new ColumnVector[] { Long(new long?[] { 90001L, 90002L }), Long(new long?[] { 47L, 45L }) },
+            new[] { false, false });
+        var address = new StructColumnVector(
+            addressType, new ColumnVector[] { Str(new[] { "seattle", "portland" }), geo }, new[] { false, false });
+        return new ManagedColumnBatch(
+            schema, new ColumnVector[] { Long(new long?[] { 1L, 2L }), address }, 2);
+    }
+
     // ================================================================ §3.1 — centerpiece (conjunctive)
 
     [Fact]
@@ -312,6 +342,88 @@ public sealed class NestedRenameDropTests : IDisposable
         Assert.Equal("portland", Encoding.UTF8.GetString(readAddr.Child(0).GetBytes(1)));
         Assert.True(readAddr.Child(1).IsNull(0)); // zip index 1 → NULL (re-added physical name absent)
         Assert.True(readAddr.Child(1).IsNull(1));
+    }
+
+    // #890 item 2: the DEPTH-2 analogue of the drop-then-re-add fresh-id cell. Drop address.geo.zip (depth 2),
+    // re-add it (same logical name) with a FRESH id (> the pre-drop maxColumnId) + a NEW physicalName, then read
+    // the OLD v0 file through the v2 schema: the re-added deep child NULL-fills (its new physical name is absent
+    // from the old file) and is NEVER re-mapped to the dropped child's stale data, while the surviving siblings
+    // (address.city, address.geo.lat) still read their real values.
+    [Fact]
+    public async Task NestedStructChildDrop_Depth2_ThenReAddSameLogicalName_MintsFreshId_OldDataNullFills_866c()
+    {
+        StructType schema = AddressGeoSchema();
+        await WriteNestedNameMappedAsync(schema, AddressGeoBatch(schema));
+
+        Snapshot v0 = await LoadSnapshotAsync();
+        StructField zipV0 = DeepChildField(v0.Schema, "address", "geo", "zip");
+        string zipPhysicalV0 = ColumnMapping.PhysicalName(zipV0, ColumnMappingMode.Name);
+        Assert.True(ColumnMapping.TryGetId(zipV0, out long zipIdV0));
+        long maxV0 = long.Parse(v0.Metadata.Configuration[ColumnMapping.MaxColumnIdKey], CultureInfo.InvariantCulture);
+
+        // Drop the depth-2 child address.geo.zip (v1) — the sibling address.geo.lat survives.
+        using (var backend = new LocalFileSystemBackend(_root))
+        {
+            await new DeltaTableWriter(backend).DropColumnAsync(new[] { "address", "geo", "zip" });
+        }
+
+        Snapshot v1 = await LoadSnapshotAsync();
+        var geoV1 = (StructType)((StructType)v1.Schema["address"].DataType)["geo"].DataType;
+        Assert.False(geoV1.TryGetField("zip", out _));
+        Assert.True(geoV1.TryGetField("lat", out _));
+        // maxColumnId is UNCHANGED by the drop (a dropped id is never reused).
+        Assert.Equal(maxV0, long.Parse(v1.Metadata.Configuration[ColumnMapping.MaxColumnIdKey], CultureInfo.InvariantCulture));
+
+        // Re-add a NEW address.geo.zip (same logical name) with a FRESH id + physicalName and a strictly
+        // increasing maxColumnId — the shape a schema-evolution append would mint. Authored as a metadata-only
+        // v2 commit. The re-added zip appends AFTER the surviving lat, so v2 geo order is [lat, zip].
+        long reAddedId = maxV0 + 1;
+        const string reAddedPhysical = "col-readded-geo-zip";
+        var reAddedZip = new StructField(
+            "zip",
+            DataTypes.LongType,
+            nullable: true,
+            FieldMetadata.FromValues(new[]
+            {
+                new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(reAddedId)),
+                new KeyValuePair<string, MetadataValue>(ColumnMapping.PhysicalNameKey, MetadataValue.String(reAddedPhysical)),
+            }));
+        var geoV2 = new StructType(geoV1.Concat(new[] { reAddedZip }));
+        var addrV1 = (StructType)v1.Schema["address"].DataType;
+        var addrV2 = new StructType(addrV1.Select(f =>
+            f.Name == "geo" ? new StructField("geo", geoV2, f.Nullable, f.Metadata) : f));
+        var schemaV2 = new StructType(v1.Schema.Select(f =>
+            f.Name == "address" ? new StructField("address", addrV2, f.Nullable, f.Metadata) : f));
+        await AppendMetadataOnlyCommitAsync(
+            2,
+            DeltaSchemaJson.ToJson(schemaV2),
+            ("delta.columnMapping.mode", "name"),
+            ("delta.columnMapping.maxColumnId", reAddedId.ToString(CultureInfo.InvariantCulture)));
+
+        Snapshot v2 = await LoadSnapshotAsync();
+        StructField zipV2 = DeepChildField(v2.Schema, "address", "geo", "zip");
+        // Fresh identity: different physicalName + different id + a fresh id strictly beyond the pre-drop
+        // maxColumnId — never reusing/re-parenting the dropped depth-2 child's id.
+        Assert.NotEqual(zipPhysicalV0, ColumnMapping.PhysicalName(zipV2, ColumnMappingMode.Name));
+        Assert.Equal(reAddedPhysical, ColumnMapping.PhysicalName(zipV2, ColumnMappingMode.Name));
+        Assert.True(ColumnMapping.TryGetId(zipV2, out long zipIdV2));
+        Assert.NotEqual(zipIdV0, zipIdV2);
+        Assert.True(zipIdV2 > maxV0, $"re-added depth>1 child id must exceed the pre-drop maxColumnId: {maxV0} -> {zipIdV2}");
+        long maxV2 = long.Parse(v2.Metadata.Configuration[ColumnMapping.MaxColumnIdKey], CultureInfo.InvariantCulture);
+        Assert.True(maxV2 > maxV0, $"maxColumnId must strictly increase: {maxV0} -> {maxV2}");
+
+        // Read the OLD v0 data file through the v2 schema: the re-added depth-2 zip NULL-fills (its new physical
+        // name is absent from the old file → the nested reader null-fills it, never re-mapping the dropped
+        // child's stale data), while address.city and the surviving address.geo.lat still read real values.
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var readAddr = (StructColumnVector)read.Column(1);
+        Assert.Equal("seattle", Encoding.UTF8.GetString(readAddr.Child(0).GetBytes(0)));  // city index 0
+        Assert.Equal("portland", Encoding.UTF8.GetString(readAddr.Child(0).GetBytes(1)));
+        var readGeo = (StructColumnVector)readAddr.Child(1);
+        Assert.Equal(47L, readGeo.Child(0).GetValue<long>(0)); // geo.lat index 0 (survivor)
+        Assert.Equal(45L, readGeo.Child(0).GetValue<long>(1)); // geo.lat index 1
+        Assert.True(readGeo.Child(1).IsNull(0)); // re-added geo.zip → NULL (new physical name absent)
+        Assert.True(readGeo.Child(1).IsNull(1));
     }
 
     // ================================================================ §3.2 — AC2 drop→re-add data read-back
@@ -1110,6 +1222,17 @@ public sealed class NestedRenameDropTests : IDisposable
         return c;
     }
 
+    // Resolves a depth-2 nested child (grandparent.parent.child), e.g. address.geo.zip (#890 item 2).
+    private static StructField DeepChildField(StructType schema, string grandparent, string parent, string child)
+    {
+        Assert.True(schema.TryGetField(grandparent, out StructField gp), $"no field '{grandparent}'");
+        var gpst = Assert.IsType<StructType>(gp.DataType);
+        Assert.True(gpst.TryGetField(parent, out StructField p), $"no field '{parent}' under '{grandparent}'");
+        var pst = Assert.IsType<StructType>(p.DataType);
+        Assert.True(pst.TryGetField(child, out StructField c), $"no field '{child}' under '{grandparent}.{parent}'");
+        return c;
+    }
+
     private async Task<Snapshot> LoadSnapshotAsync()
     {
         using var backend = new LocalFileSystemBackend(_root);
@@ -1220,37 +1343,39 @@ public sealed class NestedRenameDropTests : IDisposable
     }
 
     // Rewraps a logical-named batch under the PHYSICAL schema so the writer (which cross-checks names) accepts
-    // it: only STRUCT vectors carry field names, so only they need reconstruction (single-level scope → struct
-    // children are always scalar, never recursive).
+    // it: only STRUCT vectors carry field names, so only they need reconstruction. Recurses so a
+    // struct-within-struct (depth>1) child is relabelled all the way down (#890 item 2 depth-2 read-back).
     private static ColumnBatch RelabelBatch(ColumnBatch batch, StructType physicalSchema)
     {
         var cols = new ColumnVector[physicalSchema.Count];
         for (int i = 0; i < physicalSchema.Count; i++)
         {
-            ColumnVector col = batch.Column(i);
-            if (physicalSchema[i].DataType is StructType pst && col is StructColumnVector scv)
-            {
-                var children = new ColumnVector[pst.Count];
-                for (int j = 0; j < pst.Count; j++)
-                {
-                    children[j] = scv.Child(j);
-                }
-
-                var nulls = new bool[scv.Length];
-                for (int r = 0; r < scv.Length; r++)
-                {
-                    nulls[r] = scv.IsNull(r);
-                }
-
-                cols[i] = new StructColumnVector(pst, children, nulls);
-            }
-            else
-            {
-                cols[i] = col;
-            }
+            cols[i] = RelabelVector(batch.Column(i), physicalSchema[i].DataType);
         }
 
         return new ManagedColumnBatch(physicalSchema, cols, batch.RowCount);
+    }
+
+    private static ColumnVector RelabelVector(ColumnVector col, DataType physicalType)
+    {
+        if (physicalType is not StructType pst || col is not StructColumnVector scv)
+        {
+            return col;
+        }
+
+        var children = new ColumnVector[pst.Count];
+        for (int j = 0; j < pst.Count; j++)
+        {
+            children[j] = RelabelVector(scv.Child(j), pst[j].DataType);
+        }
+
+        var nulls = new bool[scv.Length];
+        for (int r = 0; r < scv.Length; r++)
+        {
+            nulls[r] = scv.IsNull(r);
+        }
+
+        return new StructColumnVector(pst, children, nulls);
     }
 
     private static string ProtocolFeatureLine() =>

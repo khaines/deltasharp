@@ -771,7 +771,8 @@ internal sealed class DeltaTableWriter
     /// version. Commits a lone <c>metaData</c> action under <see cref="DeltaReadScope.WholeTable"/>.
     /// </summary>
     /// <exception cref="InvalidOperationException">The table does not use column mapping <c>name</c> mode, the
-    /// column is absent, or dropping it would be a partition column (out of scope here).</exception>
+    /// column is absent, the column is the sole remaining top-level column (the last column cannot be dropped —
+    /// a table must retain at least one field), or dropping it would be a partition column (out of scope here).</exception>
     internal Task<DeltaCommitResult> DropColumnAsync(
         string name, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
@@ -794,8 +795,10 @@ internal sealed class DeltaTableWriter
     /// </summary>
     /// <exception cref="InvalidOperationException">Not name mode (F5); the path is empty (F1); a segment is
     /// absent (F2) or resolves to a scalar (F3) or array/map interior (F4, #866 — retained fail-closed); the
-    /// path nests deeper than the segment-depth ceiling (#866 866c); or the target is a top-level partition
-    /// column (F7). A struct-of-struct chain at any depth is supported (F4b lifted, #866 866c).</exception>
+    /// path nests deeper than the segment-depth ceiling (#866 866c); the target is the <b>only</b> field of its
+    /// containing struct (or the sole top-level column) so the drop would leave a zero-field struct/table — the
+    /// last field can never be dropped (#866 866c fail-closed, before any commit); or the target is a top-level
+    /// partition column (F7). A struct-of-struct chain at any depth is supported (F4b lifted, #866 866c).</exception>
     internal async Task<DeltaCommitResult> DropColumnAsync(
         IReadOnlyList<string> path, IWriteConstraintEnforcer? constraintEnforcer = null,
         CancellationToken cancellationToken = default)
