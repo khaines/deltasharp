@@ -306,7 +306,8 @@ public class MapColumnVectorTests
     public void FromChildren_AllowsNullValue_WhenValueContainsNull()
     {
         // Value nullability is advisory (Spark parity, codebase convention): a null value is accepted; only
-        // KEYS are structurally non-null. (Enforcing ValueContainsNull=false is a conscious future change, #577.)
+        // KEYS are structurally non-null. (#577 RESOLVED — advisory retained as the formal contract; enforcing
+        // ValueContainsNull=false was consciously declined, uniform with struct-field/list-element nullability.)
         MutableColumnVector values = ColumnVectors.Create(IntegerType.Instance, 1);
         values.AppendNull();
         var map = new MapColumnVector(StringToInt, Keys("k"), values, new[] { 0, 1 });

@@ -112,7 +112,8 @@ public sealed class LocalRelationBatchesTests
     public void NullInNonNullableField_IsSilentlyEncodedAsNull_DocumentedDeviation()
     {
         // DEVIATION (Spark nullability is advisory): a null cell in a non-nullable field does NOT throw;
-        // it is encoded as SQL NULL. Pinned so a future nullability-enforcement change is a conscious one.
+        // it is encoded as SQL NULL. Pinned as the formal contract (#577 RESOLVED — advisory nullability
+        // retained rather than enforced), uniform with the nested struct-field/list-element/map-value vectors.
         StructType schema = Schema(new StructField("id", IntegerType.Instance, nullable: false));
         var rows = new[] { new Row(schema, new object?[] { null }) };
 

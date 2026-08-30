@@ -247,8 +247,9 @@ public class ListColumnVectorTests
     [Fact]
     public void NullElement_IsAllowed_ContainsNullAdvisory()
     {
-        // #577: element nullability is ADVISORY. A null element in a containsNull=false list is represented,
-        // not rejected — consistent with DeltaSharp's Spark-parity advisory-nullability convention.
+        // #577 (RESOLVED — advisory retained as the formal contract): element nullability is ADVISORY.
+        // A null element in a containsNull=false list is represented, not rejected — consistent with
+        // DeltaSharp's Spark-parity advisory-nullability convention (uniform with struct-field/map-value).
         var noNullList = new ArrayType(IntegerType.Instance, containsNull: false);
         var list = new ListColumnVector(noNullList, capacity: 4);
         var elements = (MutableColumnVector)list.Elements;

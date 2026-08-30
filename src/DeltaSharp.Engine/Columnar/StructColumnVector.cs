@@ -16,6 +16,18 @@ namespace DeltaSharp.Engine.Columnar;
 /// struct's validity — distinguish a null struct from a struct of null fields with <see cref="IsNull"/>.
 /// </para>
 /// <para>
+/// <b>Field nullability is advisory (the formal contract, resolved per #577).</b> A field's
+/// <see cref="StructField.Nullable"/> <c>= false</c> flag is <b>not</b> enforced by this
+/// representation: a null in a non-nullable field child is <i>represented</i>, not rejected — matching
+/// the codebase's advisory-nullability convention and Spark's semantics (in Spark <c>nullable</c> is a
+/// planning hint, not a runtime constraint on an in-memory row). This mirrors
+/// <see cref="ListColumnVector"/> (<see cref="ArrayType.ContainsNull"/>) and
+/// <see cref="MapColumnVector"/> value nullability (<see cref="MapType.ValueContainsNull"/>), and the
+/// flat <c>CreateDataFrame</c> ingestion path. A caller needing a hard non-null guarantee must validate
+/// at its own trust boundary. (#577 was resolved to keep advisory nullability as the contract rather
+/// than enforce it; only a structural invariant — a <see cref="MapColumnVector"/> key — is enforced.)
+/// </para>
+/// <para>
 /// <b>Building.</b> The mutable builder (<see cref="ColumnVectors.Create(DataType,int)"/> or the
 /// <see cref="StructColumnVector(StructType,int)"/> ctor) owns one mutable child per field. To append
 /// a row, advance <b>every</b> field child by exactly one element (through <see cref="Child(int)"/>
