@@ -2223,7 +2223,7 @@ internal static class NestedColumnShredder
         field as DataField
         ?? throw DeltaStorageException.UnsupportedFeature(
             $"Parquet nested write for column '{label}': a nested type within a nested type is not supported "
-            + "(deferred, #585).");
+            + "at this leaf lane (#866; name/none depth>1 is built by the recursive nested node builder).");
 
     private static StructColumnVector ExpectStructVector(ColumnVector vector, string label) =>
         vector as StructColumnVector ?? throw MismatchedVector(vector, label, "struct");

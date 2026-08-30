@@ -358,7 +358,7 @@ public sealed class ArrayMapIdModeNestedIdsValidationTests
     }
 
     // -------------------------------------------------------------------------------------------------
-    // §3.19 · nested-within-nested rejected BEFORE the #839 gate (#585), no partial maxColumnId advance
+    // §3.19 · id-mode nested-within-nested rejected BEFORE the #839 gate (#866), no partial maxColumnId advance
     // -------------------------------------------------------------------------------------------------
 
     [Theory]
@@ -367,12 +367,12 @@ public sealed class ArrayMapIdModeNestedIdsValidationTests
     [InlineData("array<array>")]
     [InlineData("map<string,map>")]
     [InlineData("struct<array<struct>>")]
-    public void ArrayMapIdMode_NestedWithinNested_RejectedBeforeGate_Naming585(string shape)
+    public void ArrayMapIdMode_NestedWithinNested_RejectedBeforeGate_Naming866(string shape)
     {
         StructType logical = new(new[] { NestedWithinNested(shape) });
         DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
             () => ColumnMapping.AssignFreshMapping(logical, new SeededPhysicalNameSource("nwn"), ColumnMappingMode.Id));
-        Assert.Contains("#585", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
     }
 
     // -------------------------------------------------------------------------------------------------

@@ -339,6 +339,30 @@ public sealed class MapColumnVector : MutableColumnVector
             + "representation increment (#570); gathered/late-materialized nested Select is a follow-up (#546). "
             + "Use Slice for a contiguous sub-range or materialize the column.");
 
+    /// <summary>
+    /// Returns a <b>zero-copy</b> re-typed view of this map vector under <paramref name="logicalType"/>,
+    /// sharing the key/value children, offsets, validity, and window — only the logical map TYPE changes (its
+    /// key/value nested field names + per-field metadata, substituted recursively for a
+    /// <c>map&lt;*,struct&gt;</c>/<c>map&lt;*,array&gt;</c> value). The name-mode read-exit inverse relabel at
+    /// depth&gt;1 (#866 866a). The key/value types of <paramref name="logicalType"/> must be structurally
+    /// congruent with this map's key/value types (validated with a typed storage error upstream).
+    /// </summary>
+    /// <param name="logicalType">The logical map type to re-label onto the shared key/value children.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="logicalType"/> is null.</exception>
+    /// <exception cref="ArgumentException">A key/value type is not congruent with <paramref name="logicalType"/>.</exception>
+    public MapColumnVector RelabelTo(MapType logicalType) => RelabelTo(logicalType, 0);
+
+    // Depth-bounded recursive relabel (StackOverflow DoS guard threaded from NestedRelabel, #866 866a).
+    internal MapColumnVector RelabelTo(MapType logicalType, int depth)
+    {
+        ArgumentNullException.ThrowIfNull(logicalType);
+        ColumnVector relabelledKeys = NestedRelabel.To(_keys, logicalType.KeyType, depth + 1);
+        ColumnVector relabelledValues = NestedRelabel.To(_values, logicalType.ValueType, depth + 1);
+        SealForView();
+        return new MapColumnVector(
+            logicalType, relabelledKeys, relabelledValues, _offsets, _validity, _offset, _length, _nullCount);
+    }
+
     /// <summary>Seals this owner and, recursively, its key and value children (#575) so a slice/selection
     /// view shares the buffers safely — a retained mutable child reference cannot be mutated afterward.</summary>
     protected override void SealForView()

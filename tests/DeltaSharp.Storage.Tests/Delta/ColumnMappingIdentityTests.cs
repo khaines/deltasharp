@@ -9,8 +9,9 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// Unit tests for <see cref="ColumnMappingIdentity"/> (#671) — the value type both halves of the change-feed
 /// column-mapping identity-immutability gate compare. These exercise the comparison branches DIRECTLY (not
 /// through the CDF read door), because several are otherwise only covered incidentally: for a NESTED mapped
-/// column the recursion in <c>Collect</c> (which descends direct struct children — #676) is most directly
-/// exercised here, and the value-compare
+/// column the recursion in <c>Collect</c> — which descends direct struct children (#676) AND, under #866 866a,
+/// name/none-mode array element / map key-value interior structs — is most directly exercised here, and the
+/// value-compare
 /// branches (mode / partition columns / per-column field id + physical name / added-dropped-renamed columns)
 /// are otherwise only covered incidentally. Each negative asserts the exact branch that must fail closed; each
 /// positive guards against a false positive that would reject a legitimate table.
@@ -438,5 +439,85 @@ public sealed class ColumnMappingIdentityTests
     public void FromMetadata_UnrecognizedMode_ThrowsProtocol()
     {
         Assert.Throws<DeltaProtocolException>(() => ColumnMappingIdentity.FromMetadata(Meta(FlatSchema(1, 2), "bogus")));
+    }
+
+    // ---- #866 866a — the CDF stability gate now DESCENDS name/none-mode array/map interior structs ----
+    // These prove that an array<struct>/map<*,struct> interior struct child's (id, physicalName) IS collected
+    // (not a silent skip) and participates in the cross-version immutability compare, so a forged interior
+    // identity drift under an array/map fails closed exactly like a direct-struct-child drift. ID-mode
+    // nested-within-nested is rejected fail-closed upstream (proven by the assign/validate/write cells in
+    // NestedWithinNestedColumnMappingTests), so it is deliberately NOT descended here (the mode gate).
+
+    // A name-mode array<struct<a:long>>: the interior struct child carries its own (id, physicalName).
+    private static string NameArrayOfStruct(long arrId, string arrPhys, long childId, string childPhys) =>
+        StructSchema(
+            "{\"name\":\"arr\",\"type\":{\"type\":\"array\",\"elementType\":{\"type\":\"struct\",\"fields\":["
+            + MappedField("a", "\"long\"", childId, childPhys)
+            + "]},\"containsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":" + arrId
+            + ",\"delta.columnMapping.physicalName\":\"" + arrPhys + "\"}}");
+
+    // A name-mode map<string, struct<v:long>>: the value struct child carries its own (id, physicalName).
+    private static string NameMapOfStruct(long mapId, string mapPhys, long valId, string valPhys) =>
+        StructSchema(
+            "{\"name\":\"m\",\"type\":{\"type\":\"map\",\"keyType\":\"string\",\"valueType\":{\"type\":\"struct\",\"fields\":["
+            + MappedField("v", "\"long\"", valId, valPhys)
+            + "]},\"valueContainsNull\":true},\"nullable\":true,\"metadata\":{\"delta.columnMapping.id\":" + mapId
+            + ",\"delta.columnMapping.physicalName\":\"" + mapPhys + "\"}}");
+
+    [Fact]
+    public void IsImmutableFrom_NameMode_ArrayOfStructInteriorIdReassigned_False()
+    {
+        // The interior struct child `arr.element.a` keeps its logical path but its field id is reassigned
+        // across versions — caught ONLY if Collect descends the name-mode array interior struct (#866 866a).
+        ColumnMappingIdentity end = Identity(NameArrayOfStruct(1, "col-arr", 3, "col-a"), "name");
+        Assert.False(end.IsImmutableFrom(Identity(NameArrayOfStruct(1, "col-arr", 99, "col-a"), "name")));
+        Assert.True(end.IsImmutableFrom(Identity(NameArrayOfStruct(1, "col-arr", 3, "col-a"), "name"))); // no false positive
+    }
+
+    [Fact]
+    public void IsImmutableFrom_NameMode_ArrayOfStructInteriorPhysicalNameReassigned_False()
+    {
+        ColumnMappingIdentity end = Identity(NameArrayOfStruct(1, "col-arr", 3, "col-a"), "name");
+        Assert.False(end.IsImmutableFrom(Identity(NameArrayOfStruct(1, "col-arr", 3, "col-forged-a"), "name")));
+    }
+
+    [Fact]
+    public void IsImmutableFrom_NameMode_MapValueStructInteriorPhysicalNameReassigned_False()
+    {
+        // The interior value-struct child `m.value.v` physicalName is forged across versions — caught ONLY if
+        // Collect descends the name-mode map value interior struct (#866 866a).
+        ColumnMappingIdentity end = Identity(NameMapOfStruct(1, "col-m", 4, "col-v"), "name");
+        Assert.False(end.IsImmutableFrom(Identity(NameMapOfStruct(1, "col-m", 4, "col-forged-v"), "name")));
+        Assert.True(end.IsImmutableFrom(Identity(NameMapOfStruct(1, "col-m", 4, "col-v"), "name"))); // no false positive
+    }
+
+    [Fact]
+    public void IsImmutableFrom_NameMode_ArrayOfArrayOfStructDeepInteriorIdReassigned_False()
+    {
+        // array<array<struct<x:long>>> — a DEEP interior struct (two array hops) drift is still caught.
+        static string Deep(long deepId, string deepPhys) =>
+            StructSchema(
+                "{\"name\":\"aa\",\"type\":{\"type\":\"array\",\"elementType\":{\"type\":\"array\",\"elementType\":"
+                + "{\"type\":\"struct\",\"fields\":[" + MappedField("x", "\"long\"", deepId, deepPhys)
+                + "]},\"containsNull\":true},\"containsNull\":true},\"nullable\":true,\"metadata\":"
+                + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-aa\"}}");
+        ColumnMappingIdentity end = Identity(Deep(5, "col-x"), "name");
+        Assert.False(end.IsImmutableFrom(Identity(Deep(77, "col-x"), "name")));
+        Assert.True(end.IsImmutableFrom(Identity(Deep(5, "col-x"), "name")));
+    }
+
+    [Fact]
+    public void IsImmutableFrom_IdMode_ArrayOfStructInterior_NotDescended_ByModeGate()
+    {
+        // The mode gate: id-mode nested-within-nested is rejected fail-closed at the load door (proven by the
+        // create/validate/write cells in NestedWithinNestedColumnMappingTests), so the identity gate never
+        // legitimately sees an id-mode array/map interior struct. Collect therefore does NOT descend it — the
+        // top-level container identity (arr) is still compared, but the (unreachable) interior is not. This
+        // documents the deliberate exclusion; it is safe because such a schema cannot load in the first place.
+        ColumnMappingIdentity end = Identity(NameArrayOfStruct(1, "col-arr", 3, "col-a"), "id");
+        // A forged interior id under ID mode is not caught here (the interior is not collected) — but the
+        // schema cannot reach this gate: it is rejected upstream. The top-level container drift IS caught:
+        Assert.True(end.IsImmutableFrom(Identity(NameArrayOfStruct(1, "col-arr", 99, "col-a"), "id")));
+        Assert.False(end.IsImmutableFrom(Identity(NameArrayOfStruct(2, "col-arr", 3, "col-a"), "id"))); // container id drift
     }
 }

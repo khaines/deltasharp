@@ -289,6 +289,29 @@ public sealed class ListColumnVector : MutableColumnVector
             + "representation increment (#570); gathered/late-materialized nested Select is a follow-up (#546). "
             + "Use Slice for a contiguous sub-range or materialize the column.");
 
+    /// <summary>
+    /// Returns a <b>zero-copy</b> re-typed view of this list vector under <paramref name="logicalType"/>,
+    /// sharing the element child, offsets, validity, and window — only the logical array TYPE changes (its
+    /// element's nested field names + per-field metadata, substituted recursively for an
+    /// <c>array&lt;struct&gt;</c>/<c>array&lt;array&gt;</c> interior). The name-mode read-exit inverse relabel
+    /// at depth&gt;1 (#866 866a). The element type of <paramref name="logicalType"/> must be structurally
+    /// congruent with this list's element type (the column-mapping projection validates congruence with a
+    /// typed storage error before this is reached).
+    /// </summary>
+    /// <param name="logicalType">The logical array type to re-label onto the shared element child.</param>
+    /// <exception cref="ArgumentNullException"><paramref name="logicalType"/> is null.</exception>
+    /// <exception cref="ArgumentException">The element type is not congruent with <paramref name="logicalType"/>.</exception>
+    public ListColumnVector RelabelTo(ArrayType logicalType) => RelabelTo(logicalType, 0);
+
+    // Depth-bounded recursive relabel (StackOverflow DoS guard threaded from NestedRelabel, #866 866a).
+    internal ListColumnVector RelabelTo(ArrayType logicalType, int depth)
+    {
+        ArgumentNullException.ThrowIfNull(logicalType);
+        ColumnVector relabelledChild = NestedRelabel.To(_child, logicalType.ElementType, depth + 1);
+        SealForView();
+        return new ListColumnVector(logicalType, relabelledChild, _offsets, _validity, _offset, _length, _nullCount);
+    }
+
     /// <summary>Seals this owner and, recursively, its element child (#575) so a slice/selection view shares
     /// the buffers safely — a retained mutable child reference cannot be mutated after a view is taken.</summary>
     protected override void SealForView()

@@ -992,15 +992,15 @@ public sealed class ChangeFeedNestedColumnMappingTests
     }
 
     /// <summary>
-    /// A nested-within-nested CDF table (<c>array&lt;struct&gt;</c>, #585) is fail-closed at the load/read door
-    /// under both name and id mode — never a silent skip of the interior struct.
+    /// A nested-within-nested CDF table (<c>array&lt;struct&gt;</c>) under ID mode (#866) is fail-closed at the
+    /// load/read door — never a silent skip of the interior struct. NAME/none mode now loads it (866a); the
+    /// name-mode load-succeeds (interior collected, not skipped) companion is
+    /// <see cref="NestedWithinNested_NameModeCdfTable_LoadsInteriorStruct_NotSilentlySkipped"/>.
     /// </summary>
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public async Task NestedWithinNested_CdfTable_FailsClosedAtLoadDoor_585(bool idMode)
+    [Fact]
+    public async Task NestedWithinNested_IdModeCdfTable_FailsClosedAtLoadDoor_866()
     {
-        ColumnMappingMode mode = idMode ? ColumnMappingMode.Id : ColumnMappingMode.Name;
+        const ColumnMappingMode mode = ColumnMappingMode.Id;
         var logical = new StructType(new[]
         {
             new StructField("id", DataTypes.LongType, nullable: false),
@@ -1012,7 +1012,26 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
         using NestedCdfTable table = NestedCdfTable.FromMapped(NewRoot(), mode, logical, MappedNestedWithinNested(), maxColumnId: 2);
         await table.CreateRawMetadataAsync();
-        await AssertLoadFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(0), "#585", "nested type within a nested type");
+        await AssertLoadFailsClosedAsync(table, DeltaChangeFeedRange.FromVersion(0), "#866", "nested type within a nested type");
+    }
+
+    /// <summary>
+    /// The NAME-mode companion (#866 866a): a nested-within-nested CDF table (<c>array&lt;struct&gt;</c> and
+    /// <c>map&lt;*,struct&gt;</c>, with the interior struct child fully mapped) LOADS through the change-feed
+    /// door — it is NOT rejected and NOT silently skipped (the interior struct is a first-class part of the
+    /// column-mapping identity, its cross-version drift caught by the stability gate — see the
+    /// <c>ColumnMappingIdentityTests.IsImmutableFrom_NameMode_*Interior*</c> tamper cells).
+    /// </summary>
+    [Theory]
+    [InlineData("array")]
+    [InlineData("map")]
+    public async Task NestedWithinNested_NameModeCdfTable_LoadsInteriorStruct_NotSilentlySkipped(string kind)
+    {
+        StructType mapped = kind == "array" ? MappedNameArrayOfStruct() : MappedNameMapOfStruct();
+        using NestedCdfTable table = NestedCdfTable.FromMapped(
+            NewRoot(), ColumnMappingMode.Name, StripMapping(mapped), mapped, maxColumnId: 3);
+        await table.CreateRawMetadataAsync();
+        await AssertLoadSucceedsAsync(table, DeltaChangeFeedRange.FromVersion(0));
     }
 
     // ------------------------------------------------------------------------------------------------
@@ -1421,6 +1440,37 @@ public sealed class ChangeFeedNestedColumnMappingTests
                 MappingMeta(2, "col-items")),
         });
 
+    // A NAME-mode array<struct<x:long>> whose interior struct child carries full column-mapping metadata (so
+    // the depth>1 validator accepts it) — the #866 866a load-succeeds fixture. maxColumnId = 3.
+    private static StructType MappedNameArrayOfStruct() =>
+        new(new[]
+        {
+            new StructField("id", DataTypes.LongType, false, MappingMeta(1, "col-id")),
+            new StructField(
+                "items",
+                new ArrayType(new StructType(new[]
+                {
+                    new StructField("x", DataTypes.LongType, true, MappingMeta(3, "col-x")),
+                })),
+                true,
+                MappingMeta(2, "col-items")),
+        });
+
+    // A NAME-mode map<string, struct<v:long>> whose interior value-struct child carries full metadata.
+    private static StructType MappedNameMapOfStruct() =>
+        new(new[]
+        {
+            new StructField("id", DataTypes.LongType, false, MappingMeta(1, "col-id")),
+            new StructField(
+                "m",
+                new MapType(DataTypes.StringType, new StructType(new[]
+                {
+                    new StructField("v", DataTypes.LongType, true, MappingMeta(3, "col-v")),
+                })),
+                true,
+                MappingMeta(2, "col-m")),
+        });
+
     // ------------------------------------------------------------------------------------------------
     // Fail-closed assertions
     // ------------------------------------------------------------------------------------------------
@@ -1492,6 +1542,20 @@ public sealed class ChangeFeedNestedColumnMappingTests
     // (never ANY exception — a stray NRE would otherwise pass as "fail-closed"); optional discriminant
     // substrings additionally pin the message so a WRONG-but-thrown typed error cannot masquerade as the gate
     // under test (e.g. the #839/#585 cells pin their issue tag + defect phrase).
+    // The load-SUCCEEDS companion (#866 866a): a name/none-mode nested-within-nested CDF table loads and
+    // drains the change feed WITHOUT throwing — proof the interior struct is enabled (part of the identity),
+    // not rejected and not silently skipped. The cross-version interior-drift catch is proven at the gate's
+    // unit level (ColumnMappingIdentityTests.IsImmutableFrom_NameMode_*Interior* cells).
+    private static async Task AssertLoadSucceedsAsync(NestedCdfTable table, DeltaChangeFeedRange range)
+    {
+        using DeltaReadSource source = DeltaReadSource.ForLocalPath(table.Root);
+        DeltaChangeFeedInfo info = await source.LoadChangeFeedAsync(range);
+        await foreach (var _ in source.ReadChangeBatchesAsync(info))
+        {
+            // drain — must not throw for a name-mode depth>1 table (it is enabled, not rejected).
+        }
+    }
+
     private static async Task AssertLoadFailsClosedAsync(
         NestedCdfTable table, DeltaChangeFeedRange range, params string[] expectedSubstrings)
     {
