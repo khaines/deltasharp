@@ -225,19 +225,21 @@ public sealed class NestedColumnMappingGuardCoverageTests
             }
 
             // Invariant B: an enumerated footer/request tamper makes the reader fail closed with a typed
-            // DeltaStorageException. Operators: relocate the child id to the sibling container's leaf; request
-            // an id absent from the footer; stamp the container's declared id onto a footer leaf.
+            // DeltaStorageException. Operators: relocate the child id to the sibling container's leaf; request a
+            // REQUIRED child whose id is absent from the footer (a required lane cannot null-fill); stamp the
+            // container's declared id onto a footer leaf. (A NULLABLE absent id null-fills — 866b evolution
+            // tolerance — so the absent-id tamper uses a required child to stay fail-closed.)
             int op = random.Next(3);
-            (string container, int childId, int? containerId) = op switch
+            (string container, int childId, int? containerId, bool nullable) = op switch
             {
-                0 => ("home", workId, (int?)null),                 // relocate to sibling container's leaf
-                1 => ("home", workId + 10_000 + i, (int?)null),    // id absent from footer (no name fallback)
-                _ => ("home", homeId, (int?)homeId),               // container id stamped on a footer leaf
+                0 => ("home", workId, (int?)null, true),                 // relocate to sibling container's leaf
+                1 => ("home", workId + 10_000 + i, (int?)null, false),   // REQUIRED id absent from footer
+                _ => ("home", homeId, (int?)homeId, true),               // container id stamped on a footer leaf
             };
 
             try
             {
-                await ReadIdModeAsync(bytes, container, childId, containerId);
+                await ReadIdModeAsync(bytes, container, childId, containerId, nullable);
                 throw new Xunit.Sdk.XunitException(
                     $"tamper op {op} at iteration {i} (seed {baseSeed}) did NOT fail closed");
             }
@@ -274,7 +276,7 @@ public sealed class NestedColumnMappingGuardCoverageTests
         return stream.ToArray();
     }
 
-    private static async Task<ColumnBatch> ReadIdModeAsync(byte[] bytes, string container, int childId, int? containerId = null)
+    private static async Task<ColumnBatch> ReadIdModeAsync(byte[] bytes, string container, int childId, int? containerId = null, bool childNullable = true)
     {
         FieldMetadata containerMeta = containerId is int cid
             ? FieldMetadata.FromValues(new[] { new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(cid)) })
@@ -285,7 +287,7 @@ public sealed class NestedColumnMappingGuardCoverageTests
                 container,
                 new StructType(new[]
                 {
-                    new StructField("v", DataTypes.StringType, nullable: true, FieldMetadata.FromValues(new[]
+                    new StructField("v", DataTypes.StringType, nullable: childNullable, FieldMetadata.FromValues(new[]
                     {
                         new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(childId)),
                     })),

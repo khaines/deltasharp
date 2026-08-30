@@ -420,80 +420,60 @@ internal static class NestedParquetColumnReader
         // projection (failing valid data closed). The shared array is read-only to BuildStructNullMask.
         int[]? absentPresenceDefs = null;
         bool absentPresenceComputed = false;
+
+        // #857/#866 866b: null-fill an ABSENT nullable child (scalar leaf id absent from THIS footer, or a
+        // container child structurally absent) with an all-null subtree + the memoized per-owner-cell presence
+        // stream (INV-PARITY, B2). A REQUIRED absent child fails closed (a required lane cannot carry the null).
+        async ValueTask FillAbsentChildAsync(int idx, StructField absentField, string ctx)
+        {
+            if (!absentField.Nullable)
+            {
+                throw DeltaStorageException.ColumnNotPresentInFile(ctx);
+            }
+
+            children[idx] = SynthesizeAbsentChild(absentField.DataType, rowCount, budget, ctx, depth + 1);
+            if (!absentPresenceComputed)
+            {
+                absentPresenceDefs = await StructPresenceDefs(
+                    rowGroup, fileStruct, structMaxDef, parentMaxDef, parentMaxRep, rowCount, budget,
+                    ctx, cancellationToken).ConfigureAwait(false);
+                absentPresenceComputed = true;
+            }
+
+            fieldDefs[idx] = absentPresenceDefs;
+        }
+
         for (int i = 0; i < requested.Count; i++)
         {
             StructField field = requested[i];
-
-            // #676: id mode binds each child by field_id within the resolved container (containment-scoped,
-            // never by name); name/none mode binds by physical name. Id mode supports ONLY top-level
-            // struct<scalars> (nested-within-nested column mapping is out of scope, #676/#839), so it is always
-            // one-value-per-row.
-            if (byFieldId is not null)
-            {
-                DataField leaf = ResolveStructFieldById(fileStruct, field, byFieldId, columnName);
-                // Id-mode nested widening is out of scope (#676/#839, design §9 O1): keep the exact-match
-                // requirement — promoteLeaf is never set on an id-mode leaf.
-                (MutableColumnVector child, int[]? def, _, int numValues) = await ReadScalarLeafAsync(
-                    rowGroup, leaf, field.DataType, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
-                    .ConfigureAwait(false);
-                RejectNullInRequiredNestedLeaf(def, leaf, field.DataType, field.Nullable);
-                EnsureStructFieldRowCount(numValues, rowCount, columnName, field.Name);
-                children[i] = child;
-                fieldDefs[i] = def;
-                continue;
-            }
-
             string childContext = $"struct column '{columnName}' field '{DiagnosticText.Sanitize(field.Name)}'";
-            if (!TryResolveStructChildNode(fileStruct, field, columnName, out Field? resolvedChild))
-            {
-                // ABSENT physical name (#857, §2.3): a drop-then-re-add mints a FRESH physicalName, so a data
-                // file written before the re-add carries NO physical column for the re-added child — genuinely
-                // absent, exactly as an additively-added top-level column is absent from an older, narrower
-                // file. Reached ONLY when the physical name is absent (a PRESENT-but-mismatched child routed
-                // through the resolver as `true` and fails closed below on type/shape — absence and mismatch
-                // are never conflated, AC3); a DUPLICATE physical name already threw inside the resolver.
-                if (!field.Nullable)
-                {
-                    // §9 Q3: a REQUIRED absent child cannot be null-filled (a required lane cannot carry the
-                    // null the older rows would need) — fail closed, mirroring the flat gate
-                    // (nullFillMissingColumns && requestedField.Nullable) at ParquetFileReader. (Defense in
-                    // depth: ValidateShape's ValidateNode already fails this case closed with the SAME
-                    // ColumnNotPresentInFile before decode; this keeps the decode path fail-closed even if
-                    // reached without the up-front shape validation.)
-                    throw DeltaStorageException.ColumnNotPresentInFile(childContext);
-                }
-
-                // NULLABLE + absent → NULL-FILL (§2.4/§2.5): an all-null child vector for the FULL requested
-                // type (scalar OR nested subtree) plus a synthesized per-owner-cell presence stream clamped at
-                // structMaxDef so BuildStructNullMask's parity guard is satisfied (INV-PARITY). The presence
-                // stream is computed once (memoized) and shared across all absent children of this struct.
-                children[i] = SynthesizeAbsentChild(field.DataType, rowCount, budget, childContext, depth + 1);
-                if (!absentPresenceComputed)
-                {
-                    absentPresenceDefs = await StructPresenceDefs(
-                        rowGroup, fileStruct, structMaxDef, parentMaxDef, parentMaxRep, rowCount, budget,
-                        childContext, cancellationToken).ConfigureAwait(false);
-                    absentPresenceComputed = true;
-                }
-
-                fieldDefs[i] = absentPresenceDefs;
-                continue;
-            }
-
-            // PRESENT: unchanged routing — a scalar leaf or a 585a nested recurse. A type/shape disagreement
-            // here still fails closed (SchemaMismatch, AC3), never null-fills.
-            Field childNode = resolvedChild!;
 
             if (field.DataType is ArrayType or MapType or StructType)
             {
-                // A nested struct child (585a): recurse. The child contributes one cell per struct owner cell.
-                // Its driving-leaf def (clamped at structMaxDef, one per owner cell) reports the STRUCT's
-                // presence — feed that to the cross-field null-mask parity guard.
-                DataField drivingLeaf = FirstDataField(childNode);
-                // 585b (R5): read the driving leaf for STRUCTURE ONLY (def/rep) as its OWN physical type
-                // (ParquetTypeMapping.ToDataType — the StructPresenceDefs pattern), not the requested (possibly
-                // widened) first-scalar type; a widened driving read would fault the raw typed decode. def/rep
-                // are type-agnostic (design §2.5 driving-leaf gap).
+                // A CONTAINER child (585a name mode / 866b id mode): located STRUCTURALLY by its stable PHYSICAL
+                // name in BOTH modes (§2.5 M5 — presence is the group node's structural location, NEVER its own
+                // group id and NEVER whether a requested descendant leaf resolves). Id mode uses the rename-
+                // stable physicalName metadata (RFL-2); name mode uses the relabeled physical field.Name.
+                // Structurally absent + nullable → whole-subtree null-fill; absent + required →
+                // ColumnNotPresentInFile. Present → read its structure + recurse (in id mode threading
+                // byFieldId + the child's OWN nested.ids — the C1 re-seed, §2.5 case 2).
+                string containerMatchName = byFieldId is not null ? ColumnMapping.PhysicalNameOrName(field) : field.Name;
+                if (!TryResolveStructChildNode(fileStruct, containerMatchName, columnName, out Field? containerNode))
+                {
+                    await FillAbsentChildAsync(i, field, childContext).ConfigureAwait(false);
+                    continue;
+                }
+
+                if (byFieldId is not null)
+                {
+                    // The container child's declared column-mapping id is a structural-only GROUP id; found on
+                    // a footer leaf it is forged (the depth analogue of the top-container-id-on-leaf reject).
+                    VerifyContainerGroupIdAbsent(field, byFieldId, childContext);
+                }
+
+                // The child contributes one cell per struct owner cell; its driving-leaf def (clamped at
+                // structMaxDef) reports the STRUCT's presence for the cross-field null-mask parity guard.
+                DataField drivingLeaf = FirstDataField(containerNode!);
                 DataType drivingType = ParquetTypeMapping.ToDataType(drivingLeaf);
                 (_, int[]? drivingDef, int[]? drivingRep, int drivingNumValues) = await ReadScalarLeafAsync(
                     rowGroup, drivingLeaf, drivingType, presentFloor: 0, budget, promoteLeaf: false, cancellationToken)
@@ -501,32 +481,48 @@ internal static class NestedParquetColumnReader
                 fieldDefs[i] = ExtractOwnerCellDefs(
                     drivingDef, drivingRep, drivingNumValues, structMaxDef, parentMaxDef, parentMaxRep, rowCount, childContext);
 
-                // A struct is TRANSPARENT to repetition: its children share the struct's OWN owner cells and
-                // parent boundary (even a null-struct row yields a null child cell). So recurse with the
-                // struct's parentMaxRep/parentMaxDef UNCHANGED — NOT structMaxRep/structMaxDef.
-                //
-                // 585b defense-in-depth (#868 Issue 2): this deeper recursion nulls `byFieldId`, so the R2/R3/R4
-                // `promoteLeaf` gate's `&& byFieldId is null` conjunct is VACUOUSLY TRUE below. That is SAFE
-                // because an id-mode nested-within-nested SHAPE is rejected UPSTREAM at ValidateShape /
-                // ExpectScalarLeaf (UnsupportedFeature, "a nested type within a nested type … is not supported")
-                // BEFORE decode ever recurses here — so an id-mode read never reaches a deep name-mode promote.
-                // (585b removed the prior `depth == 0` layer; the upstream shape gate is the sufficient guard.)
+                // A struct is TRANSPARENT to repetition: recurse with the struct's parentMaxRep/parentMaxDef
+                // UNCHANGED. In id mode thread byFieldId VERBATIM + a FRESH NestedInteriorIds re-seeded from the
+                // child's OWN nested.ids (C1 — never the parent's, §2.4 R8); name mode nulls both.
+                NestedInteriorIds? childInterior = byFieldId is not null ? BuildInteriorIds(field) : null;
+                bool promoteChild = allowTypeWideningPromotion && byFieldId is null;
                 children[i] = await DecodeNode(
-                    rowGroup, childNode, field.DataType, rowCount, childContext, budget, byFieldId: null,
-                    interiorIds: null, depth + 1, parentMaxRep, parentMaxDef, allowTypeWideningPromotion,
+                    rowGroup, containerNode!, field.DataType, rowCount, childContext, budget, byFieldId,
+                    childInterior, depth + 1, parentMaxRep, parentMaxDef, promoteChild,
                     cancellationToken).ConfigureAwait(false);
                 continue;
             }
 
-            // A scalar struct field. 585b lifted the #546 depth cap on the name-mode promotion gate: a name-mode
-            // scalar child promotes at ANY depth (design §2.5, R2). The `byFieldId is null` conjunct is
-            // RETAINED so id-mode never promotes (an id-mode struct child already `continue`d above); a deeper
-            // name-mode recursion nulls `byFieldId`, so this conjunct is decisive only at the top-level entry.
-            // The up-front ValidateShape/ValidateChild (R1) runs before decode and already admits the same
-            // leaves, so this decode-side lift keeps the decode self-consistent with validation (design §2.5).
+            // A SCALAR child. Id mode binds by field_id within the container (containment-scoped); a
+            // VALID-current id absent from THIS footer → null-fill (added-after-write, §2.5). Name mode binds
+            // by physical name; absent → null-fill.
+            DataField scalarLeaf;
+            if (byFieldId is not null)
+            {
+                DataField? idLeaf = TryResolveStructFieldById(fileStruct, field, byFieldId, columnName);
+                if (idLeaf is null)
+                {
+                    await FillAbsentChildAsync(i, field, childContext).ConfigureAwait(false);
+                    continue;
+                }
+
+                scalarLeaf = idLeaf;
+            }
+            else
+            {
+                if (!TryResolveStructChildNode(fileStruct, field, columnName, out Field? nameChild))
+                {
+                    await FillAbsentChildAsync(i, field, childContext).ConfigureAwait(false);
+                    continue;
+                }
+
+                // 585b: a name-mode scalar child promotes at any depth (design §2.5, R2).
+                scalarLeaf = ExpectScalarLeaf(
+                    nameChild!, field.DataType, structMaxRep, structMaxDef, childContext, allowTypeWideningPromotion);
+            }
+
+            // The `byFieldId is null` conjunct keeps an id-mode leaf exact-match (no widening, §9 O1).
             bool promoteLeaf = allowTypeWideningPromotion && byFieldId is null;
-            DataField scalarLeaf = ExpectScalarLeaf(
-                childNode, field.DataType, structMaxRep, structMaxDef, childContext, promoteLeaf);
             int scalarPresentFloor = underRepeatedAncestor ? parentMaxDef : 0;
             (MutableColumnVector scalarChild, int[]? scalarDef, int[]? scalarRep, int scalarNumValues) = await ReadScalarLeafAsync(
                 rowGroup, scalarLeaf, field.DataType, scalarPresentFloor, budget, promoteLeaf, cancellationToken)
@@ -701,9 +697,20 @@ internal static class NestedParquetColumnReader
             // `promoteLeaf` gate's `&& byFieldId is null` conjunct is vacuously true below — SAFE because an
             // id-mode nested-within-nested shape is rejected UPSTREAM (UnsupportedFeature) before decode
             // recurses here (see the DecodeStruct site for the full rationale).
+            // #866 866b (R8/M6): thread byFieldId VERBATIM + Descend the container's interiorIds one array
+            // level into the ELEMENT scope, so a container element (array<array>, array<struct>, array<map>)
+            // binds its own interior leaves by id — never positionally. A container element's group id
+            // (interiorIds.ElementId) is structural-only; found on a footer leaf it is forged.
+            if (byFieldId is not null)
+            {
+                VerifyGroupIdAbsent(interiorIds?.ElementId, byFieldId, elementContext);
+            }
+
+            NestedInteriorIds? elementInterior = byFieldId is not null ? interiorIds?.Descend("element") : null;
+            bool promoteNestedElement = allowTypeWideningPromotion && byFieldId is null;
             elements = await DecodeNode(
-                rowGroup, fileList.Item, requested.ElementType, elemCount, elementContext, budget, byFieldId: null,
-                interiorIds: null, depth + 1, listMaxRep, listMaxDef, allowTypeWideningPromotion, cancellationToken)
+                rowGroup, fileList.Item, requested.ElementType, elemCount, elementContext, budget, byFieldId,
+                elementInterior, depth + 1, listMaxRep, listMaxDef, promoteNestedElement, cancellationToken)
                 .ConfigureAwait(false);
 
             if (elemCount != elements.Length)
@@ -718,21 +725,38 @@ internal static class NestedParquetColumnReader
 
         // A scalar list element. #839: in id mode (non-null byFieldId + interiorIds.ElementId) bind the element
         // leaf by its nested.ids field_id within the container's own interior (identity-selection + containment);
-        // name/none mode binds the element positionally (fileList.Item). The interior is ALWAYS scalar in id
-        // mode (nested-within-nested id mode is rejected upstream), so this is the only id-mode element path —
-        // the recursive branch above is never entered when byFieldId/interiorIds are present.
+        // name/none mode binds the element positionally (fileList.Item). A container element is handled by the
+        // recursive branch above; this is the SCALAR element path (a deep no-intervening-struct chain's leaf is
+        // resolved here by its multi-token id, threaded down via Descend).
         //
         // 585b lifted the #546 depth cap on the name-mode promotion gate: a name-mode scalar element promotes
         // at ANY depth, so a nested-within-nested narrow element promotes across a widen (design §2.5, R3). The
         // `byFieldId is null` conjunct is RETAINED so an id-mode element never promotes (§9 O1); deeper
         // name-mode recursion nulls `byFieldId`, so it is decisive only at the top-level entry.
         bool promoteLeaf = allowTypeWideningPromotion && byFieldId is null;
-        DataField elementLeaf = byFieldId is not null && interiorIds?.ElementId is long elementId
-            ? ExpectScalarLeaf(
+        // #866 866b (RFL-2 fail-closed bypass fix): in id mode the element MUST bind by its nested.ids
+        // element field_id — a MISSING/unresolvable interior id FAILS CLOSED (SchemaMismatch), it is NEVER
+        // silently read positionally (the positional fallback would bypass containment / group-id / wrong-leaf
+        // verification). Only name/none mode (byFieldId is null) reads the element positionally.
+        DataField elementLeaf;
+        if (byFieldId is not null)
+        {
+            if (interiorIds?.ElementId is not long elementId)
+            {
+                throw DeltaStorageException.SchemaMismatch(
+                    $"Parquet nested read for {elementContext}: an id-mode array element has no resolvable "
+                    + $"'{ColumnMapping.NestedIdsKey}' element id; the id-mode read fails closed (no positional fallback).");
+            }
+
+            elementLeaf = ExpectScalarLeaf(
                 ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext),
-                requested.ElementType, listMaxRep, listMaxDef, elementContext, promoteLeaf: false)
-            : ExpectScalarLeaf(
+                requested.ElementType, listMaxRep, listMaxDef, elementContext, promoteLeaf: false);
+        }
+        else
+        {
+            elementLeaf = ExpectScalarLeaf(
                 fileList.Item, requested.ElementType, listMaxRep, listMaxDef, elementContext, promoteLeaf);
+        }
 
         // The element child collects one cell per PRESENT element slot (a real value OR a null element),
         // skipping the placeholder slots a null/empty list emits (definition level below the list's own level).
@@ -835,18 +859,31 @@ internal static class NestedParquetColumnReader
         }
         else
         {
-            // #839: in id mode bind the key leaf by its nested.ids field_id within the container's own interior
-            // (identity-selection separates key from value, §2.5 step 3); name/none mode binds it positionally
-            // (fileMap.Key). Either way ExpectScalarLeaf type/level-validates the selected leaf. The interior is
-            // ALWAYS scalar in id mode (nested key/value id mode is rejected upstream), so this non-nested
-            // branch is the only id-mode key path.
+            // #839/#866 866b (RFL-2): in id mode bind the key leaf by its nested.ids field_id within the
+            // container's own interior (identity-selection separates key from value, §2.5 step 3); a MISSING
+            // interior id FAILS CLOSED (never positional — that would bypass id verification). Name/none mode
+            // binds it positionally (fileMap.Key).
             string keyContext = $"map column '{columnName}' key";
-            DataField keyLeaf = byFieldId is not null && interiorIds?.KeyId is long keyId
-                ? ExpectScalarLeaf(
+            DataField keyLeaf;
+            if (byFieldId is not null)
+            {
+                if (interiorIds?.KeyId is not long keyId)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"Parquet nested read for {keyContext}: an id-mode map key has no resolvable "
+                        + $"'{ColumnMapping.NestedIdsKey}' key id; the id-mode read fails closed (no positional fallback).");
+                }
+
+                keyLeaf = ExpectScalarLeaf(
                     ResolveInteriorLeafById(keyId, MapInteriorLeaves(fileMap), byFieldId, keyContext),
-                    requested.KeyType, mapMaxRep, mapMaxDef, keyContext, promoteLeaf: false)
-                : ExpectScalarLeaf(
+                    requested.KeyType, mapMaxRep, mapMaxDef, keyContext, promoteLeaf: false);
+            }
+            else
+            {
+                keyLeaf = ExpectScalarLeaf(
                     fileMap.Key, requested.KeyType, mapMaxRep, mapMaxDef, keyContext, promoteLeaf);
+            }
+
             (scalarKeys, keyDef, keyRep, keyNumValues) = await ReadScalarLeafAsync(
                 rowGroup, keyLeaf, requested.KeyType, presentFloor: mapMaxDef, budget, promoteLeaf, cancellationToken)
                 .ConfigureAwait(false);
@@ -871,16 +908,30 @@ internal static class NestedParquetColumnReader
         }
         else
         {
-            // #839: in id mode bind the value leaf by its DISTINCT nested.ids field_id within the container's
-            // own interior; name/none mode binds it positionally (fileMap.Value). Interior is always scalar in
-            // id mode, so this non-nested branch is the only id-mode value path.
+            // #839/#866 866b (RFL-2): in id mode bind the value leaf by its DISTINCT nested.ids field_id within
+            // the container's own interior; a MISSING interior id FAILS CLOSED (never positional). Name/none
+            // mode binds it positionally (fileMap.Value).
             string valueContext = $"map column '{columnName}' value";
-            DataField valueLeaf = byFieldId is not null && interiorIds?.ValueId is long valueId
-                ? ExpectScalarLeaf(
+            DataField valueLeaf;
+            if (byFieldId is not null)
+            {
+                if (interiorIds?.ValueId is not long valueId)
+                {
+                    throw DeltaStorageException.SchemaMismatch(
+                        $"Parquet nested read for {valueContext}: an id-mode map value has no resolvable "
+                        + $"'{ColumnMapping.NestedIdsKey}' value id; the id-mode read fails closed (no positional fallback).");
+                }
+
+                valueLeaf = ExpectScalarLeaf(
                     ResolveInteriorLeafById(valueId, MapInteriorLeaves(fileMap), byFieldId, valueContext),
-                    requested.ValueType, mapMaxRep, mapMaxDef, valueContext, promoteLeaf: false)
-                : ExpectScalarLeaf(
+                    requested.ValueType, mapMaxRep, mapMaxDef, valueContext, promoteLeaf: false);
+            }
+            else
+            {
+                valueLeaf = ExpectScalarLeaf(
                     fileMap.Value, requested.ValueType, mapMaxRep, mapMaxDef, valueContext, promoteLeaf);
+            }
+
             (scalarValues, valueDef, valueRep, _) = await ReadScalarLeafAsync(
                 rowGroup, valueLeaf, requested.ValueType, presentFloor: mapMaxDef, budget, promoteLeaf,
                 cancellationToken).ConfigureAwait(false);
@@ -912,20 +963,28 @@ internal static class NestedParquetColumnReader
         int entryCount = BuildRepeatedStructure(
             keyDef, keyRep, keyNumValues, mapMaxDef, mapMaxRep, parentMaxDef, parentMaxRep, ownerCells, offsets, nulls, columnName);
 
-        // 585b defense-in-depth (#868 Issue 2): the key/value recurses below null `byFieldId`, so the R4
-        // `promoteLeaf` gate's `&& byFieldId is null` conjunct is vacuously true — SAFE because an id-mode
-        // nested-within-nested shape is rejected UPSTREAM (UnsupportedFeature) before decode recurses here
-        // (see the DecodeStruct site for the full rationale).
+        // #866 866b (R8/M6): thread byFieldId VERBATIM + Descend the container's interiorIds one map level into
+        // the KEY / VALUE scope, so a container key/value binds its own interior leaves by id — never
+        // positionally. A container map KEY is fail-closed at write (§2.6), so only a container VALUE recurses
+        // in id mode; its group id (interiorIds.ValueId) is structural-only and forged if on a footer leaf.
+        if (byFieldId is not null && nestedValue)
+        {
+            VerifyGroupIdAbsent(interiorIds?.ValueId, byFieldId, $"map column '{columnName}' value");
+        }
+
+        NestedInteriorIds? keyInterior = byFieldId is not null ? interiorIds?.Descend("key") : null;
+        NestedInteriorIds? valueInterior = byFieldId is not null ? interiorIds?.Descend("value") : null;
+        bool promoteNested = allowTypeWideningPromotion && byFieldId is null;
         ColumnVector keys = nestedKey
             ? await DecodeNode(
                 rowGroup, fileMap.Key, requested.KeyType, entryCount, $"map column '{columnName}' key", budget,
-                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, allowTypeWideningPromotion,
+                byFieldId, keyInterior, depth + 1, mapMaxRep, mapMaxDef, promoteNested,
                 cancellationToken).ConfigureAwait(false)
             : scalarKeys!;
         ColumnVector values = nestedValue
             ? await DecodeNode(
                 rowGroup, fileMap.Value, requested.ValueType, entryCount, $"map column '{columnName}' value", budget,
-                byFieldId: null, interiorIds: null, depth + 1, mapMaxRep, mapMaxDef, allowTypeWideningPromotion,
+                byFieldId, valueInterior, depth + 1, mapMaxRep, mapMaxDef, promoteNested,
                 cancellationToken).ConfigureAwait(false)
             : scalarValues!;
 
@@ -1783,17 +1842,25 @@ internal static class NestedParquetColumnReader
     //     fail-closed, so absence is never conflated with a present-but-mismatched child).
     private static bool TryResolveStructChildNode(
         PqStructField fileStruct, StructField requested, string columnName, out Field? childNode)
+        => TryResolveStructChildNode(fileStruct, requested.Name, columnName, out childNode);
+
+    // #866 866b (RFL-2): locate a file struct child by an EXPLICIT match name. Name/none mode passes
+    // requested.Name (which is the relabeled physical name in the read schema); id mode passes the stable
+    // PHYSICAL name (ColumnMapping.PhysicalNameOrName) so a renamed container child is still located by its
+    // rename-stable physical identity, never the logical field name.
+    private static bool TryResolveStructChildNode(
+        PqStructField fileStruct, string matchName, string columnName, out Field? childNode)
     {
         Field? match = null;
         foreach (Field candidate in fileStruct.Fields)
         {
-            if (string.Equals(candidate.Name, requested.Name, StringComparison.Ordinal))
+            if (string.Equals(candidate.Name, matchName, StringComparison.Ordinal))
             {
                 if (match is not null)
                 {
                     throw DeltaStorageException.SchemaMismatch(
                         $"Struct column '{columnName}' has more than one file field named "
-                        + $"'{DiagnosticText.Sanitize(requested.Name)}'; a duplicate struct child name cannot be resolved safely.");
+                        + $"'{DiagnosticText.Sanitize(matchName)}'; a duplicate struct child name cannot be resolved safely.");
                 }
 
                 match = candidate;
@@ -2028,14 +2095,13 @@ internal static class NestedParquetColumnReader
     }
 
 
-    // Resolves a struct child in ID mode (#676 §2.5): binds by the child's delta.columnMapping.id within the
-    // resolved container — NEVER by name. The child's id is looked up in the path-keyed footer field-id map
-    // (#829); the resolved leaf MUST be one of the container's OWN direct leaf children (containment) so a
-    // forged footer that stamps the id on a top-level / sibling-container leaf fails closed rather than
-    // mis-attributing a column. The id-selected leaf — and only it — is then type/level-validated via
-    // ExpectScalarLeaf. A child that declares no id, whose id is absent from the footer, or whose id resolves
-    // outside the container fails closed with NO name fallback.
-    private static DataField ResolveStructFieldById(
+    // #866 866b: TryResolve a SCALAR struct child in id mode (§2.5). Binds by the child's
+    // delta.columnMapping.id within the resolved container — NEVER by name. Returns the type/level-validated
+    // leaf, or NULL when the (valid-current) id is ABSENT from THIS file's footer — the added-after-write
+    // signal the caller null-fills (nullable) or fails closed (required). A child that declares NO id, or whose
+    // id resolves OUTSIDE the container (cross-column mis-attribution), fails closed SchemaMismatch — never a
+    // name fallback, never masked as absence.
+    private static DataField? TryResolveStructFieldById(
         PqStructField fileStruct, StructField requested, IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
     {
         if (!ColumnMapping.TryGetId(requested, out long id))
@@ -2047,9 +2113,8 @@ internal static class NestedParquetColumnReader
 
         if (id is < 1 or > int.MaxValue || !byFieldId.TryGetValue((int)id, out DataField? leaf))
         {
-            throw DeltaStorageException.SchemaMismatch(
-                $"Struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}' declares a column-mapping id "
-                + "that is absent from the file footer field ids; the id-mode read fails closed (no name fallback).");
+            // ABSENT from THIS footer: a valid current id an older (narrower) file predates — null-fill, not a mismatch.
+            return null;
         }
 
         if (!IsDirectLeafChild(fileStruct, leaf))
@@ -2063,6 +2128,44 @@ internal static class NestedParquetColumnReader
         return ExpectScalarLeaf(
             leaf, requested.DataType, fileStruct.MaxRepetitionLevel, fileStruct.MaxDefinitionLevel,
             $"struct column '{columnName}' field '{DiagnosticText.Sanitize(requested.Name)}'", promoteLeaf: false);
+    }
+
+    // #866 866b: fail closed if a nested CONTAINER child's declared column-mapping GROUP id is stamped on a
+    // footer leaf. A container group id is structural-only (Parquet.Net stamps leaves only, §2.6); found on a
+    // leaf it is forged (the depth analogue of the top-container-id-on-leaf reject). Its expected-ABSENCE must
+    // NEVER be a presence signal — presence is decided structurally (§2.5 M4/M5).
+    private static void VerifyContainerGroupIdAbsent(
+        StructField field, IReadOnlyDictionary<int, DataField> byFieldId, string context)
+    {
+        if (ColumnMapping.TryGetId(field, out long groupId) && groupId is >= 1 and <= int.MaxValue
+            && byFieldId.ContainsKey((int)groupId))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Parquet nested read for {context}: the nested container's declared column-mapping id is stamped on a "
+                + "footer leaf, but a container group id must be structural-only; the id-mode read fails closed.");
+        }
+    }
+
+    // #866 866b: fail closed if an array/map interior CONTAINER's group id (from nested.ids) is stamped on a
+    // footer leaf (structural-only, must be absent — the depth analogue of VerifyContainerGroupIdAbsent).
+    private static void VerifyGroupIdAbsent(long? groupId, IReadOnlyDictionary<int, DataField> byFieldId, string context)
+    {
+        if (groupId is long id && id is >= 1 and <= int.MaxValue && byFieldId.ContainsKey((int)id))
+        {
+            throw DeltaStorageException.SchemaMismatch(
+                $"Parquet nested read for {context}: the nested interior container's '{ColumnMapping.NestedIdsKey}' group id is "
+                + "stamped on a footer leaf, but a group id must be structural-only; the id-mode read fails closed.");
+        }
+    }
+
+    // #866 866b: builds the multi-token interior-id table for a CONTAINER struct child from its OWN nested.ids
+    // (C1 re-seed — never inherit the parent's, §2.4 R8), keyed relative to the child's physical name. Null for
+    // a struct child (no nested.ids — its grandchildren are StructFields re-seeded again on the next descent).
+    private static NestedInteriorIds? BuildInteriorIds(StructField field)
+    {
+        return ColumnMapping.TryGetNestedIdsMap(field, out IReadOnlyDictionary<string, long> map)
+            ? NestedInteriorIds.FromNestedIds(map, ColumnMapping.PhysicalNameOrName(field))
+            : null;
     }
 
     // True when <paramref name="leaf"/> is one of <paramref name="container"/>'s OWN direct leaf children,
@@ -2083,10 +2186,12 @@ internal static class NestedParquetColumnReader
         return false;
     }
 
-    // Validates an id-mode struct<scalars> container against its requested (physical) struct type WITHOUT
-    // reading any data page (#676 §2.5): each requested child is resolved by id within the container and
-    // type/level-validated. The struct arm MUST NOT name-match in id mode — the id-selected leaf is the sole
-    // per-leaf validator.
+    // #676/#866 866b: validates an id-mode struct container against its requested (physical) struct type
+    // WITHOUT reading any data page (§2.5), DataType-aware + absent-tolerant. A SCALAR child is bound by id
+    // within the container (present → type/level-validated; VALID-current id absent → tolerated, decode
+    // null-fills). A CONTAINER child is located STRUCTURALLY by physical name (present → group-id-absent check +
+    // recurse; absent → tolerated, decode null-fills/required-fails). The struct arm MUST NOT name-match a
+    // scalar leaf. Containment / group-id-on-leaf violations still fail closed.
     public static void ValidateStructShapeById(
         PqStructField container, StructType requested, IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
     {
@@ -2099,37 +2204,183 @@ internal static class NestedParquetColumnReader
 
         foreach (StructField child in requested)
         {
-            _ = ResolveStructFieldById(container, child, byFieldId, columnName);
+            string childContext = $"struct column '{columnName}' field '{DiagnosticText.Sanitize(child.Name)}'";
+            if (child.DataType is ArrayType or MapType or StructType)
+            {
+                // Id mode locates a container child by its rename-stable PHYSICAL name (RFL-2).
+                if (!TryResolveStructChildNode(container, ColumnMapping.PhysicalNameOrName(child), columnName, out Field? childNode))
+                {
+                    continue;
+                }
+
+                VerifyContainerGroupIdAbsent(child, byFieldId, childContext);
+                ValidateNestedShapeById(childNode!, child.DataType, BuildInteriorIds(child), byFieldId, childContext);
+                continue;
+            }
+
+            _ = TryResolveStructFieldById(container, child, byFieldId, columnName);
         }
     }
 
-    // The interior element/key/value field_ids parsed from a container field's delta.columnMapping.nested.ids
-    // (#839, design §2.5). Carried from ResolveFileFields (validation) through to the decode (ReadListAsync/
-    // ReadMapAsync) so the interior leaf is bound by id — never positionally.
-    internal sealed class NestedInteriorIds
+    // #866 866b: validates an id-mode nested CONTAINER shape (struct/array/map) WITHOUT reading pages,
+    // DataType-aware (§2.5), the resolve-time dry-run of the decode's binding. A SCALAR interior in id mode
+    // MUST resolve its nested.ids id (missing → SchemaMismatch, RFL-2 fail-closed parity with the decode).
+    // Depth-bounded (DoS guard, checked before descent) like the decode/assignment recursions.
+    private static void ValidateNestedShapeById(
+        Field fileNode, DataType requested, NestedInteriorIds? interiorIds,
+        IReadOnlyDictionary<int, DataField> byFieldId, string context)
+        => ValidateNestedShapeById(fileNode, requested, interiorIds, byFieldId, context, depth: 1);
+
+    private static void ValidateNestedShapeById(
+        Field fileNode, DataType requested, NestedInteriorIds? interiorIds,
+        IReadOnlyDictionary<int, DataField> byFieldId, string context, int depth)
     {
-        private NestedInteriorIds(long? elementId, long? keyId, long? valueId)
+        if (depth > MaxNestedReadDepth)
         {
-            ElementId = elementId;
-            KeyId = keyId;
-            ValueId = valueId;
+            throw DeltaStorageException.UnsupportedFeature(
+                $"Parquet nested read for {context}: the schema nests deeper than the supported "
+                + $"limit of {MaxNestedReadDepth} levels.");
         }
 
-        internal long? ElementId { get; }
+        switch (requested)
+        {
+            case StructType structType:
+                ValidateStructShapeById(ExpectStruct(fileNode, context), structType, byFieldId, context);
+                break;
+            case ArrayType arrayType:
+                {
+                    PqListField fileList = ExpectList(fileNode, context);
+                    string elementContext = $"{context} element";
+                    if (arrayType.ElementType is ArrayType or MapType or StructType)
+                    {
+                        VerifyGroupIdAbsent(interiorIds?.ElementId, byFieldId, elementContext);
+                        ValidateNestedShapeById(
+                            fileList.Item, arrayType.ElementType, interiorIds?.Descend("element"), byFieldId, elementContext, depth + 1);
+                    }
+                    else
+                    {
+                        long elementId = RequireInteriorId(interiorIds?.ElementId, ColumnMapping.NestedIdsKey, "array element", elementContext);
+                        DataField elementLeaf = ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext);
+                        _ = ExpectScalarLeaf(elementLeaf, arrayType.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, elementContext, promoteLeaf: false);
+                    }
 
-        internal long? KeyId { get; }
+                    break;
+                }
 
-        internal long? ValueId { get; }
+            case MapType mapType:
+                {
+                    PqMapField fileMap = ExpectMap(fileNode, context);
+                    EnsureCanonicalMapChildNames(fileMap, context);
+                    EnsureRequiredMapKey(fileMap, context);
+                    string keyContext = $"{context} key";
+                    string valueContext = $"{context} value";
+                    long keyId = RequireInteriorId(interiorIds?.KeyId, ColumnMapping.NestedIdsKey, "map key", keyContext);
+                    DataField keyLeaf = ResolveInteriorLeafById(keyId, MapInteriorLeaves(fileMap), byFieldId, keyContext);
+                    _ = ExpectScalarLeaf(keyLeaf, mapType.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, keyContext, promoteLeaf: false);
 
-        internal static NestedInteriorIds ForArray(long elementId) => new(elementId, null, null);
+                    if (mapType.ValueType is ArrayType or MapType or StructType)
+                    {
+                        VerifyGroupIdAbsent(interiorIds?.ValueId, byFieldId, valueContext);
+                        ValidateNestedShapeById(
+                            fileMap.Value, mapType.ValueType, interiorIds?.Descend("value"), byFieldId, valueContext, depth + 1);
+                    }
+                    else
+                    {
+                        long valueId = RequireInteriorId(interiorIds?.ValueId, ColumnMapping.NestedIdsKey, "map value", valueContext);
+                        DataField valueLeaf = ResolveInteriorLeafById(valueId, MapInteriorLeaves(fileMap), byFieldId, valueContext);
+                        _ = ExpectScalarLeaf(valueLeaf, mapType.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel, valueContext, promoteLeaf: false);
+                    }
 
-        internal static NestedInteriorIds ForMap(long keyId, long valueId) => new(null, keyId, valueId);
+                    break;
+                }
+        }
+    }
+
+    // #866 866b (RFL-2): an id-mode SCALAR interior MUST carry a resolvable nested.ids id — a missing one fails
+    // closed rather than silently reading positionally (the bypass the RFL-2 red-team found).
+    private static long RequireInteriorId(long? id, string nestedIdsKey, string kind, string context)
+    {
+        if (id is long value)
+        {
+            return value;
+        }
+
+        throw DeltaStorageException.SchemaMismatch(
+            $"Parquet nested read for {context}: an id-mode {kind} has no resolvable '{nestedIdsKey}' id; "
+            + "the id-mode read fails closed (no positional fallback).");
+    }
+
+    // The interior field_ids parsed from a container field's delta.columnMapping.nested.ids (#839/#866 866b,
+    // design §2.5). At depth>1 this holds the FULL multi-token map (relative to the current container's scope):
+    // e.g. array<array<int>> at the outer scope is {element: groupId, element.element: leafId}. Carried from
+    // ResolveFileFields through the decode (ReadListAsync/ReadMapAsync) so an interior — scalar or the deep
+    // leaf of a no-intervening-struct chain — binds by id, never positionally. Descend(selector) returns the
+    // sub-scope for a CONTAINER interior (array/map element/value that is itself a container); a STRUCT interior
+    // re-seeds from each child StructField's OWN nested.ids (C1 — Descend NEVER crosses a struct boundary).
+    internal sealed class NestedInteriorIds
+    {
+        private const string ElementSelector = "element";
+        private const string KeySelector = "key";
+        private const string ValueSelector = "value";
+
+        private readonly IReadOnlyDictionary<string, long> _relative;
+
+        private NestedInteriorIds(IReadOnlyDictionary<string, long> relative) => _relative = relative;
+
+        // The direct element/key/value selector id at THIS scope (a scalar interior's leaf field_id, or a
+        // container interior's structural-only GROUP id). Null when the selector is absent.
+        internal long? ElementId => _relative.TryGetValue(ElementSelector, out long id) ? id : null;
+
+        internal long? KeyId => _relative.TryGetValue(KeySelector, out long id) ? id : null;
+
+        internal long? ValueId => _relative.TryGetValue(ValueSelector, out long id) ? id : null;
+
+        internal static NestedInteriorIds ForArray(long elementId) =>
+            new(new Dictionary<string, long>(StringComparer.Ordinal) { [ElementSelector] = elementId });
+
+        internal static NestedInteriorIds ForMap(long keyId, long valueId) =>
+            new(new Dictionary<string, long>(StringComparer.Ordinal) { [KeySelector] = keyId, [ValueSelector] = valueId });
+
+        // Builds the interior-id table from a container's full nested.ids map (dotted keys prefixed by the
+        // container physical name) by stripping the physical prefix so keys become relative to this scope.
+        internal static NestedInteriorIds FromNestedIds(IReadOnlyDictionary<string, long> dotted, string physicalPrefix)
+        {
+            string prefix = physicalPrefix + ".";
+            var relative = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (KeyValuePair<string, long> entry in dotted)
+            {
+                if (entry.Key.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    relative[entry.Key.Substring(prefix.Length)] = entry.Value;
+                }
+            }
+
+            return new NestedInteriorIds(relative);
+        }
+
+        // The sub-scope reachable by descending one array/map selector (element/key/value) into a CONTAINER
+        // interior: every key starting with "<selector>." has that prefix stripped. Never crosses a struct.
+        internal NestedInteriorIds Descend(string selector)
+        {
+            string prefix = selector + ".";
+            var sub = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (KeyValuePair<string, long> entry in _relative)
+            {
+                if (entry.Key.StartsWith(prefix, StringComparison.Ordinal))
+                {
+                    sub[entry.Key.Substring(prefix.Length)] = entry.Value;
+                }
+            }
+
+            return new NestedInteriorIds(sub);
+        }
     }
 
     // Collects the interior LEAF DataField(s) that are the container group's OWN direct children — the array
     // element (a list's Item) or the map key/value. A container whose interior is itself nested (Item/Key/Value
-    // is not a DataField) contributes no interior leaf, so an id lookup fails closed by containment (that shape
-    // is nested-within-nested #585 and rejected upstream).
+    // is not a DataField) contributes no interior leaf here; that nested-within-nested shape is now SUPPORTED
+    // (#866 866b) and is bound STRUCTURALLY + recursed by DecodeNode (the descended interiorIds threading),
+    // never through this scalar-interior collector.
     private static List<DataField> ListInteriorLeaves(PqListField fileList)
     {
         var leaves = new List<DataField>(1);
@@ -2188,49 +2439,34 @@ internal static class NestedParquetColumnReader
             + "outside the resolved container's own interior; the id-mode read fails closed to avoid cross-column mis-attribution.");
     }
 
-    // Validates an id-mode array<scalar> container against its requested type WITHOUT reading a data page
-    // (#839): the element leaf is bound by its nested.ids field_id within the container's own interior, then
-    // type/level-validated (ExpectScalarLeaf). Never positional.
+    // #839/#866 866b: validates an id-mode array container against its requested type WITHOUT reading a data
+    // page (§2.5), DataType-aware. A scalar element binds by its nested.ids element field_id; a container
+    // element is located structurally + recursed (via ValidateNestedShapeById). Never positional.
     public static void ValidateArrayShapeById(
-        Field container, ArrayType requested, long elementId,
+        Field container, ArrayType requested, NestedInteriorIds interiorIds,
         IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
     {
         columnName = DiagnosticText.Sanitize(columnName);
-        PqListField fileList = container as PqListField
+        _ = container as PqListField
             ?? throw DeltaStorageException.SchemaMismatch(
                 $"Column '{columnName}': its container physical name resolves to a non-list file column; the id-mode "
                 + "nested read fails closed.");
-        string context = $"array column '{columnName}' element";
-        DataField elementLeaf = ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, context);
-        _ = ExpectScalarLeaf(
-            elementLeaf, requested.ElementType, fileList.MaxRepetitionLevel, fileList.MaxDefinitionLevel, context,
-            promoteLeaf: false);
+        ValidateNestedShapeById(container, requested, interiorIds, byFieldId, $"array column '{columnName}'");
     }
 
-    // Validates an id-mode map<scalar,scalar> container against its requested type WITHOUT reading a data page
-    // (#839): the key/value leaves are bound by their distinct nested.ids field_ids within the container's own
-    // interior, then type/level-validated. The canonical key/value name guard is kept as defense-in-depth
-    // (§2.4). Never positional.
+    // #839/#866 866b: validates an id-mode map container against its requested type WITHOUT reading a data page
+    // (§2.5), DataType-aware. Scalar key/value bind by their distinct nested.ids field_ids; a container value is
+    // located structurally + recursed. The canonical key/value + required-key guards run. Never positional.
     public static void ValidateMapShapeById(
-        Field container, MapType requested, long keyId, long valueId,
+        Field container, MapType requested, NestedInteriorIds interiorIds,
         IReadOnlyDictionary<int, DataField> byFieldId, string columnName)
     {
         columnName = DiagnosticText.Sanitize(columnName);
-        PqMapField fileMap = container as PqMapField
+        _ = container as PqMapField
             ?? throw DeltaStorageException.SchemaMismatch(
                 $"Column '{columnName}': its container physical name resolves to a non-map file column; the id-mode "
                 + "nested read fails closed.");
-        EnsureCanonicalMapChildNames(fileMap, columnName);
-        EnsureRequiredMapKey(fileMap, columnName);
-        List<DataField> interiors = MapInteriorLeaves(fileMap);
-        DataField keyLeaf = ResolveInteriorLeafById(keyId, interiors, byFieldId, $"map column '{columnName}' key");
-        DataField valueLeaf = ResolveInteriorLeafById(valueId, interiors, byFieldId, $"map column '{columnName}' value");
-        _ = ExpectScalarLeaf(
-            keyLeaf, requested.KeyType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-            $"map column '{columnName}' key", promoteLeaf: false);
-        _ = ExpectScalarLeaf(
-            valueLeaf, requested.ValueType, fileMap.MaxRepetitionLevel, fileMap.MaxDefinitionLevel,
-            $"map column '{columnName}' value", promoteLeaf: false);
+        ValidateNestedShapeById(container, requested, interiorIds, byFieldId, $"map column '{columnName}'");
     }
 
     private static DataField ExpectScalarLeaf(

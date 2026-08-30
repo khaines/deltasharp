@@ -99,9 +99,10 @@ public sealed class NestedWithinNestedRejectTests
             keys, values, new[] { 0, 1 }, new[] { false }));
     }
 
-    // 18 — id-mode array<struct<...>> (nested-within-nested) is re-pointed to #866, not #585.
+    // 18 — id-mode array<struct<...>> (nested-within-nested) is now WRITTEN (866b) when it carries a valid
+    // nested.ids; an id-mode NWN container with NO nested.ids still fails closed (unstamped → unreadable).
     [Fact]
-    public void Write_IdModeNestedWithinNested_FailsClosed_RepointedTo866()
+    public void Write_IdModeNestedWithinNested_NoNestedIds_FailsClosed()
     {
         var metadata = FieldMetadata.FromValues(new Dictionary<string, MetadataValue>
         {
@@ -112,7 +113,7 @@ public sealed class NestedWithinNestedRejectTests
         DeltaStorageException error = Assert.Throws<DeltaStorageException>(
             () => ParquetTypeMapping.CreateField(field, honorReferenceNullability: true));
         Assert.Equal(StorageErrorKind.UnsupportedFeature, error.Kind);
-        Assert.Contains("#866", error.Message, StringComparison.Ordinal);
+        Assert.Contains("nested.ids", error.Message, StringComparison.Ordinal);
     }
 
     // 19 — an array chain past depth 64 fails closed BEFORE any byte (the schema-construction depth guard).

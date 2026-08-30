@@ -380,24 +380,30 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
         Assert.True(e2.Child("absent").IsNull(0));
     }
 
-    // ---- Fail-closed: id-mode depth>1 STAYS closed (create / evolve / validate / write) until 866b ----
+    // ---- id-mode depth>1 is now LIFTED (866b): create / evolve / write SUCCEED (see the §3.8 cells) ----
 
     [Theory]
     [InlineData("array<struct>")]
     [InlineData("struct<struct>")]
     [InlineData("map<string,struct>")]
     [InlineData("array<array>")]
-    public void IdMode_Depth2_Create_FailsClosed_866(string shape)
+    public void IdMode_Depth2_Create_Succeeds_866b(string shape)
     {
         StructType logical = new(new[] { new StructField("payload", NwnType(shape), nullable: true) });
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.AssignFreshMapping(logical, new SeededPhysicalNameSource("id-nwn"), ColumnMappingMode.Id));
-        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("nested type within a nested type", ex.Message, StringComparison.Ordinal);
+        (StructType mapped, long max) = ColumnMapping.AssignFreshMapping(
+            logical, new SeededPhysicalNameSource("id-nwn"), ColumnMappingMode.Id);
+
+        // The container gets an id + physicalName; depth>1 leaves/interiors advance maxColumnId past 1.
+        Assert.True(max >= 2);
+        Assert.True(ColumnMapping.TryGetId(mapped[0], out long payloadId));
+        Assert.Equal(1L, payloadId);
+
+        // The committed schema validates round-trip under id mode (no #866 reject).
+        ColumnMapping.ValidateColumnMappingSchema(ColumnMappingMode.Id, mapped, ColumnMapping.IdModeConfiguration(max));
     }
 
     [Fact]
-    public void IdMode_Depth2_Evolve_FailsClosed_866()
+    public void IdMode_Depth2_Evolve_Succeeds_866b()
     {
         (StructType current, long max) = ColumnMapping.AssignFreshMapping(
             new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
@@ -407,32 +413,441 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
             new StructField("id", DataTypes.LongType, nullable: false),
             new StructField("payload", NwnType("array<struct>"), nullable: true),
         });
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.EvolveNameModeMapping(
-                evolved, current, ColumnMapping.IdModeConfiguration(max),
-                new SeededPhysicalNameSource("id-evolve"), ColumnMappingMode.Id));
-        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
+        (StructType mappedEvolved, var config) = ColumnMapping.EvolveNameModeMapping(
+            evolved, current, ColumnMapping.IdModeConfiguration(max),
+            new SeededPhysicalNameSource("id-evolve"), ColumnMappingMode.Id);
+
+        Assert.Equal(2, mappedEvolved.Count);
+        ColumnMapping.ValidateColumnMappingSchema(ColumnMappingMode.Id, mappedEvolved, config);
     }
 
     [Fact]
-    public void IdMode_Depth2_Write_FailsClosed_866()
+    public void IdMode_Depth2_Write_Succeeds_866b()
     {
-        // ToPhysicalSchema (the write door) still fails closed for an id-mode depth>1 schema.
-        var mapped = new StructType(new[]
+        // ToPhysicalSchema (the write door) now relabels an id-mode depth>1 schema (866b).
+        (StructType mapped, _) = ColumnMapping.AssignFreshMapping(
+            new StructType(new[] { new StructField("payload", NwnType("array<struct>"), nullable: true) }),
+            new SeededPhysicalNameSource("id-write"), ColumnMappingMode.Id);
+        StructType physical = ColumnMapping.ToPhysicalSchema(mapped, ColumnMappingMode.Id);
+        Assert.Single(physical);
+        Assert.IsType<ArrayType>(physical[0].DataType);
+    }
+
+    // ==================================================================================================
+    // §3.8a–§3.8s · ID-MODE depth>1 write→read→resolve round trips (866b) — the critical-correctness cells
+    // ==================================================================================================
+
+    // §3.8a — array<struct<a,b>> id-mode round trip: children bind by their DIRECT StructField id (the element
+    // GROUP id is structural-only), NOT positionally. Disjoint domains (a∈[1000..], b=strings) pin id-binding.
+    [Fact]
+    public async Task IdMode_ArrayOfStruct_RoundTrip_ResolvesChildrenByDirectId()
+    {
+        var elem = new StructType(new[]
+        {
+            new StructField("a", DataTypes.LongType, nullable: true),
+            new StructField("b", DataTypes.StringType, nullable: true),
+        });
+        var schema = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("items", new ArrayType(elem), nullable: true),
+        });
+        ListColumnVector items = ArrayOfStruct(
+            (ArrayType)schema["items"].DataType,
+            new[]
+            {
+                new (long?, string?)[] { (1001L, "x"), (1002L, "y") },
+                Array.Empty<(long?, string?)>(),
+                null,
+            });
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { Long(1L, 2L, 3L), items }, 3);
+
+        (_, long max) = await WriteIdMappedFileAndV0Async(schema, batch);
+        Assert.Equal(5L, max); // id(1), items(2), element-group ⌂(3), a(4), b(5)
+
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var readItems = (ListColumnVector)read.Column(1);
+        Assert.Equal(2, readItems.ElementLength(0));
+        Assert.Equal(0, readItems.ElementLength(1));
+        Assert.True(readItems.IsNull(2));
+        var e0 = (StructColumnVector)readItems.ElementsAt(0);
+        Assert.Equal(1001L, e0.Child("a").GetValue<long>(0));
+        Assert.Equal("x", Encoding.UTF8.GetString(e0.Child("b").GetBytes(0)));
+        Assert.Equal(1002L, e0.Child("a").GetValue<long>(1));
+        Assert.Equal("y", Encoding.UTF8.GetString(e0.Child("b").GetBytes(1)));
+    }
+
+    // §3.8h (M4) — array<struct<a, b:struct<c>>>: the PRESENT nested struct `b` is bound STRUCTURALLY (its
+    // group id is expected-absent and must NOT trigger null-fill) and recursed; a by id, b.c by id. Witness
+    // that a naive own-id-absence null-fill (which would DROP present b.c) is not taken.
+    [Fact]
+    public async Task IdMode_Depth3_ArrayStructStruct_PresentNestedStruct_ReadsCorrectly()
+    {
+        var inner = new StructType(new[] { new StructField("c", DataTypes.LongType, nullable: true) });
+        var elem = new StructType(new[]
+        {
+            new StructField("a", DataTypes.LongType, nullable: true),
+            new StructField("b", inner, nullable: true),
+        });
+        var schema = new StructType(new[] { new StructField("rows", new ArrayType(elem), nullable: true) });
+
+        ListColumnVector rows = ArrayStructAB(
+            (ArrayType)schema["rows"].DataType,
+            new[]
+            {
+                new (long?, long?)[] { (10L, 900L), (11L, 901L) }, // a∈[10..], c∈[900..] disjoint
+                new (long?, long?)[] { (12L, 902L) },
+            });
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { rows }, 2);
+
+        await WriteIdMappedFileAndV0Async(schema, batch);
+
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rItems = (ListColumnVector)read.Column(0);
+        var e0 = (StructColumnVector)rItems.ElementsAt(0);
+        Assert.Equal(10L, e0.Child("a").GetValue<long>(0));
+        var b0 = (StructColumnVector)e0.Child("b");
+        Assert.Equal(900L, b0.Child("c").GetValue<long>(0)); // present nested struct NOT dropped
+        Assert.Equal(901L, b0.Child("c").GetValue<long>(1));
+    }
+
+    // §3.8c — read an OLD id-mode file after adding a NULLABLE child: the added child NULL-FILLS (not
+    // SchemaMismatch/unreadable). a values intact.
+    [Fact]
+    public async Task IdMode_ReadOldFileAfterDepth2Add_NullFillsAbsentNullableChild()
+    {
+        var oldElem = new StructType(new[] { new StructField("a", DataTypes.LongType, nullable: true) });
+        var oldSchema = new StructType(new[] { new StructField("items", new ArrayType(oldElem), nullable: true) });
+        ListColumnVector oldItems = ArrayOfSingleLong(
+            (ArrayType)oldSchema["items"].DataType,
+            new long?[]?[] { new long?[] { 100L, 101L }, new long?[] { 102L } });
+        (StructType oldMapped, long oldMax) =
+            await WriteIdMappedFileAndV0Async(oldSchema, new ManagedColumnBatch(oldSchema, new ColumnVector[] { oldItems }, 2));
+
+        var newElem = new StructType(new[]
+        {
+            new StructField("a", DataTypes.LongType, nullable: true),
+            new StructField("b", DataTypes.LongType, nullable: true),
+        });
+        var newLogical = new StructType(new[] { new StructField("items", new ArrayType(newElem), nullable: true) });
+        (StructType newMapped, ImmutableConfig cfg) = EvolveId(newLogical, oldMapped, oldMax);
+        await CommitMetadataIdAsync(newMapped, cfg.MaxColumnId, version: 1);
+
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rItems = (ListColumnVector)read.Column(0);
+        var e0 = (StructColumnVector)rItems.ElementsAt(0);
+        Assert.Equal(100L, e0.Child("a").GetValue<long>(0)); // a intact
+        Assert.True(e0.Child("b").IsNull(0));                // b null-filled, NOT unreadable
+        Assert.True(e0.Child("b").IsNull(1));
+    }
+
+    // §3.8l (M5) — array<struct<a>> evolved to array<struct<b>> (drop a, add b): the OLD file physically holds
+    // the array with NON-TRIVIAL per-row lengths (empty, multi, single). The array container is located by its
+    // stable physicalName (present), so its per-row LENGTHS are read from the file and b is null-filled per
+    // element — reads back the SAME lengths, a dropped. Asserts array lengths preserved, NOT a null array.
+    [Fact]
+    public async Task IdMode_AllChildrenReplaced_RetainsArrayLengths_M5()
+    {
+        var oldElem = new StructType(new[] { new StructField("a", DataTypes.LongType, nullable: true) });
+        var oldSchema = new StructType(new[] { new StructField("items", new ArrayType(oldElem), nullable: true) });
+        ListColumnVector oldItems = ArrayOfSingleLong(
+            (ArrayType)oldSchema["items"].DataType,
+            new long?[]?[] { Array.Empty<long?>(), new long?[] { 100L, 101L }, new long?[] { 102L } });
+        (StructType oldMapped, long oldMax) =
+            await WriteIdMappedFileAndV0Async(oldSchema, new ManagedColumnBatch(oldSchema, new ColumnVector[] { oldItems }, 3));
+
+        // Rebuild the mapped schema replacing the element child with a fresh nullable `b` (drop `a`, add `b`).
+        StructType newMapped = ReplaceArrayElementChild(oldMapped, "items", "b", oldMax + 1);
+        await CommitMetadataIdAsync(newMapped, oldMax + 1, version: 1);
+
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rItems = (ListColumnVector)read.Column(0);
+        Assert.Equal(0, rItems.ElementLength(0)); // empty row preserved
+        Assert.Equal(2, rItems.ElementLength(1)); // multi row preserved
+        Assert.Equal(1, rItems.ElementLength(2)); // single row preserved
+        var e1 = (StructColumnVector)rItems.ElementsAt(1);
+        Assert.True(e1.Child("b").IsNull(0)); // b null-filled per element (a dropped)
+        Assert.True(e1.Child("b").IsNull(1));
+    }
+
+    // §3.8o (R8/M6) — array<array<int>> id-mode: the inner element leaf binds by its MULTI-TOKEN nested.ids id
+    // (P.element.element) threaded through the ReadListAsync→ReadListAsync recursion, NOT positionally.
+    [Fact]
+    public async Task IdMode_ArrayArray_InnerElementResolvedById_RoundTrip()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("aa", new ArrayType(new ArrayType(DataTypes.LongType)), nullable: true),
+        });
+        ListColumnVector aa = ArrayOfArrayLong(
+            (ArrayType)schema["aa"].DataType,
+            new long?[]?[]?[]
+            {
+                new long?[]?[] { new long?[] { 7L, 8L }, new long?[] { 9L } },
+                new long?[]?[] { Array.Empty<long?>() },
+            });
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { aa }, 2);
+
+        await WriteIdMappedFileAndV0Async(schema, batch);
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rAa = (ListColumnVector)read.Column(0);
+        Assert.Equal(2, rAa.ElementLength(0));
+        var inner0 = (ListColumnVector)rAa.ElementsAt(0);
+        Assert.Equal(7L, ((ListColumnVector)rAa.ElementsAt(0)).ElementsAt(0).GetValue<long>(0));
+        Assert.Equal(8L, inner0.ElementsAt(0).GetValue<long>(1));
+        Assert.Equal(9L, inner0.ElementsAt(1).GetValue<long>(0));
+    }
+
+    // §3.8s (R8/M6 — StructField re-seed) — struct<b: array<int>>: the inner array element binds by `b`'s OWN
+    // nested.ids id via the re-seed at the struct boundary, NOT positionally / not by the parent's ids.
+    [Fact]
+    public async Task IdMode_StructArray_InnerElementResolvedById_ReSeed()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("s", new StructType(new[]
+            {
+                new StructField("b", new ArrayType(DataTypes.LongType), nullable: true),
+            }), nullable: true),
+        });
+        var bVec = ArrayOfScalarLong(
+            (ArrayType)((StructType)schema["s"].DataType)["b"].DataType,
+            new long?[]?[] { new long?[] { 55L, 56L }, new long?[] { 57L } });
+        var sVec = new StructColumnVector((StructType)schema["s"].DataType, new ColumnVector[] { bVec }, new[] { false, false });
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { sVec }, 2);
+
+        await WriteIdMappedFileAndV0Async(schema, batch);
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rs = (StructColumnVector)read.Column(0);
+        var rb = (ListColumnVector)rs.Child("b");
+        Assert.Equal(2, rb.ElementLength(0));
+        Assert.Equal(55L, rb.ElementsAt(0).GetValue<long>(0));
+        Assert.Equal(56L, rb.ElementsAt(0).GetValue<long>(1));
+        Assert.Equal(57L, rb.ElementsAt(1).GetValue<long>(0));
+    }
+
+    // §3.8q — map<string, array<long>>: the id threads through the MAP VALUE into the inner array
+    // (ReadMapAsync→ReadListAsync), so the inner long binds by its multi-token nested.ids id (P.value.element).
+    [Fact]
+    public async Task IdMode_MapValueArray_IdThreadsThroughIntoInnerArray()
+    {
+        var schema = new StructType(new[]
+        {
+            new StructField("m", new MapType(DataTypes.StringType, new ArrayType(DataTypes.LongType)), nullable: true),
+        });
+        var mVec = MapStringToArrayLong(
+            (MapType)schema["m"].DataType,
+            new[]
+            {
+                new (string, long?[])[] { ("k1", new long?[] { 200L, 201L }) },
+                new (string, long?[])[] { ("k2", new long?[] { 202L }) },
+            });
+        var batch = new ManagedColumnBatch(schema, new ColumnVector[] { mVec }, 2);
+
+        await WriteIdMappedFileAndV0Async(schema, batch);
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rm = (MapColumnVector)read.Column(0);
+        var values0 = (ListColumnVector)rm.ValuesAt(0);
+        Assert.Equal(200L, values0.ElementsAt(0).GetValue<long>(0));
+        Assert.Equal(201L, values0.ElementsAt(0).GetValue<long>(1));
+    }
+
+    // §3.8b companion — a container map KEY stays fail-closed on write in id mode (§2.6).
+    [Fact]
+    public void IdMode_MapKeyContainer_FailsClosed()
+    {
+        var schema = new StructType(new[]
         {
             new StructField(
-                "payload",
-                NwnType("array<struct>"),
-                nullable: true,
-                DeltaSharp.Types.FieldMetadata.FromValues(new[]
-                {
-                    new KeyValuePair<string, MetadataValue>(ColumnMapping.PhysicalNameKey, MetadataValue.String("col-payload")),
-                    new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(1)),
-                })),
+                "m",
+                new MapType(new StructType(new[] { new StructField("x", DataTypes.LongType) }), DataTypes.LongType),
+                nullable: true),
         });
-        DeltaProtocolException ex = Assert.Throws<DeltaProtocolException>(
-            () => ColumnMapping.ToPhysicalSchema(mapped, ColumnMappingMode.Id));
-        Assert.Contains("#866", ex.Message, StringComparison.Ordinal);
+        Assert.Throws<DeltaProtocolException>(
+            () => ColumnMapping.AssignFreshMapping(schema, new SeededPhysicalNameSource("mk"), ColumnMappingMode.Id));
+    }
+
+    // §3.8e/§3.8j/§3.8n — REQUIRED-absent depth>1 fail-closed cells are pinned at the READER level (clean
+    // ColumnNotPresentInFile) in NestedIdModeRenameDiscriminationTests; through the full scan path a
+    // required-added column is caught earlier by the schema-evolution guard (also fail-closed).
+
+    // §3.8m — struct-field container M5 companion: struct<s: struct<a>> evolved to struct<s: struct<b>>, old
+    // file holds s + s.a; s is located by its physicalName (PRESENT) so its per-row presence structure is read
+    // and `b` is null-filled per row — `s` is NOT null-filled whole even though `b` is its only requested child.
+    [Fact]
+    public async Task IdMode_StructField_AllChildrenReplaced_StructPresent_NullFillsLeaves_M5()
+    {
+        var oldInner = new StructType(new[] { new StructField("a", DataTypes.LongType, nullable: true) });
+        var oldSchema = new StructType(new[] { new StructField("s", oldInner, nullable: true) });
+        var aVec = Long(10L, 11L);
+        var sVec = new StructColumnVector(oldInner, new ColumnVector[] { aVec }, new[] { false, false });
+        (StructType oldMapped, long oldMax) =
+            await WriteIdMappedFileAndV0Async(oldSchema, new ManagedColumnBatch(oldSchema, new ColumnVector[] { sVec }, 2));
+
+        // Replace `a` with a fresh nullable `b` (struct `s` unchanged/present).
+        StructType newMapped = ReplaceStructFieldChild(oldMapped, "s", "b", oldMax + 1);
+        await CommitMetadataIdAsync(newMapped, oldMax + 1, version: 1);
+
+        ColumnBatch read = await ReadSingleBatchAsync();
+        var rs = (StructColumnVector)read.Column(0);
+        Assert.False(rs.IsNull(0)); // s PRESENT (not null-filled whole)
+        Assert.False(rs.IsNull(1));
+        Assert.True(rs.Child("b").IsNull(0)); // b null-filled per row (a dropped)
+        Assert.True(rs.Child("b").IsNull(1));
+    }
+
+    // ---- required-absent / evolve mapped-schema builders (id mode) ----
+
+    private static DeltaSharp.Types.FieldMetadata IdMeta(long id) =>
+        DeltaSharp.Types.FieldMetadata.FromValues(new[]
+        {
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.PhysicalNameKey, MetadataValue.String("col-" + id.ToString(CultureInfo.InvariantCulture))),
+            new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(id)),
+        });
+
+    private static StructType ReplaceStructFieldChild(StructType mapped, string structColumn, string newChild, long id)
+    {
+        var fields = mapped.Select(f =>
+        {
+            if (f.Name != structColumn)
+            {
+                return f;
+            }
+
+            var inner = new StructType(new[] { new StructField(newChild, DataTypes.LongType, nullable: true, IdMeta(id)) });
+            return new StructField(f.Name, inner, f.Nullable, f.Metadata);
+        }).ToList();
+        return new StructType(fields);
+    }
+
+    // ---- id-mode test vector builders ----
+
+    private static ListColumnVector ArrayStructAB(ArrayType type, IReadOnlyList<(long? A, long? C)[]> rows)
+    {
+        var elemType = (StructType)type.ElementType;
+        var innerType = (StructType)elemType["b"].DataType;
+        MutableColumnVector a = ColumnVectors.Create(DataTypes.LongType, 16);
+        MutableColumnVector c = ColumnVectors.Create(DataTypes.LongType, 16);
+        var innerNulls = new List<bool>();
+        var elemNulls = new List<bool>();
+        var offsets = new int[rows.Count + 1];
+        int cursor = 0;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            offsets[i] = cursor;
+            foreach ((long? av, long? cv) in rows[i])
+            {
+                AppendLong(a, av);
+                AppendLong(c, cv);
+                innerNulls.Add(false);
+                elemNulls.Add(false);
+                cursor++;
+            }
+        }
+
+        offsets[rows.Count] = cursor;
+        var innerVec = new StructColumnVector(innerType, new ColumnVector[] { c }, innerNulls.ToArray());
+        var elemVec = new StructColumnVector(elemType, new ColumnVector[] { a, innerVec }, elemNulls.ToArray());
+        return new ListColumnVector(type, elemVec, offsets, new bool[rows.Count]);
+    }
+
+    private static ListColumnVector ArrayOfArrayLong(ArrayType type, IReadOnlyList<long?[]?[]?> rows)
+    {
+        var innerType = (ArrayType)type.ElementType;
+        MutableColumnVector leaf = ColumnVectors.Create(DataTypes.LongType, 16);
+        var innerOffsets = new List<int> { 0 };
+        var innerNulls = new List<bool>();
+        var outerOffsets = new int[rows.Count + 1];
+        var outerNulls = new bool[rows.Count];
+        int leafCursor = 0;
+        int innerCursor = 0;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            outerOffsets[i] = innerCursor;
+            long?[]?[]? row = rows[i];
+            outerNulls[i] = row is null;
+            if (row is not null)
+            {
+                foreach (long?[]? innerRow in row)
+                {
+                    innerNulls.Add(innerRow is null);
+                    if (innerRow is not null)
+                    {
+                        foreach (long? v in innerRow)
+                        {
+                            AppendLong(leaf, v);
+                            leafCursor++;
+                        }
+                    }
+
+                    innerOffsets.Add(leafCursor);
+                    innerCursor++;
+                }
+            }
+        }
+
+        outerOffsets[rows.Count] = innerCursor;
+        var innerList = new ListColumnVector(innerType, leaf, innerOffsets.ToArray(), innerNulls.ToArray());
+        return new ListColumnVector(type, innerList, outerOffsets, outerNulls);
+    }
+
+    private static MapColumnVector MapStringToArrayLong(MapType type, IReadOnlyList<(string K, long?[] V)[]> rows)
+    {
+        var valueType = (ArrayType)type.ValueType;
+        MutableColumnVector keys = ColumnVectors.Create(DataTypes.StringType, 16);
+        MutableColumnVector leaf = ColumnVectors.Create(DataTypes.LongType, 16);
+        var valInnerOffsets = new List<int> { 0 };
+        var valInnerNulls = new List<bool>();
+        var entryOffsets = new int[rows.Count + 1];
+        int entryCursor = 0;
+        int leafCursor = 0;
+        for (int i = 0; i < rows.Count; i++)
+        {
+            entryOffsets[i] = entryCursor;
+            foreach ((string k, long?[] v) in rows[i])
+            {
+                AppendStr(keys, k);
+                foreach (long? lv in v)
+                {
+                    AppendLong(leaf, lv);
+                    leafCursor++;
+                }
+
+                valInnerOffsets.Add(leafCursor);
+                valInnerNulls.Add(false);
+                entryCursor++;
+            }
+        }
+
+        entryOffsets[rows.Count] = entryCursor;
+        var values = new ListColumnVector(valueType, leaf, valInnerOffsets.ToArray(), valInnerNulls.ToArray());
+        return new MapColumnVector(type, keys, values, entryOffsets, new bool[rows.Count]);
+    }
+
+    // Rebuilds a mapped id-mode array<struct> so the element struct has a SINGLE fresh nullable child (drop the
+    // old children, add `newChild` with a fresh id + physicalName) — the M5 all-children-replaced evolution.
+    private static StructType ReplaceArrayElementChild(
+        StructType mapped, string arrayColumn, string newChild, long newId)
+    {
+        var fields = mapped.Select(f =>
+        {
+            if (f.Name != arrayColumn)
+            {
+                return f;
+            }
+
+            var arr = (ArrayType)f.DataType;
+            var newElem = new StructType(new[]
+            {
+                new StructField(newChild, DataTypes.LongType, nullable: true, DeltaSharp.Types.FieldMetadata.FromValues(new[]
+                {
+                    new KeyValuePair<string, MetadataValue>(ColumnMapping.PhysicalNameKey, MetadataValue.String("col-" + newId.ToString(CultureInfo.InvariantCulture))),
+                    new KeyValuePair<string, MetadataValue>(ColumnMapping.IdKey, MetadataValue.Long(newId)),
+                })),
+            });
+            return new StructField(f.Name, new ArrayType(newElem, arr.ContainsNull), f.Nullable, f.Metadata);
+        }).ToList();
+        return new StructType(fields);
     }
 
     // ==================================================================================================
@@ -532,6 +947,48 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
     {
         (_, long maxColumnId) = await WriteNameMappedFileAndV0Async(schema, batch);
         return maxColumnId;
+    }
+
+    // ---- id-mode round-trip helpers (866b) ----
+
+    // Assigns an ID mapping, writes the physical batch (leaf field_ids stamped) via the production writer, and
+    // commits a raw protocol+metaData+add v0 under column-mapping ID mode. Returns the mapped schema + max.
+    private async Task<(StructType Mapped, long MaxColumnId)> WriteIdMappedFileAndV0Async(
+        StructType schema, ColumnBatch batch)
+    {
+        (StructType mapped, long maxColumnId) =
+            ColumnMapping.AssignFreshMapping(schema, new SeededPhysicalNameSource(Seed), ColumnMappingMode.Id);
+        StructType physical = ColumnMapping.MapWriteSchemaToPhysical(schema, mapped, ColumnMappingMode.Id);
+        byte[] parquetBytes = await ParquetTestHelpers.WriteToBytesAsync(physical, new[] { RelabelForWrite(batch, physical) });
+
+        using var backend = new LocalFileSystemBackend(_root);
+        await backend.PutIfAbsentAsync("part-00000.parquet", parquetBytes, CancellationToken.None);
+        string addLine =
+            $"{{\"add\":{{\"path\":\"part-00000.parquet\",\"partitionValues\":{{}},"
+            + $"\"size\":{parquetBytes.Length},\"modificationTime\":0,\"dataChange\":true}}}}";
+        byte[] commit = Encoding.UTF8.GetBytes(
+            ProtocolFeatureLine() + "\n" + MetadataLineMode(mapped, maxColumnId, "id") + "\n" + addLine + "\n");
+        await backend.PutIfAbsentAsync("_delta_log/00000000000000000000.json", commit, CancellationToken.None);
+        return (mapped, maxColumnId);
+    }
+
+    private async Task CommitMetadataIdAsync(StructType mapped, long maxColumnId, int version)
+    {
+        using var backend = new LocalFileSystemBackend(_root);
+        byte[] commit = Encoding.UTF8.GetBytes(MetadataLineMode(mapped, maxColumnId, "id") + "\n");
+        await backend.PutIfAbsentAsync(
+            $"_delta_log/{version.ToString("D20", CultureInfo.InvariantCulture)}.json", commit, CancellationToken.None);
+    }
+
+    private static (StructType Mapped, ImmutableConfig Config) EvolveId(
+        StructType evolvedLogical, StructType currentMapped, long currentMax)
+    {
+        (StructType mapped, System.Collections.Immutable.ImmutableSortedDictionary<string, string> config) =
+            ColumnMapping.EvolveNameModeMapping(
+                evolvedLogical, currentMapped, ColumnMapping.IdModeConfiguration(currentMax),
+                new SeededPhysicalNameSource(Seed + "-evolve"), ColumnMappingMode.Id);
+        long newMax = long.Parse(config[ColumnMapping.MaxColumnIdKey], CultureInfo.InvariantCulture);
+        return (mapped, new ImmutableConfig(newMax, config));
     }
 
     // Assigns a name mapping, writes the physical batch to a real Parquet file via the production writer, and
@@ -635,11 +1092,14 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
     private static string ProtocolFeatureLine() =>
         """{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["columnMapping"],"writerFeatures":["columnMapping"]}}""";
 
-    private static string MetadataLine(StructType mapped, long maxColumnId)
+    private static string MetadataLine(StructType mapped, long maxColumnId) =>
+        MetadataLineMode(mapped, maxColumnId, "name");
+
+    private static string MetadataLineMode(StructType mapped, long maxColumnId, string mode)
     {
         string schemaJson = DeltaSchemaJson.ToJson(mapped);
         string escapedSchema = System.Text.Json.JsonSerializer.Serialize(schemaJson);
-        string config = "{\"delta.columnMapping.mode\":\"name\",\"delta.columnMapping.maxColumnId\":\""
+        string config = "{\"delta.columnMapping.mode\":\"" + mode + "\",\"delta.columnMapping.maxColumnId\":\""
             + maxColumnId.ToString(CultureInfo.InvariantCulture) + "\"}";
         return "{\"metaData\":{\"id\":\"t\",\"format\":{\"provider\":\"parquet\",\"options\":{}},"
             + "\"schemaString\":" + escapedSchema + ",\"partitionColumns\":[]"
