@@ -889,6 +889,31 @@ public sealed class NestedWithinNestedColumnMappingTests : IDisposable
         string[] nearNames = ColumnMappingProjection.ResolvePhysicalNames(nearMapped, ColumnMappingMode.Name);
         _ = ColumnMappingProjection.BuildDataSchema(
             nearMapped, nearNames, System.Collections.Immutable.ImmutableArray<string>.Empty);
+
+        // --- evolution (EvolveMappedType) — #886 item 2: the evolve recursion is depth-bounded too (symmetry
+        // with assign/validate/physical/read). Evolve a shallow { id } mapping by ADDING an over-cap-deep column:
+        // the new column's recursion fails closed with a TYPED DeltaProtocolException before any descent, never
+        // a StackOverflowException; a near-cap addition evolves fine.
+        (StructType shallowMapped, long shallowMax) = ColumnMapping.AssignFreshMapping(
+            new StructType(new[] { new StructField("id", DataTypes.LongType, nullable: false) }),
+            new SeededPhysicalNameSource("dos-evolve-base"), ColumnMappingMode.Name);
+        var overCapEvolvedLogical = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("deep", DeepLogicalStruct(overCap), nullable: true),
+        });
+        Assert.Throws<DeltaProtocolException>(() => ColumnMapping.EvolveNameModeMapping(
+            overCapEvolvedLogical, shallowMapped, ColumnMapping.NameModeConfiguration(shallowMax),
+            new SeededPhysicalNameSource("dos-evolve-over"), ColumnMappingMode.Name));
+
+        var nearCapEvolvedLogical = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("deep", DeepLogicalStruct(nearCap), nullable: true),
+        });
+        _ = ColumnMapping.EvolveNameModeMapping(
+            nearCapEvolvedLogical, shallowMapped, ColumnMapping.NameModeConfiguration(shallowMax),
+            new SeededPhysicalNameSource("dos-evolve-near"), ColumnMappingMode.Name);
     }
 
     // A logical struct nested `depth` levels deep: { c1: struct<c2: struct< … struct<leaf:long> >> }.

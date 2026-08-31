@@ -741,13 +741,9 @@ internal static class NestedParquetColumnReader
         DataField elementLeaf;
         if (byFieldId is not null)
         {
-            if (interiorIds?.ElementId is not long elementId)
-            {
-                throw DeltaStorageException.SchemaMismatch(
-                    $"Parquet nested read for {elementContext}: an id-mode array element has no resolvable "
-                    + $"'{ColumnMapping.NestedIdsKey}' element id; the id-mode read fails closed (no positional fallback).");
-            }
-
+            // #888: route through the shared RequireInteriorId helper so the decode and validate
+            // (ValidateNestedShapeById) paths fail-close on a missing interior id from ONE message source.
+            long elementId = RequireInteriorId(interiorIds?.ElementId, ColumnMapping.NestedIdsKey, "array element", elementContext);
             elementLeaf = ExpectScalarLeaf(
                 ResolveInteriorLeafById(elementId, ListInteriorLeaves(fileList), byFieldId, elementContext),
                 requested.ElementType, listMaxRep, listMaxDef, elementContext, promoteLeaf: false);
@@ -867,13 +863,8 @@ internal static class NestedParquetColumnReader
             DataField keyLeaf;
             if (byFieldId is not null)
             {
-                if (interiorIds?.KeyId is not long keyId)
-                {
-                    throw DeltaStorageException.SchemaMismatch(
-                        $"Parquet nested read for {keyContext}: an id-mode map key has no resolvable "
-                        + $"'{ColumnMapping.NestedIdsKey}' key id; the id-mode read fails closed (no positional fallback).");
-                }
-
+                // #888: shared RequireInteriorId helper — one fail-close message source across decode/validate.
+                long keyId = RequireInteriorId(interiorIds?.KeyId, ColumnMapping.NestedIdsKey, "map key", keyContext);
                 keyLeaf = ExpectScalarLeaf(
                     ResolveInteriorLeafById(keyId, MapInteriorLeaves(fileMap), byFieldId, keyContext),
                     requested.KeyType, mapMaxRep, mapMaxDef, keyContext, promoteLeaf: false);
@@ -915,13 +906,8 @@ internal static class NestedParquetColumnReader
             DataField valueLeaf;
             if (byFieldId is not null)
             {
-                if (interiorIds?.ValueId is not long valueId)
-                {
-                    throw DeltaStorageException.SchemaMismatch(
-                        $"Parquet nested read for {valueContext}: an id-mode map value has no resolvable "
-                        + $"'{ColumnMapping.NestedIdsKey}' value id; the id-mode read fails closed (no positional fallback).");
-                }
-
+                // #888: shared RequireInteriorId helper — one fail-close message source across decode/validate.
+                long valueId = RequireInteriorId(interiorIds?.ValueId, ColumnMapping.NestedIdsKey, "map value", valueContext);
                 valueLeaf = ExpectScalarLeaf(
                     ResolveInteriorLeafById(valueId, MapInteriorLeaves(fileMap), byFieldId, valueContext),
                     requested.ValueType, mapMaxRep, mapMaxDef, valueContext, promoteLeaf: false);

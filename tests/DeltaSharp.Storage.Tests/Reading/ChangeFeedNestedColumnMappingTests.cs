@@ -139,6 +139,52 @@ public sealed class ChangeFeedNestedColumnMappingTests
     }
 
     /// <summary>
+    /// #886 item 1 — a CDF <b>value</b> round-trip over a DEPTH&gt;1 name-mode shape. The existing 866a nested-
+    /// within-nested CDF coverage proves LOAD-succeeds / interior-identity / id-mode fail-closed, but no cell
+    /// read change RECORDS back through a nested-within-nested column. This does: a struct-within-struct
+    /// <c>{id, geo:struct&lt;pos:struct&lt;lat,lon&gt;&gt;}</c> history (append → overwrite) is read through the
+    /// production change-feed door, and the depth-2 leaves <c>geo.pos.lat/lon</c> are asserted for value fidelity
+    /// (disjoint lat/lon domains ⇒ a positional mis-bind of the deep leaves surfaces as a signature mismatch),
+    /// plus the reconciled output surfaces the depth-2 leaves under their logical names while the end snapshot
+    /// carries name-mode physical (<c>col-&lt;uuid&gt;</c>) names on those same deep leaves.
+    /// </summary>
+    [Fact]
+    public async Task NameMode_NestedWithinNestedStruct_CdfHistory_DeepValueFidelity_866a()
+    {
+        using NestedCdfTable table = NewNestedStructTable();
+        await table.CreateAsync();                                                          // v0
+        var model = new List<ExpectedChange>();
+
+        NestedCdfTable.FileRef f1 = await table.AppendAsync(NestedStructBatch(table, (1, 6001, 7001), (2, 6002, 7002)));
+        AddInserts(model, 1, NestedStructSig(1, 6001, 7001), NestedStructSig(2, 6002, 7002));  // v1
+        await table.OverwriteAsync(NestedStructBatch(table, (3, 6003, 7003)), f1);
+        AddDeletes(model, 2, NestedStructSig(1, 6001, 7001), NestedStructSig(2, 6002, 7002));  // v2 delete f1 rows
+        AddInserts(model, 2, NestedStructSig(3, 6003, 7003));                                  // v2 insert
+
+        (StructType schema, List<ActualChange> changes) =
+            await table.ReadRangeAsync(DeltaChangeFeedRange.FromVersion(1, 2), DecodeNestedStruct);
+
+        AssertMultisetEqual(model, changes);
+
+        // Reconciled output: the depth-2 leaves present under LOGICAL names geo.pos.lat/lon (long).
+        var geoStruct = Assert.IsType<StructType>(FindField(schema, "geo").DataType);
+        var posStruct = Assert.IsType<StructType>(geoStruct["pos"].DataType);
+        Assert.Equal(new[] { "lat", "lon" }, posStruct.Select(c => c.Name).ToArray());
+        Assert.All(posStruct, c => Assert.Equal(DataTypes.LongType, c.DataType));
+
+        // End snapshot: the depth-2 leaves carry PHYSICAL col-<uuid> names reconciling to the logical lat/lon
+        // (name mode: physical != logical, all the way down) — the deep physical↔logical witness.
+        StructType endSchema = await table.LoadEndSchemaAsync();
+        var endPos = (StructType)((StructType)endSchema["geo"].DataType)["pos"].DataType;
+        foreach (string child in new[] { "lat", "lon" })
+        {
+            string physical = Physical(endPos[child]);
+            Assert.StartsWith("col-", physical, StringComparison.Ordinal);
+            Assert.NotEqual(child, physical);
+        }
+    }
+
+    /// <summary>
     /// Struct id mode. The same history under id mode, where each nested child leaf binds by <c>field_id</c>
     /// within the container. Change-row value fidelity (disjoint a/b domains) AND the end snapshot's nested
     /// leaves each carry their own <c>delta.columnMapping.id</c> reconciling to the logical child.
@@ -1638,6 +1684,42 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
     private static ActualChange DecodeStruct(ChangeRowCursor c) => DecodeStructWithChild(c, "b");
 
+    // Decodes the DEPTH>1 struct-within-struct fixture geo:struct<pos:struct<lat,lon>> (#886 item 1): reads the
+    // depth-2 leaves lat/lon back through the reconciled output and renders them (each null rendered distinct
+    // from a value), so a lost null or a positional mis-bind of the deep leaves surfaces as a signature mismatch.
+    private static ActualChange DecodeNestedStruct(ChangeRowCursor c)
+    {
+        var geo = (StructColumnVector)c.Batch.Column(c.Schema.IndexOf("geo"));
+        // Reconciled output surfaces geo.pos and its lat/lon leaves under their END logical names.
+        var geoType = (StructType)FindField(c.Schema, "geo").DataType;
+        var posType = (StructType)geoType["pos"].DataType;
+        Assert.Equal(new[] { "lat", "lon" }, posType.Select(f => f.Name).ToArray());
+
+        string sig;
+        if (geo.IsNull(c.Row))
+        {
+            sig = NestedStructSig(c.Id, null, null, nullGeo: true, nullPos: false).Sig;
+        }
+        else
+        {
+            var pos = (StructColumnVector)geo.Child(0);
+            if (pos.IsNull(c.Row))
+            {
+                sig = NestedStructSig(c.Id, null, null, nullGeo: false, nullPos: true).Sig;
+            }
+            else
+            {
+                ColumnVector latVec = pos.Child(0);
+                ColumnVector lonVec = pos.Child(1);
+                long? lat = latVec.IsNull(c.Row) ? null : latVec.GetValue<long>(c.Row);
+                long? lon = lonVec.IsNull(c.Row) ? null : lonVec.GetValue<long>(c.Row);
+                sig = NestedStructSig(c.Id, lat, lon).Sig;
+            }
+        }
+
+        return new ActualChange(c.Version, c.ChangeType, c.Id, sig);
+    }
+
     private static ActualChange DecodeStructWithChild(ChangeRowCursor c, string secondChild)
     {
         var pt = (StructColumnVector)c.Batch.Column(c.Schema.IndexOf("pt"));
@@ -1751,6 +1833,19 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
     private static (long Id, string Sig) StructSig(long id, long a, long b) => StructSig(id, a, b, nullStruct: false);
 
+    // Depth>1 struct-within-struct signature geo(pos(lat,lon)) (#886 item 1): a whole-null geo renders
+    // "geo=<null>", a null pos "geo(pos=<null>)", and each null deep leaf "<null>" — every level distinct from a
+    // present value so a lost null cannot pass as an equal value.
+    private static (long Id, string Sig) NestedStructSig(long id, long? lat, long? lon) =>
+        NestedStructSig(id, lat, lon, nullGeo: false, nullPos: false);
+
+    private static (long Id, string Sig) NestedStructSig(long id, long? lat, long? lon, bool nullGeo, bool nullPos) =>
+        (id, nullGeo
+            ? "geo=<null>"
+            : nullPos
+                ? "geo(pos=<null>)"
+                : string.Create(CultureInfo.InvariantCulture, $"geo(pos(lat={LongText(lat)},lon={LongText(lon)}))"));
+
     // A dropped-child struct signature: only child a survives (child b removed by a metadata-only drop). A null
     // a-child renders "<null>" (distinct from a 0 value), so a lost null cannot pass as an equal value.
     private static (long Id, string Sig) StructASig(long id, long? a) =>
@@ -1790,6 +1885,29 @@ public sealed class ChangeFeedNestedColumnMappingTests
 
     private static ColumnBatch StructBatch(NestedCdfTable table, params (long Id, long A, long B)[] rows) =>
         StructBatchNullable(table, rows.Select(r => (r.Id, (long?)r.A, (long?)r.B, false)).ToArray());
+
+    // A {id, geo:struct<pos:struct<lat, lon>>} depth>1 logical batch (#886 item 1). Every row's geo/pos is
+    // PRESENT; the deep leaves carry disjoint lat/lon domains so a positional mis-bind surfaces as a signature
+    // mismatch. The physical file is authored purely by the physical mapping (recursive RelabelBatch), so the
+    // interior struct field names carried here are irrelevant — the mapping binds by physical name at every depth.
+    private static ColumnBatch NestedStructBatch(NestedCdfTable table, params (long Id, long Lat, long Lon)[] rows)
+    {
+        MutableColumnVector id = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector lat = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        MutableColumnVector lon = ColumnVectors.Create(DataTypes.LongType, rows.Length);
+        foreach ((long rid, long rlat, long rlon) in rows)
+        {
+            id.AppendValue(rid);
+            lat.AppendValue(rlat);
+            lon.AppendValue(rlon);
+        }
+
+        var geoType = (StructType)table.LogicalSchema["geo"].DataType;
+        var posType = (StructType)geoType["pos"].DataType;
+        var pos = new StructColumnVector(posType, new ColumnVector[] { lat, lon }, new bool[rows.Length]);
+        var geo = new StructColumnVector(geoType, new ColumnVector[] { pos }, new bool[rows.Length]);
+        return new ManagedColumnBatch(table.LogicalSchema, new ColumnVector[] { id, geo }, rows.Length);
+    }
 
     // A NARROW {id:long, pt:struct<a:int, b:int>} logical batch for the widening fixture — the a,b vectors are
     // INT (the pre-widening leaf type); the file it writes must read-PROMOTE to long once the table widens.
@@ -2059,6 +2177,27 @@ public sealed class ChangeFeedNestedColumnMappingTests
             }), nullable: true),
         });
         return new NestedCdfTable(NewRoot(), mode, logical, "cdf-nested-struct");
+    }
+
+    // Depth>1 fixture: {id:long, geo:struct<pos:struct<lat:long, lon:long>>} — a struct-WITHIN-struct
+    // nested-within-nested shape (#585/#866). Disjoint deep-leaf domains (lat ∈ [6000..], lon ∈ [7000..], id ∈
+    // [1..]) so a positional mis-bind of the depth-2 leaves is visible. Name mode: physical ≠ logical at every
+    // depth (#886 item 1 deep CDF value round-trip).
+    private NestedCdfTable NewNestedStructTable()
+    {
+        var logical = new StructType(new[]
+        {
+            new StructField("id", DataTypes.LongType, nullable: false),
+            new StructField("geo", new StructType(new[]
+            {
+                new StructField("pos", new StructType(new[]
+                {
+                    new StructField("lat", DataTypes.LongType, nullable: true),
+                    new StructField("lon", DataTypes.LongType, nullable: true),
+                }), nullable: true),
+            }), nullable: true),
+        });
+        return new NestedCdfTable(NewRoot(), ColumnMappingMode.Name, logical, "cdf-nested-within-nested-struct");
     }
 
     // Widening fixture: {id:long, pt:struct<a:int, b:int>} with typeWidening + CDF enabled. A later WidenAsync
@@ -2429,37 +2568,41 @@ public sealed class ChangeFeedNestedColumnMappingTests
             + "\"partitionValues\":{},\"size\":" + file.Size.ToString(CultureInfo.InvariantCulture) + "}}";
 
         // Rewraps a logical-named nested batch under the PHYSICAL schema (only STRUCT columns carry field names,
-        // so only they need reconstruction; array/map interiors and scalar leaves ride through unchanged). Same
-        // technique as NestedColumnMappingTests.RelabelBatch.
+        // so only they need reconstruction; array/map interiors and scalar leaves ride through unchanged).
+        // Recurses through struct children so a struct-within-struct depth>1 shape has EVERY interior struct
+        // relabelled to its physical field names (#886 item 1 deep value round-trip). Same technique as
+        // NestedColumnMappingTests.RelabelBatch.
         private static ColumnBatch RelabelBatch(ColumnBatch batch, StructType physicalSchema)
         {
             var cols = new ColumnVector[physicalSchema.Count];
             for (int i = 0; i < physicalSchema.Count; i++)
             {
-                ColumnVector col = batch.Column(i);
-                if (physicalSchema[i].DataType is StructType pst && col is StructColumnVector scv)
-                {
-                    var children = new ColumnVector[pst.Count];
-                    for (int j = 0; j < pst.Count; j++)
-                    {
-                        children[j] = scv.Child(j);
-                    }
-
-                    var nulls = new bool[scv.Length];
-                    for (int r = 0; r < scv.Length; r++)
-                    {
-                        nulls[r] = scv.IsNull(r);
-                    }
-
-                    cols[i] = new StructColumnVector(pst, children, nulls);
-                }
-                else
-                {
-                    cols[i] = col;
-                }
+                cols[i] = RelabelVector(batch.Column(i), physicalSchema[i].DataType);
             }
 
             return new ManagedColumnBatch(physicalSchema, cols, batch.RowCount);
+        }
+
+        private static ColumnVector RelabelVector(ColumnVector col, DataType physicalType)
+        {
+            if (physicalType is not StructType pst || col is not StructColumnVector scv)
+            {
+                return col;
+            }
+
+            var children = new ColumnVector[pst.Count];
+            for (int j = 0; j < pst.Count; j++)
+            {
+                children[j] = RelabelVector(scv.Child(j), pst[j].DataType);
+            }
+
+            var nulls = new bool[scv.Length];
+            for (int r = 0; r < scv.Length; r++)
+            {
+                nulls[r] = scv.IsNull(r);
+            }
+
+            return new StructColumnVector(pst, children, nulls);
         }
     }
 }
