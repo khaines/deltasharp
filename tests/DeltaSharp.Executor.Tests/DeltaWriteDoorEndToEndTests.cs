@@ -180,8 +180,10 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         // Every active add lives under its Hive-style partition directory.
         foreach (AddRecord add in active)
         {
-            Assert.Contains("region=", add.Path);
-            Assert.True(File.Exists(Path.Combine(table, add.Path)));
+            // #806: add.path is URI-encoded; the on-disk 'region=' directory is its decode.
+            string physical = Uri.UnescapeDataString(add.Path);
+            Assert.Contains("region=", physical);
+            Assert.True(File.Exists(Path.Combine(table, physical)));
         }
     }
 
@@ -603,8 +605,11 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         var rows = new List<(int, string?, string?)>();
         foreach (AddRecord add in ActiveAdds(table))
         {
-            string? partition = partitionColumn is null ? null : PartitionFromHivePath(add.Path, partitionColumn);
-            foreach ((int id, string? name) in ReadDataFileRows(Path.Combine(table, add.Path)))
+            // #806: add.path is URI-encoded (layer 2); decode to the escapePathName on-disk key (layer 1)
+            // before opening the file or parsing the Hive segment.
+            string physical = Uri.UnescapeDataString(add.Path);
+            string? partition = partitionColumn is null ? null : PartitionFromHivePath(physical, partitionColumn);
+            foreach ((int id, string? name) in ReadDataFileRows(Path.Combine(table, physical)))
             {
                 rows.Add((id, name, partition));
             }
