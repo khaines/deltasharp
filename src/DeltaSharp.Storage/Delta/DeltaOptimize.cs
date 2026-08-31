@@ -667,7 +667,7 @@ internal sealed class DeltaOptimize
         var batches = new List<ColumnBatch>();
         foreach (AddFileAction input in group.Inputs)
         {
-            Stream stream = await _backend.OpenReadAsync(input.Path, cancellationToken).ConfigureAwait(false);
+            Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, input.Path, cancellationToken).ConfigureAwait(false);
             await using (stream.ConfigureAwait(false))
             {
                 try

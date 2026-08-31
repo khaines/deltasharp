@@ -518,7 +518,7 @@ internal sealed class DeltaDelete
         // row. The alternative — a second full-file scan to re-read the matched rows — trades this bounded
         // memory for a second pass over object storage (higher latency + I/O), which §4.3 rejects.
         List<ColumnBatch>? changeRows = captureChangeData ? new List<ColumnBatch>() : null;
-        Stream stream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
+        Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, add.Path, cancellationToken).ConfigureAwait(false);
         await using (stream.ConfigureAwait(false))
         {
             await foreach (ColumnBatch dataBatch in _reader
