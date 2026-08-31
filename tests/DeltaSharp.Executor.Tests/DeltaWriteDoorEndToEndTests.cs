@@ -180,7 +180,11 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         // Every active add lives under its Hive-style partition directory.
         foreach (AddRecord add in active)
         {
-            // #806: add.path is URI-encoded; the on-disk 'region=' directory is its decode.
+            // #806: add.path is layer-2 URI-encoded, so the structural '=' is written as '%3D'
+            // (positively pins that the encoder applied layer-2 — a dropped ToAddPath would leave a
+            // bare 'region=' here and fail this assertion). The on-disk directory is its decode.
+            Assert.Contains("region%3D", add.Path);
+            Assert.DoesNotContain("region=", add.Path);
             string physical = Uri.UnescapeDataString(add.Path);
             Assert.Contains("region=", physical);
             Assert.True(File.Exists(Path.Combine(table, physical)));
@@ -435,6 +439,15 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
             active.Select(a => a.PartitionValues["region"]).OrderBy(v => v, StringComparer.Ordinal));
         Assert.True(Directory.Exists(Path.Combine(table, "region=US")));
         Assert.True(Directory.Exists(Path.Combine(table, "region=EU")));
+        // #806 two-layer contract: on-disk directory is layer-1 (`region=US`), while add.path is
+        // layer-2 URI-encoded (`region%3DUS`). Pin BOTH so a dropped ToAddPath (add.path left as the
+        // bare physical key) fails here, and the layer-2 encoding inverts back to the on-disk key.
+        foreach (AddRecord add in active)
+        {
+            Assert.Contains("region%3D", add.Path);
+            Assert.DoesNotContain("region=", add.Path);
+            Assert.True(Directory.Exists(Path.Combine(table, Path.GetDirectoryName(Uri.UnescapeDataString(add.Path))!)));
+        }
         Assert.Equal(3, active.Sum(a => a.NumRecords));
     }
 
