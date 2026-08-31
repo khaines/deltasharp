@@ -755,6 +755,43 @@ public sealed class ChangeFeedReadTests : IDisposable
         Assert.Equal((1L, "east", (long?)10L, ChangeDataWriter.DeleteChange), (only.Id, only.Region, only.Val, only.ChangeType));
     }
 
+    // ---------------------------------------------------------------- #806 Inc-A: CDF read via resolver fallback
+
+    [Fact]
+    public async Task PartitionValueWithSlash_ChangeFeed_ImplicitAndExplicit_ReadViaResolver_806IncA()
+    {
+        // #806 Inc-A: a partition VALUE containing '/' lands on-disk as 'region=a%2Fb' with a LITERAL add.path.
+        // The IMPLICIT CDF read (the add/remove data-file open, now routed through PartitionPathResolver) must
+        // resolve it via the decoded-miss -> literal fallback; the EXPLICIT cdc read (also now routed) still
+        // reads DeltaSharp's flat '_change_data/cdc-*' file (a resolver no-op). Both reconstruct the raw
+        // partition value 'a/b' from add.partitionValues, never the path.
+        await CreateCdfPartitionedTableAsync(PartBatch((1, "a/b", 10), (2, "a/b", 20)));   // v0 data, v1 enable CDF
+
+        // Implicit path (:1176/:1208): a plain append is derived from its add DATA file, which lives under the
+        // percent-encoded 'region=a%2Fb' directory — the genuine resolver-fallback exercise.
+        long vAdd = await AppendPartAsync(PartBatch((3, "a/b", 30)));
+        (_, List<ColumnBatch> addBatches) = await ReadCdfBatchesAsync(DeltaChangeFeedRange.FromVersion(vAdd, vAdd));
+        (List<PartChange> addRows, _) = DecodePartChanges(addBatches);
+        PartChange added = Assert.Single(addRows);
+        Assert.Equal(
+            (3L, "a/b", (long?)30L, ChangeDataWriter.InsertChange),
+            (added.Id, added.Region, added.Val, added.ChangeType));
+
+        // Explicit path (:767/:1041): a CDF DELETE writes an explicit flat cdc file; the newly-wired sites must
+        // still read it correctly (resolver no-op on the flat path) and reconstruct 'a/b'.
+        var backend = new LocalFileSystemBackend(_root);
+        DeleteResult del = await NewCdfDelete(backend, "slash-explicit").DeleteAsync(WhereId(id => id == 1));
+        Assert.NotNull(del.CommittedVersion);
+        long delVersion = del.CommittedVersion.Value;
+        (_, List<ColumnBatch> delBatches) = await ReadCdfBatchesAsync(
+            DeltaChangeFeedRange.FromVersion(delVersion, delVersion));
+        (List<PartChange> delRows, _) = DecodePartChanges(delBatches);
+        PartChange deleted = Assert.Single(delRows);
+        Assert.Equal(
+            (1L, "a/b", (long?)10L, ChangeDataWriter.DeleteChange),
+            (deleted.Id, deleted.Region, deleted.Val, deleted.ChangeType));
+    }
+
     // ---------------------------------------------------------------- column mapping (name + id): explicit path
 
     [Fact]

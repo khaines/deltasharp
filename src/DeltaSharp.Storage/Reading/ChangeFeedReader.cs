@@ -764,7 +764,7 @@ internal sealed class ChangeFeedReader
         IReadOnlyList<ParquetFileReader.ParquetLeafColumn> fileColumns;
         try
         {
-            Stream stream = await _backend.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+            Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, path, cancellationToken).ConfigureAwait(false);
             await using (stream.ConfigureAwait(false))
             {
                 // Field-id-aware in id mode (#662): the leaf columns carry their footer field_id so a foreign
@@ -1038,7 +1038,7 @@ internal sealed class ChangeFeedReader
         Stream stream;
         try
         {
-            stream = await _backend.OpenReadAsync(cdc.Path, cancellationToken).ConfigureAwait(false);
+            stream = await PartitionPathResolver.OpenReadAsync(_backend, cdc.Path, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaStorageException ex)
         {
