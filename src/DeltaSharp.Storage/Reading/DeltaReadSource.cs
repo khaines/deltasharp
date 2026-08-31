@@ -325,7 +325,7 @@ public sealed class DeltaReadSource : IDisposable
             long physicalRecords;
             try
             {
-                Stream metaStream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
+                Stream metaStream = await PartitionPathResolver.OpenReadAsync(_backend, add.Path, cancellationToken).ConfigureAwait(false);
                 await using (metaStream.ConfigureAwait(false))
                 {
                     physicalRecords = await _reader.GetRowCountAsync(metaStream, cancellationToken).ConfigureAwait(false);
@@ -377,7 +377,7 @@ public sealed class DeltaReadSource : IDisposable
         }
 
         long fileRowOffset = 0;
-        Stream stream = await _backend.OpenReadAsync(add.Path, cancellationToken).ConfigureAwait(false);
+        Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, add.Path, cancellationToken).ConfigureAwait(false);
         await using (stream.ConfigureAwait(false))
         {
             try

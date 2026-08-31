@@ -1173,7 +1173,7 @@ internal sealed class ChangeFeedReader
             try
             {
                 long physicalRecords;
-                Stream metaStream = await _backend.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+                Stream metaStream = await PartitionPathResolver.OpenReadAsync(_backend, path, cancellationToken).ConfigureAwait(false);
                 await using (metaStream.ConfigureAwait(false))
                 {
                     physicalRecords = await _reader.GetRowCountAsync(metaStream, cancellationToken)
@@ -1205,7 +1205,7 @@ internal sealed class ChangeFeedReader
         Stream stream;
         try
         {
-            stream = await _backend.OpenReadAsync(path, cancellationToken).ConfigureAwait(false);
+            stream = await PartitionPathResolver.OpenReadAsync(_backend, path, cancellationToken).ConfigureAwait(false);
         }
         catch (DeltaStorageException ex)
         {
