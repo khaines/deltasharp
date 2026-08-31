@@ -252,17 +252,20 @@ public sealed class DeltaWriteTargetTests : IDisposable
 
         foreach (AddFileAction add in snapshot.ActiveFiles)
         {
-            // The physical directory is percent-encoded: neither the raw space nor the raw quote survive.
+            // #806 layer 2: add.path is URI-encoded — neither the raw space nor the raw quote survive.
             Assert.DoesNotContain(' ', add.Path);
             Assert.DoesNotContain('\'', add.Path);
-            Assert.Contains("my%20col%27x=", add.Path, StringComparison.Ordinal);
+            // escapePathName leaves the space, escapes ' -> %27; layer 2 then URI-encodes (space -> %20,
+            // % -> %25, '=' -> %3D), so the committed add.path segment is 'my%20col%2527x%3Deast'.
+            Assert.Contains("my%20col%2527x%3D", add.Path, StringComparison.Ordinal);
 
             // Partition truth is preserved under the RAW logical column name in add.partitionValues.
             Assert.True(add.PartitionValues.ContainsKey(hostileColumn));
 
-            // The value directory is also encoded, and the physical file exists at exactly add.path.
-            string full = Path.Combine(_root, add.Path);
-            Assert.True(File.Exists(full), $"expected data file at encoded path {add.Path}");
+            // The physical file exists at the DECODED add.path (the escapePathName layer-1 on-disk key).
+            string physical = Uri.UnescapeDataString(add.Path);
+            Assert.Contains("my col%27x=", physical, StringComparison.Ordinal); // escapePathName: space passthrough, ' -> %27
+            Assert.True(File.Exists(Path.Combine(_root, physical)), $"expected data file at physical path {physical}");
         }
 
         Assert.Equal(
@@ -289,11 +292,12 @@ public sealed class DeltaWriteTargetTests : IDisposable
         // EnsureNoneModePartitionNamesSafe / FindUnsafePathSegmentReason, tested separately, not this encoder.
         string segment = DeltaWriteEncoding.HivePartitionSegment(column, "v");
 
-        Assert.DoesNotContain('/', segment);                 // no fabricated sub-directory
+        Assert.DoesNotContain('/', segment);                 // no fabricated sub-directory ('/' -> %2F)
         Assert.Equal(1, segment.Count(c => c == '='));       // exactly one structural key/value split
-        // The raw hostile name never appears verbatim in the segment (each of these rows is percent-encoded,
-        // so this assertion is DISCRIMINATING — it fails if the name encoding is removed).
-        Assert.DoesNotContain(column, segment, StringComparison.Ordinal);
+        // #806 layer 1 is Spark escapePathName: structural chars are escaped (a/b -> a%2Fb, a=b -> a%3Db) so a
+        // hostile name cannot fabricate a segment, while non-ASCII passes through byte-for-byte (région ->
+        // région) for Spark/delta-rs parity. Pinning the exact escapePathName output is discriminating.
+        Assert.Equal(DeltaWriteEncoding.EscapePathName(column) + "=v", segment);
         // The value half is intact.
         Assert.EndsWith("=v", segment, StringComparison.Ordinal);
     }
@@ -326,16 +330,19 @@ public sealed class DeltaWriteTargetTests : IDisposable
         AddFileAction add = Assert.Single(snapshot.ActiveFiles);
 
         // Exactly one '/' in the relative path: it separates the single partition directory from the file
-        // name. The '/' inside the VALUE was encoded to %2F and did NOT fabricate a second directory.
+        // name. The '/' inside the VALUE was encoded (%2F on disk, %252F in the URI-encoded add.path) and did
+        // NOT fabricate a second directory.
         Assert.Equal(1, add.Path.Count(c => c == '/'));
-        Assert.Contains("region=a%2Fb/", add.Path, StringComparison.Ordinal);
-        Assert.DoesNotContain("region=a/b", add.Path, StringComparison.Ordinal);
 
         // Partition truth keys on the RAW logical value, not the encoded directory.
         Assert.Equal("a/b", add.PartitionValues["region"]);
 
-        // The physical file exists at exactly add.path (one directory deep).
-        Assert.True(File.Exists(Path.Combine(_root, add.Path)), $"expected data file at {add.Path}");
+        // #806: the on-disk key is the DECODED add.path — escapePathName layer 1 ('region=a%2Fb'); the raw
+        // 'region=a/b' (a fabricated second directory) never appears.
+        string physical = Uri.UnescapeDataString(add.Path);
+        Assert.Contains("region=a%2Fb/", physical, StringComparison.Ordinal);
+        Assert.DoesNotContain("region=a/b", physical, StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(_root, physical)), $"expected data file at physical path {physical}");
     }
 
     [Theory]
@@ -568,7 +575,8 @@ public sealed class DeltaWriteTargetTests : IDisposable
     // column is NOT stored in the data file).
     private IReadOnlyList<string> DataFileColumnNames(string relativePath)
     {
-        using FileStream fs = File.OpenRead(Path.Combine(_root, relativePath));
+        // #806: add.path is URI-encoded; the on-disk key is its decode (escapePathName layer 1).
+        using FileStream fs = File.OpenRead(Path.Combine(_root, Uri.UnescapeDataString(relativePath)));
         ParquetReader reader = ParquetReader.CreateAsync(fs).GetAwaiter().GetResult();
         try
         {
@@ -619,7 +627,7 @@ public sealed class DeltaWriteTargetTests : IDisposable
             foreach (AddFileAction add in snapshot.ActiveFiles)
             {
                 add.PartitionValues.TryGetValue("region", out string? region);
-                Stream stream = await backend.OpenReadAsync(add.Path, CancellationToken.None);
+                Stream stream = await PartitionPathResolver.OpenReadAsync(backend, add.Path, CancellationToken.None);
                 await using (stream)
                 {
                     await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))
@@ -653,7 +661,7 @@ public sealed class DeltaWriteTargetTests : IDisposable
             var rows = new List<(long, string?)>();
             foreach (AddFileAction add in snapshot.ActiveFiles)
             {
-                Stream stream = await backend.OpenReadAsync(add.Path, CancellationToken.None);
+                Stream stream = await PartitionPathResolver.OpenReadAsync(backend, add.Path, CancellationToken.None);
                 await using (stream)
                 {
                     await foreach (ColumnBatch batch in reader.ReadAsync(stream, FlatSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))

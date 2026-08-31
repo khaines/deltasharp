@@ -6884,12 +6884,15 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
                 .Add("region", "EU"),
             "TOKEN");
 
-        // Sanity: the writer really did percent-encode a PII-shaped value into the path, so this can fail.
-        Assert.Contains(EncodedValue, produced, StringComparison.OrdinalIgnoreCase);
+        // Sanity: the writer really did place a PII-shaped value into the physical path, so this can fail.
+        // #806: escapePathName (layer 1) leaves an email's '@' and '.' unescaped (they are outside its Hive
+        // charToEscape set), so the RAW value appears in the on-disk directory — a stronger redaction input.
+        Assert.Contains(DecodedValue, produced, StringComparison.OrdinalIgnoreCase);
 
         string rendered = DiagnosticText.DescribePath(produced);
 
         Assert.Equal("'part-TOKEN.parquet' (partitioned by: email, region)", rendered);
+        Assert.DoesNotContain(DecodedValue, rendered, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(EncodedValue, rendered, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotContain(
             DecodedValue, Uri.UnescapeDataString(rendered), StringComparison.OrdinalIgnoreCase);
