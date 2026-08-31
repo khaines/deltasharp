@@ -117,11 +117,13 @@ on-disk directory name; it is what Spark and delta-rs write and expect.
 add.path = uriEncodePath( seg1 + "/" + seg2 + "/" + … + "part-<token>.parquet" )
 ```
 
-`uriEncodePath` percent-encodes each path *segment's* octets per RFC 3986 while preserving the `/`
-separators. Crucially this is applied **on top of** layer 1, so a layer-1 `%XX` has its `%` re-encoded to
-`%25` (e.g. value `a/b` → layer-1 segment `col=a%2Fb` → `add.path` `col%3Da%252Fb/…`), the literal separator
-`=` becomes `%3D`, a passthrough space becomes `%20`, and a passthrough non-ASCII octet becomes its UTF-8
-`%`-triplets. This is exactly the Delta protocol rule (`country=US/f` ⇒ `country%3DUS/f`).
+`uriEncodePath` percent-encodes each path *segment's* octets per the Delta protocol URI rule (the protocol
+cites **RFC 2396**; the encoder alphabet is **subordinate to the O1 goldens** below — DeltaSharp conforms to
+the exact bytes real Spark/delta-rs emit via `Path.toUri`, not to an independent RFC-3986 derivation) while
+preserving the `/` separators. Crucially this is applied **on top of** layer 1, so a layer-1 `%XX` has its `%`
+re-encoded to `%25` (e.g. value `a/b` → layer-1 segment `col=a%2Fb` → `add.path` `col%3Da%252Fb/…`), the
+literal separator `=` becomes `%3D`, a passthrough space becomes `%20`, and a passthrough non-ASCII octet
+becomes its UTF-8 `%`-triplets. This is exactly the Delta protocol rule (`country=US/f` ⇒ `country%3DUS/f`).
 
 **Read — recover the physical object key:**
 
@@ -136,34 +138,50 @@ splitting a directory). The read therefore resolves through a **bounded, fail-cl
 
 ### 2.3 Read resolution & data flow
 
+The resolver is **decoded-first** (the go-forward L2 format is the common case for new tables), centralized
+into a single `ResolvePhysicalKey(add.path)` that **every** data-file open site calls (§2.5):
+
 ```mermaid
 sequenceDiagram
-    participant Snap as Snapshot / DeltaReadSource
+    participant Site as Any data-file open site<br/>(scan / DELETE / OPTIMIZE-input / CDF-data)
     participant Res as ResolvePhysicalKey
-    participant BE as Storage backend
-    Snap->>Res: add.path (from AddFile)
-    Res->>Res: k_lit = add.path (as-is)
-    Res->>Res: k_dec = uriDecodePath(add.path)
-    alt k_dec == k_lit (no %-encoding present)
-        Res->>BE: OpenRead(k_lit)
-        BE-->>Res: stream  (legacy raw & ASCII-unreserved: one key, one probe)
-    else k_dec != k_lit (encoded path)
-        Res->>BE: exists(k_dec)?  [two-layer / Spark / delta-rs]
-        alt k_dec exists
-            Res->>BE: OpenRead(k_dec)
-        else legacy literal-% layout
-            Res->>BE: OpenRead(k_lit)
+    participant BE as Storage backend (root-jailed)
+    Site->>Res: add.path (from AddFile/RemoveFile)
+    Res->>Res: k_dec = uriDecodePath(add.path)   (bounded, pre-decode length cap)
+    alt k_dec == k_lit (no %-encoding: legacy-raw & ASCII-unreserved non-partitioned)
+        Res->>BE: OpenRead(k_lit)  (one open, zero extra probe)
+    else k_dec != k_lit
+        Res->>BE: OpenRead(k_dec)   [protocol-correct: L2 / Spark / delta-rs]
+        alt k_dec opens
+            BE-->>Res: stream
+        else not-found (legacy L0/L1 literal-% layout)
+            Res->>BE: OpenRead(k_lit)   (fallback; +1 open only on the legacy miss)
         end
     end
     Note over Res,BE: neither candidate resolvable → bounded DeltaStorageException (fail closed, as today)
-    Note over Snap: partition VALUES always from add.partitionValues (never from the path)
+    Note over Res,BE: confinement (root-jail, .. normalization) enforced on the DECODED key
+    Note over Site: partition VALUES always from add.partitionValues (never from the path)
 ```
 
-The candidate set is **at most two** keys and is only consulted when `add.path` actually contains a `%`
-(the overwhelmingly common case — ASCII-unreserved names/values, and all legacy raw tables — decodes to
-itself, so exactly one key and one probe, preserving today's cost). Partition **truth** is untouched:
-`add.partitionValues` remains authoritative (`DeltaReadSource` const/null-fills partition columns from it),
-so a directory-encoding change cannot change query results.
+**Cost (corrected — see §4).** `k_dec` is computed unconditionally but is a no-op string when `add.path`
+carries no `%`. There is **no** `exists()` probe: the resolver **opens `k_dec` and, only on a not-found, falls
+back to opening `k_lit`**. So an **L2 (go-forward) file opens in one round-trip**; a legacy L0/L1 file whose
+`add.path` contains a `%` pays **+1 open only on the first (decoded) miss**; a non-partitioned or
+ASCII-unreserved-non-partitioned file (`k_dec==k_lit`) is one open, unchanged. (Earlier drafts claimed the
+go-forward format hits the zero-extra-probe path — it does **not**, because layer-2 always encodes the `=`
+separator to `%3D`, so every L2 partition segment has `k_dec≠k_lit`; §4 and O2 are re-scoped accordingly.)
+
+**Untrusted both-exist tie-break (adversarial — §6 T-Poison).** On a **foreign, attacker-authored** table a
+file may be planted at *both* `k_dec` and `k_lit`. Decoded-first is the protocol-correct interpretation, so the
+resolver serves `k_dec`; the blast radius is bounded and **fail-safe**: (a) both keys are confined under the
+single table root (a single tenant — no cross-tenant crossing); (b) partition **truth** is `add.partitionValues`,
+not the served bytes, so query *partitioning* cannot be poisoned; (c) the opened object is parsed as Parquet
+against the committed schema and fails closed on mismatch. The design **mandates** an integrity cross-check where
+one is cheaply available (the AddFile's `size`/`stats` vs the opened file) and records the residual in §6. This
+is a read-only, in-root, single-tenant residual — not an isolation break.
+
+Partition **truth** is untouched: `add.partitionValues` remains authoritative (`DeltaReadSource` const/null-fills
+partition columns from it), so a directory-encoding change cannot change query results.
 
 ### 2.4 Migration & backward compatibility (three on-disk layouts)
 
@@ -176,10 +194,24 @@ so a directory-encoding change cannot change query results.
 Key observations that make the bounded resolver (§2.3) correct and fail-closed:
 
 - The file physically exists at **exactly one** object key. `{k_lit, k_dec}` always contains it: L0/L1 at
-  `k_lit`, L2 at `k_dec`. The two candidates never collide on a real file (a single `AddFile` maps to one
-  file), so resolution is unambiguous.
-- For the ASCII-unreserved happy path (and all non-partitioned tables) `k_dec == k_lit` — no extra probe,
-  no behavior change.
+  `k_lit`, L2 at `k_dec`. For **well-formed producers** the two candidates never point at *different real
+  files*, because (a) each write emits a unique `part-<token>.parquet` filename, and (b) both `escapePathName`
+  and `Uri.EscapeDataString` escape `/`, so a physical segment never contains an un-escaped separator — an
+  L1 file's `k_dec` (which would re-introduce a `/`) cannot coincide with any legitimate L2 physical key.
+  Resolution is therefore unambiguous for conforming tables. (A **foreign/adversarial** table that plants a
+  file at *both* keys is handled by the decoded-first tie-break + integrity cross-check — §2.3, §6 T-Poison —
+  and is a read-only, in-root, single-tenant residual.)
+- For a non-partitioned table and the ASCII-unreserved-name/value legacy case `k_dec == k_lit` — one open, no
+  behavior change. (Note: a **go-forward L2 partitioned** file always has `k_dec≠k_lit` because layer-2 encodes
+  the `=` separator — §2.3/§4.)
+- **Commit-time conflict detection & tombstones are canonicalization-safe:** `RemoveFile`/conflict comparison
+  use the **verbatim** stored `add.path` string (never recomposed across versions — e.g. `DeltaOptimize`'s
+  `ToRemove` copies `input.Path` as-is), so string comparison stays encoding-consistent even in a mixed
+  L1/L2 table.
+- **`__HIVE_DEFAULT_PARTITION__` collision (E2):** on disk a `null` value and a literal value
+  `"__HIVE_DEFAULT_PARTITION__"` map to the **same** directory (none of those chars is escaped). This collision
+  is **unavoidable and matches Spark's own behaviour**; DeltaSharp stays correct because partition truth is
+  `add.partitionValues` (authoritative), which distinguishes them — asserted by E2.
 - **OrphanCleanup / VACUUM are already encoding-robust** (`MatchesEncodingRobust`, protected set
   `{raw} ∪ {UnescapeDataString(raw)}`). This design extends the *same* tolerance to the two-layer form; the
   union can only over-protect, never over-delete (a data-loss-safe direction) — re-verified in §3.
@@ -196,15 +228,26 @@ Key observations that make the bounded resolver (§2.3) correct and fail-closed:
 | Write door | `DeltaWriteTarget.DataFilePath` (`DeltaWriteTarget.cs:862-891`) | compose physical key (L1) for `PutIfAbsent`; store `ToAddPath(...)` in `AddFile.path` |
 | OPTIMIZE | `DeltaOptimize.BuildOutputPath` (`DeltaOptimize.cs:778-801`) | identical L1+L2 as the write door (lockstep — same helper) |
 | Log writer | `DeltaLogActionWriter.cs:142` | unchanged (writes `add.Path` verbatim — now already layer-2 encoded) |
-| Read resolve | `DeltaReadSource` (`:328`, `:380`) + snapshot/scan key resolution | route `add.Path` through `ResolvePhysicalKey` (§2.3) before `OpenRead` |
+| **Read resolve (centralized)** | **every data-file open site** must route through one `ResolvePhysicalKey` (§2.3): `DeltaReadSource` (`:328`, `:380`), **`DeltaDelete` (`:521`)**, **`DeltaOptimize` input read (`:670`)**, **`ChangeFeedReader` add/remove data reads (`:1176`, `:1208`)** | a **single** enforcement point for both the decode+fallback and the §5 confinement-on-decoded-key check |
 | Orphan/VACUUM | `OrphanCleanup.MatchesEncodingRobust` (`:204-269`) | extend encoding-robust union to the two-layer form |
 | Validation | `ColumnMapping.FindUnsafePathSegmentReason` (`:229-305`), `MaxPathSegmentNameBytes` (`:207`) | keep injection rejects; add encoded-length budget (§2.6) |
 
+> **Centralization is load-bearing (Storage-review HIGH).** `add.path`/`input.Path` is opened by **four**
+> partition-directory-resident data-file sites, not just the scan path: the scan (`DeltaReadSource`), DELETE
+> (reads the file it rewrites — `DeltaDelete.cs:521`), OPTIMIZE (reads its compaction **inputs** —
+> `DeltaOptimize.cs:670`; the §2.5 OPTIMIZE-write row above only covers `BuildOutputPath`), and CDF (reads the
+> partitioned add/remove data files behind change records — `ChangeFeedReader.cs:1176/1208`). If only the scan
+> is routed through the resolver, **DELETE / OPTIMIZE / CDF fail-closed on exactly the L2 tables Inc-B creates**
+> (any partition name/value outside the ASCII-unreserved set) — broken functionality (fail-closed, so no data
+> loss, but a correctness regression). Inc-A therefore wires the resolver into **all four** sites (one shared
+> helper), and §3 adds read-side L2/mixed scenarios for DELETE, OPTIMIZE-input, and CDF-data (§3.3 M5–M7). DV
+> sidecar and CDF-*composition* paths remain out of scope (they don't resolve partition dirs).
+
 **Out of scope by construction — do not compose partition dirs:** deletion-vector sidecars
-(`DeletionVectorDescriptor` — random-prefix + Z85 UUID + `.bin`) and CDF (`ChangeDataWriter` — flat
-`_change_data/cdc-<token>.parquet`). They carry their own relative-key contracts and their `PartitionValues`
-come from the action/model, not path parsing. VACUUM's path *matching* for these must remain encoding-robust
-(§3.2) but their composition is unchanged.
+(`DeletionVectorDescriptor` — random-prefix + Z85 UUID + `.bin`) and CDF *composition* (`ChangeDataWriter` —
+flat `_change_data/cdc-<token>.parquet`). They carry their own relative-key contracts and their
+`PartitionValues` come from the action/model, not path parsing. VACUUM's path *matching* for these must remain
+encoding-robust (§3.2) but their composition is unchanged.
 
 ### 2.6 Validation, injection safety & the encoded-length budget
 
@@ -214,14 +257,22 @@ come from the action/model, not path parsing. VACUUM's path *matching* for these
   whitespace-only, `.`/`..`, >128 UTF-8 bytes) remain as **defense in depth** (a rejected name never even
   reaches encoding).
 - **Encoded-length budget (the #806 length concern).** Today `MaxPathSegmentNameBytes=128` bounds the **raw**
-  name, but `Uri.EscapeDataString` can triple a non-ASCII byte (`é`→`%C3%A9`), so a 128-byte all-non-ASCII name
-  → ~384 chars, which can breach a filesystem `NAME_MAX` (ext4/PVC = 255). **Adopting `escapePathName` largely
-  resolves this by construction** (non-ASCII passes through: 128 raw bytes → 128 on-disk bytes). The design still
-  adds an explicit **encoded-segment length assertion** on the *composed layer-1 segment* (`escapePathName(name)`
-  `+"="+` worst-case-encoded value budget) against a conservative component budget, failing **closed** at the
-  write door (pre-commit, orphan-Parquet-only) with a bounded `DeltaStorageException` — never a late
-  `ENAMETOOLONG` at `PutIfAbsent`. This preserves the "fails closed today (staging → bounded exception,
-  object-store-immaterial)" property #806 calls out.
+  name (checked at `ColumnMapping.cs:297`); it does **not** bound the encoded value. Under the *old*
+  `Uri.EscapeDataString` scheme a non-ASCII byte tripled (`é`→`%C3%A9`), so a 128-byte all-non-ASCII name →
+  ~384 chars, breaching a filesystem `NAME_MAX` (ext4/PVC = 255). **Adopting `escapePathName` removes the
+  non-ASCII blow-up entirely** (non-ASCII passes through: 128 raw bytes → 128 on-disk bytes) — so, under the new
+  scheme, the residual expansion is **not** non-ASCII but **escape-heavy ASCII**: each escaped char
+  (`/ = % : " ' * ? \ { [ ] ^`, controls) becomes **3 bytes**, so a value of e.g. 90 `%`/`/` chars → ~270 on-disk
+  bytes. The design adds an explicit **encoded-segment length assertion** on the *composed layer-1 segment*
+  (`escapePathName(name)+"="+escapePathName(value)`, byte count) against a conservative component budget,
+  failing **closed** at the write door (pre-commit, orphan-Parquet-only) with a bounded `DeltaStorageException`
+  — never a late `ENAMETOOLONG` at `PutIfAbsent`.
+  - **Oracle correctness (Quality-review F2):** the E3 length cell (§3.4) MUST use an **escape-expanding ASCII**
+    input (e.g. a value of N `%` or `/` chars sized to breach the *encoded* component budget) and assert the
+    reject fires **because of the encoded expansion** — an all-non-ASCII input no longer expands under
+    `escapePathName` and would make the oracle vacuous.
+  - This preserves the "fails closed today (staging → bounded exception, object-store-immaterial)" property #806
+    calls out.
 
 ### 2.7 Increment decomposition (fail-closed by construction)
 
@@ -229,11 +280,16 @@ The write and read halves are coupled: a two-layer-written table is unreadable b
 read decode, and a naive decode corrupts legacy tables. To keep every intermediate `main` state
 **fail-closed and shippable** (the #866 model), decompose XL → three increments:
 
-1. **Inc-A (read resolver, backward-compatible; ships first).** Introduce `ResolvePhysicalKey` (§2.3): a
-   bounded `{k_lit, k_dec}` resolver that is a **no-op for every current table** (`k_dec==k_lit`, or
-   `k_lit` exists) and pre-positions read for layer-2 writes. No write change yet, so no new on-disk layout
-   is produced — purely additive, fail-closed (neither candidate → today's bounded not-found error). Its own
-   test: a synthetic layer-2 `add.path` fixture resolves to the right key; legacy L0/L1 fixtures still resolve.
+1. **Inc-A (read resolver, backward-compatible; ships first).** Introduce the centralized decoded-first
+   `ResolvePhysicalKey` (§2.3, §2.5) wired into **all four** data-file open sites (`DeltaReadSource`,
+   `DeltaDelete`, `DeltaOptimize` input, `ChangeFeedReader`). It is a **no-op for every current table**
+   (`k_dec==k_lit` → one open; legacy `%`-bearing paths open `k_dec`, miss, fall back to `k_lit`), pre-positions
+   read for layer-2 writes, and applies the §5 confinement-on-decoded-key check uniformly. No write change yet,
+   so no new on-disk layout is produced — purely additive, fail-closed (neither candidate → today's bounded
+   not-found error). Its own tests: (a) a synthetic layer-2 `add.path` fixture resolves; legacy L0/L1 fixtures
+   still resolve; (b) **an I/O-equivalence oracle for the `k_dec==k_lit` path — exactly one `OpenRead`, zero
+   fallback — proving the claimed no-op** (a regression that added a probe or changed the fail-closed error must
+   turn this red — Quality-review F4).
 2. **Inc-B (write two-layer + OPTIMIZE lockstep).** Switch `HivePartitionSegment` to `escapePathName` and
    store `ToAddPath(...)` in `AddFile.path`; `DeltaOptimize.BuildOutputPath` rides the same helper. Add the
    §2.6 length assertion. After Inc-A, a two-layer table's decoded `add.path` resolves correctly — the pair
@@ -269,6 +325,13 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
 - **ref→DS:** a Spark/delta-rs-written `_delta_log` + files fixture is **read** by DeltaSharp and returns the
   correct rows/partition values (closes the read half — the more urgent gap per #708).
 
+> **Fixture provenance is an Inc-C acceptance gate (Quality-review F3 — promoted out of O4).** A golden is only
+> a "measurement" if it is **provably not producible by DeltaSharp** (else the differential is a tautology). The
+> reference fixtures MUST: be emitted by **real Spark and delta-rs** (a regeneration script that shells out to a
+> pinned engine version, recorded in-repo — the #520/#646 harness), carry the **engine name + version** and a
+> **checksum/attestation**, and be governed by an explicit **"never regenerated from DeltaSharp output"** rule in
+> the fixture README. This provenance guarantee is a launch-checklist item for Inc-C, not a deferred pointer.
+
 > **Open item O1 (§9):** the exact `%`-double-encoding of a layer-1 `%XX` inside `add.path` (`%2F`→`%252F`)
 > must be **verified against** the reference goldens, not assumed — Hadoop `Path`/`SparkPath` URI handling is
 > the authority. The differential fixture is the oracle; the implementation conforms to it.
@@ -282,6 +345,18 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
 - **M3** — L2 fixture: read via `k_dec`.
 - **M4** — Mixed table: a single table containing files from L1 (pre-existing) and L2 (appended after upgrade);
   a full scan reads **all** rows. (Exercises the resolver per-file.)
+- **M5** — **DELETE reads an L2/mixed table** (`DeltaDelete` opens the file it rewrites): assert DELETE on a
+  partitioned L2 table succeeds (resolver routes `DeltaDelete.cs:521`), and on a mixed L1+L2 table rewrites the
+  correct rows. Without the centralized resolver this fail-closes — the Storage-review HIGH regression cell.
+- **M6** — **OPTIMIZE compacts an L2/mixed table** (`DeltaOptimize` opens its **inputs**): assert compaction
+  reads L2 input files (`DeltaOptimize.cs:670`) and lands the output in the same L2 layout (ties to E5).
+- **M7** — **CDF reads partitioned add/remove data files on an L2 table** (`ChangeFeedReader.cs:1176/1208`):
+  assert change records over a partitioned L2 table return correct rows/partition values.
+- **M8** — **Adversarial both-exist (§2.3 / §6 T-Poison):** a foreign table plants a file at *both* `k_dec` and
+  `k_lit`; assert the resolver serves `k_dec` (decoded-first), stays in-root (confinement), does not poison
+  partition values (truth from `add.partitionValues`), and — where `size`/`stats` are present — the integrity
+  cross-check fails closed on mismatch. Proves the "impossible collision" claim is correctly narrowed to
+  conforming producers and the adversarial case is bounded, not silently trusted.
 
 ### 3.4 Edge cases & fail-closed
 
@@ -289,8 +364,11 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
   as `null`.
 - **E2** — value that *is* the literal string `__HIVE_DEFAULT_PARTITION__` vs a real null (must stay distinct —
   Spark parity gap guard).
-- **E3** — encoded-length breach (§2.6): a name/value whose composed segment would exceed the component budget
+- **E3** — encoded-length breach (§2.6): an **escape-expanding ASCII** name/value (e.g. a value of N `%`/`/`
+  chars, each → 3 on-disk bytes) sized so the *composed encoded* layer-1 segment exceeds the component budget
   → bounded `DeltaStorageException` at the write door, **pre-commit**, no orphan directory, no `ENAMETOOLONG`.
+  The input MUST be escape-expanding ASCII, **not** all-non-ASCII (which no longer expands under `escapePathName`
+  and would make the oracle vacuous — Quality-review F2).
 - **E4** — injection: a name/value containing `/` or `=` cannot fabricate or escape a segment (escaped to
   `%2F`/`%3D`); write-door validation still rejects a *column* name containing `/ = :` (defense in depth).
 - **E5** — OPTIMIZE: a compacted file lands in the **same** two-layer directory and its `add.path` is layer-2
@@ -302,26 +380,42 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
   set is a **superset** of every live file's real key — asserted by construction (union of raw+decoded on both
   sides), so VACUUM can never reclaim a live file. Split oracle: identical over conforming layouts, over-protects
   (never under-protects) over forged/ambiguous literal-`%` keys.
+- **VACUUM lists a real Spark-written non-ASCII directory (Quality-review F7 — promoted to a named cell):** over
+  a `région=…`/`名前=…` fixture emitted by real Spark, assert every live file is protected (listing key ↔ log
+  path matched through the encoding-robust union), not an asserted-by-construction claim.
 - **Round-trip inverse:** `uriDecodePath(ToAddPath(p)) == p` for all composed physical paths `p` (property test
-  over the character matrix) — layer-2 is a total inverse.
+  over the character matrix) — layer-2 is a total inverse. This proves *self-consistency* only; **parity** is on
+  §3.2 goldens (a wrong-but-self-consistent alphabet passes the inverse but fails the golden — correctly split).
+- **Concurrent OPTIMIZE vs. reader (Quality-review F6):** while OPTIMIZE rewrites an L1 input to an L2 output (both
+  physical files transiently coexist), a concurrent resolver-driven read returns a consistent snapshot. Snapshot
+  isolation + the escapePathName-never-emits-`/` non-collision invariant (§2.4) cover correctness; assert it, or
+  explicitly hand off to the concurrent-writer suite that owns commit isolation.
 
-### 3.6 Determinism
+### 3.6 Determinism & host-stability
 
-Encoding is pure and host-stable under D1 (non-Windows alphabet on all hosts); the file-name token is the only
-nondeterministic input and is factored out (as today). No wall-clock, no map-ordering dependence (partition
-columns iterate in schema order).
+Encoding is pure; the file-name token is the only nondeterministic input and is factored out (as today). No
+wall-clock, no map-ordering dependence (partition columns iterate in schema order).
+
+- **Host-determinism oracle (Quality-review F5):** a parameterized cell asserts `escapePathName(x)` produces
+  **byte-identical** output on Windows and Linux CI (D1 — the non-Windows alphabet is used on all hosts), so a
+  table written on one host and compacted on another cannot diverge.
+- **Windows-local `< > | space` cell:** reading a Spark-written partition dir containing `<`/`>`/`|`/space on the
+  **Windows local** backend either reads correctly or fails **closed** with a bounded backend error (D1 punts
+  Windows-local illegality to the backend) — asserted, not assumed.
 
 ### 3.7 Acceptance-criteria mapping
 
 | Source AC | Scenario(s) |
 |---|---|
-| #806 — differential Spark/delta-rs parity across ASCII-reserved & non-ASCII | §3.2 (DS→ref, ref→DS) |
-| #806 — migration/compat for mixed legacy + new layouts | §3.3 (M1–M4), §3.5 |
-| #806 — encoded-segment length budget (raw-vs-encoded gap; fails closed) | §2.6, §3.4 E3 |
-| #708 — behaviour of Spark/delta-rs on hostile-but-legal names **measured** | §3.2 (goldens are the measurement) |
+| #806 — differential Spark/delta-rs parity across ASCII-reserved & non-ASCII | §3.2 (DS→ref, ref→DS) + provenance gate |
+| #806 — migration/compat for mixed legacy + new layouts | §3.3 (M1–M8), §3.5 |
+| #806 — read compat across DELETE / OPTIMIZE-input / CDF-data on L2/mixed | §3.3 M5–M7 (Storage-review HIGH) |
+| #806 — encoded-segment length budget (encoded-expansion gap; fails closed) | §2.6, §3.4 E3 (escape-expanding ASCII) |
+| #708 — behaviour of Spark/delta-rs on hostile-but-legal names **measured** | §3.2 (goldens + provenance are the measurement) |
 | #708 — decision among {deviating / conventional / ambiguous} with rationale | §9 D2 (we ARE deviating → adopt escapePathName + URI add.path) |
 | #708 — round-trip: name with space + quote written & read back | §3.1 H1 |
-| #708 — write-format change preserves read compat; OPTIMIZE/CDF/DV re-verified | §3.3, §3.5, §2.5 |
+| #708 — write-format change preserves read compat; OPTIMIZE/CDF/DV re-verified | §3.3 M5–M7, §3.5, §2.5 |
+| resolver adversarial both-exist / host-stability / concurrency | §3.3 M8, §3.6, §3.5 |
 
 ---
 
@@ -332,18 +426,29 @@ columns iterate in schema order).
 - **Encode cost.** `escapePathName` is a single pass with a fast "no-escape" early-out (identical shape to
   Spark's); strictly cheaper than `Uri.EscapeDataString` on the common no-escape path. Negligible vs Parquet
   I/O.
-- **Read-resolution cost (the only new hot-path cost).** For `k_dec==k_lit` (ASCII-unreserved names/values and
-  **all** legacy raw tables) there is **one** key and **zero** extra probes — identical to today. Only files
-  whose `add.path` contains a `%` **and** whose `k_dec≠k_lit` incur at most **one** extra existence probe
-  (a `HEAD` on object stores) to disambiguate L1-literal from L2-decoded. Budget: **≤1 extra metadata probe
-  per encoded-partition file on first open**; zero for the dominant case.
-  - **Optimization O2 (§9):** resolve-order and an optional per-table encoding hint (a `_delta_log` config, or
-    inferring from the protocol/writer that produced the commit) can drop the probe to zero for two-layer
-    tables; deferred unless the probe shows up in a partitioned-scan benchmark.
+- **Read-resolution cost (corrected — Architect-review Finding 1).** The resolver is **open-first, not
+  probe-first** (§2.3): it opens `k_dec` and, only on a not-found, opens `k_lit`. Accounting per file:
+  - **Non-partitioned tables & ASCII-unreserved-name/value legacy files** (`k_dec==k_lit`): **one** open,
+    identical to today.
+  - **Go-forward L2 partitioned files** (`k_dec≠k_lit` — because layer-2 always encodes the `=` separator to
+    `%3D`, so *every* L2 partition segment differs): **one** open of `k_dec` (the correct key). No extra
+    round-trip in the steady state.
+  - **Legacy L0/L1 partitioned files whose `add.path` carries a `%`:** `k_dec` misses, then `k_lit` opens —
+    **+1 open only on the legacy miss**.
+  - Earlier drafts wrongly put the go-forward format on the "zero-extra-probe" path. Corrected: the extra cost
+    lands on **legacy** `%`-bearing files (a one-time cost that disappears as tables are rewritten), **not** on
+    new tables.
+  - **O2 (§9) is a legacy-cost optimization, not a go-forward requirement** (the decoded-first open already makes
+    L2 one round-trip). A per-table encoding hint could still skip the legacy fallback; deferred behind a
+    partitioned-scan benchmark on a **legacy** table.
 - **Allocation budget.** Encoding allocates a bounded `StringBuilder` per segment (as today). No per-row
   allocation. Resolution allocates at most one extra decoded string per encoded file.
 - **Regression gate.** A partitioned-scan micro-benchmark (many small partition dirs) asserts no
-  >X% wall-clock/allocation regression vs the pre-change baseline for the ASCII-unreserved case (must be ~0).
+  >X% wall-clock/allocation regression vs baseline. Because the go-forward L2 read is one open (§4 above),
+  the gate is measured on **two** baselines: (a) a **new L2 table** vs the pre-change ASCII baseline (must be
+  ~0 — the corrected steady-state cost); (b) a **legacy `%`-bearing table** vs pre-change (bounds the one-time
+  decoded-miss→literal fallback cost). This avoids the earlier draft's mistake of scoping the gate only to the
+  ASCII-unreserved case.
 
 ---
 
@@ -351,20 +456,28 @@ columns iterate in schema order).
 
 - **Data classification.** `add.path` and partition directory names are **restricted foreign input on read**
   (a Delta table may be attacker-authored) and DeltaSharp-authored on write. Partition **values** may carry
-  PII/tenant data — they appear in the directory name and `add.path`, so diagnostics must never echo a raw
-  value (see §7 / #696).
+  PII/tenant data — they appear in the directory name and `add.path`, so any diagnostic that references a path
+  must render it through **`DiagnosticText.DescribePath`** (which drops the value-bearing terminal segment),
+  **never** bare `DiagnosticText.Sanitize` — `Sanitize` leaves an email/PII value verbatim (it is neither a
+  control char nor over-cap) and `Uri.UnescapeDataString` would recover it, re-opening the #696 leak (see §7).
 - **Input validation.** Write-door validation (`FindUnsafePathSegmentReason`) rejects column names that could
   restructure the path; `escapePathName` neutralizes `/ = : \` in **values** so a hostile value cannot fabricate
-  or escape a directory. The bounded backend (`LocalFileSystemBackend` openat/confinement) enforces that a
-  resolved key stays under the table root — a decode that produced a `..` or absolute key is rejected at the
-  backend (**must be re-verified for the decode path** — §6 T-Escape).
+  or escape a directory. The bounded backend (`LocalFileSystemBackend` `LexicallyConfine`/`Resolve` —
+  `Path.GetFullPath` collapses `..`, `StartsWith(_rootWithSeparator)` gate, POSIX `openat`+`O_NOFOLLOW`) enforces
+  that a resolved key stays under the table root — a decode that produced a `..` or absolute key is rejected at
+  the backend (verified against source; §6 T-Escape).
 - **Read decode is a new attack surface.** `uriDecodePath(add.path)` runs on **foreign** input. It must:
-  (a) never yield a key that escapes the table root (path-traversal via `%2e%2e%2f` → `../`); (b) be bounded
-  (no quadratic blow-up on adversarial `%`); (c) fail **closed** (a malformed/over-long decode → bounded
-  `DeltaStorageException`, never an unbounded allocation or an out-of-confinement open). The confinement check
-  must apply to the **decoded** key, not the pre-decode literal.
+  (a) never yield a key that escapes the table root (path-traversal via `%2e%2e%2f` → `../`) — confinement is
+  applied to the **decoded** key; (b) be bounded — `Uri.UnescapeDataString` is single-pass O(n) (no quadratic
+  blow-up), but the true residual is **memory ∝ input length**, so the resolver adds an explicit **pre-decode
+  length cap on the foreign `add.path`** (a bounded `DeltaStorageException` above the cap) rather than leaning on
+  the write-door `MaxPathSegmentNameBytes` (which does **not** bound a foreign read path) — Security-review;
+  (c) fail **closed** (malformed/over-long → bounded exception, never an unbounded allocation or an
+  out-of-confinement open).
 - **Tenant isolation.** Unchanged: partition truth is `add.partitionValues`; no cross-tenant path inference is
-  introduced. The decode is per-file and stateless.
+  introduced. The decode is per-file and stateless. Note the confined backend stops **root escape** but not
+  **in-root cross-area** reads (a decoded key could point at `_delta_log/…` / a DV `.bin` / `_change_data/…`
+  under the same single-tenant root — §6 T-InRoot; low residual: single tenant, parsed as Parquet, fails closed).
 - **Supply chain.** No new dependency — `escapePathName`/URI codec are in-repo (a small, audited port of the
   Hive/Spark bitset).
 
@@ -392,11 +505,14 @@ graph LR
 
 | STRIDE | Threat | Surface | Mitigation | Residual |
 |---|---|---|---|---|
-| **T**amper / **E**oP | `add.path` = `..%2f..%2fetc%2fpasswd` decodes to a traversal key | read decode | Confinement check on the **decoded** key at the backend (root-jail); decode is single-pass, not recursive | Backend openat is the enforcement point — covered by existing confinement tests, extended to the decoded key (§3) |
-| **D**oS | Adversarial `add.path` with pathological `%` sequences | read decode | Bounded, single-pass `uriDecodePath` (O(n)); over-long segment → fail-closed bounded exception | Bounded by existing per-path length limits |
+| **T**amper / **E**oP (T-Escape) | `add.path` = `..%2f..%2fetc%2fpasswd` decodes to a traversal key | read decode | Confinement on the **decoded** key (`Path.GetFullPath` collapses `..`, `StartsWith(_rootWithSeparator)` gate, POSIX `openat`+`O_NOFOLLOW`), verified against `LocalFileSystemBackend.LexicallyConfine`/`Resolve` | Backend root-jail is the enforcement point — existing confinement tests extended to the decoded key (§3) |
+| **T**amper (T-InRoot) | Decoded key stays in-root but points at `_delta_log/…`, a DV `.bin`, or `_change_data/…` | read decode | In-root only (single tenant); opened as Parquet against the committed schema → fails closed on parse; partition truth from `partitionValues` | **Low, accepted:** read-only, single-tenant, no cross-boundary crossing; recorded here explicitly |
+| **T**amper (T-Poison) | Foreign table plants a file at **both** `k_dec` and `k_lit`; decoded-first serves attacker bytes for a legit AddFile | read resolve | Decoded-first is protocol-correct; blast radius bounded (in-root, single tenant); integrity cross-check vs `AddFile.size`/`stats` where present; partition truth from `partitionValues` | **Low, accepted:** read-only in-root; tested by §3.3 M8 |
+| **D**oS | Adversarial `add.path` with pathological `%` / over-long input | read decode | Single-pass `uriDecodePath` (O(n)); **explicit pre-decode length cap on the foreign `add.path`** → fail-closed bounded exception (does **not** rely on the write-door `MaxPathSegmentNameBytes`, which is a write-only bound) | Bounded by the new read-side length cap (§5) |
 | **I**njection | Hostile partition **value** fabricates a directory (`v="../x"` or `v="a=b/c"`) | write compose | `escapePathName` escapes `/ = \ :` in the value; name rejected by write-door validation | None (injection-hardening from #797 retained + strengthened) |
-| **I**nfo disclosure | Raw partition **value** (PII) leaks into a fault/log message via a raw-key-shaped path | diagnostics | #696 recognizer stays fixed; `DiagnosticText.Sanitize` on any path echoed; **`escapePathName` also stops us *generating* the raw-key shape** (the #708 §2 concern) | Foreign tables still contain raw shapes — `Redact` handles forever |
-| **S**poofing (data-loss) | Ambiguous legacy-`%` key mis-resolved so VACUUM reclaims a live file | orphan/VACUUM | Encoding-robust union {raw ∪ decoded} over-protects; bounded resolver reads the real key; partition truth from `partitionValues` | Over-protection (a leaked orphan) is the safe failure direction |
+| **I**nfo disclosure | Raw partition **value** (PII) leaks into a fault/log message via a raw-key-shaped path | diagnostics | #696 recognizer stays fixed; **`DiagnosticText.DescribePath`** (drops the value-bearing terminal segment) on any path echoed — **not** bare `Sanitize` (which would leave the value verbatim); `escapePathName` also stops us *generating* the raw-key shape (#708 §2) | Foreign tables still contain raw shapes — `DescribePath` handles forever |
+| **S**poofing (data-loss) | Ambiguous legacy-`%` key mis-resolved so VACUUM reclaims a live file | orphan/VACUUM | Encoding-robust union {raw ∪ decoded} over-protects; decoded-first resolver reads the real key; partition truth from `partitionValues` | Over-protection (a leaked orphan) is the safe failure direction |
+| **T**amper (T-Norm) | Unicode NFC/NFD (or homoglyph) makes two byte-distinct passthrough non-ASCII values collide to one on-disk key on a normalizing FS (macOS) | write / on-disk | `PutIfAbsent` fails closed on the collision; partition truth from `partitionValues` | **Accepted interop residual** (not disclosure); recorded in §8 risk register |
 
 ---
 
@@ -407,9 +523,11 @@ graph LR
     the resolver used the non-primary candidate; a spike on `decoded` is expected post-upgrade, a spike on
     `literal` for a supposedly-migrated table is a signal.
   - `deltasharp.delta.partition_path.length_reject` (counter) — write-door encoded-length rejections (§2.6).
-- **Logging.** Any log line that must reference a partition path routes through `DiagnosticText.Sanitize`
-  (tenant-safe; never a raw value). A resolution fail-close logs the **sanitized** `add.path` shape + the
-  candidate-set outcome (which keys were probed), never the decoded PII.
+- **Logging.** Any log line that must reference a partition path routes through **`DiagnosticText.DescribePath`**
+  (drops the value-bearing terminal segment; tenant-safe) — **never** bare `Sanitize`, which leaves a PII value
+  verbatim (an email is neither a control char nor over-cap and `UnescapeDataString` recovers it — the #696 leak).
+  A resolution fail-close logs the **`DescribePath`-rendered** `add.path` shape + the candidate-set outcome
+  (which keys were tried), never the decoded value.
 - **Tracing.** The read-resolution decision is a cheap attribute (`partition_path.layout`) on the existing
   file-open span; no new span.
 - **Correlation.** Reuses table path/version + `add.path` (sanitized) already carried on storage spans.
@@ -436,11 +554,20 @@ graph LR
     backend accepts `space < > |` in a key or rejects at its own layer with a bounded error.
   - *R4 — read-decode traversal (T-Escape).* Mitigation: confinement on the decoded key; existing root-jail tests
     extended.
-  - *R5 — probe cost on partitioned scans.* Mitigation: zero for the common case; O2 hint deferred behind a
-    benchmark.
-- **Launch checklist:** differential parity green (Spark + delta-rs, both directions); mixed-layout migration
-  green; OrphanCleanup/VACUUM/DV/CDF path-matching re-verified; length-budget fail-closed; confinement-on-decoded
-  key verified; partitioned-scan benchmark within gate; `dotnet format`/build/test green.
+  - *R5 — legacy decoded-miss→literal fallback cost on partitioned scans.* Mitigation: go-forward L2 reads are
+    one open (decoded-first); extra cost only on legacy `%`-bearing files and disappears as tables are rewritten;
+    O2 hint deferred behind a legacy-table benchmark.
+  - *R6 — Unicode NFC/NFD on-disk collision (T-Norm).* Mitigation: `PutIfAbsent` fails closed; partition truth
+    from `partitionValues`. **Accepted interop residual** on normalizing filesystems (macOS).
+  - *R7 — golden fixture provenance / self-fulfilling fixture.* Mitigation: fixtures emitted by real Spark/delta-rs,
+    version-pinned, checksum'd, never regenerated from DeltaSharp — an Inc-C acceptance gate (§3.2), not a deferred
+    pointer.
+- **Launch checklist:** differential parity green (Spark + delta-rs, both directions) **with attested non-DeltaSharp
+  fixture provenance**; mixed-layout migration green incl. **DELETE / OPTIMIZE-input / CDF-data reads on L2/mixed**
+  (§3.3 M5–M7); adversarial both-exist (M8) green; OrphanCleanup/VACUUM/DV/CDF path-matching re-verified; VACUUM
+  lists a real Spark non-ASCII dir (§3.5); encoded-length fail-closed on **escape-expanding ASCII** (E3);
+  confinement-on-decoded-key + read-side `add.path` length cap verified; host-determinism + Windows-local cells
+  green (§3.6); partitioned-scan benchmark (new L2 + legacy) within gate; `dotnet format`/build/test green.
 
 ---
 
@@ -453,18 +580,26 @@ graph LR
 - **D2 — we ARE deviating; adopt the two-layer fix.** *Decided (answers #708's three-way choice):* current
   behavior is a genuine protocol/interop deviation (both layers), not merely a robustness gap → adopt
   `escapePathName` physical + URI-encoded `add.path` + read decode. Recorded on #708/#806.
-- **D3 — bounded resolve-by-existence vs a per-table encoding marker.** *Recommended:* bounded `{k_lit, k_dec}`
-  resolver (no protocol surface, fail-closed, ≤1 extra probe only for encoded files, mirrors OrphanCleanup's
-  existing tolerance). *Alternative (O2):* a `_delta_log` config hint to skip the probe. *Open:* accept the
-  recommendation, or gate the hint on a benchmark showing probe cost matters.
+- **D3 — decoded-first bounded resolver (adopted) vs a per-table encoding marker.** *Decided:* a bounded,
+  centralized **decoded-first** `ResolvePhysicalKey` (open `k_dec`; on not-found, fall back to `k_lit`) wired
+  into **all four** data-file open sites (§2.5). No protocol surface, fail-closed, one open for the go-forward
+  L2 format, extra cost only on the legacy decoded-miss (§4), and it mirrors OrphanCleanup's existing encoding
+  tolerance. *Alternative (O2):* a `_delta_log` config hint to skip the legacy fallback — deferred behind a
+  legacy-table benchmark. *Confirm the adopted resolver + the untrusted both-exist tie-break (§2.3 T-Poison).*
+- **O5 — foreign `add.path` read-side length cap.** A concrete pre-decode byte cap for the DoS residual (§5/§6
+  T-DoS) must be chosen (independent of the write-door `MaxPathSegmentNameBytes`). *Open: pick the value in Inc-A.*
+- **O6 — stale code comment (follow-up, not this design).** `DeltaWriteEncoding.cs`'s XML comment cites the
+  literal-open sites as `DeltaReadSource.cs:310,362`; the actual sites are `:328,:380`. Tracked as a code
+  follow-up in **#894** (does not affect this doc).
 - **O1 — exact `%`-double-encoding in `add.path` must be measured, not assumed.** The layer-1 `%XX`→`%25XX`
   and separator `=`→`%3D` behavior is specified per RFC/protocol but the **reference goldens (Spark, delta-rs)
   are the authority** — Inc-C conforms DeltaSharp to them. *Open until the goldens are captured.*
 - **O3 — do we ever need to *parse* a directory name?** Currently no (partition truth = `partitionValues`).
   Confirm no read path infers partition values from the path (survey found none) so the encoding is a pure
   locator. *Believed closed; reviewer confirm.*
-- **O4 — coordinate with #520/#646 golden infrastructure.** The Spark/delta-rs fixture mechanism should be the
+- **O4 — coordinate with #520/#646 golden infrastructure.** The Spark/delta-rs fixture mechanism should reuse the
   same reference-engine-emitted `_delta_log` harness those issues introduce. *Sequence Inc-C after / alongside.*
+  Note the **provenance guarantee** itself is no longer deferred here — it is an Inc-C acceptance gate (§3.2, R7).
 
 ---
 
