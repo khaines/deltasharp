@@ -93,12 +93,16 @@ public sealed class DeltaWriteEncodingTests
         Assert.Equal("région=café", DeltaWriteEncoding.HivePartitionSegment("région", "café"));
     }
 
-    [Fact]
-    public void HivePartitionSegment_NullValue_UsesHiveDefaultSentinel()
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    public void HivePartitionSegment_NullOrEmptyValue_UsesHiveDefaultSentinel(string? value)
     {
+        // Spark parity: both a null and an empty-string value map to the sentinel directory (they collide on
+        // disk, disambiguated by the authoritative add.partitionValues).
         Assert.Equal(
             "region=__HIVE_DEFAULT_PARTITION__",
-            DeltaWriteEncoding.HivePartitionSegment("region", null));
+            DeltaWriteEncoding.HivePartitionSegment("region", value));
     }
 
     [Fact]

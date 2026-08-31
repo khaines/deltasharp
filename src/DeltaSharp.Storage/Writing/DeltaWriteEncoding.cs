@@ -106,9 +106,9 @@ internal static class DeltaWriteEncoding
     /// <summary>
     /// Composes a single Hive-style partition directory <b>physical</b> segment, <c>column=value</c> (#806
     /// layer 1), using Apache Spark's <c>ExternalCatalogUtils.escapePathName</c> alphabet
-    /// (<see cref="EscapePathName"/>) for both the column name and the value. A null value uses the
-    /// <see cref="HiveDefaultPartition"/> sentinel.
-    /// </summary>
+    /// (<see cref="EscapePathName"/>) for both the column name and the value. A null <b>or empty</b> value uses
+    /// the <see cref="HiveDefaultPartition"/> sentinel (Spark parity — both collide on disk, disambiguated by
+    /// the authoritative <c>add.partitionValues</c>).</summary>
     /// <remarks>
     /// <para><b>#806 two-layer encoding — layer 1 (physical on disk).</b> This is the directory name written to
     /// storage; it is byte-for-byte what Spark/delta-rs write for the same <c>(name, value)</c>, so the on-disk
@@ -136,7 +136,9 @@ internal static class DeltaWriteEncoding
     public static string HivePartitionSegment(string column, string? value)
     {
         ArgumentNullException.ThrowIfNull(column);
-        string encodedValue = value is null ? HiveDefaultPartition : EscapePathName(value);
+        // Spark parity (ExternalCatalogUtils.getPartitionValueString): BOTH null and empty-string map to the
+        // sentinel directory (they collide on disk, disambiguated by the authoritative add.partitionValues).
+        string encodedValue = string.IsNullOrEmpty(value) ? HiveDefaultPartition : EscapePathName(value);
         string segment = EscapePathName(column) + "=" + encodedValue;
 
         int encodedBytes = Encoding.UTF8.GetByteCount(segment);
