@@ -28,19 +28,24 @@ VALUES = [
     "lt<gt>", "pipe|", "brace{}", "brack[]", "caret^", "quote\"", "back\\", "at@", "hash`bt",
 ]
 
+# ASCII-safe readable table for the ref->DS read test (no non-ASCII → no macOS NFC/NFD hazard, R6).
+READ_ROWS = {"id": [1, 2, 3, 4, 5], "name": ["a1", "b2", "c3", "d4", "e5"],
+             "region": ["US", "a=b", "na me", "o'brien", "US"]}
+
 
 def main(out_dir: str) -> None:
     import deltalake
     import pyarrow as pa
     from deltalake import write_deltalake
 
-    table_dir = os.path.join(out_dir, "table")
-    shutil.rmtree(table_dir, ignore_errors=True)
+    # (1) Full matrix table → throwaway temp dir (not committed) to harvest matrix.json.
+    matrix_src = os.path.join(out_dir, ".matrix-src")
+    shutil.rmtree(matrix_src, ignore_errors=True)
     tab = pa.table({"id": list(range(len(VALUES))), "region": VALUES})
-    write_deltalake(table_dir, tab, partition_by=["region"])
+    write_deltalake(matrix_src, tab, partition_by=["region"])
 
-    disk_dirs = [n for n in os.listdir(table_dir) if n.startswith("region=")]
-    log = os.path.join(table_dir, "_delta_log", "00000000000000000000.json")
+    disk_dirs = [n for n in os.listdir(matrix_src) if n.startswith("region=")]
+    log = os.path.join(matrix_src, "_delta_log", "00000000000000000000.json")
     add_by_value = {}
     for line in open(log, encoding="utf-8"):
         o = json.loads(line)
@@ -53,13 +58,21 @@ def main(out_dir: str) -> None:
         decoded = unquote(add_path.split("/")[0])
         assert decoded in disk_dirs, f"dir {decoded!r} for {v!r} not on disk"
         matrix.append({"value": v, "on_disk_dir": decoded, "add_path_segment": add_path.split("/")[0]})
+    shutil.rmtree(matrix_src, ignore_errors=True)
+
+    # (2) Committed small readable table.
+    read_table = os.path.join(out_dir, "read-table")
+    shutil.rmtree(read_table, ignore_errors=True)
+    write_deltalake(read_table, pa.table(READ_ROWS), partition_by=["region"])
+    _strip_crc(read_table)
 
     out = {
         "engine": "delta-rs",
         "version": deltalake.__version__,
         "pyarrow": pa.__version__,
-        "note": "delta-rs reference (dir, add.path). It escapes space/non-ASCII on disk (diverges from Spark). "
-                "DeltaSharp follows Spark; this fixture backs the read-compat + documented-residual tests.",
+        "note": "delta-rs reference (dir, add.path). It escapes space/non-ASCII (and some sub-delims like '&') "
+                "on disk (diverges from Spark). DeltaSharp follows Spark; this fixture backs the read-compat + "
+                "documented-residual tests.",
         "column": "region",
         "matrix": matrix,
     }
@@ -67,7 +80,14 @@ def main(out_dir: str) -> None:
     with open(os.path.join(out_dir, "matrix.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     _write_checksums(out_dir)
-    print(f"wrote {len(matrix)} delta-rs golden rows + readable table to {out_dir}")
+    print(f"wrote {len(matrix)} delta-rs golden rows + {len(READ_ROWS['id'])}-row read-table to {out_dir}")
+
+
+def _strip_crc(root: str) -> None:
+    for cur, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".crc"):
+                os.remove(os.path.join(cur, name))
 
 
 def _write_checksums(out_dir: str) -> None:

@@ -30,6 +30,11 @@ VALUES = [
     "lt<gt>", "pipe|", "brace{}", "brack[]", "caret^", "quote\"", "back\\", "at@", "hash`bt",
 ]
 
+# The small ASCII-SAFE readable table consumed by the ref->DS read test. Deliberately NO non-ASCII
+# (avoids the macOS NFC/NFD filesystem-normalization hazard, design R6); covers unreserved, the '='
+# reserved char, a quote, a space, and a 2-row partition (US).
+READ_ROWS = [(1, "a1", "US"), (2, "b2", "a=b"), (3, "c3", "na me"), (4, "d4", "o'brien"), (5, "e5", "US")]
+
 
 def main(out_dir: str) -> None:
     import pyspark
@@ -45,30 +50,34 @@ def main(out_dir: str) -> None:
     spark = configure_spark_with_delta_pip(builder).getOrCreate()
     spark.sparkContext.setLogLevel("ERROR")
 
-    table_dir = os.path.join(out_dir, "table")
-    shutil.rmtree(table_dir, ignore_errors=True)
+    # (1) The full matrix table is written to a throwaway temp dir (NOT committed) purely to harvest
+    #     the (on-disk dir, add.path) mapping into matrix.json.
+    matrix_src = os.path.join(out_dir, ".matrix-src")
+    shutil.rmtree(matrix_src, ignore_errors=True)
     rows = [(i, v) for i, v in enumerate(VALUES)]
-    spark.createDataFrame(rows, ["id", "region"]).write.format("delta").partitionBy("region").mode("overwrite").save(table_dir)
-
-    # on-disk directory per value: the region=<...> dir that physically holds the file.
-    disk_dirs = [n for n in os.listdir(table_dir) if n.startswith("region=")]
-    # add.path per value from the commit log.
-    log = os.path.join(table_dir, "_delta_log", "00000000000000000000.json")
+    spark.createDataFrame(rows, ["id", "region"]).write.format("delta").partitionBy("region").mode("overwrite").save(matrix_src)
+    disk_dirs = [n for n in os.listdir(matrix_src) if n.startswith("region=")]
+    log = os.path.join(matrix_src, "_delta_log", "00000000000000000000.json")
     add_by_value = {}
     for line in open(log, encoding="utf-8"):
         o = json.loads(line)
         if "add" in o:
             add_by_value[o["add"]["partitionValues"]["region"]] = o["add"]["path"]
 
+    from urllib.parse import unquote
     matrix = []
     for v in VALUES:
         add_path = add_by_value[v]
-        on_disk = add_path.split("/")[0]  # the reference on-disk dir == uri-decode is identity for its own layout
-        # confirm the dir physically exists (locate by decode)
-        from urllib.parse import unquote
         decoded = unquote(add_path.split("/")[0])
         assert decoded in disk_dirs, f"dir {decoded!r} for value {v!r} not on disk: {disk_dirs}"
         matrix.append({"value": v, "on_disk_dir": decoded, "add_path_segment": add_path.split("/")[0]})
+    shutil.rmtree(matrix_src, ignore_errors=True)
+
+    # (2) The committed small readable table.
+    read_table = os.path.join(out_dir, "read-table")
+    shutil.rmtree(read_table, ignore_errors=True)
+    spark.createDataFrame(READ_ROWS, ["id", "name", "region"]).write.format("delta").partitionBy("region").mode("overwrite").save(read_table)
+    _strip_crc(read_table)
 
     out = {
         "engine": "apache-spark",
@@ -83,7 +92,14 @@ def main(out_dir: str) -> None:
         json.dump(out, f, ensure_ascii=False, indent=2)
     _write_checksums(out_dir)
     spark.stop()
-    print(f"wrote {len(matrix)} golden rows + readable table to {out_dir}")
+    print(f"wrote {len(matrix)} golden rows + {len(READ_ROWS)}-row read-table to {out_dir}")
+
+
+def _strip_crc(root: str) -> None:
+    for cur, _dirs, files in os.walk(root):
+        for name in files:
+            if name.endswith(".crc"):
+                os.remove(os.path.join(cur, name))
 
 
 def _write_checksums(out_dir: str) -> None:

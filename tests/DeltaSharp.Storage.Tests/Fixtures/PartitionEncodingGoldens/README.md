@@ -64,5 +64,9 @@ pip install deltalake==1.6.3 pyarrow
 python generate_delta_rs.py delta-rs
 ```
 
-Both scripts rewrite `matrix.json`, `read-table/`, and `SHA256SUMS` for their engine. Strip Spark's
-`.crc` sidecars before committing (the scripts do not need them).
+Both scripts write `matrix.json` (harvested from a throwaway full-matrix table), the committed
+`read-table/` (the small ASCII-safe readable table), and `SHA256SUMS` for their engine. They strip
+Spark's `.crc` sidecars themselves. Regenerating produces an **equivalent** fixture — the Parquet
+file names/bytes differ by a fresh UUID each run, so `SHA256SUMS` changes; commit the regenerated
+bytes together. A checked-in golden whose hash no longer matches `SHA256SUMS` fails
+`Goldens_MatchCheckedInChecksums` at test time.
