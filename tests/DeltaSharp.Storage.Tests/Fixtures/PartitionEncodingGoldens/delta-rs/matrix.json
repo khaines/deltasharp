@@ -2,7 +2,7 @@
   "engine": "delta-rs",
   "version": "1.6.3",
   "pyarrow": "25.0.1",
-  "note": "delta-rs reference (dir, add.path). It escapes space/non-ASCII on disk (diverges from Spark). DeltaSharp follows Spark; this fixture backs the read-compat + documented-residual tests.",
+  "note": "delta-rs reference (dir, add.path). It escapes space/non-ASCII (and some sub-delims like '&') on disk (diverges from Spark). DeltaSharp follows Spark; this fixture backs the read-compat + documented-residual tests.",
   "column": "region",
   "matrix": [
     {

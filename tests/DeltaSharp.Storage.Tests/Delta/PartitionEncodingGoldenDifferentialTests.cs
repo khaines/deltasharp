@@ -107,6 +107,57 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.Contains("région", spaceOrNonAsciiDiverged);
         Assert.True(spaceOrNonAsciiDiverged.Count >= 4,
             $"expected the space/non-ASCII residual to be broadly exercised; diverged={spaceOrNonAsciiDiverged.Count}");
+
+        // delta-rs also escapes some ASCII sub-delims on disk that Spark/DeltaSharp keep literal — pin the
+        // measured '&' case explicitly (the documented broader-escaping residual): DeltaSharp writes
+        // `region=amp&r` (like Spark), delta-rs writes `region=amp%26r`.
+        GoldenRow ampSpark = spark.Single(r => r.Value == "amp&r");
+        Assert.Equal("region=amp&r", DeltaWriteEncoding.HivePartitionSegment("region", "amp&r"));
+        Assert.Equal("region=amp&r", ampSpark.OnDiskDir);
+        Assert.Equal("region=amp%26r", deltaRsByValue["amp&r"].OnDiskDir);
+    }
+
+    // ---- Provenance: the checked-in goldens match their committed SHA256SUMS (design §3.2 / R7) -----
+
+    [Theory]
+    [InlineData("spark")]
+    [InlineData("delta-rs")]
+    public void Goldens_MatchCheckedInChecksums(string engine)
+    {
+        // Self-enforcing provenance tripwire: a golden silently regenerated or hand-edited to match a buggy
+        // encoder (the exact failure mode design R7 warns about) drifts from SHA256SUMS and fails here,
+        // forcing a deliberate checksum update rather than passing unnoticed.
+        string engineDir = Path.Combine(GoldensDir, engine);
+        string sumsPath = Path.Combine(engineDir, "SHA256SUMS");
+        Assert.True(File.Exists(sumsPath), $"missing {engine}/SHA256SUMS");
+
+        int verified = 0;
+        foreach (string line in File.ReadAllLines(sumsPath))
+        {
+            if (line.Length == 0)
+            {
+                continue;
+            }
+
+            // Format: "<hex-sha256>  <relative/path>" (two spaces, sha256sum/shasum -c convention).
+            int sep = line.IndexOf("  ", StringComparison.Ordinal);
+            Assert.True(sep > 0, $"malformed SHA256SUMS line: {line}");
+            string expectedHash = line[..sep].Trim();
+            string relative = line[(sep + 2)..].Trim();
+            if (relative.StartsWith("./", StringComparison.Ordinal))
+            {
+                relative = relative[2..];
+            }
+
+            string filePath = Path.Combine(engineDir, relative.Replace('/', Path.DirectorySeparatorChar));
+            Assert.True(File.Exists(filePath), $"SHA256SUMS references a missing file: {relative}");
+            string actualHash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(filePath)));
+            Assert.Equal(expectedHash, actualHash);
+            verified++;
+        }
+
+        // Must cover at least matrix.json + the read-table log + its 4 partition files.
+        Assert.True(verified >= 6, $"expected the checksum manifest to cover the full fixture; verified={verified}");
     }
 
     // ---- ref→DS: DeltaSharp reads a real Spark-written table (literal-space on-disk layout) ------
