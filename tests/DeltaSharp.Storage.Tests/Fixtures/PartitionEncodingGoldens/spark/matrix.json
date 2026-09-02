@@ -1,0 +1,159 @@
+{
+  "engine": "apache-spark",
+  "version": "3.5.3",
+  "delta": "3.2.0",
+  "note": "Reference (dir, add.path) partition-encoding golden. Emitted by real Spark; never from DeltaSharp.",
+  "column": "region",
+  "matrix": [
+    {
+      "value": "US",
+      "on_disk_dir": "region=US",
+      "add_path_segment": "region=US"
+    },
+    {
+      "value": "a=b",
+      "on_disk_dir": "region=a%3Db",
+      "add_path_segment": "region=a%253Db"
+    },
+    {
+      "value": "na me",
+      "on_disk_dir": "region=na me",
+      "add_path_segment": "region=na%20me"
+    },
+    {
+      "value": "région",
+      "on_disk_dir": "region=région",
+      "add_path_segment": "region=région"
+    },
+    {
+      "value": "名前",
+      "on_disk_dir": "region=名前",
+      "add_path_segment": "region=名前"
+    },
+    {
+      "value": "e🎯moji",
+      "on_disk_dir": "region=e🎯moji",
+      "add_path_segment": "region=e🎯moji"
+    },
+    {
+      "value": "o'brien",
+      "on_disk_dir": "region=o%27brien",
+      "add_path_segment": "region=o%2527brien"
+    },
+    {
+      "value": "a/b",
+      "on_disk_dir": "region=a%2Fb",
+      "add_path_segment": "region=a%252Fb"
+    },
+    {
+      "value": "c:d",
+      "on_disk_dir": "region=c%3Ad",
+      "add_path_segment": "region=c%253Ad"
+    },
+    {
+      "value": "q?x",
+      "on_disk_dir": "region=q%3Fx",
+      "add_path_segment": "region=q%253Fx"
+    },
+    {
+      "value": "h#h",
+      "on_disk_dir": "region=h%23h",
+      "add_path_segment": "region=h%2523h"
+    },
+    {
+      "value": "p%p",
+      "on_disk_dir": "region=p%25p",
+      "add_path_segment": "region=p%2525p"
+    },
+    {
+      "value": "amp&r",
+      "on_disk_dir": "region=amp&r",
+      "add_path_segment": "region=amp&r"
+    },
+    {
+      "value": "plus+",
+      "on_disk_dir": "region=plus+",
+      "add_path_segment": "region=plus+"
+    },
+    {
+      "value": "comma,",
+      "on_disk_dir": "region=comma,",
+      "add_path_segment": "region=comma,"
+    },
+    {
+      "value": "semi;",
+      "on_disk_dir": "region=semi;",
+      "add_path_segment": "region=semi;"
+    },
+    {
+      "value": "excl!",
+      "on_disk_dir": "region=excl!",
+      "add_path_segment": "region=excl!"
+    },
+    {
+      "value": "dollar$",
+      "on_disk_dir": "region=dollar$",
+      "add_path_segment": "region=dollar$"
+    },
+    {
+      "value": "paren()",
+      "on_disk_dir": "region=paren()",
+      "add_path_segment": "region=paren()"
+    },
+    {
+      "value": "star*",
+      "on_disk_dir": "region=star%2A",
+      "add_path_segment": "region=star%252A"
+    },
+    {
+      "value": "tilde~",
+      "on_disk_dir": "region=tilde~",
+      "add_path_segment": "region=tilde~"
+    },
+    {
+      "value": "lt<gt>",
+      "on_disk_dir": "region=lt<gt>",
+      "add_path_segment": "region=lt%3Cgt%3E"
+    },
+    {
+      "value": "pipe|",
+      "on_disk_dir": "region=pipe|",
+      "add_path_segment": "region=pipe%7C"
+    },
+    {
+      "value": "brace{}",
+      "on_disk_dir": "region=brace%7B}",
+      "add_path_segment": "region=brace%257B%7D"
+    },
+    {
+      "value": "brack[]",
+      "on_disk_dir": "region=brack%5B%5D",
+      "add_path_segment": "region=brack%255B%255D"
+    },
+    {
+      "value": "caret^",
+      "on_disk_dir": "region=caret%5E",
+      "add_path_segment": "region=caret%255E"
+    },
+    {
+      "value": "quote\"",
+      "on_disk_dir": "region=quote%22",
+      "add_path_segment": "region=quote%2522"
+    },
+    {
+      "value": "back\\",
+      "on_disk_dir": "region=back%5C",
+      "add_path_segment": "region=back%255C"
+    },
+    {
+      "value": "at@",
+      "on_disk_dir": "region=at@",
+      "add_path_segment": "region=at@"
+    },
+    {
+      "value": "hash`bt",
+      "on_disk_dir": "region=hash`bt",
+      "add_path_segment": "region=hash%60bt"
+    }
+  ]
+}

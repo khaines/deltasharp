@@ -325,15 +325,26 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 
 ### 3.2 Differential parity vs Spark & delta-rs (the #806 core oracle — "measured, not assumed")
 
+> **STATUS (Inc-C): captured & green.** The reference fixtures are checked in under
+> `tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/` (real **Spark 3.5 / delta-rs 1.6**,
+> pinned generators + `SHA256SUMS` + a provenance README enforcing *never regenerated from DeltaSharp*),
+> and consumed by `PartitionEncodingGoldenDifferentialTests` (DS→ref byte-parity over the full 30-value
+> matrix + both ref→DS reads). Measured detail beyond the original assumption: **delta-rs escapes a broader
+> on-disk set than Spark** — not only space and non-ASCII but also some sub-delims (e.g. `&` → `region=amp%26r`)
+> — whereas Spark/DeltaSharp keep them literal. DeltaSharp follows Spark (D1); the residual test asserts
+> DeltaSharp == Spark everywhere and characterises (does not require byte-equality with) delta-rs.
+
 A **golden differential** test: for a matrix of partition names/values spanning
 {ASCII-unreserved, ASCII-reserved (`" # % ' * / : = ? \ { [ ] ^ space`), control-adjacent (rejected — asserted
 rejected), non-ASCII (`région`, `名前`, emoji), `null`→sentinel}, compare DeltaSharp's `(physical dir, add.path)`
 against **reference fixtures emitted by real Spark and delta-rs** (checked-in goldens produced out-of-band, the
 same OR-a/OR-b pattern as #520/#646). Two directions:
 
-- **DS→ref:** DeltaSharp's directory and `add.path` equal the reference bytes.
+- **DS→ref:** DeltaSharp's directory and `add.path` equal the reference **Spark** bytes (delta-rs's broader
+  on-disk escaping is a documented residual, not a parity target — DeltaSharp follows Spark, D1).
 - **ref→DS:** a Spark/delta-rs-written `_delta_log` + files fixture is **read** by DeltaSharp and returns the
-  correct rows/partition values (closes the read half — the more urgent gap per #708).
+  correct rows/partition values (closes the read half — the more urgent gap per #708). Covered for both a
+  Spark-shaped (literal-space `region=na me`) and a delta-rs-shaped (escaped-space `region=na%20me`) layout.
 
 > **Fixture provenance is an Inc-C acceptance gate (Quality-review F3 — promoted out of O4).** A golden is only
 > a "measurement" if it is **provably not producible by DeltaSharp** (else the differential is a tautology). The
