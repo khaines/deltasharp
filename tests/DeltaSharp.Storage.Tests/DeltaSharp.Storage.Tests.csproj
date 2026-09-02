@@ -18,6 +18,20 @@
     <PackageReference Include="Parquet.Net" />
   </ItemGroup>
 
+  <!--
+    #806 Inc-C partition-encoding goldens: real Apache Spark 3.5 + delta-rs 1.6 reference fixtures
+    (per-engine matrix.json + SHA256SUMS + small read-table trees) copied beside the test binary so
+    PartitionEncodingGoldenDifferentialTests can measure DeltaSharp against them at runtime. Only the
+    two engine subtrees are copied — the generator scripts and README stay in-repo (not needed at
+    runtime). The read-table directory names contain '=', '%XX' and a space (e.g. region=a%3Db,
+    region=na me); the glob is discovered from disk so MSBuild carries those literally. See
+    Fixtures/PartitionEncodingGoldens/README.md for the provenance guarantee.
+  -->
+  <ItemGroup>
+    <None Include="Fixtures\PartitionEncodingGoldens\spark\**\*" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="Fixtures\PartitionEncodingGoldens\delta-rs\**\*" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
   <ItemGroup>
     <ProjectReference Include="../../src/DeltaSharp.Storage/DeltaSharp.Storage.csproj" />
     <!--

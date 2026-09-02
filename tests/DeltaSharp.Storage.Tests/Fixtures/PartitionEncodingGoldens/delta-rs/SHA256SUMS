@@ -1,0 +1,6 @@
+38b8d3993afe93873fc276b611cd731ac1b8c6065e0488cdc0f24dc1653b1e0d  read-table/region=a%3Db/part-00000-f0e1c87d-742c-4d9e-82ed-e97fcc75e168-c000.snappy.parquet
+4fbb8c47a6820835740d35a88a4d344c660afda864f247d643fda39be683ff8c  read-table/_delta_log/00000000000000000000.json
+6a04cb14a5cedba45517a73b111740554b39288c1ea999491e9b8a9edd06b811  read-table/region=o%27brien/part-00000-ea7143ca-e62b-4651-9ed1-57c43cab9034-c000.snappy.parquet
+7cb844111375c5a4657bd6639c790be5db8d00e5e9dc773b3142771ab23a2d82  read-table/region=US/part-00000-92e68a31-7adf-44cb-8503-18baa3a1d4d0-c000.snappy.parquet
+a0f3c36406b10cd0a5cf5f77eb1c6a5742d80b11e7d43fac5474d3c5c6de3dd4  matrix.json
+dce23e376def6d077604e6a469acf0a3cadc5f52319ae3382233ddaea2d40084  read-table/region=na%20me/part-00000-90582a6f-9a1f-4e38-ae46-76bd75f0461e-c000.snappy.parquet

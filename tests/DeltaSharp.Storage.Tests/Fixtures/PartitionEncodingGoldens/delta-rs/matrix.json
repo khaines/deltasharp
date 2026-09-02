@@ -1,0 +1,159 @@
+{
+  "engine": "delta-rs",
+  "version": "1.6.3",
+  "pyarrow": "25.0.1",
+  "note": "delta-rs reference (dir, add.path). It escapes space/non-ASCII (and some sub-delims like '&') on disk (diverges from Spark). DeltaSharp follows Spark; this fixture backs the read-compat + documented-residual tests.",
+  "column": "region",
+  "matrix": [
+    {
+      "value": "US",
+      "on_disk_dir": "region=US",
+      "add_path_segment": "region=US"
+    },
+    {
+      "value": "a=b",
+      "on_disk_dir": "region=a%3Db",
+      "add_path_segment": "region=a%253Db"
+    },
+    {
+      "value": "na me",
+      "on_disk_dir": "region=na%20me",
+      "add_path_segment": "region=na%2520me"
+    },
+    {
+      "value": "région",
+      "on_disk_dir": "region=r%C3%A9gion",
+      "add_path_segment": "region=r%25C3%25A9gion"
+    },
+    {
+      "value": "名前",
+      "on_disk_dir": "region=%E5%90%8D%E5%89%8D",
+      "add_path_segment": "region=%25E5%2590%258D%25E5%2589%258D"
+    },
+    {
+      "value": "e🎯moji",
+      "on_disk_dir": "region=e%F0%9F%8E%AFmoji",
+      "add_path_segment": "region=e%25F0%259F%258E%25AFmoji"
+    },
+    {
+      "value": "o'brien",
+      "on_disk_dir": "region=o%27brien",
+      "add_path_segment": "region=o%2527brien"
+    },
+    {
+      "value": "a/b",
+      "on_disk_dir": "region=a%2Fb",
+      "add_path_segment": "region=a%252Fb"
+    },
+    {
+      "value": "c:d",
+      "on_disk_dir": "region=c%3Ad",
+      "add_path_segment": "region=c%253Ad"
+    },
+    {
+      "value": "q?x",
+      "on_disk_dir": "region=q%3Fx",
+      "add_path_segment": "region=q%253Fx"
+    },
+    {
+      "value": "h#h",
+      "on_disk_dir": "region=h%23h",
+      "add_path_segment": "region=h%2523h"
+    },
+    {
+      "value": "p%p",
+      "on_disk_dir": "region=p%25p",
+      "add_path_segment": "region=p%2525p"
+    },
+    {
+      "value": "amp&r",
+      "on_disk_dir": "region=amp%26r",
+      "add_path_segment": "region=amp%2526r"
+    },
+    {
+      "value": "plus+",
+      "on_disk_dir": "region=plus%2B",
+      "add_path_segment": "region=plus%252B"
+    },
+    {
+      "value": "comma,",
+      "on_disk_dir": "region=comma%2C",
+      "add_path_segment": "region=comma%252C"
+    },
+    {
+      "value": "semi;",
+      "on_disk_dir": "region=semi%3B",
+      "add_path_segment": "region=semi%253B"
+    },
+    {
+      "value": "excl!",
+      "on_disk_dir": "region=excl%21",
+      "add_path_segment": "region=excl%2521"
+    },
+    {
+      "value": "dollar$",
+      "on_disk_dir": "region=dollar%24",
+      "add_path_segment": "region=dollar%2524"
+    },
+    {
+      "value": "paren()",
+      "on_disk_dir": "region=paren%28%29",
+      "add_path_segment": "region=paren%2528%2529"
+    },
+    {
+      "value": "star*",
+      "on_disk_dir": "region=star%2A",
+      "add_path_segment": "region=star%252A"
+    },
+    {
+      "value": "tilde~",
+      "on_disk_dir": "region=tilde~",
+      "add_path_segment": "region=tilde~"
+    },
+    {
+      "value": "lt<gt>",
+      "on_disk_dir": "region=lt%3Cgt%3E",
+      "add_path_segment": "region=lt%253Cgt%253E"
+    },
+    {
+      "value": "pipe|",
+      "on_disk_dir": "region=pipe%7C",
+      "add_path_segment": "region=pipe%257C"
+    },
+    {
+      "value": "brace{}",
+      "on_disk_dir": "region=brace%7B%7D",
+      "add_path_segment": "region=brace%257B%257D"
+    },
+    {
+      "value": "brack[]",
+      "on_disk_dir": "region=brack%5B%5D",
+      "add_path_segment": "region=brack%255B%255D"
+    },
+    {
+      "value": "caret^",
+      "on_disk_dir": "region=caret%5E",
+      "add_path_segment": "region=caret%255E"
+    },
+    {
+      "value": "quote\"",
+      "on_disk_dir": "region=quote%22",
+      "add_path_segment": "region=quote%2522"
+    },
+    {
+      "value": "back\\",
+      "on_disk_dir": "region=back%5C",
+      "add_path_segment": "region=back%255C"
+    },
+    {
+      "value": "at@",
+      "on_disk_dir": "region=at%40",
+      "add_path_segment": "region=at%2540"
+    },
+    {
+      "value": "hash`bt",
+      "on_disk_dir": "region=hash%60bt",
+      "add_path_segment": "region=hash%2560bt"
+    }
+  ]
+}
