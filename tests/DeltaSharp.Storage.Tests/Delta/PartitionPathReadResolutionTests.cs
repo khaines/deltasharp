@@ -57,16 +57,16 @@ public sealed class PartitionPathReadResolutionTests : IDisposable
     public async Task TwoLayerWrite_ProducesUriEncodedAddPath_ReadsViaDecode_806IncB()
     {
         // #806 Inc-B: the write door now emits a two-layer path — an escapePathName on-disk key (layer 1) and a
-        // URI-encoded add.path (layer 2). A partition value 'a/b' lands on disk as 'region=a%2Fb'; its committed
-        // add.path is 'region%3Da%252Fb' (the '=' separator and the layer-1 '%2F' re-encoded). The Inc-A
-        // resolver decodes the add.path back to the on-disk key and reads the rows (the go-forward L2 shape,
-        // interoperable with Spark/delta-rs).
+        // Java-URI/RFC-2396 add.path (layer 2, Spark-parity). A partition value 'a/b' lands on disk as
+        // 'region=a%2Fb'; its committed add.path is 'region=a%252Fb' (the '=' separator stays literal, the
+        // layer-1 '%2F' has its '%' re-encoded to '%25'). The Inc-A resolver decodes the add.path back to the
+        // on-disk key and reads the rows (the go-forward L2 shape, interoperable with Spark/delta-rs reads).
         await WritePartitionedAsync(("a/b", 5L));
         Snapshot snap = await LoadSnapshotAsync();
         AddFileAction add = Assert.Single(snap.ActiveFiles);
 
-        // Layer 2: add.path is URI-encoded.
-        Assert.Contains("region%3Da%252Fb/", add.Path, StringComparison.Ordinal);
+        // Layer 2: add.path percent-encodes the layer-1 '%' (Spark keeps the '=' separator literal).
+        Assert.Contains("region=a%252Fb/", add.Path, StringComparison.Ordinal);
         // Layer 1: the on-disk key is the single decode of add.path.
         string physical = Uri.UnescapeDataString(add.Path);
         Assert.Contains("region=a%2Fb/", physical, StringComparison.Ordinal);

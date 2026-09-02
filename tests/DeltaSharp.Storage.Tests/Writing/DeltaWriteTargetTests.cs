@@ -255,9 +255,10 @@ public sealed class DeltaWriteTargetTests : IDisposable
             // #806 layer 2: add.path is URI-encoded — neither the raw space nor the raw quote survive.
             Assert.DoesNotContain(' ', add.Path);
             Assert.DoesNotContain('\'', add.Path);
-            // escapePathName leaves the space, escapes ' -> %27; layer 2 then URI-encodes (space -> %20,
-            // % -> %25, '=' -> %3D), so the committed add.path segment is 'my%20col%2527x%3Deast'.
-            Assert.Contains("my%20col%2527x%3D", add.Path, StringComparison.Ordinal);
+            // escapePathName leaves the space, escapes ' -> %27; layer 2 then Java-URI-quotes (space -> %20,
+            // % -> %25) while keeping the '=' separator literal (Spark parity), so the committed add.path
+            // segment is 'my%20col%2527x=<value>'.
+            Assert.Contains("my%20col%2527x=", add.Path, StringComparison.Ordinal);
 
             // Partition truth is preserved under the RAW logical column name in add.partitionValues.
             Assert.True(add.PartitionValues.ContainsKey(hostileColumn));

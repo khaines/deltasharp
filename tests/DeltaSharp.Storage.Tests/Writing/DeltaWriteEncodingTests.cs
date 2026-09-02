@@ -52,18 +52,31 @@ public sealed class DeltaWriteEncodingTests
         Assert.Equal("a%2Fb", DeltaWriteEncoding.EscapePathName("a/b")); // %2F not %2f
     }
 
-    // ---- ToAddPath (layer 2 — URI-encoded add.path) ---------------------------------------------
+    // ---- ToAddPath (layer 2 — Java-URI / RFC 2396 add.path, Spark-parity #806) -------------------
 
+    // Golden values measured byte-for-byte against Apache Spark 3.5 (Delta 3.2). The structural '=' and
+    // non-ASCII pass through literally; only URI-illegal ASCII (space, '%', '< > { } | `') is percent-encoded;
+    // a layer-1 '%XX' has its '%' re-encoded to '%25'. See Inc-C fixtures for the full provenance matrix.
     [Theory]
-    [InlineData("region=US/part-x.parquet", "region%3DUS/part-x.parquet")]
-    // A layer-1 %2F is re-encoded to %252F; the '=' separator to %3D; the '/' separators are preserved.
-    [InlineData("region=a%2Fb/part-x.parquet", "region%3Da%252Fb/part-x.parquet")]
-    // Space (layer-1 passthrough) becomes %20; non-ASCII becomes its UTF-8 %-triplets.
-    [InlineData("my col=east/part-x.parquet", "my%20col%3Deast/part-x.parquet")]
-    [InlineData("region=café/part-x.parquet", "region%3Dcaf%C3%A9/part-x.parquet")]
+    // '=' separator stays literal; unreserved value unchanged.
+    [InlineData("region=US/part-x.parquet", "region=US/part-x.parquet")]
+    // A layer-1 %2F (from a '/' in the value) has its '%' → '%25'; the '/' separators are preserved.
+    [InlineData("region=a%2Fb/part-x.parquet", "region=a%252Fb/part-x.parquet")]
+    // Space (layer-1 passthrough) becomes %20; the '=' separator stays literal.
+    [InlineData("my col=east/part-x.parquet", "my%20col=east/part-x.parquet")]
+    // Non-ASCII passes through literally (Spark URI.toString, not toASCIIString).
+    [InlineData("region=café/part-x.parquet", "region=café/part-x.parquet")]
+    // URI-illegal ASCII left literal by escapePathName is percent-encoded here: '<' '>' '|' '`' '}'.
+    [InlineData("region=lt<gt>/part-x.parquet", "region=lt%3Cgt%3E/part-x.parquet")]
+    [InlineData("region=pipe|/part-x.parquet", "region=pipe%7C/part-x.parquet")]
+    [InlineData("region=hash`bt/part-x.parquet", "region=hash%60bt/part-x.parquet")]
+    // A layer-1 '%3D' (escaped '=' inside a value) has only its '%' re-encoded → '%253D'.
+    [InlineData("region=a%3Db/part-x.parquet", "region=a%253Db/part-x.parquet")]
+    // Sub-delims / pchar extras stay literal: & + , ; ! $ ( ) ~ @.
+    [InlineData("region=amp&r+,;!$()~@/part-x.parquet", "region=amp&r+,;!$()~@/part-x.parquet")]
     // A non-partitioned file (no '=', unreserved chars) is unchanged.
     [InlineData("part-x.parquet", "part-x.parquet")]
-    public void ToAddPath_UriEncodesSegments_PreservingSeparators(string physical, string expected)
+    public void ToAddPath_JavaUriQuotesPhysicalPath_SparkParity(string physical, string expected)
     {
         Assert.Equal(expected, DeltaWriteEncoding.ToAddPath(physical));
     }
@@ -73,6 +86,8 @@ public sealed class DeltaWriteEncodingTests
     [InlineData("region=a%2Fb/part-x.parquet")]
     [InlineData("my col=east/part-x.parquet")]
     [InlineData("region=café/part-x.parquet")]
+    [InlineData("region=lt<gt>/part-x.parquet")]
+    [InlineData("region=a%3Db/part-x.parquet")]
     [InlineData("a=b/c=d/part-x.parquet")]
     [InlineData("part-x.parquet")]
     public void ToAddPath_IsExactInverseOfResolverDecode(string physical)

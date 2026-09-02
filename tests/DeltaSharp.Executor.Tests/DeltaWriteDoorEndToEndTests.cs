@@ -177,14 +177,11 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
         Assert.Equal(1, byRegion["EU"].Sum(a => a.NumRecords)); // original EU row preserved
         Assert.Equal(1, byRegion["US"].Sum(a => a.NumRecords)); // US replaced (still 1, but the new row)
 
-        // Every active add lives under its Hive-style partition directory.
+        // Every active add lives under its Hive-style partition directory. add.path is the layer-2 Java-URI
+        // encoding (Spark parity); decode it to the on-disk key. (Positive layer-2 pinning lives in
+        // Delta_PartitionedAppend_WritesHiveStyleDirectories, which uses a space-bearing value.)
         foreach (AddRecord add in active)
         {
-            // #806: add.path is layer-2 URI-encoded, so the structural '=' is written as '%3D'
-            // (positively pins that the encoder applied layer-2 — a dropped ToAddPath would leave a
-            // bare 'region=' here and fail this assertion). The on-disk directory is its decode.
-            Assert.Contains("region%3D", add.Path);
-            Assert.DoesNotContain("region=", add.Path);
             string physical = Uri.UnescapeDataString(add.Path);
             Assert.Contains("region=", physical);
             Assert.True(File.Exists(Path.Combine(table, physical)));
@@ -427,25 +424,33 @@ public sealed class DeltaWriteDoorEndToEndTests : IDisposable
     {
         using SparkSession spark = NewSession();
         string table = Table("partitioned");
+        // "N Z" carries a space: escapePathName (layer 1) passes it through on disk, but the Java-URI add.path
+        // (layer 2) percent-encodes it to %20 — so this value positively exercises layer-2 (an alphanumeric
+        // value like "US" is identity under both layers and cannot distinguish a dropped ToAddPath).
         DataFrame df = spark.CreateDataFrame(
-            Regional((1, "a", "US"), (2, "b", "EU"), (3, "c", "US")), RegionSchema);
+            Regional((1, "a", "US"), (2, "b", "N Z"), (3, "c", "US")), RegionSchema);
 
         df.Write.Format("delta").PartitionBy("region").Mode("append").Save(table);
 
         IReadOnlyList<AddRecord> active = ActiveAdds(table);
-        Assert.Equal(2, active.Count); // one file per partition (US, EU)
+        Assert.Equal(2, active.Count); // one file per partition (US, "N Z")
         Assert.Equal(
-            new[] { "EU", "US" },
+            new[] { "N Z", "US" },
             active.Select(a => a.PartitionValues["region"]).OrderBy(v => v, StringComparer.Ordinal));
         Assert.True(Directory.Exists(Path.Combine(table, "region=US")));
-        Assert.True(Directory.Exists(Path.Combine(table, "region=EU")));
-        // #806 two-layer contract: on-disk directory is layer-1 (`region=US`), while add.path is
-        // layer-2 URI-encoded (`region%3DUS`). Pin BOTH so a dropped ToAddPath (add.path left as the
-        // bare physical key) fails here, and the layer-2 encoding inverts back to the on-disk key.
+        Assert.True(Directory.Exists(Path.Combine(table, "region=N Z"))); // layer-1 keeps the raw space (Spark)
+        // #806 two-layer contract (Spark parity): the on-disk directory keeps the raw space (layer-1
+        // escapePathName passthrough) while add.path percent-encodes it to %20 (layer-2 Java-URI). Pin BOTH so a
+        // dropped ToAddPath (add.path left as the bare physical key, raw space intact) fails here, and the
+        // layer-2 encoding still inverts back to the on-disk key.
         foreach (AddRecord add in active)
         {
-            Assert.Contains("region%3D", add.Path);
-            Assert.DoesNotContain("region=", add.Path);
+            if (add.PartitionValues["region"] == "N Z")
+            {
+                Assert.Contains("region=N%20Z", add.Path); // layer-2 applied: space -> %20
+                Assert.DoesNotContain(' ', add.Path);       // no raw space survives into add.path
+            }
+
             Assert.True(Directory.Exists(Path.Combine(table, Path.GetDirectoryName(Uri.UnescapeDataString(add.Path))!)));
         }
         Assert.Equal(3, active.Sum(a => a.NumRecords));
