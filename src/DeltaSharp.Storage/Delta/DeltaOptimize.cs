@@ -482,7 +482,8 @@ internal sealed class DeltaOptimize
             }
 
             actions.Add(new AddFileAction(
-                output.Path,
+                // #806 layer 2: output.Path is the physical key we wrote by; add.path records the URI-encoded form.
+                DeltaWriteEncoding.ToAddPath(output.Path),
                 outputPartition,
                 output.ByteSize,
                 timestamp,

@@ -10,6 +10,7 @@ using DeltaSharp.Storage.Delta.DeletionVectors;
 using DeltaSharp.Storage.Diagnostics;
 using DeltaSharp.Storage.Parquet;
 using DeltaSharp.Storage.Reading;
+using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
 using Xunit;
 using StructField = DeltaSharp.Types.StructField;
@@ -378,7 +379,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.NotNull(checksum);
         Assert.StartsWith("sha256:", checksum, StringComparison.Ordinal);
 
-        Stream stream = await _backend.OpenReadAsync(output.Path, CancellationToken.None);
+        Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, output.Path, CancellationToken.None);
         byte[] onDisk;
         await using (stream)
         {
@@ -560,7 +561,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         AddFileAction output = Assert.Single(
             after.ActiveFiles.Where(f => f.PartitionValues.TryGetValue("region", out string? r) && r == "US"));
         Assert.Equal("US", output.PartitionValues["region"]);
-        Assert.StartsWith("region=US/", output.Path, StringComparison.Ordinal);
+        Assert.StartsWith("region=US/", Uri.UnescapeDataString(output.Path), StringComparison.Ordinal);
         Assert.Equal(usBefore, Sorted(await ReadRowsAsync(new[] { output.Path }))); // US rows preserved.
     }
 
@@ -592,12 +593,13 @@ public sealed class DeltaOptimizeTests : IDisposable
         AddFileAction output = Assert.Single(after.ActiveFiles);
         // The value is preserved verbatim in the log (authoritative partition membership), independent of path.
         Assert.Equal(trickyValue, output.PartitionValues["region"]);
-        // The output path uses the percent-encoded value as ONE segment (region=<encoded>/part-...), matching
-        // the write path exactly, with no bare ".." traversal segment.
-        string encoded = Uri.EscapeDataString(trickyValue);
-        Assert.StartsWith("region=" + encoded + "/", output.Path, StringComparison.Ordinal);
-        Assert.DoesNotContain("..", output.Path.Split('/'));
-        // Rows survive compaction and read back through the encoded path.
+        // #806: the committed add.path is URI-encoded (layer 2); its DECODE is the physical on-disk key —
+        // 'region=<escapePathName(value)>/...' (layer 1), matching the write path exactly, with no bare '..'
+        // traversal segment (escapePathName escapes '/', so a '/../' value cannot fabricate a climb).
+        string physical = Uri.UnescapeDataString(output.Path);
+        Assert.StartsWith("region=" + DeltaWriteEncoding.EscapePathName(trickyValue) + "/", physical, StringComparison.Ordinal);
+        Assert.DoesNotContain("..", physical.Split('/'));
+        // Rows survive compaction and read back through the resolver-resolved path.
         Assert.Equal(
             Sorted(new List<(long, string?)> { (1L, "a"), (2L, "b") }),
             Sorted(await ReadRowsAsync(new[] { output.Path })));
@@ -1006,7 +1008,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         foreach (AddFileAction output in after.ActiveFiles)
         {
             string region = output.PartitionValues["region"]!;
-            Assert.StartsWith($"region={region}/", output.Path, StringComparison.Ordinal);
+            Assert.StartsWith($"region={region}/", Uri.UnescapeDataString(output.Path), StringComparison.Ordinal);
 
             // Each output physically carries [id,value,extra] with extra NULL, and holds only its partition's
             // rows (no cross-partition mixing).
@@ -1212,7 +1214,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         foreach (AddFileAction output in after.ActiveFiles)
         {
             string region = output.PartitionValues["region"]!;
-            Assert.StartsWith($"region={region}/", output.Path, StringComparison.Ordinal);
+            Assert.StartsWith($"region={region}/", Uri.UnescapeDataString(output.Path), StringComparison.Ordinal);
             long[] expectedIds = region == "US" ? new long[] { 1, 2 } : new long[] { 3, 4 };
             List<(long Id, string? Value)> rows = await ReadRowsAsync(new[] { output.Path });
             Assert.All(rows, r => Assert.Contains(r.Id, expectedIds)); // no cross-partition mixing.
@@ -1866,7 +1868,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         var rows = new List<(long, string?, string?)>();
         foreach (string path in paths)
         {
-            Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
+            Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, path, CancellationToken.None);
             await using (stream)
             {
                 await foreach (ColumnBatch batch in reader.ReadAsync(
@@ -1900,7 +1902,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         var rows = new List<(long, string?, string?, string?)>();
         foreach (string path in paths)
         {
-            Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
+            Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, path, CancellationToken.None);
             await using (stream)
             {
                 await foreach (ColumnBatch batch in reader.ReadAsync(
@@ -1929,7 +1931,7 @@ public sealed class DeltaOptimizeTests : IDisposable
     // rewrote, AC3).
     private async Task<string> Sha256Async(string path)
     {
-        Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
+        Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, path, CancellationToken.None);
         await using (stream)
         {
             using var buffer = new MemoryStream();
@@ -1952,7 +1954,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         var rows = new List<(long, string?)>();
         foreach (string path in paths)
         {
-            Stream stream = await _backend.OpenReadAsync(path, CancellationToken.None);
+            Stream stream = await PartitionPathResolver.OpenReadAsync(_backend, path, CancellationToken.None);
             await using (stream)
             {
                 await foreach (ColumnBatch batch in reader.ReadAsync(stream, DataSchema, null, nullFillMissingColumns: false, allowTypeWideningPromotion: false, CancellationToken.None))

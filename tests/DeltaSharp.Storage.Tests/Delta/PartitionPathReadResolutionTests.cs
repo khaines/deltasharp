@@ -46,49 +46,61 @@ public sealed class PartitionPathReadResolutionTests : IDisposable
     [Fact]
     public async Task UnencodedAddPath_ReadsThroughResolver_NoOp()
     {
-        // (a) k_dec == k_lit: the resolver opens the literal key directly (no fallback), unchanged behavior.
+        // A simple ASCII partition value round-trips: Inc-B writes 'region%3DUS' (layer 2), the resolver
+        // decodes it to the on-disk 'region=US' key, and the rows read back.
         await WritePartitionedAsync(("US", 1L), ("US", 2L));
         List<(string Region, long Id)> rows = await ReadRowsAsync();
         Assert.Equal(new[] { ("US", 1L), ("US", 2L) }, rows.OrderBy(r => r.Id).ToArray());
     }
 
     [Fact]
-    public async Task LegacyLiteralPercentAddPath_ReadsViaLiteralFallback()
+    public async Task TwoLayerWrite_ProducesUriEncodedAddPath_ReadsViaDecode_806IncB()
     {
-        // (b) A partition VALUE containing '/', written by the current write door as an on-disk 'region=a%2Fb'
-        // with a LITERAL add.path. The resolver decodes it to 'region=a/b' (a miss) and falls back to the
-        // literal key — a naive decode-always read would corrupt this (the #806 L1 trap).
-        await WritePartitionedAsync(("a/b", 7L));
-        // Sanity: the committed add.path is the literal percent form.
+        // #806 Inc-B: the write door now emits a two-layer path — an escapePathName on-disk key (layer 1) and a
+        // Java-URI/RFC-2396 add.path (layer 2, Spark-parity). A partition value 'a/b' lands on disk as
+        // 'region=a%2Fb'; its committed add.path is 'region=a%252Fb' (the '=' separator stays literal, the
+        // layer-1 '%2F' has its '%' re-encoded to '%25'). The Inc-A resolver decodes the add.path back to the
+        // on-disk key and reads the rows (the go-forward L2 shape, interoperable with Spark/delta-rs reads).
+        await WritePartitionedAsync(("a/b", 5L));
         Snapshot snap = await LoadSnapshotAsync();
-        Assert.Contains("region=a%2Fb/", Assert.Single(snap.ActiveFiles).Path, StringComparison.Ordinal);
+        AddFileAction add = Assert.Single(snap.ActiveFiles);
+
+        // Layer 2: add.path percent-encodes the layer-1 '%' (Spark keeps the '=' separator literal).
+        Assert.Contains("region=a%252Fb/", add.Path, StringComparison.Ordinal);
+        // Layer 1: the on-disk key is the single decode of add.path.
+        string physical = Uri.UnescapeDataString(add.Path);
+        Assert.Contains("region=a%2Fb/", physical, StringComparison.Ordinal);
+        Assert.True(File.Exists(Path.Combine(_root, physical)));
+        Assert.False(File.Exists(Path.Combine(_root, add.Path))); // the encoded key is not a real on-disk path
 
         List<(string Region, long Id)> rows = await ReadRowsAsync();
         (string Region, long Id) row = Assert.Single(rows);
-        Assert.Equal(("a/b", 7L), row); // partition truth from add.partitionValues (raw 'a/b')
+        Assert.Equal(("a/b", 5L), row); // partition truth from add.partitionValues (raw 'a/b')
     }
 
     [Fact]
-    public async Task UriEncodedAddPath_ReadsViaDecode_ForwardL2Shape()
+    public async Task LegacyLiteralPercentAddPath_ReadsViaResolverFallback_806IncB()
     {
-        // (c) The go-forward L2 / Spark-delta-rs shape: the on-disk directory is 'region=US' but the committed
-        // add.path is URI-encoded ('region%3DUS'). Inc-A does not WRITE this yet (that is Inc-B), so we author
-        // it by rewriting the committed add.path to the encoded form while the file stays at 'region=US'. The
-        // resolver decodes 'region%3DUS' -> 'region=US' and opens the real file on the first try.
-        await WritePartitionedAsync(("US", 5L));
+        // A pre-#806 DeltaSharp table stored add.path LITERALLY (no layer-2 URI encoding): on-disk 'region=a%2Fb'
+        // with add.path 'region=a%2Fb'. Simulate it by rewriting the two-layer add.path back to the legacy
+        // literal form while the on-disk file stays at 'region=a%2Fb'. The resolver decodes 'region=a%2Fb' to
+        // 'region=a/b' (a miss) and falls back to the literal key — a naive decode-always read would corrupt it
+        // (the #806 L1 migration trap).
+        await WritePartitionedAsync(("a/b", 7L));
         Snapshot before = await LoadSnapshotAsync();
-        string literal = Assert.Single(before.ActiveFiles).Path;                 // region=US/part-<token>.parquet
-        string encoded = literal.Replace("=", "%3D", StringComparison.Ordinal);  // region%3DUS/part-<token>.parquet
-        Assert.NotEqual(literal, encoded);
-        RewriteCommittedAddPath(literal, encoded);
+        string encoded = Assert.Single(before.ActiveFiles).Path;   // region%3Da%252Fb/part-*
+        string legacyLiteral = Uri.UnescapeDataString(encoded);    // region=a%2Fb/part-*  (the real on-disk key)
+        Assert.NotEqual(encoded, legacyLiteral);
+        RewriteCommittedAddPath(encoded, legacyLiteral);
 
-        // The physical file is still at the literal on-disk key; only the log's add.path is now encoded.
-        Assert.True(File.Exists(Path.Combine(_root, literal)));
-        Assert.False(File.Exists(Path.Combine(_root, encoded)));
+        // On disk unchanged; the committed add.path is now the legacy literal.
+        Assert.True(File.Exists(Path.Combine(_root, legacyLiteral)));
+        Snapshot after = await LoadSnapshotAsync();
+        Assert.Equal(legacyLiteral, Assert.Single(after.ActiveFiles).Path);
 
         List<(string Region, long Id)> rows = await ReadRowsAsync();
         (string Region, long Id) row = Assert.Single(rows);
-        Assert.Equal(("US", 5L), row);
+        Assert.Equal(("a/b", 7L), row); // read via decoded-miss -> literal fallback; raw 'a/b' from partitionValues
     }
 
     // ---- helpers ---------------------------------------------------------------------------------
