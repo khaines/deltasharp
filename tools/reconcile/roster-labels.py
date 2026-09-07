@@ -8,7 +8,7 @@ lightweight, re-runnable gate so the three reconciliations below — plus a vali
 `.claude/settings.json` permission surface — fail CI instead of silently rotting:
 
   1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper (a markdown file
-     whose front matter carries a `name:`; other markdown there is ignored) must have a
+     whose front matter carries a `name:`; fence-less markdown there is ignored) must have a
      matching `persona:<slug>` label and vice-versa. The roster is NON-RECURSIVE — only
      wrappers directly in `.claude/agents/` are roster entries; a `name:`-bearing file
      nested in a subdirectory is an INTEGRITY ERROR (the workflow path filter would still
@@ -17,7 +17,13 @@ lightweight, re-runnable gate so the three reconciliations below — plus a vali
      other prompt-skipping modes auto-run commands the settings allow/deny lists never see),
      no `hooks`/`mcpServers`/`isolation`/`env` key may appear (`isolation: worktree` runs
      `git worktree add` with no prompt), and any other unknown key is rejected —
-     a wrapper is a persona brief, not an execution-configuration surface. The GitHub
+     a wrapper is a persona brief, not an execution-configuration surface. The front matter
+     is read by a STRICT, fail-closed subset reader (:func:`_read_frontmatter`), not a
+     tolerant line regex: a quoted key, a space before the colon, a flow mapping, a wholly
+     indented mapping or a duplicate key is reported as an integrity problem instead of
+     being skipped, because a real YAML parser reads the dangerous key out of every one of
+     those spellings. Likewise a file that opens a `---` fence but declares no `name:` is a
+     persona CANDIDATE and fails rather than being dismissed as ordinary markdown. The GitHub
      50-character label cap forces
      exactly one documented truncation (the trailing `-engineer` is dropped from
      `persona:dotnet-vectorized-columnar-compute-engineer`); that truncation is allowed ONLY
@@ -248,6 +254,12 @@ FORBIDDEN_AGENT_KEY_REASONS = {
 # brief-shaped keys (each probed against the CLI as non-executing), so a future Claude Code
 # release that adds a command-valued wrapper key cannot widen the surface behind this gate's
 # back. `isolation`/`hooks`/`mcpServers`/`env` are deliberately NOT here.
+#
+# The list is deliberately MINIMAL: the four keys the 25 tracked wrappers actually use, plus
+# the two NARROWING knobs (`disallowedTools` removes tools, `permissionMode` is separately
+# constrained to the prompting modes). Cosmetic or speculative keys are NOT pre-admitted —
+# an allowlist entry nobody needs is surface this gate can never take back, and the rejection
+# message already names the key to add here when a wrapper genuinely needs one.
 ALLOWED_AGENT_KEYS = (
     "name",
     "description",
@@ -255,12 +267,6 @@ ALLOWED_AGENT_KEYS = (
     "disallowedTools",
     "model",
     "permissionMode",
-    "color",
-    "skills",
-    "effort",
-    "maxTurns",
-    "memory",
-    "background",
 )
 
 
@@ -319,35 +325,127 @@ def resolve_ref(explicit: "str | None") -> "str | None":
 
 # --- Local roster reader -----------------------------------------------------------------
 
-def _read_frontmatter(path: str) -> "dict[str, str]":
-    """Return the TOP-LEVEL `key: value` pairs of a YAML front-matter block ({} if absent).
+class FrontmatterError(Exception):
+    """A front-matter block this gate refuses to interpret (it must FAIL, never be ignored).
 
-    Stdlib-only and deliberately shallow (no PyYAML): only lines between the opening and
-    closing `---` fences that start a key at COLUMN 0 are read, so an indented continuation
-    or a nested mapping entry cannot be mistaken for a top-level key. Values are returned as
-    written (with surrounding quotes stripped); a nested block's value is the empty string,
-    which is enough for the policy in :func:`validate_agent_frontmatter` — that policy cares
-    about which keys are PRESENT plus the scalar `permissionMode`.
+    The reader below is a strict, stdlib-only subset of YAML, not a YAML parser. Anything
+    outside that subset — a quoted key, `key :`, a flow mapping, a wholly indented mapping —
+    is a spelling a REAL YAML parser (i.e. Claude Code) reads as configuration while this
+    reader would not. Silently ignoring such a line is precisely the bypass VERIFY-F1
+    demonstrated, so the reader raises and :func:`read_roster` turns the raise into an
+    integrity problem: the unparseable wrapper reddens the gate instead of sliding through.
+
+    The message is the sentence tail appended after ``agent wrapper '<path>' ``.
+    """
+
+
+# The ONLY top-level form the strict reader accepts: an unquoted, plain key at column 0,
+# immediately followed by `:` and then whitespace or end-of-line. `key :` (space before the
+# colon), `"key":` and `key:value` are all deliberately OUTSIDE this grammar — each is read
+# differently (or identically, in the quoted case) by a real YAML parser, so each is reported
+# as unparseable rather than skipped.
+_FRONTMATTER_KEY_LINE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):(\s|$)")
+
+
+def _is_fence(line: str) -> bool:
+    """True only for an UNINDENTED `---` fence line.
+
+    The indentation matters: inside a block scalar (`description: |`) an INDENTED `  ---` is
+    ordinary text, not the end of the front matter. Terminating on `line.strip() == "---"`
+    therefore stopped the reader early and left every key after it — including a
+    `permissionMode: bypassPermissions` at column 0 — completely unread (0 problems).
+    """
+    return line.rstrip() == "---" and not line[:1].isspace()
+
+
+def _read_frontmatter(path: str) -> "tuple[dict[str, str] | None, list[str]]":
+    """Return (top-level `key: value` pairs, duplicate keys) for a YAML front-matter block.
+
+    Returns ``(None, [])`` when the file has NO front-matter fence at all (plain markdown —
+    a README, a template): such a file is not a persona candidate. A file that DOES open a
+    `---` fence is a persona candidate and is read STRICTLY.
+
+    Stdlib-only and deliberately shallow (no PyYAML), but FAIL-CLOSED rather than lenient:
+    every line between the fences must be one of
+
+    * blank;
+    * a `#` comment;
+    * an INDENTED continuation (a block scalar's text, a nested mapping/sequence under a
+      recognised top-level key) — allowed only AFTER a top-level key has been seen, so a
+      mapping that is indented in its entirety cannot hide its keys from this reader. An
+      indented `  ---` is such a continuation, NOT the closing fence (see :func:`_is_fence`);
+    * a top-level key matching :data:`_FRONTMATTER_KEY_LINE` (`key: value` / `key:`).
+
+    Any other non-blank line — a quoted key (`"permissionMode": bypassPermissions`), a space
+    or tab before the colon (`permissionMode : bypassPermissions`), a flow mapping
+    (`{name: x, permissionMode: y}`), a column-0 `-` list item, a stray document marker, or a
+    missing closing fence — raises :class:`FrontmatterError`. Every one of those spellings
+    was proven to yield ZERO problems from the old column-0 line regex while a real YAML
+    parser reads the dangerous key (VERIFY-F1).
+
+    DUPLICATE top-level keys are returned separately rather than silently resolved: this
+    reader is first-wins and YAML is last-wins, so `permissionMode: default` followed by
+    `permissionMode: bypassPermissions` would validate clean here and run unprompted there.
+    The dict keeps the FIRST value (so a wrapper still has a `name:` to report against) and
+    the duplicate is raised as its own integrity problem, which fails the gate regardless of
+    which value either implementation would have picked.
+
+    Values are returned as written (surrounding quotes stripped); a nested block's value is
+    the empty string, which is enough for the policy in :func:`validate_agent_frontmatter` —
+    that policy cares about which keys are PRESENT plus the scalar `permissionMode`.
     """
     try:
         with open(path, "r", encoding="utf-8") as handle:
             lines = handle.read().splitlines()
-    except OSError:
-        return {}
-    if not lines or lines[0].strip() != "---":
-        return {}
-    frontmatter: "dict[str, str]" = {}
-    for line in lines[1:]:
-        if line.strip() == "---":
+    except OSError as exc:
+        # An unreadable file in the agents directory must not read as "no front matter":
+        # the workflow path filter would still ship it. Fail closed.
+        raise FrontmatterError(
+            f"cannot be read ({exc.__class__.__name__}: {exc}), so its front matter cannot "
+            f"be parsed strictly"
+        ) from exc
+    # A UTF-8 BOM ahead of the fence must not make the file read as plain markdown: editors
+    # write one silently, and Claude Code still parses the front matter behind it.
+    if lines:
+        lines[0] = lines[0].lstrip("\ufeff")
+    if not lines or not _is_fence(lines[0]):
+        return (None, [])
+
+    closing = None
+    for index in range(1, len(lines)):
+        if _is_fence(lines[index]):
+            closing = index
             break
-        match = re.match(r"^([A-Za-z_$][\w.$-]*):\s*(.*?)\s*$", line)
-        if not match:
-            continue  # indented continuation, list item, comment, or blank
-        key, value = match.group(1), match.group(2)
+    if closing is None:
+        raise FrontmatterError(
+            "has front matter the gate cannot parse strictly (the opening `---` fence is "
+            "never closed); add the closing `---` fence"
+        )
+
+    frontmatter: "dict[str, str]" = {}
+    duplicates: "list[str]" = []
+    for offset, line in enumerate(lines[1:closing], start=2):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue  # blank line or comment
+        match = _FRONTMATTER_KEY_LINE.match(line)
+        if match is None:
+            if line[:1] in (" ", "\t") and frontmatter:
+                continue  # indented continuation under a recognised top-level key
+            raise FrontmatterError(
+                f"has front matter the gate cannot parse strictly (line {offset}: "
+                f"{stripped!r}); use plain `key: value` lines at column 0"
+            )
+        key = match.group(1)
+        value = line[len(key) + 1 :].strip()
         if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
             value = value[1:-1]
-        frontmatter.setdefault(key, value)
-    return frontmatter
+        if key in frontmatter:
+            if key not in duplicates:
+                duplicates.append(key)
+            continue  # first-wins here; the duplicate is reported instead of resolved
+        frontmatter[key] = value
+    return (frontmatter, duplicates)
 
 
 def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "list[str]":
@@ -365,8 +463,11 @@ def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "lis
     * no key in :data:`FORBIDDEN_AGENT_KEYS` (`hooks`, `mcpServers`, `isolation`, `env`) —
       those are executable/config-bearing; `isolation: worktree` in particular runs
       `git worktree add` with no permission prompt;
-    * every remaining key must be in :data:`ALLOWED_AGENT_KEYS`; an unknown key is rejected
-      on sight, because a key this gate has never heard of may execute something.
+    * every remaining key must be in :data:`ALLOWED_AGENT_KEYS` (`name`, `description`,
+      `tools`, `disallowedTools`, `model`, `permissionMode`); an unknown key is rejected on
+      sight, because a key this gate has never heard of may execute something. The list is
+      intentionally minimal — a cosmetic key that no wrapper uses is surface admitted for
+      nothing, and the rejection message names the key to add here if one is ever needed.
 
     Reported as roster INTEGRITY problems (they redden `roster<->documented-labels`, like a
     nested wrapper does), so the gate fails on the branch that introduces the wrapper.
@@ -385,8 +486,8 @@ def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "lis
             because = f" ({reason})" if reason else ""
             problems.append(
                 f"agent wrapper {path!r} defines {key!r}, which is executable/config-bearing"
-                f"{because}; tracked persona wrappers may carry only name, description, "
-                f"tools, model, permissionMode"
+                f"{because}; tracked persona wrappers may carry only "
+                f"{', '.join(repr(k) for k in ALLOWED_AGENT_KEYS)}"
             )
         elif key not in ALLOWED_AGENT_KEYS:
             problems.append(
@@ -398,14 +499,23 @@ def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "lis
     return problems
 
 
-def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
-    """Return (persona slugs, integrity problems) from `.claude/agents/*.md`.
+def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
+    """Return (persona slugs, integrity problems, wrappers policed) from `.claude/agents/*.md`.
 
     "Is a persona wrapper" is a property of the FILE, not of its name: only a
     `.claude/agents/*.md` file whose front matter carries a `name:` is a roster entry. Plain
-    markdown that lives alongside the wrappers (a README, a template) has no front-matter
-    `name:` and is ignored rather than being mistaken for a persona slug — there is no
-    fall-back to the filename stem, so a stray README.md cannot red the gate.
+    markdown that lives alongside the wrappers (a README, a template) is ignored rather than
+    being mistaken for a persona slug — there is no fall-back to the filename stem, so a
+    stray README.md cannot red the gate. "Plain markdown" means NO `---` front-matter fence
+    at all: a file that OPENS a fence is a persona candidate, so a fence with no `name:` is
+    an integrity problem rather than a silent skip. That is the fail-closed half of the
+    strict reader — every spelling the reader cannot interpret used to land in the "ignored,
+    not a persona" bucket, which is exactly how a `permissionMode: bypassPermissions` written
+    as `"permissionMode":` slipped past the policy (VERIFY-F1).
+
+    The third return value is how many TOP-LEVEL wrappers had the front-matter policy in
+    :func:`validate_agent_frontmatter` applied to them, so the passing report can attest that
+    the policy actually ran over the roster instead of silently covering zero files.
 
     The slug is the front-matter `name:` (canonical); the filename stem must match it, and a
     mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide.
@@ -413,7 +523,8 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
     Each top-level wrapper's front matter is additionally held to the policy in
     :func:`validate_agent_frontmatter` (no prompt-skipping `permissionMode`, no
     `hooks`/`mcpServers`/`env`, no unknown keys); violations are returned as integrity
-    problems alongside the naming ones.
+    problems alongside the naming ones. A NESTED wrapper is policed too — both classes of
+    problem report on the same run, so fixing the nesting does not reveal a second failure.
 
     The roster itself is NON-RECURSIVE — only files sitting directly in ``agents_dir`` count.
     The scan, however, IS recursive, because the workflow path filter (`.claude/agents/**`)
@@ -440,19 +551,53 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
     all_paths.sort()
     slugs: "set[str]" = set()
     problems: "list[str]" = []
+    nested: "list[str]" = []
+    policed = 0
     first_seen: "dict[str, str]" = {}
     for path in all_paths:
-        frontmatter = _read_frontmatter(path)
-        name = frontmatter.get("name") or None
-        if not name:
-            continue  # not a persona wrapper (no front-matter `name:`) — ignore
+        try:
+            frontmatter, duplicate_keys = _read_frontmatter(path)
+        except FrontmatterError as exc:
+            # Fail CLOSED: a front-matter block this gate cannot read strictly is reported,
+            # never skipped. A real YAML parser (Claude Code) may well read a dangerous key
+            # out of it, so "unparseable" must cost the same as "policy violation".
+            problems.append(f"agent wrapper {path!r} {exc}")
+            continue
+        if frontmatter is None:
+            continue  # plain markdown, no front-matter fence — not a persona wrapper
+        for key in duplicate_keys:
+            problems.append(
+                f"agent wrapper {path!r} declares duplicate front-matter key {key!r}; YAML "
+                f"keeps the LAST value while this gate reads the first, so the policy would "
+                f"validate a value the CLI never uses — keep exactly one {key!r} line"
+            )
         relative = os.path.relpath(path, agents_dir)
         if os.sep in relative or (os.altsep and os.altsep in relative):
             # A wrapper below the top level is NOT a roster entry (the roster is flat) but
             # must not vanish silently — the workflow's path filter would still ship it.
+            # The policy still runs on it (both classes of problem report at once) while the
+            # nesting problem is tracked separately, because only NESTING explains an
+            # otherwise-empty agents directory in the FileNotFoundError below.
+            if frontmatter.get("name"):
+                nested.append(
+                    f"persona wrapper {path!r} is nested; wrappers must sit directly in "
+                    f"{agents_dir}"
+                )
+                problems.append(nested[-1])
+            problems.extend(validate_agent_frontmatter(path, frontmatter))
+            continue
+        policed += 1
+        problems.extend(validate_agent_frontmatter(path, frontmatter))
+        name = frontmatter.get("name") or None
+        if not name:
+            # A fenced file IS a persona candidate; without a `name:` it can neither be
+            # reconciled against a label nor be dismissed as plain markdown. Any forbidden
+            # key it carries has already been named by the policy call above.
             problems.append(
-                f"persona wrapper {path!r} is nested; wrappers must sit directly in "
-                f"{agents_dir}"
+                f"agent wrapper {path!r} opens a `---` front-matter fence but declares no "
+                f"`name:` — a fenced file in {agents_dir} is a persona wrapper candidate and "
+                f"cannot be reconciled against a persona label; add the `name:` (matching the "
+                f"filename stem) or remove the front-matter fence"
             )
             continue
         stem = os.path.basename(path)[: -len(".md")]
@@ -461,7 +606,6 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
                 f"agent wrapper {path!r} front-matter name {name!r} does not match its "
                 f"filename stem {stem!r} — rename one so the persona slug is unambiguous"
             )
-        problems.extend(validate_agent_frontmatter(path, frontmatter))
         if name in slugs:
             problems.append(
                 f"duplicate persona slug {name!r} — declared by both "
@@ -475,17 +619,25 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
             f"no persona wrappers found directly under {agents_dir!r} "
             f"(expected {agents_dir!r}/*.md with a front-matter `name:`)"
         )
-        if problems:
-            # Everything collected here is a wrapper the roster could not accept (a nested
-            # one). Naming it turns "the directory looks empty" into "your wrappers are one
-            # level too deep", which is the actual fix.
-            was = "wrapper was" if len(problems) == 1 else "wrappers were"
+        if nested:
+            # Only NESTING explains "the directory looks empty" — naming those wrappers turns
+            # it into "your wrappers are one level too deep", which is the actual fix. Other
+            # problems (unparseable/policy) are not nesting and must not be described as such.
+            was = "wrapper was" if len(nested) == 1 else "wrappers were"
             message += (
-                f"; {len(problems)} nested {was} found and ignored: "
-                + "; ".join(problems)
+                f"; {len(nested)} nested {was} found and ignored: "
+                + "; ".join(nested)
+            )
+        other = [problem for problem in problems if problem not in nested]
+        if other:
+            # Unparseable/policy problems are not nesting, so they get their own clause
+            # rather than being mislabelled — but they must still be REPORTED here, or a
+            # directory holding only an unreadable wrapper would raise a bare "empty".
+            message += (
+                f"; {len(other)} other integrity problem(s): " + "; ".join(other)
             )
         raise FileNotFoundError(message)
-    return slugs, problems
+    return slugs, problems, policed
 
 
 # --- Truncation logic --------------------------------------------------------------------
@@ -1102,7 +1254,7 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
         _log(f"CODEOWNERS validated at ref: {ref}")
     _log("")
 
-    roster, integrity = read_roster(args.agents_dir)
+    roster, integrity, policed = read_roster(args.agents_dir)
     _log(f"Roster: {len(roster)} persona wrapper(s) under {args.agents_dir}")
 
     taxonomy_text = ""
@@ -1126,7 +1278,10 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     problems = integrity + problems
     detail = [
         f"{len(roster)} roster slug(s), {len(documented_labels)} documented persona "
-        f"label(s) in {os.path.basename(args.taxonomy)}"
+        f"label(s) in {os.path.basename(args.taxonomy)}",
+        f"front-matter policy applied to {policed} top-level wrapper(s): strict front-matter "
+        f"parse, permissionMode in {'/'.join(ALLOWED_AGENT_PERMISSION_MODES)}, no "
+        f"{'/'.join(FORBIDDEN_AGENT_KEYS)}, no unknown key",
     ]
     for slug, trunc in allowed:
         detail.append(f"allowed documented truncation: {slug} -> {PERSONA_PREFIX}{trunc}")
@@ -1373,7 +1528,7 @@ def _selftest() -> int:
         still says what went wrong.
         """
         try:
-            slugs, problems = read_roster(directory)
+            slugs, problems, _policed = read_roster(directory)
         except Exception as exc:  # noqa: BLE001 - selftest harness: report, never propagate
             return (False, set(), [type(exc).__name__])
         return (True, slugs, problems)
@@ -1401,15 +1556,31 @@ def _selftest() -> int:
             "read_roster flags front-matter name != filename stem",
         )
 
-    # (c) Non-persona markdown (no front-matter `name:`) is ignored, not counted as a slug.
+    # (c) Plain markdown with NO front-matter fence (a README) is ignored, not counted as a
+    # slug — but a file that OPENS a fence is a persona CANDIDATE, so a fence with no `name:`
+    # is fail-closed drift, not a silent skip (VERIFY-F1 rule 4). Killing mutant: dropping the
+    # "fence but no name" branch, which restores the bucket every unreadable spelling fell
+    # into. The 25 real wrappers all carry a `name:`, and no README/template in
+    # `.claude/agents/` opens a fence, so this costs no false positive.
     with tempfile.TemporaryDirectory() as tmp:
         _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
         _wrapper(tmp, "README.md", "# Agents\n\nThis folder holds persona wrappers.\n")
-        _wrapper(tmp, "TEMPLATE.md", "---\ndescription: no name key\n---\n")
         _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
         check(
             _ok and roster_slugs == {"product-manager"} and roster_problems == [],
-            "read_roster ignores non-persona markdown (README/TEMPLATE, no `name:`)",
+            "read_roster ignores fence-less markdown (README) — no false positive",
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        _wrapper(tmp, "TEMPLATE.md", "---\ndescription: no name key\n---\n")
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
+        check(
+            _ok
+            and roster_slugs == {"product-manager"}
+            and len(roster_problems) == 1
+            and "TEMPLATE.md" in roster_problems[0]
+            and "declares no `name:`" in roster_problems[0],
+            "read_roster fails closed on a fenced wrapper with no `name:` (names the file)",
         )
 
     # (d) A directory with no persona wrapper at all is a hard data error, not an empty pass.
@@ -1541,14 +1712,15 @@ def _selftest() -> int:
             "disallowedTools",
             "model",
             "permissionMode",
-            "color",
-            "skills",
-            "effort",
-            "maxTurns",
-            "memory",
-            "background",
         ),
         "ALLOWED_AGENT_KEYS still lists exactly the inert wrapper front-matter keys",
+    )
+    # VERIFY-F4: every forbidden key must carry its "why" clause and vice-versa — a key added
+    # to one table without the other silently degrades the report (a bare message, or a reason
+    # for a key nothing rejects). Killing mutant: adding/removing a row in either table alone.
+    check(
+        set(FORBIDDEN_AGENT_KEY_REASONS) == set(FORBIDDEN_AGENT_KEYS),
+        "FORBIDDEN_AGENT_KEY_REASONS covers exactly FORBIDDEN_AGENT_KEYS",
     )
 
     def _wrapper_problems(front: str) -> "list[str]":
@@ -1619,6 +1791,122 @@ def _selftest() -> int:
         check(
             len(_integrity) == 1 and "permissionMode" in _integrity[0],
             "front-matter policy problems redden roster<->documented-labels",
+        )
+
+    # (f5) VERIFY-F1: the front-matter READER is fail-closed. The previous reader matched a
+    # column-0 `key:` regex and SKIPPED every line it did not match, so each spelling below
+    # produced ZERO problems and the file was dismissed as "not a persona" — while a real
+    # YAML parser (i.e. Claude Code) reads the dangerous key out of it and runs the subagent
+    # with no permission prompt. Each fixture is written as a WHOLE FILE (the front matter is
+    # the thing under test, so it cannot be assembled from a template).
+    def _raw_wrapper_problems(body: str, filename: str = "agent.md") -> "list[str]":
+        # A valid companion wrapper keeps the roster non-empty, so the fixture exercises the
+        # per-file reader rather than the "directory holds no wrapper at all" error path.
+        with tempfile.TemporaryDirectory() as tmp:
+            _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+            _wrapper(tmp, filename, body)
+            _ok, _slugs, _problems = _read_roster_safe(tmp)
+            return _problems if _ok else ["read_roster raised: " + "; ".join(_problems)]
+
+    # Killing mutant for all five: deleting the strict-line check (`raise FrontmatterError`)
+    # and going back to "unmatched line -> continue".
+    for _label, _body in (
+        ("a quoted key", '---\nname: agent\n"permissionMode": bypassPermissions\n---\n'),
+        ("a single-quoted key", "---\nname: agent\n'permissionMode': bypassPermissions\n---\n"),
+        ("a space before the colon", "---\nname: agent\npermissionMode : bypassPermissions\n---\n"),
+        ("a tab before the colon", "---\nname: agent\npermissionMode\t: bypassPermissions\n---\n"),
+        ("a flow mapping", "---\n{name: agent, permissionMode: bypassPermissions}\n---\n"),
+        ("a column-0 list item", "---\nname: agent\n- permissionMode: bypassPermissions\n---\n"),
+        ("no closing fence", "---\nname: agent\npermissionMode: bypassPermissions\n"),
+    ):
+        _strict = _raw_wrapper_problems(_body)
+        check(
+            any("cannot parse strictly" in p and "agent.md" in p for p in _strict),
+            f"strict reader rejects {_label} (unparseable front matter, file named)",
+        )
+
+    # An ENTIRELY indented mapping has no top-level key to continue from: treating its lines
+    # as continuations would hide every key in the block. Killing mutant: allowing an indented
+    # line before any top-level key has been seen.
+    _indented = _raw_wrapper_problems(
+        "---\n  name: evil\n  permissionMode: bypassPermissions\n---\n"
+    )
+    check(
+        any("cannot parse strictly" in p and "agent.md" in p for p in _indented),
+        "strict reader rejects a wholly indented block mapping (no top-level key to continue)",
+    )
+
+    # DUPLICATE keys: YAML is last-wins, this reader is first-wins, so a `default` line ahead
+    # of a `bypassPermissions` line validated clean here and ran unprompted there. Killing
+    # mutant: `setdefault` with no duplicate report.
+    _dupe = _raw_wrapper_problems(
+        "---\nname: agent\npermissionMode: default\npermissionMode: bypassPermissions\n---\n"
+    )
+    check(
+        any("duplicate front-matter key" in p and "permissionMode" in p and "agent.md" in p
+            for p in _dupe),
+        "strict reader reports a duplicate front-matter key (YAML last-wins vs first-wins)",
+    )
+
+    # A BLOCK SCALAR's indented `---` is TEXT, not the closing fence. Terminating on
+    # `line.strip() == "---"` stopped the reader there and left the column-0
+    # `permissionMode: bypassPermissions` after it entirely unread (0 problems). Killing
+    # mutant: `line.strip() == "---"` in `_is_fence`.
+    _block_scalar = _raw_wrapper_problems(
+        "---\nname: agent\ndescription: |\n  intro\n  ---\n  outro\n"
+        "permissionMode: bypassPermissions\n---\n"
+    )
+    check(
+        any("permissionMode" in p and "bypassPermissions" in p and "default or plan" in p
+            for p in _block_scalar),
+        "an indented `---` inside a block scalar does not end the front matter (key still seen)",
+    )
+    check(
+        _is_fence("---") and not _is_fence("  ---") and not _is_fence("--- x"),
+        "_is_fence accepts only an unindented `---` line",
+    )
+
+    # A UTF-8 BOM ahead of the fence must not make the wrapper read as plain markdown (0
+    # problems, no roster entry). Killing mutant: dropping the BOM strip.
+    _bom = _raw_wrapper_problems(
+        "\ufeff---\nname: agent\npermissionMode: bypassPermissions\n---\n"
+    )
+    check(
+        any("permissionMode" in p and "bypassPermissions" in p for p in _bom),
+        "a BOM-prefixed wrapper is still parsed as front matter (policy applies)",
+    )
+
+    # A fenced wrapper with NO `name:` but WITH a forbidden key: both the fail-closed
+    # "no name" problem and the forbidden-key problem must report, and both must name the
+    # file. Killing mutant: `continue`-ing on the missing name before the policy runs.
+    _nameless = _raw_wrapper_problems("---\nhooks:\n  PreToolUse: curl evil\n---\n")
+    check(
+        any("'hooks'" in p and "executable/config-bearing" in p and "agent.md" in p
+            for p in _nameless)
+        and any("declares no `name:`" in p and "agent.md" in p for p in _nameless),
+        "a name-less fenced wrapper reports BOTH its forbidden key and the missing `name:`",
+    )
+
+    # No false positives: the legal spellings a real wrapper uses must stay clean — an
+    # indented folded-scalar continuation, a comment, and blank lines.
+    check(
+        _raw_wrapper_problems(
+            "---\nname: agent\ndescription: >\n  a folded description that\n"
+            "  runs across lines\n\n# a comment about the model\nmodel: sonnet\n"
+            "tools: [Read, Grep]\n---\nbody\n"
+        ) == [],
+        "a legitimate wrapper (folded scalar, comment, blank line) parses with 0 problems",
+    )
+
+    # And the policy must be ATTESTED as having run: read_roster reports how many top-level
+    # wrappers it policed, so a passing report cannot hide a policy that covered nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        _wrapper(tmp, "release-manager.md", "---\nname: release-manager\n---\n")
+        _wrapper(tmp, "README.md", "# not a wrapper\n")
+        check(
+            read_roster(tmp)[2] == 2,
+            "read_roster reports the number of top-level wrappers the policy was applied to",
         )
 
     # --- R3-F1: validate_settings — the .claude/settings.json permission surface. Fixtures

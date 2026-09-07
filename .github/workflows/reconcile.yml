@@ -25,10 +25,10 @@ name: Reconcile
 #                          permissions.additionalDirectories are rejected by name, and any
 #                          defaultMode outside default/plan is rejected (bypassPermissions/
 #                          dontAsk skip every prompt; acceptEdits auto-approves writes).
-#                          In `allow`
-#                          it rejects the enumerated mutating git/gh prefixes in
-#                          FORBIDDEN_ALLOW_COMMANDS (`gh api`, `git push`, `gh pr merge`, ...
-#                          compared CASE-INSENSITIVELY, including via a broad `Bash(gh:*)`)
+#                          In `allow` it rejects the enumerated mutating git/gh
+#                          prefixes in FORBIDDEN_ALLOW_COMMANDS (`gh api`, `git push`,
+#                          `gh pr merge`, ... compared CASE-INSENSITIVELY, including
+#                          via a broad `Bash(gh:*)`)
 #                          and any wildcard or TOOL-WIDE Bash grant (`Bash`, `Bash()`,
 #                          `Bash(*)`, `Bash(gh *)` — an unescaped `*` is matched as a GLOB).
 #                          It also requires every deny entry. Allow entries outside those
