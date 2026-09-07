@@ -127,12 +127,21 @@ tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md`, `.claude/Settings.local.jso
 or `.mcp.jſon` (U+017F) materialises at the path the CLI reads, so it fails as
 "rename it" whatever its index mode — and "is it tracked?" is asked of the
 checked-out path the same way, so a committed `.claude/Settings.local.json` is not
-filed as harmless per-machine state. The `.claude` question is asked by all three
-local checks, so a finding there is named wherever the reader looks (`.mcp.json` is
-owned by `tracked-startup-config`). Git's answer must also *cover* what the walks
-read: a path outside the work tree git answered from, a directory holding files no
-index entry folds under (an export dropped inside an enclosing checkout), and a
-sparse index are all *unverified*, not clean.
+filed as harmless per-machine state. The same fold decides file *names*, in the
+walks as well as the index: `.claude/skills/<x>/ſkill.md` is the manifest APFS
+resolves `SKILL.md` to and the CLI loads, so it is scanned like any other manifest
+and the index may hold only the canonical `SKILL.md` spelling. The `.claude`
+question is asked by all three local checks, so a finding there is named wherever
+the reader looks (`.mcp.json` is owned by `tracked-startup-config`). Git's answer
+must also *cover* what the walks read: a path outside the work tree git answered
+from, and a `.claude` whose checkout tracks nothing at or under any policed child
+(an export dropped inside an enclosing checkout) are *unverified*, not clean —
+while an untracked subtree inside a `.claude` that checkout *does* own is ordinary
+work in progress, so it is walked, policed and noted rather than skipped. A tracked
+path whose bytes are not valid UTF-8 is reported rather than decoded, and a
+collapsed sparse-index entry, should git ever return one, is unverified too: git
+≥2.35 expands a sparse index for `ls-files`, so that branch is defence in depth
+rather than a shape seen in practice.
 The CLI follows such a link; the gate's walks deliberately do not, so
 it would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
 `mcpServers[*].command` is started when the CLI launches, before any tool call and

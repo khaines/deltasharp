@@ -256,13 +256,24 @@ of three reconciliations or the three local validations (`settings-permissions`,
    `.lower()` sees) materialises at the path the CLI reads, so it fails as "rename it"
    whatever its index mode — and "is it tracked?" is asked of the checked-out path the
    same way, so a committed `.claude/Settings.local.json` is not filed as harmless
-   per-machine state. All three local checks ask the `.claude` question — over
-   `.claude` and its policed children, never over the whole repository, with
-   `.mcp.json` owned by `tracked-startup-config` — so a finding is reported wherever
-   the reader looks, once per check. Git's answer must also COVER what the walks read:
-   a path outside the work tree git answered from, a directory holding files no index
-   entry folds under (an export dropped inside an enclosing checkout), a sparse index,
-   and an index git cannot read are all unverified rather than clean. The walks
+   per-machine state. The same fold decides file **names**, in the walks as well as
+   the index: a manifest committed as `.claude/skills/<x>/ſkill.md` is what APFS
+   resolves `SKILL.md` to and what the CLI loads, so it is scanned like any other
+   manifest and the index may hold only the canonical `SKILL.md` spelling; a tracked
+   path whose bytes are not valid UTF-8 is reported rather than decoded. All three
+   local checks ask the `.claude` question — over `.claude` and its policed children,
+   never over the whole repository, with `.mcp.json` owned by
+   `tracked-startup-config` — so a finding is reported wherever the reader looks, once
+   per check, and a spelling the checkout merges into a policed path is reported as
+   the collision it is rather than twice. Git's answer must also COVER what the walks
+   read: a path outside the work tree git answered from, a `.claude` whose checkout
+   tracks nothing at or under any policed child (an export dropped inside an enclosing
+   checkout), and an index git cannot read are unverified rather than clean, while an
+   untracked subtree inside a `.claude` that checkout does own is walked, policed and
+   noted rather than skipped (`git add` is the remedy there, not "run inside the
+   checkout"); a collapsed sparse-index entry is unverified too, should git ever
+   return one — git ≥2.35 expands a sparse index for `ls-files`, so that branch is
+   defence in depth rather than a shape seen in practice. The walks
    report any link they meet as well (the directory roots themselves, and every file
    entry whatever its name), so the rule still holds where git cannot be asked; links
    are never followed (a loop would hang the gate), and if git cannot answer at all the

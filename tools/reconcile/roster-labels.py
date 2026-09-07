@@ -804,6 +804,39 @@ def _case_collision_problem(path: str, expected: str) -> str:
     )
 
 
+def _display_path(path: str) -> str:
+    """`path` rendered so it can be PRINTED (surrogate escapes become U+FFFD, never raise).
+
+    Index paths reach this file surrogate-escaped (:func:`_ls_files`), and writing a lone
+    surrogate to stdout raises :exc:`UnicodeEncodeError` — which would turn a finding into a
+    crash at the very moment the gate has something to say.
+    """
+    return path.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+
+
+def _is_undecodable(path: str) -> bool:
+    """True when `path` carries surrogate escapes, i.e. bytes that are not valid UTF-8."""
+    return any("\udc80" <= char <= "\udcff" for char in path)
+
+
+def _undecodable_problem(path: str) -> str:
+    """The message for a tracked path under a policed tree whose bytes are not UTF-8.
+
+    Reported rather than tolerated (PR-901 addendum 2). Such an entry is legal in the index
+    and on ext4; what it is not is comparable — this gate, the CLI's own globs, and the
+    reviewer reading the diff each see a different name for it, and on a checkout that folds
+    names it may materialise as one the CLI loads. "Cannot be named reliably" is a finding,
+    so it fails CLOSED instead of passing through as an ordinary file.
+    """
+    return _LinkMessage(
+        f"{_display_path(path)!r} is tracked under a policed `.claude` tree but its bytes are "
+        f"not valid UTF-8; no walk, glob or review can name it reliably and a folding "
+        f"checkout may merge it into a name Claude Code loads — rename it to a UTF-8 spelling",
+        path,
+        "encoding",
+    )
+
+
 def _fold(name: str) -> str:
     """The ONE key two spellings that name the SAME checked-out path share (PR-901 RT-2).
 
@@ -846,6 +879,8 @@ def _index_finding_problem(kind: str, detail: str, path: str) -> str:
     """Render one :func:`_index_findings` tuple as the message an operator reads."""
     if kind == "case":
         return _case_collision_problem(path, detail)
+    if kind == "encoding":
+        return _undecodable_problem(path)
     return _tracked_link_problem(detail, path)
 
 
@@ -872,6 +907,21 @@ def _query_anchor(absolute: "list[str]") -> str:
     return os.path.dirname(base) or os.curdir
 
 
+# Cache of `git ls-files` answers, keyed by the work-tree root, so the several checks that
+# each ask about `.claude` spend ONE subprocess per repository per run (PR-901 SRE L-2). A
+# ``None`` (git could not answer) is cached like any other answer: the failure is a property
+# of the repository/index, not of which caller asked, and re-asking would only turn one
+# honest "unverified" into a flaky mix of verdicts within a single report.
+_LS_FILES_CACHE: "dict[str, list[tuple[str, str]] | None]" = {}
+
+# The cache is correct for a RUN of this gate — a one-shot process that never writes to an
+# index — and wrong for the SELF-TEST, which builds fixture repositories and stages files into
+# them BETWEEN queries in one process. The self-test therefore turns it off and exercises the
+# caching path in one dedicated assertion instead of silently reading stale listings
+# everywhere (PR-901 SRE L-2).
+_LS_FILES_CACHE_ENABLED = True
+
+
 def _ls_files(top: str) -> "list[tuple[str, str]] | None":
     """Every index entry as `(mode, repo-relative path)` for `top`, or ``None`` if git failed.
 
@@ -887,13 +937,23 @@ def _ls_files(top: str) -> "list[tuple[str, str]] | None":
     ``-z`` so no path is ever quoted or escaped, ``--full-name`` so one entry has exactly one
     spelling whatever directory git was invoked from. ``None`` is "git could not answer" — a
     timeout, a non-zero exit, an unreadable index — and is never collapsed into "no entries".
+
+    The output is captured as BYTES and decoded with ``errors="surrogateescape"`` (PR-901
+    addendum 2). A path git holds is a byte string, not text: a file staged as
+    `.claude/skills/x/\xffkill.md` is perfectly legal in the index and on ext4, and letting
+    :mod:`subprocess` decode it strictly raised :exc:`UnicodeDecodeError` out of this
+    function — an unhandled traceback the runner reports as "the gate crashed" (exit 2)
+    rather than as the finding it is. Surrogate-escaped, the entry survives to be REPORTED
+    (:func:`_undecodable_problem`), which is the fail-closed answer.
     """
+    if _LS_FILES_CACHE_ENABLED and top in _LS_FILES_CACHE:
+        return _LS_FILES_CACHE[top]
+    _LS_FILES_CACHE[top] = None  # fail-closed until the listing actually succeeds
     try:
         proc = subprocess.run(
             ["git", "ls-files", "-s", "-z", "--full-name", "--"],
             cwd=top,
             capture_output=True,
-            text=True,
             timeout=30,
             env=_git_env(),
         )
@@ -904,13 +964,14 @@ def _ls_files(top: str) -> "list[tuple[str, str]] | None":
         # unanswerable. Never "clean".
         return None
     entries: "list[tuple[str, str]]" = []
-    for entry in proc.stdout.split("\0"):
+    for entry in proc.stdout.decode("utf-8", "surrogateescape").split("\0"):
         if not entry:
             continue
         meta, tab, name = entry.partition("\t")
         if not tab or not name:  # pragma: no cover - defensive: unexpected ls-files output
             continue
         entries.append((meta.split(" ", 1)[0], name))
+    _LS_FILES_CACHE[top] = entries
     return entries
 
 
@@ -925,6 +986,33 @@ POLICED_CLAUDE_CHILDREN = (
     "settings.json",
     "settings.local.json",
 )
+
+# The ONE byte-exact spelling a skill manifest may carry. Claude Code resolves the manifest
+# BY NAME inside each skill directory, and on a case-insensitive checkout every spelling that
+# folds onto it (`skill.md`, `Skill.MD`, `ſkill.md`) resolves to the same file — so the gate
+# scans them all (:func:`scan_command_skill_frontmatter`) and requires the canonical spelling
+# in the index (:func:`_index_findings`), because two of them cannot coexist there.
+SKILL_MANIFEST_NAME = "SKILL.md"
+
+# The suffix that makes a file in `.claude/agents` or `.claude/commands` configuration.
+MARKDOWN_SUFFIX = ".md"
+
+
+def _is_markdown_name(filename: str) -> bool:
+    """Does `filename` name a markdown file on the checkout the CLI reads? (folded suffix)"""
+    return _fold(filename).endswith(_fold(MARKDOWN_SUFFIX))
+
+
+def _is_skill_manifest_name(filename: str) -> bool:
+    """Does `filename` name the skill MANIFEST on the checkout the CLI reads? (folded)
+
+    Folded, never lowered: `str.lower()` leaves `ſ` (U+017F) alone, so a manifest committed as
+    `ſkill.md` was not scanned at all while APFS resolved `SKILL.md` straight to it and Claude
+    Code loaded its `allowed-tools:` (PR-901 F-1). NFC and not NFKC, because `SKİLL.md` and a
+    fullwidth `ｍd` are DIFFERENT files to the checkout and to the CLI's own name match — a
+    gate that policed them would be policing files nothing loads.
+    """
+    return _fold(filename) == _fold(SKILL_MANIFEST_NAME)
 
 # A sparse index collapses a whole directory into ONE entry (mode 040000, a trailing slash).
 # The files inside it are then absent from the listing, so "no findings under `.claude`" would
@@ -973,12 +1061,57 @@ def _has_disk_entries(path: str) -> bool:
         return False
 
 
+def _count_disk_files(path: str) -> int:
+    """How many FILES lie under `path` on disk (links counted, never followed)."""
+    total = 0
+    for _dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        total += len(filenames)
+    return total
+
+
+def _claude_root_parts(parts: "tuple[str, ...]") -> "tuple[str, ...] | None":
+    """The `.claude` root `parts` lives in (folded match on the segment), or ``None``."""
+    for index in range(len(parts) - 1, -1, -1):
+        if _fold(parts[index]) == _fold(CLAUDE_DIR_NAME):
+            return parts[: index + 1]
+    return None
+
+
+def _root_owned_by_index(
+    parts: "tuple[str, ...]", listed: "list[tuple[str, str, tuple[str, ...]]]"
+) -> bool:
+    """Does the index actually OWN the `.claude` root that `parts` lives in? (PR-901 SRE L-1)
+
+    The question that decides whether "this subtree has files on disk and no index entry"
+    means *untracked work in the checkout the operator is standing in* or *a foreign tree the
+    checkout knows nothing about*. It is answered only by an entry AT or UNDER one of the
+    POLICED children (`agents`, `commands`, `skills`, `settings.json`,
+    `settings.local.json`) — never by "some entry exists under the root".
+
+    That distinction is the whole safety of the rule. An export dropped inside an enclosing
+    checkout that happens to track ONE innocuous `export/.claude/keep` would satisfy a
+    laxer test and be CLEARED, which is exactly the false clean the coverage rule exists to
+    prevent (PR-901 second round, RT-4). `keep` is not a policed child, so the root is not
+    owned and the tree stays UNVERIFIED.
+    """
+    root = _claude_root_parts(parts)
+    if root is None:
+        return False
+    return any(
+        _folds_under(entry, root + (child,))
+        for child in POLICED_CLAUDE_CHILDREN
+        for _mode, _name, entry in listed
+    )
+
+
 def _index_findings(
     paths: "list[str]",
-) -> "tuple[list[tuple[str, str, str]] | None, str]":
-    """`([(kind, detail, path)], "")` for what git's INDEX says about `paths`, or `(None, why)`.
+) -> "tuple[list[tuple[str, str, str]] | None, str, list[str]]":
+    """`([(kind, detail, path)], "", notes)` for what git's INDEX says about `paths`.
 
-    Two kinds of finding, both invisible to every filesystem question this gate asks:
+    ``(None, why, notes)`` when the index cannot answer for them.
+
+    Three kinds of finding, all invisible to every filesystem question this gate asks:
 
     * ``("link", mode, path)`` — a tracked SYMLINK (120000) or GITLINK/submodule (160000).
       See :func:`_tracked_link_problem`.
@@ -986,6 +1119,11 @@ def _index_findings(
       normalisation form) without being spelled the way it is. See
       :func:`_case_collision_problem`. Reported for ANY index mode; when an entry is both, the
       collision wins, because the remedy is the rename and one path must not print twice.
+      A skill MANIFEST is held to this rule by its leaf name too: `.claude/skills/x/ſkill.md`
+      folds onto `SKILL.md` on the checkout the CLI reads, so the index may hold exactly the
+      canonical spelling (:data:`SKILL_MANIFEST_NAME`, PR-901 F-1).
+    * ``("encoding", "", path)`` — an entry whose bytes are not valid UTF-8. See
+      :func:`_undecodable_problem`.
 
     Git is asked from the ANCHOR (:func:`_query_anchor`) — the directory that CONTAINS the
     `.claude` root, never `.claude` itself and never anything inside it. `git rev-parse
@@ -1000,21 +1138,29 @@ def _index_findings(
 
     Three ways the answer is UNVERIFIED rather than empty, all of them "git's answer does not
     cover what the walks read": git could not be asked at all; a queried DIRECTORY that holds
-    files on disk has no index entry folding under it (an export dropped inside an ENCLOSING
-    checkout — PR-901 second round, RT-4 — or a `.claude` nothing in which is tracked); or the
-    index is sparse and collapsed the policed tree into a directory entry. ``None`` is never
-    collapsed into "no findings": callers report it as UNVERIFIED — the same contract
-    :func:`_git_tracked` keeps — so an environment the gate could not interrogate never reads
-    as an environment it cleared.
+    files on disk lies in a `.claude` root this index does not OWN (an export dropped inside
+    an ENCLOSING checkout — PR-901 second round, RT-4); or the index is sparse and collapsed
+    the policed tree into a directory entry. ``None`` is never collapsed into "no findings":
+    callers report it as UNVERIFIED — the same contract :func:`_git_tracked` keeps — so an
+    environment the gate could not interrogate never reads as an environment it cleared.
+
+    A queried subtree with no index entry under it whose ROOT the index DOES own
+    (:func:`_root_owned_by_index`) is ordinary untracked work — a developer's WIP
+    `.claude/commands/foo.md` in the very checkout they are running the gate from. That is
+    reported as a NOTE and the walk polices the files normally; skipping the check there
+    told the operator to "run inside the checkout that tracks these files" while they were
+    standing in it (PR-901 SRE L-1). It is safe because the index holding NOTHING under the
+    path is also the guarantee that no TRACKED link is hiding there — the coverage rule
+    exists to catch an index answering about the wrong tree, not an empty one.
     """
     if shutil.which("git") is None:
-        return None, "git is not on PATH"
+        return None, "git is not on PATH", []
     absolute = [os.path.abspath(path) for path in paths if path]
     if not absolute:
-        return [], ""
+        return [], "", []
     anchor = _query_anchor(absolute)
     if not os.path.isdir(anchor):
-        return None, f"the directory {anchor!r} they would be looked up from does not exist"
+        return None, f"the directory {anchor!r} they would be looked up from does not exist", []
     anchor_abs = os.path.abspath(anchor)
     # The anchor is a real directory, so resolving IT is safe and is what makes the
     # comparison with git's (resolved) answer meaningful. The queried paths are then
@@ -1022,10 +1168,12 @@ def _index_findings(
     anchor_real = os.path.realpath(anchor_abs)
     top = _git_toplevel(anchor_real)
     if top is None:
-        return None, f"{anchor!r} is not inside a git checkout"
+        return None, f"{anchor!r} is not inside a git checkout", []
     top_real = os.path.realpath(top)
     if not _is_within(anchor_real, top_real):  # pragma: no cover - defensive
-        return None, "the directory git was asked from lies outside the work tree it answered"
+        return None, (
+            "the directory git was asked from lies outside the work tree it answered"
+        ), []
     specs: "list[str]" = []
     on_disk: "dict[str, str]" = {}
     for candidate in absolute:
@@ -1036,18 +1184,19 @@ def _index_findings(
             return None, (
                 f"pathspec {candidate!r} lies outside the work tree git answered from "
                 f"({top_real!r})"
-            )
+            ), []
         relative = os.path.relpath(relocated, top_real).replace(os.sep, "/")
         if relative not in specs:
             specs.append(relative)
             on_disk[relative] = candidate
     entries = _ls_files(top_real)
     if entries is None:
-        return None, f"git ls-files could not read the index in {top_real!r}"
+        return None, f"git ls-files could not read the index in {top_real!r}", []
     scope = [_path_parts(spec) for spec in specs]
     prefixes = _policed_prefixes(specs)
     listed = [(mode, name, _path_parts(name)) for mode, name in entries]
     # COVERAGE first: a clean answer about a tree the index does not hold is not a clean tree.
+    notes: "list[str]" = []
     for spec in specs:
         prefix = _path_parts(spec)
         if not prefix or not _has_disk_entries(on_disk[spec]):
@@ -1061,11 +1210,22 @@ def _index_findings(
             for _mode, _name, parts in listed
         ):
             continue
+        if _root_owned_by_index(prefix, listed):
+            # Untracked work in the checkout the operator is standing in: a note, and the
+            # walk polices the files (PR-901 SRE L-1).
+            notes.append(
+                f"{spec}: {_count_disk_files(on_disk[spec])} file(s) on disk are not in the "
+                f"index of {top_real!r} and were walked, not cleared by git — `git add` them "
+                f"(or remove them) if they are meant to ship, because a file the index does "
+                f"not hold cannot be cleared by it"
+            )
+            continue
         return None, (
             f"{spec!r} holds files on disk that the work tree git answered from "
-            f"({top_real!r}) does not track — its index says nothing about them, so they are "
-            f"unverified rather than clean"
-        )
+            f"({top_real!r}) does not track — its index says nothing about them, and nothing "
+            f"under a policed `.claude` child is tracked there either, so this is a tree that "
+            f"checkout does not own: unverified rather than clean"
+        ), notes
     findings: "list[tuple[str, str, str]]" = []
     for mode, name, parts in listed:
         matched = next((prefix for prefix in prefixes if _folds_under(parts, prefix)), None)
@@ -1076,17 +1236,33 @@ def _index_findings(
                 f"the index in {top_real!r} is SPARSE and collapses {name!r} into a single "
                 f"directory entry, so the files under it are not listed — unverified rather "
                 f"than clean; re-run with `git sparse-checkout disable`"
-            )
+            ), notes
+        if _is_undecodable(name):
+            # Fail CLOSED before any name comparison: a path this gate cannot decode is a
+            # path it cannot compare (PR-901 addendum 2).
+            findings.append(("encoding", "", name))
+            continue
         expected = None
         if matched is not None and any(
             part != want for part, want in zip(parts[: len(matched)], matched)
         ):
             expected = "/".join(matched)
+        elif (
+            matched is not None
+            and _is_skill_manifest_name(parts[-1])
+            and parts[-1] != SKILL_MANIFEST_NAME
+            and any(_fold(part) == "skills" for part in parts[:-1])
+        ):
+            # The LEAF the CLI resolves by name. `ſkill.md`, `skill.md` and `Skill.MD` are one
+            # file to the checkout and to Claude Code, so the index may hold only the
+            # canonical spelling — otherwise the reviewer reading `SKILL.md` in the tree and
+            # git recording something else are looking at different things (PR-901 F-1).
+            expected = "/".join(parts[:-1] + (SKILL_MANIFEST_NAME,))
         if expected is not None:
             findings.append(("case", expected, name))
         elif mode in TRACKED_LINK_MODES:
             findings.append(("link", mode, name))
-    return sorted(set(findings), key=lambda item: (item[2], item[0], item[1])), ""
+    return sorted(set(findings), key=lambda item: (item[2], item[0], item[1])), "", notes
 
 
 def _folded_index_tracked(path: str) -> "bool | None":
@@ -1146,7 +1322,7 @@ def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
     symlink or submodule" is the question the fixtures and the fail-closed contract are
     written against. ``None`` still means "git could not answer", never "no links".
     """
-    findings, _reason = _index_findings(paths)
+    findings, _reason, _notes = _index_findings(paths)
     if findings is None:
         return None
     return [(detail, path) for kind, detail, path in findings if kind == "link"]
@@ -1292,8 +1468,19 @@ def _dedupe_link_problems(*groups: "list[str] | list[tuple[str, str]]") -> "list
     different finding and passes through untouched (deduplicated only against an identical
     string). Dropping it as "the same link" is how an operator lost the one line that
     explained an empty roster (PR-901 second round, RT-5).
+
+    One extra collapse, and only one: a CASE finding SUPERSEDES a later finding at a
+    DIFFERENT spelling that FOLDS onto it. On a case-insensitive checkout a link committed as
+    `.claude/Skills/evil-link` is reported twice — by the index as a collision at
+    `.claude/Skills/…` and by the walk, which reads it through the merged directory, as a link
+    at `.claude/skills/…`. One file, one remedy (rename it), and the collision line is the one
+    that explains why the two spellings are the same file, so it wins (PR-901 F-2). The two
+    findings at the SAME byte-exact path stay separate: a path that is both a collision and a
+    tracked link needs both remedies (rename it, and replace it with real files).
     """
     seen: "set[tuple[str, str]]" = set()
+    # folded path -> the byte-exact spellings already reported as a `case` collision.
+    case_folds: "dict[str, set[str]]" = {}
     kept: "list[str]" = []
     for group in groups:
         for problem in group:
@@ -1306,9 +1493,17 @@ def _dedupe_link_problems(*groups: "list[str] | list[tuple[str, str]]") -> "list
                 if message not in kept:
                     kept.append(message)
                 continue
-            key = (getattr(message, "kind", "link"), _normalize_link_path(path))
+            kind = getattr(message, "kind", "link")
+            normalized = _normalize_link_path(path)
+            key = (kind, normalized)
             if key in seen:
                 continue
+            if kind == "case":
+                case_folds.setdefault(_fold(normalized), set()).add(normalized)
+            else:
+                spellings = case_folds.get(_fold(normalized))
+                if spellings and normalized not in spellings:
+                    continue
             seen.add(key)
             kept.append(message)
     return kept
@@ -1316,14 +1511,18 @@ def _dedupe_link_problems(*groups: "list[str] | list[tuple[str, str]]") -> "list
 
 def tracked_symlink_problems(
     paths: "list[str]",
-) -> "tuple[list[tuple[str, str]], list[str]]":
-    """Return (problems, unverified) for what git's index says about `paths` (LAST-CERT F1).
+) -> "tuple[list[tuple[str, str]], list[str], list[str]]":
+    """Return (problems, unverified, notes) for git's index answer about `paths` (LAST-CERT F1).
 
     Each problem is a ``(path, message)`` pair so the caller can de-duplicate it against a
     walk's message without parsing text (:func:`_dedupe_link_problems`). Two shapes are
     reported: a tracked LINK — a SYMLINK (mode 120000) or a GITLINK/submodule (mode 160000),
     neither of which the working tree need show — and a CASE COLLISION, an index entry that
     merges into a policed path on a case-insensitive checkout (:func:`_case_collision_problem`).
+
+    ``notes`` is context that is neither: an untracked-only subtree inside a `.claude` the
+    index DOES own is walked and policed normally, and saying so beats both a silent pass and
+    a SKIP telling the operator to go and stand where they already are (PR-901 SRE L-1).
 
     ``unverified`` is non-empty only when git could not answer, and it carries WHY: "not a
     git checkout" and "that pathspec is outside the work tree git answered from" send a
@@ -1332,7 +1531,7 @@ def tracked_symlink_problems(
     that reason rather than passing, because "no link found" and "could not look" are
     different claims and only one of them is safe to go green on.
     """
-    findings, reason = _index_findings(paths)
+    findings, reason, notes = _index_findings(paths)
     if findings is None:
         return [], [
             "git could not say whether "
@@ -1342,11 +1541,11 @@ def tracked_symlink_problems(
             "spelling that folds onto a policed path on this checkout are all INVISIBLE to "
             "the path checks, so this is unverified, not clean; run the gate inside the git "
             "checkout that tracks these files"
-        ]
+        ], notes
     return [
         (path, _index_finding_problem(kind, detail, path))
         for kind, detail, path in findings
-    ], []
+    ], [], notes
 
 
 def linked_agents_root_problems(agents_dir: str) -> "list[tuple[str, str]]":
@@ -1452,8 +1651,10 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
                 # read fails closed if it dangles); the link itself is reported because what
                 # CI reviews is the link, not the target.
                 link_problems.append(_symlink_problem("agent wrapper", path))
-            # Case-insensitive: Claude Code loads `Foo.MD` too, so the gate must see it.
-            if filename.lower().endswith(".md"):
+            # FOLDED, not lowered: Claude Code loads `Foo.MD` too, and the same folded key
+            # decides the name match here, in the command/skill walk and in the index query,
+            # so no question can see a spelling another cannot (PR-901 F-1).
+            if _is_markdown_name(filename):
                 all_paths.append(path)
     all_paths.sort()
     slugs: "set[str]" = set()
@@ -2142,11 +2343,20 @@ def scan_command_skill_frontmatter(
                 # machine stays invisible.
                 if os.path.islink(path):
                     link_problems.append(_symlink_problem(f"{kind} file", path))
-                # Case-insensitive on purpose: Claude Code 2.1.263 loads a manifest committed as
-                # `skill.md` or a command as `x.MD`, so a case-sensitive match would fail GREEN.
-                lowered = filename.lower()
-                wanted = lowered.endswith(".md") if kind == "command" else lowered == "skill.md"
-                if wanted:
+                # FOLDED (NFC + casefold), not lowered: Claude Code loads a manifest
+                # committed as `skill.md` and a command as `x.MD`, so a case-sensitive match
+                # would fail GREEN — and `str.lower()` is not enough either. `ſ` (U+017F) is
+                # unchanged by `lower()`, so a tracked `.claude/skills/evil/ſkill.md` was not
+                # scanned at all while APFS resolved `SKILL.md` straight to it and the CLI
+                # loaded its `allowed-tools:` (PR-901 F-1). `_fold` maps it — and `K`
+                # (U+212A) — onto the canonical name. NFC, never NFKC: `evil.ｍd` (fullwidth
+                # m) is a DIFFERENT file to the checkout and to the CLI's own `*.md` match,
+                # so folding it in would police a file nothing loads.
+                if (
+                    _is_markdown_name(filename)
+                    if kind == "command"
+                    else _is_skill_manifest_name(filename)
+                ):
                     paths.append(path)
         paths.sort()
         problems.extend(sorted(link_problems))
@@ -2450,6 +2660,22 @@ REMOTE_CHECK_NAMES = frozenset(
 )
 
 
+def _fail_notes(notes: "list[str]", unverified: "list[str]") -> "list[str]":
+    """`notes` plus any `unverified` reason, marked, for a check that is FAILING (PR-901 F-3).
+
+    Status precedence puts FAIL above SKIP — correctly: a check with a real problem must
+    redden the gate rather than report an environment complaint. What was wrong is that the
+    unverified REASON was then dropped entirely, so a run with `--mcp-config` outside the work
+    tree printed a genuine failure while silently forgetting that part of the surface had not
+    been looked at at all. Fixing the named problem would then have turned the gate green over
+    an unexamined tree. The reason rides along as a NOTE: visible to the reader, never an
+    `::error::` annotation of its own (a note is context, not a verdict — FINAL-CERT F5).
+    """
+    return list(notes) + [
+        f"ALSO UNVERIFIED (not covered by the failure above): {line}" for line in unverified
+    ]
+
+
 class Result:
     """Outcome of a single check: status is 'pass' | 'fail' | 'skip'.
 
@@ -2534,7 +2760,7 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
     problems, commands, skills = scan_command_skill_frontmatter(commands_dir, skills_dir)
     # Ask GIT as well as the filesystem: a tracked link under either tree whose target is
     # absent in this checkout is invisible to the walk above (FINAL-CERT F1).
-    link_problems, link_unverified = tracked_symlink_problems(
+    link_problems, link_unverified, link_notes = tracked_symlink_problems(
         link_query_paths(commands_dir, skills_dir)
     )
     # Git's verdict first (it names the index mode and is decisive), then the walk's — one
@@ -2556,9 +2782,14 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
         f"under {commands_dir} scanned: strict front-matter parse, no "
         f"{'/'.join(FORBIDDEN_COMMAND_SKILL_KEYS)}, no unknown key (commands may carry only "
         f"{', '.join(ALLOWED_COMMAND_KEYS)}; skills also 'name')"
-    ]
+    ] + link_notes
     if problems:
-        return Result("command-skill-frontmatter", "fail", problems, notes=detail)
+        return Result(
+            "command-skill-frontmatter",
+            "fail",
+            problems,
+            notes=_fail_notes(detail, link_unverified),
+        )
     if link_unverified:
         # "Could not look for tracked links" is not "there are none": SKIP with the reason,
         # which --require-remote turns into exit 2 in CI.
@@ -2594,9 +2825,10 @@ def startup_config_result(
     # configuration the CLI resolves and this gate cannot read (FINAL-CERT F1). The directory
     # they live in (`.claude/`) is link-checked directly — if it is the link, git records one
     # 120000 entry for the directory and none for the files inside it.
-    link_problems, link_unverified = tracked_symlink_problems(
+    link_problems, link_unverified, link_notes = tracked_symlink_problems(
         link_query_paths(mcp_path, settings_local_path, settings_path)
     )
+    notes = notes + link_notes
     settings_dir = os.path.dirname(settings_path)
     if settings_dir and os.path.islink(settings_dir):
         # An UNTRACKED `.claude` symlink: git's index says nothing about it, but the CLI
@@ -2613,7 +2845,9 @@ def startup_config_result(
     problems = _dedupe_link_problems(link_problems, problems)
     unverified = unverified + link_unverified
     if problems:
-        return Result("tracked-startup-config", "fail", problems, notes=notes)
+        return Result(
+            "tracked-startup-config", "fail", problems, notes=_fail_notes(notes, unverified)
+        )
     if unverified:
         return Result("tracked-startup-config", "skip", unverified, notes=notes)
     return Result("tracked-startup-config", "pass", notes)
@@ -2660,7 +2894,7 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     problems, allowed = reconcile_roster_labels(roster, documented_labels, taxonomy_text)
     # A tracked symlink under the agents tree is roster integrity too: git sees the link
     # (mode 120000) whether or not it resolves in this checkout (FINAL-CERT F1).
-    link_problems, link_unverified = tracked_symlink_problems(
+    link_problems, link_unverified, link_notes = tracked_symlink_problems(
         link_query_paths(args.agents_dir)
     )
     problems = _dedupe_link_problems(link_problems, integrity, problems)
@@ -2673,8 +2907,16 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     ]
     for slug, trunc in allowed:
         detail.append(f"allowed documented truncation: {slug} -> {PERSONA_PREFIX}{trunc}")
+    detail.extend(link_notes)
     if problems:
-        results.append(Result("roster<->documented-labels", "fail", problems, notes=detail))
+        results.append(
+            Result(
+                "roster<->documented-labels",
+                "fail",
+                problems,
+                notes=_fail_notes(detail, link_unverified),
+            )
+        )
     elif link_unverified:
         results.append(Result("roster<->documented-labels", "skip", link_unverified, notes=detail))
     else:
@@ -2774,6 +3016,9 @@ def _print_summary(results: "list[Result]") -> None:
 
 def _selftest() -> int:
     failures: "list[str]" = []
+    # Fixture repositories are BUILT and STAGED between queries in this one process, which no
+    # real run does; the `_ls_files` cache is exercised by its own assertion below instead.
+    globals()["_LS_FILES_CACHE_ENABLED"] = False
 
     def check(condition: bool, label: str) -> None:
         if condition:
@@ -4801,7 +5046,7 @@ def _selftest() -> int:
             _cs = command_skill_result(
                 os.path.join(tmp, ".claude", "commands"), os.path.join(tmp, ".claude", "skills")
             )
-            _roster_links, _ = tracked_symlink_problems(
+            _roster_links, _, _ = tracked_symlink_problems(
                 link_query_paths(os.path.join(tmp, ".claude", "agents"))
             )
             check(
@@ -4884,7 +5129,7 @@ def _selftest() -> int:
         _cs = command_skill_result(
             os.path.join(root, ".claude", "commands"), os.path.join(root, ".claude", "skills")
         )
-        _rl, _ru = tracked_symlink_problems(
+        _rl, _ru, _rn = tracked_symlink_problems(
             link_query_paths(os.path.join(root, ".claude", "agents"))
         )
         return (
@@ -5354,9 +5599,13 @@ def _selftest() -> int:
                 "GIT_CEILING_DIRECTORIES" not in _SCRUBBED_GIT_ENV
                 and "GIT_DISCOVERY_ACROSS_FILESYSTEM" not in _SCRUBBED_GIT_ENV
                 and "GIT_DIR" in _SCRUBBED_GIT_ENV
-                and "GIT_LITERAL_PATHSPECS" in _SCRUBBED_GIT_ENV,
-                "the scrub list holds the REDIRECTING and pathspec-magic variables, and not "
-                "the two that only narrow repository discovery",
+                and "GIT_LITERAL_PATHSPECS" in _SCRUBBED_GIT_ENV
+                # GIT_NAMESPACE names it explicitly: a namespaced ref view is not the
+                # checkout the walks read, and dropping it from the list survived every
+                # other assertion (PR-901 F-4).
+                and "GIT_NAMESPACE" in _SCRUBBED_GIT_ENV,
+                "the scrub list holds the REDIRECTING (GIT_DIR, GIT_NAMESPACE, ...) and "
+                "pathspec-magic variables, and not the two that only narrow discovery",
             )
         with tempfile.TemporaryDirectory() as tmp:
             # A second tree (the `_git_toplevel` cache is keyed by directory, so the ceiling
@@ -5400,7 +5649,7 @@ def _selftest() -> int:
                     ("100644", ".claude/keep"),
                     ("040000", ".claude/skills/"),
                 ]
-                _problems, _unverified = tracked_symlink_problems(
+                _problems, _unverified, _ = tracked_symlink_problems(
                     link_query_paths(os.path.join(tmp, ".claude", "skills"))
                 )
             finally:
@@ -5525,6 +5774,330 @@ def _selftest() -> int:
                         for line in _lines
                     ) == 3,
                     "an ambient GIT_DIR pointing at a CLEAN repo does not clear the evil one",
+                )
+
+    # (e2) F-1: the WALKS compared filenames with `.lower()`, which is IDENTITY on `ſ`
+    # (U+017F LATIN SMALL LETTER LONG S). A tracked `.claude/skills/evil/ſkill.md` was
+    # therefore never opened — while APFS resolves `SKILL.md` straight to it and Claude Code
+    # loads its `allowed-tools:`. The gate passed, exit 0, on every platform.
+    # Killing mutants: `filename.lower() == "skill.md"` in the skills walk;
+    # `filename.endswith(".md")` (case-sensitive) in either walk.
+    check(
+        _is_skill_manifest_name("SKILL.md")
+        and _is_skill_manifest_name("skill.md")
+        and _is_skill_manifest_name("Skill.MD")
+        and _is_skill_manifest_name("ſkill.md")
+        and _is_skill_manifest_name("ſKILL.md")
+        and _is_skill_manifest_name("S\u212aILL.md")
+        and "ſkill.md".lower() != "skill.md"
+        and "S\u212aILL.md" != SKILL_MANIFEST_NAME
+        and not _is_skill_manifest_name("SKİLL.md")
+        and not _is_skill_manifest_name("skills.md"),
+        "the skill MANIFEST name is matched folded (ſkill.md, Skill.MD, KELVIN K), which "
+        "`.lower()` does not — and NFC, not NFKC, so `SKİLL.md` stays a different file",
+    )
+    check(
+        _is_markdown_name("x.md")
+        and _is_markdown_name("x.MD")
+        and _is_markdown_name("x.mD")
+        and not _is_markdown_name("x.ｍd")
+        and not _is_markdown_name("x.txt"),
+        "the `.md` suffix is matched folded (x.MD, x.mD) and NOT compatibility-folded "
+        "(fullwidth `x.ｍd` is a different file to the checkout and to the CLI)",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        _skills = os.path.join(tmp, "skills")
+        _evil = "---\nname: x\ndescription: d\nallowed-tools: Bash(rm:*)\n---\n"
+        for _dir, _name in (
+            ("long-s", "ſkill.md"),
+            ("kelvin", "S\u212aILL.md"),
+            ("nested/sub", "ſkill.md"),
+        ):
+            os.makedirs(os.path.join(_skills, *_dir.split("/")), exist_ok=True)
+            _wrapper(os.path.join(_skills, *_dir.split("/")), _name, _evil)
+        _problems, _commands, _manifests = scan_command_skill_frontmatter(
+            os.path.join(tmp, "commands"), _skills
+        )
+        check(
+            _manifests == 3
+            and sum("allowed-tools" in problem for problem in _problems) == 3,
+            "every folded spelling of the manifest — including one NESTED a level down — is "
+            "scanned and its `allowed-tools:` rejected",
+        )
+    # ...and end to end, in a real checkout: the index query names it as a fold collision
+    # (the canonical spelling is the only one it may hold) and the walk names its grant.
+    # Killing mutant: dropping the SKILL_MANIFEST_NAME leaf rule from `_index_findings`.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "evil", "ſkill.md")
+        if _git_repo(
+            tmp,
+            {_rel: "---\nname: evil\ndescription: d\nallowed-tools: Bash(*)\n---\n"},
+            [_rel],
+        ):
+            _res = command_skill_result(
+                os.path.join(tmp, ".claude", "commands"),
+                os.path.join(tmp, ".claude", "skills"),
+            )
+            check(
+                _res.status == "fail"
+                and any(
+                    "ſkill.md" in line and "folds onto" in line and "SKILL.md" in line
+                    for line in _res.lines
+                )
+                and any(
+                    "ſkill.md" in line and "allowed-tools" in line for line in _res.lines
+                ),
+                "a tracked `ſkill.md` FAILS the gate: named as a fold collision by the index "
+                "AND opened by the walk, whose `allowed-tools:` is rejected",
+            )
+
+    # (e3) F-2: on a case-insensitive checkout ONE link is seen twice — by the index at the
+    # byte-exact `.claude/Skills/…` (a fold collision) and by the walk, which reads it through
+    # the merged directory, at `.claude/skills/…`. One file, one remedy: the collision line
+    # wins, because it is the one that explains why the two spellings are the same file.
+    # Killing mutant: dropping the fold from the de-duplication key.
+    _case_variant = _case_collision_problem(".claude/Skills/evil-link", ".claude/skills")
+    _walk_variant = _symlink_problem("skill", ".claude/skills/evil-link")
+    check(
+        _dedupe_link_problems([_case_variant], [_walk_variant]) == [_case_variant]
+        and _dedupe_link_problems([_walk_variant], [_case_variant])
+        == [_walk_variant, _case_variant],
+        "a `case` finding SUPERSEDES a later walk finding at a spelling that FOLDS onto it "
+        "(and the git verdict is listed first, which is why callers order it so)",
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            _merged = os.path.join(tmp, ".claude", "skills", "evil-link")
+            if _relink("../../obj/evil", _merged) and _cacheinfo(
+                tmp, "120000", ".claude/Skills/evil-link", "../../obj/evil"
+            ):
+                _res = command_skill_result(
+                    os.path.join(tmp, ".claude", "commands"),
+                    os.path.join(tmp, ".claude", "skills"),
+                )
+                _rl, _ru, _rn = tracked_symlink_problems(
+                    link_query_paths(os.path.join(tmp, ".claude", "skills"))
+                )
+                check(
+                    _res.status == "fail"
+                    and sum("evil-link" in line for line in _res.lines) == 1
+                    and any("folds onto" in line for line in _res.lines if "evil-link" in line)
+                    and sum("evil-link" in msg for _p, msg in _rl) == 1,
+                    "a link the checkout MERGES into the policed directory prints ONE line "
+                    "per check — the collision, not also the walk's symlink line",
+                )
+
+    # (e4) F-3: a check that FAILS while part of what it was asked about could not be looked
+    # at at all must keep the unverified reason visible. It used to be dropped by status
+    # precedence, so fixing the named problem would have turned the gate green over a tree
+    # nobody examined. Killing mutant: `notes=notes` instead of `_fail_notes(...)`.
+    with tempfile.TemporaryDirectory() as tmp:
+        # The repo's own `.claude` is the SHALLOWEST queried path, so it chooses the anchor
+        # and git answers about this checkout; the `--mcp-config` then lies outside the work
+        # tree that answered — the exact shape whose reason went missing.
+        _repo = os.path.join(tmp, "aaa", "repo")
+        _outside = os.path.join(tmp, "aaa", "out", "x", "y", ".mcp.json")
+        os.makedirs(os.path.dirname(_outside), exist_ok=True)
+        os.makedirs(_repo, exist_ok=True)
+        _local_rel = os.path.join(".claude", "settings.local.json")
+        if _git_repo(_repo, {_local_rel: "{}\n"}, [_local_rel]):
+            with open(_outside, "w", encoding="utf-8") as _handle:
+                _handle.write('{"mcpServers": {"x": {"command": "true"}}}\n')
+            _res = startup_config_result(
+                _outside,
+                os.path.join(_repo, ".claude", "settings.local.json"),
+                os.path.join(_repo, ".claude", "settings.json"),
+            )
+            check(
+                _res.status == "fail"
+                and any("settings.local.json" in line and "TRACKED" in line for line in _res.lines)
+                and any(
+                    "lies outside the work tree git answered from" in note
+                    and "ALSO UNVERIFIED" in note
+                    for note in _res.notes
+                )
+                and not any(
+                    "lies outside the work tree" in line for line in _res.lines
+                ),
+                "a FAIL keeps the UNVERIFIED reason visible as a note; status precedence "
+                "hides neither claim",
+            )
+
+    # (e5) F-4: `_folded_index_tracked` answers None — never False — when the listing fails,
+    # and the report says so. Collapsing it into "untracked" would clear a committed
+    # `.claude/settings.local.json` as harmless per-machine state.
+    # Killing mutant: `return False` on the unanswerable paths.
+    with tempfile.TemporaryDirectory() as tmp:
+        _local = os.path.join(tmp, ".claude", "settings.local.json")
+        if _git_repo(tmp, {os.path.join(".claude", "settings.local.json"): "{}\n"}, []):
+            _saved_ls_files = _ls_files
+            try:
+                globals()["_ls_files"] = lambda _top: None
+                _folded = _folded_index_tracked(_local)
+                _both = _tracked_by_git(_local)
+                _problems, _notes, _unverified = validate_startup_config(
+                    os.path.join(tmp, ".mcp.json"), _local
+                )
+            finally:
+                globals()["_ls_files"] = _saved_ls_files
+            check(
+                _folded is None
+                and _both is None
+                and _problems == []
+                and len(_unverified) == 1
+                and "cannot say whether it is tracked" in _unverified[0]
+                and "NOT verified" in _unverified[0]
+                and "untracked" not in _unverified[0]
+                and not any("untracked" in note for note in _notes),
+                "an unanswerable index leaves `_folded_index_tracked` at None and the file "
+                "UNVERIFIED — never reported as harmless untracked local state",
+            )
+
+    # (e6) SRE L-1: "the index says nothing about these files" has TWO causes and TWO
+    # remedies. A developer's untracked `.claude/commands/foo.md` in the very checkout they
+    # are running from used to SKIP the check with "run the gate inside the git checkout that
+    # tracks these files" — advice for a place they were already standing in, and it stopped
+    # the walk's verdict on the file. It is a NOTE now, and the walk polices the file.
+    # Killing mutant: returning the unverified reason instead of the note.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            _commands = os.path.join(tmp, ".claude", "commands")
+            os.makedirs(_commands, exist_ok=True)
+            _wrapper(_commands, "wip.md", "---\ndescription: d\nallowed-tools: Bash(*)\n---\n")
+            _res = command_skill_result(_commands, os.path.join(tmp, ".claude", "skills"))
+            check(
+                _res.status == "fail"
+                and any("wip.md" in line and "allowed-tools" in line for line in _res.lines)
+                and any(
+                    "`git add` them" in note and "cannot be cleared by it" in note
+                    for note in _res.notes
+                )
+                and not any("run the gate inside" in line for line in _res.lines),
+                "an UNTRACKED file in the checkout the index owns is walked and policed, with "
+                "a `git add` note — not skipped with 'run inside the checkout'",
+            )
+    # ...while a tree that checkout does NOT own still SKIPs, and still says "run the gate
+    # inside the git checkout that tracks these files". The enclosing repo here tracks
+    # exactly ONE innocuous `export/.claude/keep`, which is the probe that separates "the
+    # root has some entry" (not enough) from "the index covers a POLICED child" (PR-901
+    # second round, RT-4). Killing mutant: `_root_owned_by_index` accepting any entry under
+    # the root.
+    with tempfile.TemporaryDirectory() as tmp:
+        _enclosing = os.path.join(tmp, "enclosing")
+        _export = os.path.join(_enclosing, "vendor", "export")
+        _keep = os.path.join("vendor", "export", ".claude", "keep")
+        os.makedirs(os.path.join(_export, ".claude", "skills", "demo"), exist_ok=True)
+        _wrapper(
+            os.path.join(_export, ".claude", "skills", "demo"),
+            "SKILL.md",
+            "---\nname: demo\ndescription: d\n---\n",
+        )
+        if _git_repo(_enclosing, {_keep: "x\n"}, [_keep]):
+            _res = command_skill_result(
+                os.path.join(_export, ".claude", "commands"),
+                os.path.join(_export, ".claude", "skills"),
+            )
+            check(
+                _res.status == "skip"
+                and any(
+                    "does not own" in line
+                    and "run the gate inside the git checkout" in line
+                    for line in _res.lines
+                ),
+                "an enclosing checkout that tracks ONE innocuous file under the export's "
+                "`.claude` still does not OWN it: UNVERIFIED, 'run inside the checkout'",
+            )
+
+    # (e7) SRE L-2: the index listing is cached per work tree, so the several checks that ask
+    # about `.claude` spend ONE subprocess — and a listing that FAILED is never re-asked into
+    # a pass. Killing mutants: dropping the cache (the counter sees two calls); caching the
+    # entries but not the `None`.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            _calls = {"n": 0}
+            _saved_run = subprocess.run
+
+            def _counting_run(argv, *args, **kwargs):  # noqa: ANN001 - selftest shim
+                if isinstance(argv, list) and argv[:2] == ["git", "ls-files"]:
+                    _calls["n"] += 1
+                return _saved_run(argv, *args, **kwargs)
+
+            _LS_FILES_CACHE.clear()
+            globals()["_LS_FILES_CACHE_ENABLED"] = True
+            subprocess.run = _counting_run
+            try:
+                _first = command_skill_result(
+                    os.path.join(tmp, ".claude", "commands"),
+                    os.path.join(tmp, ".claude", "skills"),
+                )
+                _second = startup_config_result(
+                    os.path.join(tmp, ".mcp.json"),
+                    os.path.join(tmp, ".claude", "settings.local.json"),
+                    os.path.join(tmp, ".claude", "settings.json"),
+                )
+                _shared = _calls["n"]
+                # ...and a listing that FAILED stays failed for the whole run. Git answering
+                # once and then recovering must not print one check's SKIP beside another's
+                # PASS over the same index: one report, one verdict about one work tree.
+                _LS_FILES_CACHE.clear()
+                _flaky = {"n": 0}
+
+                def _flaky_run(argv, *args, **kwargs):  # noqa: ANN001 - selftest shim
+                    if isinstance(argv, list) and argv[:2] == ["git", "ls-files"]:
+                        _flaky["n"] += 1
+                        if _flaky["n"] == 1:
+                            return subprocess.CompletedProcess(argv, 128, b"", b"boom")
+                    return _saved_run(argv, *args, **kwargs)
+
+                subprocess.run = _flaky_run
+                _flaky_statuses = [
+                    command_skill_result(
+                        os.path.join(tmp, ".claude", "commands"),
+                        os.path.join(tmp, ".claude", "skills"),
+                    ).status,
+                    startup_config_result(
+                        os.path.join(tmp, ".mcp.json"),
+                        os.path.join(tmp, ".claude", "settings.local.json"),
+                        os.path.join(tmp, ".claude", "settings.json"),
+                    ).status,
+                ]
+            finally:
+                subprocess.run = _saved_run
+                globals()["_LS_FILES_CACHE_ENABLED"] = False
+                _LS_FILES_CACHE.clear()
+            check(
+                _first.status == "pass"
+                and _second.status == "pass"
+                and _shared == 1
+                and _flaky_statuses == ["skip", "skip"],
+                "the index listing is cached per work tree (two checks, one `git ls-files`) "
+                "and a FAILED listing stays failed for the run — never one SKIP beside one "
+                "PASS about the same index",
+            )
+
+    # (e8) A tracked path whose BYTES are not valid UTF-8. `subprocess(text=True)` decoded the
+    # listing strictly and raised out of `_ls_files`, so the gate CRASHED (exit 2, "the gate
+    # is broken") on a file an attacker chooses the name of. Surrogate-escaped, the entry is
+    # reported — fail closed — and every message it appears in can still be printed.
+    # Killing mutants: restoring `text=True`; dropping the `_is_undecodable` finding.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            if _cacheinfo(tmp, "100644", ".claude/skills/evil/\udcffkill.md", "x\n"):
+                _res = command_skill_result(
+                    os.path.join(tmp, ".claude", "commands"),
+                    os.path.join(tmp, ".claude", "skills"),
+                )
+                _rendered = "\n".join(_res.lines).encode("utf-8", "strict")
+                check(
+                    _res.status == "fail"
+                    and any("not valid UTF-8" in line for line in _res.lines)
+                    and b"kill.md" in _rendered,
+                    "a tracked path whose bytes are not UTF-8 is REPORTED (and printable), "
+                    "never a decode crash the runner reads as a broken gate",
                 )
 
     # (f) A path containing BOTH quote characters. `repr` switches to double quotes for a
@@ -5661,7 +6234,7 @@ def _selftest() -> int:
                 _tracked_links([_outside]) is None,
                 "_tracked_links returns None (not []) when git cannot answer outside a checkout",
             )
-            _problems, _unverified = tracked_symlink_problems([_outside])
+            _problems, _unverified, _ = tracked_symlink_problems([_outside])
             check(
                 _problems == []
                 and len(_unverified) == 1
