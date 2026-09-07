@@ -245,10 +245,10 @@ of three reconciliations or the three local validations (`settings-permissions`,
    absent in the checkout-only CI job and resolves to real configuration on every
    machine that has run `dotnet build`, and a submodule is checked out *empty* by that
    job while `git submodule update --init` loads whatever it contains — a
-   filesystem-only check passes both. Git is asked from the directory that
-   *contains* `.claude`, never from inside it — a submodule `.claude` would answer
-   from the nested repository and a symlinked one from outside the checkout, both
-   "clean". The index is **listed once from the work-tree root with no pathspec** (so
+   filesystem-only check passes both. The link and index query is asked from the
+   directory that *contains* `.claude`, never from inside it — a submodule `.claude`
+   would answer from the nested repository and a symlinked one from outside the
+   checkout, both "clean". The index is **listed once from the work-tree root with no pathspec** (so
    no pathspec magic — `GIT_LITERAL_PATHSPECS` and friends are scrubbed alongside
    `GIT_DIR`, while the discovery-narrowing `GIT_CEILING_DIRECTORIES` is deliberately
    honored), and **every entry that case- or normalization-folds onto `.claude/…` or

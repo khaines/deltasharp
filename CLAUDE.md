@@ -120,9 +120,9 @@ here, so neither shape can hide: a **dangling** link (one pointing at `bin/` or
 `obj/`) is absent in a checkout-only CI job and resolves to real configuration on
 any machine that has built, and a **submodule** is checked out *empty* by CI while
 `git submodule update --init` loads whatever it contains on a developer machine.
-Git is asked from the directory that *contains* `.claude`, never from inside it — a
-submodule `.claude` would answer from the nested repository and a symlinked one
-from outside the checkout, both "clean". The index is **listed once from the
+The link and index query is asked from the directory that *contains* `.claude`, never
+from inside it — a submodule `.claude` would answer from the nested repository and a
+symlinked one from outside the checkout, both "clean". The index is **listed once from the
 work-tree root**, with no pathspec (so no pathspec magic — `GIT_LITERAL_PATHSPECS`
 and friends are scrubbed along with `GIT_DIR`) and every entry that **case- or
 normalization-folds** onto `.claude/…` or `.mcp.json` is compared with the canonical
