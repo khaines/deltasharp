@@ -1,3 +1,5 @@
+<!-- GENERATED from .claude/skills/review-pr/scout.md by tools/aiconfig/generate-copilot.py — do not edit; edit the source and re-run with --write. -->
+
 # Scout — RFL council triage role
 
 > Dispatched by the `review-pr` skill (Phase 1.6) as the **first** pass of a review.
@@ -7,14 +9,12 @@
 
 ## Dispatch
 
-Run the scout with the Agent tool on the **cheap tier** (it only reads/classifies — no deep
+Run the scout with the task tool on the **cheap tier** (it only reads/classifies — no deep
 reasoning needed):
 
-<!-- ai:block scout-tier -->
-- Model: `haiku`. The scout only **routes** — it never scores or gates — so its tier is
+- Model: a cheap tier. The scout only **routes** — it never scores or gates — so its model is
   immaterial to council decorrelation.
-<!-- ai:endblock scout-tier -->
-- `subagent_type`: `Explore` (read/grep/glob/bash) or `general-purpose`.
+- `agent_type`: `explore` (read/grep/glob/bash) or `general-purpose`.
 - Always run the scout, even for small PRs — its Review Package is the audit record of
   *why* each seat was (or was not) selected. For a trivial 1–2 file docs-only change the
   orchestrator may inline the scout's logic instead of dispatching it, and must say so.
@@ -24,9 +24,9 @@ changed-file list.
 
 ## What the scout reads first
 
-- `.claude/skills/review-pr/agent-map.md` — file/content → specialist persona.
-- `.claude/skills/review-pr/checklist-map.md` — file → checklist IDs.
-- `CLAUDE.md` — DeltaSharp canon (used to spot cross-cutting concerns).
+- `.github/skills/review-pr/agent-map.md` — file/content → specialist persona.
+- `.github/skills/review-pr/checklist-map.md` — file → checklist IDs.
+- `.github/copilot-instructions.md` — DeltaSharp canon (used to spot cross-cutting concerns).
 
 ## Tasks
 
@@ -44,13 +44,13 @@ changed-file list.
    and the files it owns. **Confirm each spec file exists** (`ls`); drop any that don't.
    The 4 fixed council lenses (Architect / Balanced / Quality / Security) are always present —
    the roster is *additional* domain depth, not a replacement. **Dedup:** do **not** list a
-   specialist whose persona is already the recommended `subagent_type` of a fixed lens (step 5) —
+   specialist whose persona is already the recommended `agent_type` of a fixed lens (step 5) —
    that lens already provides the depth; pick the next-best distinct specialist or drop the slot
    (a duplicate seat double-counts in consensus and wastes budget).
 4. **Map checklists per seat.** For each seat (4 lenses + specialists), list the
    `CHECKLIST_IDS` from `checklist-map.md` that apply to the changed files.
-5. **Recommend the per-lens `subagent_type`.** For each of the 4 fixed lenses, pick the
-   best-fit `subagent_type` from that lens's allowlist (see `SKILL.md` Phase 3) given the PR's
+5. **Recommend the per-lens `agent_type`.** For each of the 4 fixed lenses, pick the
+   best-fit `agent_type` from that lens's allowlist (see `SKILL.md` Phase 3) given the PR's
    primary content, with a one-line justification.
 6. **Surface claims to verify (feeds C4/C7).** Grep the diff/PR body for: design-doc/ADR
    paths, "Closes/Fixes #N", "complete"/"implements"/"fixes", CHANGELOG/migration notes,
@@ -66,14 +66,12 @@ changed-file list.
 - Changed files by domain:
   - <domain>: <files>
 - Fixed lenses (always run): Architect, Balanced, Quality, Security
-  - recommended subagent_type: architect=<…> balanced=<…> quality=<…> security=<…>  (+1-line why each)
+  - recommended agent_type: architect=<…> balanced=<…> quality=<…> security=<…>  (+1-line why each)
 - Specialist seats (≤3, voting on their domain):
   1. DOMAIN=<…>  CANONICAL_SPEC=<abs path, verified>  OWNS=<files>  CHECKLIST_IDS=<…>
 - Per-seat checklist IDs: architect=<…> balanced=<…> quality=<…> security=<…> <specialists…>
 - Claims to verify (C4/C7): <design-doc fields | issue-closure claims | migration notes | enforcement/parity/efficacy claims>
-<!-- ai:block scout-gate-check -->
-- Red-team tier check: voting seats are all `opus`; red-team runs on `fable` (a tier no voting seat uses), blind-first, not forked.
-<!-- ai:endblock scout-gate-check -->
+- Red-team vendor check: voting seats are all Claude; red-team runs on `gemini-3.1-pro-preview` (a vendor no voting seat uses), blind-first, not forked.
 ```
 
 The scout classifies and routes only. It never reviews code quality, scores, or edits files.

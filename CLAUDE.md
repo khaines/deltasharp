@@ -26,10 +26,14 @@ assumed; see [ADR-0015](docs/adr/0015-open-source-positioning.md)).
 > [repository layout & project conventions](docs/engineering/design/repository-layout.md),
 > and keep these instructions in sync as engine code lands.
 >
+<!-- ai:block ai-workflows -->
 > **AI-assisted workflows.** Specialist personas live in `.claude/agents/` (canonical
 > role specs in `docs/persona/agents/`), and the orchestration skills — `design-doc`,
 > `implement-work-item`, `review-pr`, `review-fix-loop`, `stacked-pr-chain` — live in
-> `.claude/skills/`.
+> `.claude/skills/`. The GitHub Copilot mirror of both trees, plus
+> `.github/copilot-instructions.md`, is GENERATED from this one by
+> `tools/aiconfig/generate-copilot.py` — edit `.claude/**`, never `.github/**`.
+<!-- ai:endblock ai-workflows -->
 
 ## Build, test, and lint
 
@@ -55,6 +59,7 @@ Prefer keeping the solution buildable with `dotnet build` from the repo root
 (i.e. a single `*.sln` at the root that references all `src/` and `tests/`
 projects).
 
+<!-- ai:block agent-permissions -->
 ## Agent permissions
 
 `.claude/settings.json` pre-approves read-only inspection commands:
@@ -156,6 +161,7 @@ launches, before any tool call and with no prompt. **A tracked
 per-machine grants this file keeps recommending there are only safe while it stays
 untracked and gitignored (both paths are in `.gitignore`).
 
+<!-- ai:endblock agent-permissions -->
 ## Architecture — the big picture
 
 DeltaSharp follows Spark's layered execution model. Keep these layers separate:

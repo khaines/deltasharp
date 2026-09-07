@@ -1,0 +1,1 @@
+- Red-team vendor check: voting seats are all Claude; red-team runs on `gemini-3.1-pro-preview` (a vendor no voting seat uses), blind-first, not forked.
