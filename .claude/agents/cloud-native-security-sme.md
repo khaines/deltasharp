@@ -1,7 +1,7 @@
 ---
 name: cloud-native-security-sme
 description: Use for zero trust, job IAM and authorization, tenant isolation, secrets handling, supply-chain integrity, and security incident readiness in DeltaSharp.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

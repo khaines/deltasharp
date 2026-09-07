@@ -1,7 +1,7 @@
 ---
 name: data-platform-connectors-engineer
 description: Use for DeltaSharp data source/sink connectors, file formats, catalog integration, streaming ingestion, schema-on-read, and pushdown contracts.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

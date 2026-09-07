@@ -53,7 +53,7 @@ triage.
   **list** — 25 roles — is maintained in the [workstream plan](README.md) (the
   source of truth for *which* personas exist); the **canonical per-role specs**
   live in [`docs/persona/agents/README.md`](../persona/agents/README.md) and are
-  mirrored by the wrappers in `.github/agents/*.agent.md`.
+  mirrored by the wrappers in `.claude/agents/*.md`.
 - **One slug is truncated in label form.** GitHub caps label names at 50
   characters. `persona:dotnet-vectorized-columnar-compute-engineer` is 51
   characters, so its label drops the redundant trailing `-engineer`:
@@ -125,7 +125,7 @@ links) is the **source of truth**. STORY-00.6.2 AC3 requires roster changes to b
 tracked there. When a persona is added, removed, or renamed:
 
 1. Update the roster in [`docs/planning/README.md`](README.md) and the canonical
-   spec under `docs/persona/agents/` (plus its `.github/agents/` wrapper).
+   spec under `docs/persona/agents/` (plus its `.claude/agents/` wrapper).
 2. Add or remove the matching `persona:<slug>` label, honoring the 50-character
    truncation rule above.
 3. Update the committed
@@ -141,7 +141,7 @@ slugs, 25 labels, with the single documented truncation. Reconcile at any time
 
 ```bash
 comm -3 \
-  <(ls .github/agents/*.agent.md | sed 's#.*/##; s#\.agent\.md$##' | sort) \
+  <(ls .claude/agents/*.md | sed 's#.*/##; s#\.md$##' | sort) \
   <(gh label list --limit 200 \
       | awk -F'\t' '$1 ~ /^persona:/ { sub(/^persona:/,"",$1); print $1 }' | sort)
 ```
@@ -162,7 +162,7 @@ labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
 the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
 of three reconciliations breaks:
 
-1. **Roster ↔ persona labels.** Every `.github/agents/*.agent.md` wrapper must have a
+1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
    matching `persona:<slug>` label and vice-versa. The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone

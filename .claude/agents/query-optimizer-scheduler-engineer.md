@@ -1,7 +1,7 @@
 ---
 name: query-optimizer-scheduler-engineer
 description: Use for DeltaSharp CBO, table/column statistics, Adaptive Query Execution, join-strategy intelligence, and fair scheduler/resource-pool design.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

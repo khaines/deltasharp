@@ -1,7 +1,7 @@
 ---
 name: reliability-test-chaos-engineer
 description: Designs oracle-backed reliability, chaos, fuzzing, simulation, and consistency tests proving DeltaSharp remains data-correct under fault.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

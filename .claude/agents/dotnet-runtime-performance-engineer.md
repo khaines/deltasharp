@@ -1,7 +1,7 @@
 ---
 name: dotnet-runtime-performance-engineer
 description: Use for DeltaSharp CLR/runtime performance, GC/JIT/AOT analysis, allocation elimination, unsafe/SIMD hot paths, EventPipe diagnostics, BenchmarkDotNet micro-benchmarks, and the ADR-0001 optional codegen tier.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

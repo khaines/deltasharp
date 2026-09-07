@@ -1,7 +1,7 @@
 ---
 name: catalog-metastore-engineer
 description: Use for DeltaSharp catalog/metastore design, Spark V2-style catalog plugins, native catalog persistence, Hive Metastore compatibility, namespaces, identifier resolution, DDL metadata semantics, information_schema, and Delta table binding.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

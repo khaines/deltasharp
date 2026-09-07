@@ -1,7 +1,7 @@
 ---
 name: developer-experience-api-engineer
 description: Designs DeltaSharp's Spark-parity public API, migration ergonomics, samples, diagnostics, and developer experience.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 
