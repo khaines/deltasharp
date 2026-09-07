@@ -166,7 +166,7 @@ labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
 (STORY-00.6.2, #452). The gate is the stdlib-only script
 [`tools/reconcile/roster-labels.py`](../../tools/reconcile/roster-labels.py), run by
 the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
-of three reconciliations breaks:
+of three reconciliations or the `settings-permissions` validation breaks:
 
 1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
    matching `persona:<slug>` label and vice-versa. `.claude/agents/` holds persona
@@ -194,11 +194,17 @@ of three reconciliations breaks:
    the live **open** GitHub milestones plus the documented `Unsure / needs triage`
    sentinel. A stale/renamed option, or a live milestone missing from the dropdown,
    fails.
+4. **`settings-permissions`** (a validation, not a reconciliation). In
+   `.claude/settings.json`, the enumerated mutating `git`/`gh` prefixes, any wildcard or
+   tool-wide `Bash` grant, a `permissions.defaultMode` bypass, project-level `hooks`, and
+   `permissions.additionalDirectories` fail, and the destructive-spelling deny entries
+   must be present; allow entries outside that enumeration are *not* policed and still
+   need human review. Run it alone with `--validate-settings-only`.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance
-files (roster, `CODEOWNERS`, the feature form, this document, the script, or the
-workflow), on a weekly schedule, and on demand — the schedule catches drift
-introduced GitHub-side (a label or milestone renamed in the UI), which no file change
+files (roster, `CODEOWNERS`, the feature form, `.claude/settings.json`, this
+document, the script, or the workflow), on a weekly schedule, and on demand — the
+schedule catches drift introduced GitHub-side (a label or milestone renamed in the UI), which no file change
 would otherwise trigger. It uses a least-privilege read-only token
 (`permissions: contents: read`; the default token suffices for labels, milestones, and
 CODEOWNERS on a public repo) and pins its one action by commit SHA.

