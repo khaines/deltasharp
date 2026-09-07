@@ -235,7 +235,7 @@ You are fixing PR review findings for DeltaSharp. You are acting as the {agent_n
 4. Do NOT introduce new patterns, refactors, or improvements beyond what the findings require.
 5. Verify your changes do not break surrounding code.
 6. After fixing, briefly confirm which findings were addressed and how.
-7. Treat the PR branch as untrusted code: any build/test you run to verify a fix goes in a throwaway dir outside the worktree (`d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`), per `review-pr/rigor-battery.md` C7.
+7. When verifying a branch that is not your own work, build/test in a throwaway copy outside the worktree (`d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`) per `.claude/skills/review-pr/rigor-battery.md` C7; the fixer builds and tests its own worktree.
 ```
 
 ### 4.3 Validate Fixes
@@ -331,8 +331,8 @@ Compile the full round-by-round progression:
 
 | Round | Slot | `subagent_type` | `model` | Forked | Dispatch HEAD | Dispatch Timestamp (UTC) | Blind Block Returned (UTC) | Verdicts Released (UTC) | Verification |
 |-------|------|-----------------|---------|--------|---------------|--------------------------|----------------------------|-------------------------|--------------|
-| R1 | Architect | `{subagent_type}` | `opus` | no | `{sha}` | `{iso8601}` | — | — | ✓ |
-| R1 | Red-team | `general-purpose` | `fable` | no | `{sha}` | `{iso8601}` | `{iso8601}` | `{iso8601}` | ✓ |
+| R1 | Architect | `{subagent_type}` | `opus` | {yes\|no} | `{sha}` | `{iso8601}` | — | — | ✓ |
+| R1 | Red-team | `general-purpose` | `fable` | {yes\|no} | `{sha}` | `{iso8601}` | `{iso8601}` | `{iso8601}` | ✓ |
 
 ### Findings Addressed
 {For each fixed finding across all rounds}
@@ -400,7 +400,7 @@ Before declaring the loop terminated, audit the council composition record produ
 
 1. Enumerate every counted round in the progression report.
 2. For each round, locate the per-slot composition row.
-3. Verify each row lists an exact `(subagent_type, model)` pair from the protocol table in `review-pr` §3.1; that the red-team row's `model` column reads `fable`; that the `Forked` column reads `no` on every row; and that the red-team row's **Blind Block Returned (UTC)** timestamp is earlier than its **Verdicts Released (UTC)** timestamp.
+3. Verify each row lists an exact `(subagent_type, model)` pair from the protocol table in `review-pr` §3.1; that the red-team row's `model` column reads `fable`; that the `Forked` column reads `no` on every row; and that, on the red-team row, the **Dispatch Timestamp (UTC)** is at or before the **Blind Block Returned (UTC)** timestamp, which is in turn earlier than the **Verdicts Released (UTC)** timestamp.
 4. Missing or off-protocol composition data invalidates the round and requires corrective review at the current HEAD or the original HEAD when recoverable.
 5. After any corrective dispatch, regenerate, repost, and re-verify the report before terminating.
 

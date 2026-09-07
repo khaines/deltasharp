@@ -142,10 +142,14 @@ needed):
 
 ```bash
 comm -3 \
-  <(ls .claude/agents/*.md | sed 's#.*/##; s#\.md$##' | sort) \
+  <(grep -l '^name:' .claude/agents/*.md | xargs -n1 sed -n 's/^name: *//p' | sort) \
   <(gh label list --limit 200 \
       | awk -F'\t' '$1 ~ /^persona:/ { sub(/^persona:/,"",$1); print $1 }' | sort)
 ```
+
+The left half reads the frontmatter `name:` from the top-level wrappers, exactly
+as the gate does; `python3 tools/reconcile/roster-labels.py --offline` is the
+authoritative check.
 
 The only expected difference is the truncated slug — roster-only
 `dotnet-vectorized-columnar-compute-engineer` versus label-only
@@ -165,9 +169,10 @@ of three reconciliations breaks:
 
 1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
    matching `persona:<slug>` label and vice-versa. `.claude/agents/` holds persona
-   wrappers only at the top level; the gate counts every `*.md` there that carries
-   a frontmatter `name:`, ignores markdown without one (e.g. a README), and does
-   not scan subdirectories. The one 50-character truncation
+   wrappers only: the gate counts every `*.md` there that carries a frontmatter
+   `name:` and ignores markdown without one (e.g. a README). Wrappers must sit
+   directly in `.claude/agents/`; a `name:`-bearing file in a subdirectory fails
+   the gate. The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone
    truncated label out of this file, so an *undocumented* truncation still fails. The

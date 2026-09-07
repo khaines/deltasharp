@@ -57,22 +57,30 @@ projects).
 
 ## Agent permissions
 
-`.claude/settings.json` pre-approves read-only inspection commands — `git
-status`/`diff`/`log`/`show`/`rev-parse`/`rev-list`/`merge-base`/`ls-files`/`fetch`
-and branch/worktree listings, plus `gh pr view`/`diff`/`list`/`checks` and `gh
-issue view`/`list` — along with `dotnet restore`, `build`, `test`, and `format`.
-It denies destructive git/gh forms (branch deletion/rename, force push, `gh pr
-merge`, `gh release`, `gh secret`, `gh api` mutations). Anything that writes to
-the repo or to GitHub — commit, push, `git worktree add`/`remove`, PR or issue
-creation, reviews — deliberately prompts. Prompt-on-write is the design, not an
-omission.
+`.claude/settings.json` pre-approves read-only inspection commands —
+`git status`, `git diff`, `git log`, `git show`, `git rev-parse`,
+`git rev-list`, `git merge-base`, `git ls-files`, and branch/worktree
+listings, plus `gh pr view`/`diff`/`list`/`checks` and `gh issue view`/`list`
+— along with `dotnet restore`, `build`, `test`, and `format`.
 
-The `dotnet` grant is scoped to the maintainer's own branches. `dotnet
-restore`/`build`/`test`/`format` execute PR-supplied MSBuild targets, analyzers,
-source generators, and `nuget.config` package sources in-process, so when
-reviewing or verifying someone else's branch, run them from a throwaway copy
-outside the worktree per `.claude/skills/review-pr/rigor-battery.md` (C7). The
-allowlist does not relax that rule.
+These are `Bash(prefix:*)` grants, and a prefix match covers everything typed
+after the prefix, so a flag such as `--output=<path>` on `git diff`, `git log`,
+or `git show` can still write a file: the allowlist is a convenience for the
+maintainer's own machine, not a sandbox boundary.
+
+The deny list covers only the explicit destructive spellings — branch
+delete/rename short flags, `git push -f`, `gh api` with
+`-X POST`/`PUT`/`PATCH`/`DELETE` or `--method`, `gh pr merge`, `gh release`,
+and `gh secret`. Everything else that writes is simply unlisted, so it prompts:
+`git push` always prompts, as do commit, `git worktree add`/`remove`, PR or
+issue creation, and reviews. Prompt-on-write is the design, not an omission.
+
+The `dotnet` grant is intended only for the maintainer's own branches; nothing
+enforces that. `dotnet restore`/`build`/`test`/`format` execute PR-supplied
+MSBuild targets, analyzers, source generators, and `nuget.config` package
+sources in-process, so when reviewing or verifying someone else's branch, run
+them from a throwaway copy outside the worktree per
+`.claude/skills/review-pr/rigor-battery.md` (C7).
 
 Per-user overrides belong in `.claude/settings.local.json`, which is gitignored.
 

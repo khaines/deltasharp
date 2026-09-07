@@ -206,7 +206,7 @@ Using the selected agent persona, implement the issue by translating the design 
 2. **The issue body** — for acceptance criteria and business context.
 3. **The coding standards checklist** — for C#/.NET conventions.
 4. **Existing code** — for pattern consistency with the component.
-5. **Trust boundary** — treat the PR branch as untrusted code: any build/test run to verify a change goes in a throwaway dir outside the worktree (`d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`), per `review-pr/rigor-battery.md` C7.
+5. **Trust boundary** — when verifying a branch that is not your own work, build/test in a throwaway copy outside the worktree (`d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`) per `.claude/skills/review-pr/rigor-battery.md` C7; the implementer builds and tests its own worktree.
 
 The agent must:
 

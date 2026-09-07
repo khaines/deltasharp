@@ -9,7 +9,10 @@ silently rotting:
 
   1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper (a markdown file
      whose front matter carries a `name:`; other markdown there is ignored) must have a
-     matching `persona:<slug>` label and vice-versa. The GitHub 50-character label cap forces
+     matching `persona:<slug>` label and vice-versa. The roster is NON-RECURSIVE — only
+     wrappers directly in `.claude/agents/` are roster entries; a `name:`-bearing file
+     nested in a subdirectory is an INTEGRITY ERROR (the workflow path filter would still
+     ship it), not a silently ignored file. The GitHub 50-character label cap forces
      exactly one documented truncation (the trailing `-engineer` is dropped from
      `persona:dotnet-vectorized-columnar-compute-engineer`); that truncation is allowed ONLY
      when `label-taxonomy.md` records it. The roster is reconciled against BOTH the persona
@@ -178,16 +181,33 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
     fall-back to the filename stem, so a stray README.md cannot red the gate.
 
     The slug is the front-matter `name:` (canonical); the filename stem must match it, and a
-    mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide. The
-    glob is deliberately non-recursive: nested directories are not part of the roster.
+    mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide.
+
+    The roster itself is NON-RECURSIVE — only files sitting directly in ``agents_dir`` count.
+    The scan, however, IS recursive, because the workflow path filter (`.claude/agents/**`)
+    is: a `name:`-bearing wrapper hidden in a subdirectory would otherwise be silently
+    ignored by this gate while still shipping as an agent. Such a NESTED WRAPPER IS AN
+    INTEGRITY ERROR, reported here rather than passed over.
     """
-    paths = sorted(glob.glob(os.path.join(agents_dir, "*.md")))
+    all_paths = sorted(
+        glob.glob(os.path.join(agents_dir, "**", "*.md"), recursive=True)
+    )
     slugs: "set[str]" = set()
     problems: "list[str]" = []
-    for path in paths:
+    first_seen: "dict[str, str]" = {}
+    for path in all_paths:
         name = _read_frontmatter_name(path)
         if not name:
             continue  # not a persona wrapper (no front-matter `name:`) — ignore
+        relative = os.path.relpath(path, agents_dir)
+        if os.sep in relative or (os.altsep and os.altsep in relative):
+            # A wrapper below the top level is NOT a roster entry (the roster is flat) but
+            # must not vanish silently — the workflow's path filter would still ship it.
+            problems.append(
+                f"persona wrapper {path!r} is nested; wrappers must sit directly in "
+                f"{agents_dir}"
+            )
+            continue
         stem = os.path.basename(path)[: -len(".md")]
         if name != stem:
             problems.append(
@@ -195,7 +215,12 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
                 f"filename stem {stem!r} — rename one so the persona slug is unambiguous"
             )
         if name in slugs:
-            problems.append(f"duplicate persona slug {name!r} (from {path!r})")
+            problems.append(
+                f"duplicate persona slug {name!r} — declared by both "
+                f"{first_seen[name]!r} and {path!r}"
+            )
+        else:
+            first_seen[name] = path
         slugs.add(name)
     if not slugs:
         raise FileNotFoundError(
@@ -824,12 +849,26 @@ def _selftest() -> int:
             "read_roster finds `<slug>.md` wrappers by front-matter name (0 problems)",
         )
 
+    def _read_roster_safe(directory: str) -> "tuple[bool, set[str], list[str]]":
+        """read_roster that records a raise as a FAILURE instead of escaping as a traceback.
+
+        Every read_roster fixture below funnels through here so a mutation that makes
+        read_roster raise (e.g. reverting the glob to `*.agent.md`, which finds nothing and
+        raises FileNotFoundError) yields FAIL lines from --selftest rather than an
+        unhandled traceback that obscures which assertions were meant to hold.
+        """
+        try:
+            slugs, problems = read_roster(directory)
+        except FileNotFoundError:
+            return (False, set(), ["FileNotFoundError"])
+        return (True, slugs, problems)
+
     # (b) front-matter `name:` != filename stem → exactly one integrity problem.
     with tempfile.TemporaryDirectory() as tmp:
         _wrapper(tmp, "product-manager.md", "---\nname: prodcut-manager\n---\n")
-        roster_slugs, roster_problems = read_roster(tmp)
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
         check(
-            len(roster_problems) == 1 and "does not match its" in roster_problems[0],
+            _ok and len(roster_problems) == 1 and "does not match its" in roster_problems[0],
             "read_roster flags front-matter name != filename stem",
         )
 
@@ -838,9 +877,9 @@ def _selftest() -> int:
         _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
         _wrapper(tmp, "README.md", "# Agents\n\nThis folder holds persona wrappers.\n")
         _wrapper(tmp, "TEMPLATE.md", "---\ndescription: no name key\n---\n")
-        roster_slugs, roster_problems = read_roster(tmp)
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
         check(
-            roster_slugs == {"product-manager"} and roster_problems == [],
+            _ok and roster_slugs == {"product-manager"} and roster_problems == [],
             "read_roster ignores non-persona markdown (README/TEMPLATE, no `name:`)",
         )
 
@@ -852,6 +891,47 @@ def _selftest() -> int:
         except FileNotFoundError:
             _empty_raised = True
     check(_empty_raised, "read_roster raises FileNotFoundError when no persona wrapper exists")
+
+    # (e) R2-F5a/b: two files declaring the SAME front-matter `name:` (the realistic
+    # collision: a canonical `<slug>.md` wrapper plus a copy under another filename) →
+    # EXACTLY ONE duplicate problem, and it names BOTH paths. Without the both-paths
+    # message the report would finger only the file encountered second, which for this
+    # fixture is the canonical wrapper — the innocent one. A mutation deleting the
+    # duplicate branch must redden here.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        _wrapper(tmp, "copy-of-pm.md", "---\nname: product-manager\n---\n")
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
+        _dupes = [p for p in roster_problems if "duplicate persona slug" in p]
+        check(
+            _ok and len(_dupes) == 1,
+            "read_roster flags a duplicate persona slug exactly once",
+        )
+        check(
+            len(_dupes) == 1
+            and "copy-of-pm.md" in _dupes[0]
+            and "product-manager.md" in _dupes[0],
+            "duplicate-slug message names BOTH declaring files (not just the second)",
+        )
+
+    # (f) R2-F5c: a `name:`-bearing wrapper NESTED below agents_dir is an integrity error,
+    # not a silent no-op. The workflow path filter (`.claude/agents/**`) is recursive, so a
+    # flat glob here would ship an agent this gate never saw. The roster still counts only
+    # the top-level wrapper. A mutation flattening the glob must redden here.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        _wrapper(os.path.join(tmp, "sub"), "nested.md", "---\nname: nested-persona\n---\n")
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
+        _nested = [p for p in roster_problems if "is nested" in p]
+        check(
+            _ok and len(_nested) == 1 and "nested.md" in _nested[0],
+            "read_roster flags a nested persona wrapper as an integrity problem",
+        )
+        check(
+            _ok and roster_slugs == {"product-manager"},
+            "nested wrapper is NOT counted as a roster entry (roster stays flat)",
+        )
 
     # --- Finding 7a: resolve_repo must NOT shell out to gh under --offline.
     mod = sys.modules[__name__]

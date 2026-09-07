@@ -244,7 +244,7 @@ After dispatching the 4 reviewers and **before** reporting any aggregate council
 1. **Read back each dispatch.** For each reviewer, look at the actual `subagent_type` and `model` arguments passed.
 2. **Validate against the protocol** verbatim. A round is invalid if any slot's model does not match its fixed value or if any `subagent_type` is not in its allowlist.
 3. **Correct off-protocol dispatches** by re-dispatching affected slots at the same HEAD SHA when possible; otherwise re-run the full round at current HEAD.
-4. **Capture verified composition** per round: slot name, `subagent_type`, `model`, fork flag (must be `no`), justification, dispatch HEAD SHA, and dispatch timestamp. For the red-team seat, also capture the blind-block-returned and verdicts-released timestamps.
+4. **Capture verified composition** per round: slot name, `subagent_type`, `model`, fork flag read back from the dispatch (`yes` if `subagent_type: fork` was used, else `no`), dispatch HEAD SHA, and dispatch timestamp captured with `date -u +%Y-%m-%dT%H:%M:%SZ` at dispatch time. For the red-team seat, also capture the blind-block-returned and verdicts-released timestamps.
 5. **Composition verification gates aggregate-rating claims.** Do not claim unanimity, consensus, or aggregate rating until verified.
 6. **Externalized composition record.** At each round's close, post the verified composition record as a PR comment or persist it in an auditable project-relative path for local-only reviews. Prior records are append-only.
 

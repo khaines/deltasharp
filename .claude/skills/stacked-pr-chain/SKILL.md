@@ -136,7 +136,7 @@ this tip (2.1).
 
 Example:
 
-```
+```text
 Stack root: main @ 3bbb864 (unchanged all build)
 | item | issue | branch                         | PR  | base                    | PASS |
 |------|-------|--------------------------------|-----|-------------------------|------|

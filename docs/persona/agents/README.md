@@ -39,15 +39,15 @@ canonical spec drift, the canonical spec wins.
 
 Every persona internalizes the DeltaSharp architecture (see `CLAUDE.md`):
 **transformations are lazy, actions are eager**; a Catalyst-style pipeline
-(logical plan → analyzer/optimizer → physical plan → execution); stages split at
-shuffle boundaries; Delta tables backed by
-Parquet and the `_delta_log` transaction log (ACID, time travel, schema
-evolution); a driver coordinating executor pods under a Kubernetes Operator; and
-storage on both cloud object stores (S3/ADLS/GCS) and PersistentVolumes (PVCs).
-Foundational engineering decisions (execution backend, columnar batch format,
-transport, shuffle) are recorded as ADRs in `docs/adr/` and summarized in
-`docs/engineering/design/engine-architecture.md`; every persona **defers** to those
-ADRs rather than redefining them.
+(logical plan → analyzer/optimizer → physical plan → execution); stages split
+at shuffle boundaries; Delta tables backed by Parquet and the `_delta_log`
+transaction log (ACID, time travel, schema evolution); a driver coordinating
+executor pods under a Kubernetes Operator; and storage on both cloud object
+stores (S3/ADLS/GCS) and PersistentVolumes (PVCs). Foundational engineering
+decisions (execution backend, columnar batch format, transport, shuffle) are
+recorded as ADRs in `docs/adr/` and summarized in
+`docs/engineering/design/engine-architecture.md`; every persona **defers** to
+those ADRs rather than redefining them.
 
 ## Agent roster (25 agents)
 
