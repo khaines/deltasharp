@@ -3330,7 +3330,7 @@ def _print_summary(results: "list[Result]") -> None:
 #     GITHUB_ACTIONS/CI default on) — those two escapes become failures in their own right:
 #     any skip, and any reduced coverage, FAILS the floor and names what was skipped. So an
 #     automated run either executes the full count or goes red; it cannot go green with less.
-SELFTEST_ASSERTIONS_IN_CHECKOUT = 327
+SELFTEST_ASSERTIONS_IN_CHECKOUT = 338
 # The assertions that can only run there (they exercise the REAL .claude tree through main()).
 # Anywhere else — a `git archive` export, a tarball, a vendored copy, a subdirectory — they
 # are skipped rather than failed, so the floor below is what proves they ran where they can.
@@ -5527,6 +5527,107 @@ def _selftest(strict: bool = False) -> int:
                 and _root in _raised,
                 f"an empty roster under a symlinked `.claude` ({_shape}) names the parent link",
             )
+
+    # --- COPILOT-A/B: the SECOND config root (`.github`). The Copilot tree
+    # (`.github/agents`, `.github/skills`, `.github/copilot-instructions.md`) is generated
+    # from `.claude/**` and executed by Copilot on the same machines, so it is policed the
+    # same way. Two properties decide whether that policing is real, and both have a false
+    # green as their failure mode.
+    #
+    # (A) SCOPE. `.github` also holds `workflows/`, `CODEOWNERS`, `ISSUE_TEMPLATE/` and
+    # `dependabot.yml`. Policing the root the way `.claude` is policed — everything beneath
+    # it — would make a tracked symlink at `.github/workflows/ci.yml` a finding of THIS gate
+    # and red unrelated PRs on a rule that was never about them. The root ENTRY is policed
+    # (a link or submodule AT `.github` would otherwise hide the whole AI tree behind it);
+    # depth comes only from the three named children.
+    # Killing mutant: dropping `SHALLOW_CONFIG_ROOTS` from `_prefix_matches`, or adding
+    # `workflows` to `POLICED_GITHUB_CHILDREN`.
+    _github_prefixes = _policed_prefixes([GITHUB_DIR_NAME])
+    check(
+        set(_github_prefixes) == {
+            (GITHUB_DIR_NAME,),
+            (GITHUB_DIR_NAME, "agents"),
+            (GITHUB_DIR_NAME, SKILLS_CHILD_NAME),
+            (GITHUB_DIR_NAME, "copilot-instructions.md"),
+        },
+        "the `.github` root contributes exactly its three AI-config children plus itself",
+    )
+    check(
+        _prefix_matches((GITHUB_DIR_NAME,), (GITHUB_DIR_NAME,))
+        and _prefix_matches(("." + "GitHub",), (GITHUB_DIR_NAME,)),
+        "the `.github` ROOT ENTRY is policed, in any spelling the checkout folds onto it",
+    )
+    check(
+        not any(
+            _prefix_matches(_parts, _prefix)
+            for _prefix in _github_prefixes
+            for _parts in (
+                (GITHUB_DIR_NAME, "workflows", "ci.yml"),
+                (GITHUB_DIR_NAME, "CODEOWNERS"),
+                (GITHUB_DIR_NAME, "ISSUE_TEMPLATE", "bug.yml"),
+                (GITHUB_DIR_NAME, "dependabot.yml"),
+            )
+        ),
+        "`.github/workflows`, CODEOWNERS, ISSUE_TEMPLATE and dependabot.yml stay OUT of scope",
+    )
+    check(
+        any(
+            _prefix_matches((GITHUB_DIR_NAME, "agents", "x.agent.md"), _prefix)
+            for _prefix in _github_prefixes
+        )
+        and any(
+            _prefix_matches(
+                (GITHUB_DIR_NAME, SKILLS_CHILD_NAME, "s", SKILL_MANIFEST_NAME), _prefix
+            )
+            for _prefix in _github_prefixes
+        ),
+        "the three `.github` AI-config children ARE policed to full depth",
+    )
+    check(
+        any(
+            _prefix_matches((CLAUDE_DIR_NAME, "hooks"), _prefix)
+            for _prefix in _policed_prefixes([CLAUDE_DIR_NAME])
+        ),
+        "`.claude` keeps its root-and-everything-below breadth (LAST-CERT F2 unchanged)",
+    )
+
+    # (B) THE SYNTHESIZED-ROOT FALSE GREEN. `config_root_pathspec` used to answer
+    # `dirname(path)/.claude` for ANY path with no `.claude` ancestor. That is right for the
+    # `.mcp.json` sibling it was written for (PR-901 F-B) and catastrophic for a second root:
+    # `.github/agents` would have been scoped to `.github/.claude`, a directory that does not
+    # exist, so every finding in the Copilot tree would have been selected away and the check
+    # would have reported a clean tree it never looked at. An unrecognized path now answers
+    # None, which `link_query_paths` skips — the path is then queried under its own spelling
+    # and nothing else. A wrong root is a false green; no root is a narrower truth.
+    # Killing mutant: restoring the unconditional `dirname/.claude` synthesis.
+    check(
+        config_root_pathspec(DEFAULT_COPILOT_AGENTS_DIR) == GITHUB_DIR_NAME
+        and config_root_pathspec(DEFAULT_COPILOT_SKILLS_DIR) == GITHUB_DIR_NAME
+        and config_root_pathspec(DEFAULT_COPILOT_INSTRUCTIONS) == GITHUB_DIR_NAME,
+        "every policed `.github` path scopes to the `.github` root",
+    )
+    check(
+        config_root_pathspec(DEFAULT_COPILOT_AGENTS_DIR)
+        != os.path.join(GITHUB_DIR_NAME, CLAUDE_DIR_NAME),
+        "`.github/agents` does NOT scope to a synthesized `.github/.claude` (false green)",
+    )
+    check(
+        config_root_pathspec(DEFAULT_MCP_CONFIG) == CLAUDE_DIR_NAME,
+        "the `.mcp.json` sibling still scopes to the `.claude` beside it (PR-901 F-B)",
+    )
+    check(
+        config_root_pathspec(os.path.join("docs", "x.md")) is None
+        and config_root_pathspec(os.path.join("vendor", "lib")) is None,
+        "a path in NEITHER root scopes to None, never to an invented root",
+    )
+    check(
+        claude_root_pathspec(DEFAULT_AGENTS_DIR) == CLAUDE_DIR_NAME,
+        "the `claude_root_pathspec` alias still answers for the `.claude` root",
+    )
+    check(
+        link_query_paths(os.path.join("docs", "x.md")) == [os.path.join("docs", "x.md")],
+        "a None root drops out of link_query_paths, leaving the path's own spelling",
+    )
 
     # --- PR-901 F-A/F-B/F-C/F-D/F-E: WHERE git is asked, and about WHAT. ---------------
     # Every fixture above builds a link INSIDE a `.claude` that is itself an ordinary
