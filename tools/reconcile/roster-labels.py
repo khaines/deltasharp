@@ -42,7 +42,7 @@ of the `.claude/settings.json` permission surface, of the `.claude/commands` /
      milestones, plus the documented "needs triage" sentinel. A stale/renamed option or a
      live milestone missing from the dropdown FAILS.
 
-Alongside those three reconciliations the gate runs two local VALIDATIONS. The first is
+Alongside those three reconciliations the gate runs three local VALIDATIONS. The first is
 `settings-permissions` (:func:`validate_settings`): `.claude/settings.json` must parse and its
 `permissions.allow` / `permissions.deny` must be LISTS OF STRINGS. It then rejects, precisely:
 the enumerated mutating git/gh prefixes in :data:`FORBIDDEN_ALLOW_COMMANDS` (`gh api`,
@@ -731,10 +731,12 @@ _GITLINK_MODE = "160000"
 # repository reads exactly like a clean answer from this one (PR-901 F-E). The pathspec-magic
 # family is the same defect one level down: `GIT_LITERAL_PATHSPECS=1` makes a `:(literal)…`
 # pathspec match NOTHING, so the index query returned zero entries and the gate passed in
-# silence (PR-901 second round, H-2). This file no longer hands git any pathspec at all — it
-# lists the index once and filters in Python — but the variables stay scrubbed so a future
-# pathspec cannot reintroduce the hole, and `GIT_NAMESPACE` is scrubbed because a namespaced
-# ref view is not the checkout the walks read.
+# silence (PR-901 second round, H-2). The index and link/fold query hands git no pathspec at
+# all — it lists the index once and filters in Python; the only per-file question,
+# `git ls-files --error-unmatch`, passes one absolute path after `--` with no magic prefix —
+# and the variables stay scrubbed so neither that call nor a future pathspec can reopen the
+# hole. `GIT_NAMESPACE` is scrubbed because a namespaced ref view is not the checkout the
+# walks read.
 #
 # What is deliberately NOT scrubbed: `GIT_CEILING_DIRECTORIES` and
 # `GIT_DISCOVERY_ACROSS_FILESYSTEM`, which only RESTRICT where git looks for a repository.
@@ -1677,8 +1679,12 @@ def tracked_symlink_problems(
             + f" hold tracked symlinks, submodules or fold-variants ({reason}) — a "
             "link whose target is absent here, a submodule CI checks out empty, and a "
             "spelling that folds onto a policed path on this checkout are all INVISIBLE to "
-            "the path checks, so this is unverified, not clean; run the gate inside the git "
-            "checkout that tracks these files"
+            "the path checks, so this is unverified, not clean; "
+            + (
+                "install git and rerun"
+                if "git is not on PATH" in reason
+                else "run the gate inside the git checkout that tracks these files"
+            )
         ]
         if reason
         else []
@@ -5678,7 +5684,7 @@ def _selftest(strict: bool = False) -> int:
                 # is the collision (rename it), not the collision AND the link.
                 and sum(_variant in line for line in _lines) == 3,
                 f"a tracked `{_variant}` folds onto `{_canonical}` and is named exactly once "
-                f"by each of the three local checks",
+                f"by each of the three link-asking local checks",
             )
 
     # (c3) ...and it reaches the GATE as exit 1, named by `tracked-startup-config` — the
@@ -6614,7 +6620,7 @@ def _selftest(strict: bool = False) -> int:
                     link_query_paths(os.path.join(_export, ".claude", "agents"))
                 ) is None,
                 "an export under an UNINITIALIZED submodule gitlink is UNVERIFIED in all "
-                "three local checks, not cleared by an enclosing index that says nothing "
+                "three link-asking local checks, not cleared by an enclosing index that says nothing "
                 "about it",
             )
 
@@ -7303,7 +7309,12 @@ def _selftest(strict: bool = False) -> int:
         floor(
             in_checkout,
             f"selftest floor: --require-full-coverage run has REDUCED coverage "
-            f"({coverage_gap}) — run --selftest from the root of the git checkout it tests",
+            f"({coverage_gap}) — "
+            + (
+                "install git and rerun"
+                if coverage_gap == "git is not on PATH"
+                else "run --selftest from the root of the git checkout it tests"
+            ),
         )
     _log("")
     if failures:
@@ -7462,8 +7473,12 @@ def main(argv: "list[str] | None" = None) -> int:
             f"reconciliation could not run: {len(local_skipped)} local check(s) could not "
             f"verify their input ("
             + "; ".join(r.name for r in local_skipped)
-            + ") — this is an environment problem, not a remote outage and not drift; run "
-            f"the gate inside the git checkout"
+            + ") — this is an environment problem, not a remote outage and not drift; "
+            + (
+                "install git and rerun"
+                if shutil.which("git") is None
+                else "run the gate inside the git checkout"
+            )
         )
         return 2
     if args.require_remote and remote_skipped:

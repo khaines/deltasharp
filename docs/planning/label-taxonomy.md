@@ -328,7 +328,9 @@ A local `--selftest` reports fixture groups this machine cannot build (no `git a
 no symlink privilege, a `TMPDIR` inside a checkout) as counted **skips** and still exits
 `0`. CI adds `--require-full-coverage`, which turns any skip — and any run with reduced
 coverage — into a failure, because there a skipped fixture group is indistinguishable
-from one that quietly stopped building.
+from one that quietly stopped building. The flag is also on by default whenever
+`GITHUB_ACTIONS` or `CI` is set in the environment, so a shell that exports `CI` gets
+the strict behavior locally too.
 
 The live GitHub-API checks degrade gracefully: without `gh` (or a token) they are
 **skipped** with a warning so local dev works offline, while the script still parses the
