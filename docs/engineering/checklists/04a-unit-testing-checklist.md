@@ -73,7 +73,7 @@ Use unit tests to lock down semantics before introducing distributed or storage 
 - [15 — Spark API Parity Checklist](15-spark-api-parity-checklist.md)
 - [16 — Catalyst Planning Checklist](16-catalyst-planning-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
-- `.github/skills/implement-work-item/build-test-config.md`
+- `.claude/skills/implement-work-item/build-test-config.md`
 - `CLAUDE.md`
 - ADR-0001: Execution strategy
 - ADR-0013: Memory model for in-memory batches

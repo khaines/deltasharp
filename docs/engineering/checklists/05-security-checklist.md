@@ -79,7 +79,7 @@ Apply this checklist to every change that can affect credentials, identities, ne
 - [10 — Runtime Environment Checklist](10-runtime-environment-checklist.md)
 - [13 — Infrastructure as Code Checklist](13-infrastructure-as-code-checklist.md)
 - `SECURITY.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0003: Data-plane transport
 - ADR-0004: Shuffle architecture
 - ADR-0009: Kubernetes Operator and CRD design

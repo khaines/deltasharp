@@ -7,7 +7,7 @@ feature-request milestone dropdown. This script turns that manual snapshot into 
 lightweight, re-runnable gate so the three sources of drift below fail CI instead of
 silently rotting:
 
-  1. **Roster ↔ persona labels.** Every `.github/agents/*.agent.md` wrapper must have a
+  1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
      matching `persona:<slug>` label and vice-versa. The GitHub 50-character label cap forces
      exactly one documented truncation (the trailing `-engineer` is dropped from
      `persona:dotnet-vectorized-columnar-compute-engineer`); that truncation is allowed ONLY
@@ -78,7 +78,7 @@ DEFAULT_REPO = "khaines/deltasharp"
 # Dropdown options that are intentionally NOT backed by a live GitHub milestone.
 SENTINEL_MILESTONE_OPTIONS = frozenset({"Unsure / needs triage"})
 
-DEFAULT_AGENTS_DIR = os.path.join(".github", "agents")
+DEFAULT_AGENTS_DIR = os.path.join(".claude", "agents")
 DEFAULT_FEATURE_FORM = os.path.join(".github", "ISSUE_TEMPLATE", "feature_request.yml")
 DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
 
@@ -167,18 +167,18 @@ def _read_frontmatter_name(path: str) -> "str | None":
 
 
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
-    """Return (persona slugs, integrity problems) from `.github/agents/*.agent.md`.
+    """Return (persona slugs, integrity problems) from `.claude/agents/*.md`.
 
     The slug is the front-matter `name:` (canonical); the filename stem must match it, and a
     mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide.
     """
-    paths = sorted(glob.glob(os.path.join(agents_dir, "*.agent.md")))
+    paths = sorted(glob.glob(os.path.join(agents_dir, "*.md")))
     if not paths:
         raise FileNotFoundError(f"no agent wrappers found under {agents_dir!r}")
     slugs: "set[str]" = set()
     problems: "list[str]" = []
     for path in paths:
-        stem = os.path.basename(path)[: -len(".agent.md")]
+        stem = os.path.basename(path)[: -len(".md")]
         name = _read_frontmatter_name(path)
         slug = name if name else stem
         if name and name != stem:
@@ -269,12 +269,12 @@ def reconcile_roster_labels(
                 continue
         problems.append(
             f"roster persona {slug!r} has no matching '{PERSONA_PREFIX}{slug}' GitHub label "
-            f"— create the label, or remove/rename the .github/agents wrapper"
+            f"— create the label, or remove/rename the .claude/agents wrapper"
         )
     for label in sorted(label_only - covered_truncations):
         problems.append(
             f"GitHub label '{PERSONA_PREFIX}{label}' has no matching "
-            f".github/agents/{label}.agent.md — add the wrapper, or delete the stale label"
+            f".claude/agents/{label}.md — add the wrapper, or delete the stale label"
         )
     return problems, allowed
 

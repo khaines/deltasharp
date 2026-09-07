@@ -79,7 +79,7 @@ Use this checklist when adding or changing logs, exceptions, diagnostics, or ope
 - [09c — Distributed Tracing Checklist](09c-distributed-tracing-checklist.md)
 - [14 — Tenant Isolation Checklist](14-tenant-isolation-checklist.md)
 - `CLAUDE.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`
 - `docs/persona/agents/dotnet-distributed-execution-engineer-agent.md`
 - `docs/persona/agents/dotnet-runtime-performance-engineer-agent.md`

@@ -2,8 +2,8 @@
 
 Authoritative engineering checklists used during design, implementation, and code
 review. The `review-pr` and `design-doc` skills load these by number via
-`.github/skills/review-pr/checklist-map.md` and
-`.github/skills/design-doc/checklist-refs.md`.
+`.claude/skills/review-pr/checklist-map.md` and
+`.claude/skills/design-doc/checklist-refs.md`.
 
 These checklists **operationalize** the project canon; they defer to the
 [ADRs](../../adr/README.md) (source of truth for decisions), the
@@ -19,7 +19,7 @@ checklist and an ADR disagree, the ADR wins.
 - Each item is phrased as a **verifiable check**. Focus on items relevant to the
   change, not every item.
 - Severity and priority language follows
-  [`review-pr/rating-rubric.md`](../../../.github/skills/review-pr/rating-rubric.md):
+  [`review-pr/rating-rubric.md`](../../../.claude/skills/review-pr/rating-rubric.md):
   **Critical → High → Medium → Low → Info**, with **CRITICAL / HIGH / STANDARD /
   SUPPLEMENTARY** priority tiers.
 

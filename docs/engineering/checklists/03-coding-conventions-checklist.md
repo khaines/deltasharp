@@ -71,6 +71,6 @@ Apply this checklist before using the deeper 03a .NET rules. Treat Critical and 
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
 - `CLAUDE.md`
 - `CONTRIBUTING.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0001: Execution strategy
 - ADR-0014: Target framework and AOT posture

@@ -4,7 +4,7 @@ name: Reconcile
 # fails when the persona roster, the GitHub label taxonomy, CODEOWNERS, and the
 # feature-request milestone dropdown drift out of the manual reconciliation recorded in
 # docs/planning/label-taxonomy.md (#449). It reconciles three sources of drift:
-#   * roster<->labels    — every .github/agents/*.agent.md wrapper has a persona:<slug> label
+#   * roster<->labels    — every .claude/agents/*.md wrapper has a persona:<slug> label
 #                          and vice-versa (allowing the ONE documented 50-char truncation),
 #                          reconciled against the committed label list AND the live labels.
 #   * codeowners-errors  — GET /repos/{repo}/codeowners/errors?ref=<PR head> reports no
@@ -21,7 +21,7 @@ on:
   push:
     branches: [main]
     paths:
-      - ".github/agents/**"
+      - ".claude/agents/**"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
       - "docs/planning/label-taxonomy.md"
@@ -30,7 +30,7 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - ".github/agents/**"
+      - ".claude/agents/**"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
       - "docs/planning/label-taxonomy.md"

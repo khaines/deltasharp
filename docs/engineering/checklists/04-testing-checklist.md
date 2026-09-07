@@ -70,6 +70,6 @@ Use this checklist to decide whether the right kinds of tests exist before apply
 - [17 — Delta Storage Format Checklist](17-delta-storage-format-checklist.md)
 - [18 — Kubernetes Operator Checklist](18-kubernetes-operator-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
-- `.github/skills/implement-work-item/build-test-config.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/implement-work-item/build-test-config.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0001: Execution strategy

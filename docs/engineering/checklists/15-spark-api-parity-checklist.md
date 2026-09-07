@@ -79,7 +79,7 @@ Use this checklist for any user-visible API or semantic change. Spark compatibil
 - Breaking public API changes without deprecation, migration path, or [20](20-developer-experience-api-checklist.md) review.
 
 ## References
-- [DeltaSharp Copilot Instructions](../../../CLAUDE.md)
+- [DeltaSharp Claude Code Instructions](../../../CLAUDE.md)
 - [ADR-0007: SQL frontend — parser and dialect](../../adr/0007-sql-frontend.md)
 - [ADR-0008: Type system and internal row/value representation](../../adr/0008-type-system-row-format.md)
 - [16 — Catalyst Planning Checklist](16-catalyst-planning-checklist.md)
@@ -87,4 +87,4 @@ Use this checklist for any user-visible API or semantic change. Spark compatibil
 - [Developer Experience & API Engineer Agent](../../persona/agents/developer-experience-api-engineer-agent.md)
 - [SQL Language & Frontend Engineer Agent](../../persona/agents/sql-language-frontend-engineer-agent.md)
 - [Query & Execution Engine Engineer Agent](../../persona/agents/query-execution-engine-engineer-agent.md)
-- [Review PR rating rubric](../../../.github/skills/review-pr/rating-rubric.md)
+- [Review PR rating rubric](../../../.claude/skills/review-pr/rating-rubric.md)

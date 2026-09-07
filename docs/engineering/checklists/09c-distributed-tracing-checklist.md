@@ -76,7 +76,7 @@ Use this checklist when adding or changing spans, context propagation, sampling,
 - [14 — Tenant Isolation Checklist](14-tenant-isolation-checklist.md)
 - ADR-0003: Data-plane transport
 - `CLAUDE.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`
 - `docs/persona/agents/dotnet-distributed-execution-engineer-agent.md`
 - `docs/persona/agents/dotnet-runtime-performance-engineer-agent.md`

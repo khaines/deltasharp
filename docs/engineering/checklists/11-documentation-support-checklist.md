@@ -78,7 +78,7 @@ Use this checklist for documentation changes and for code changes that alter pub
 - [09c — Distributed Tracing Checklist](09c-distributed-tracing-checklist.md)
 - [Markdown Style Guide Checklist](markdown-style-guide-checklist.md)
 - `CLAUDE.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/technical-writer-agent.md`
 - `docs/persona/research/technical-writer.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`

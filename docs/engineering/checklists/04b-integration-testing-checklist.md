@@ -75,7 +75,7 @@ Run these tests when behavior crosses process, storage, filesystem, object-store
 - [18 — Kubernetes Operator Checklist](18-kubernetes-operator-checklist.md)
 - [19 — Data Source Connectors Checklist](19-data-source-connectors-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
-- `.github/skills/implement-work-item/build-test-config.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/implement-work-item/build-test-config.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0001: Execution strategy
 - ADR-0013: Memory model for in-memory batches
