@@ -93,12 +93,17 @@ Usage
 Exit codes: 0 = reconciled (no drift), 1 = drift detected (a check FAILED), 2 = usage/data
 error, OR a required remote check could not run (`--require-remote` with `gh`/the GitHub API
 unavailable) — a remote outage, reported distinctly from drift so an outage never reads as
-roster drift.
+roster drift. The split is by WHO ACTS, not by where the error was raised: roster INTEGRITY
+problems (nested / unparseable / nameless wrappers) exit 1 even when they leave the roster
+empty, because the author fixes them in the repo; only a MISSING or genuinely empty agents
+directory — nothing to verify against — exits 2 alongside the remote-outage case.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import json
 import os
 import re
@@ -397,9 +402,15 @@ def _read_frontmatter(path: str) -> "tuple[dict[str, str] | None, list[str]]":
     try:
         with open(path, "r", encoding="utf-8") as handle:
             lines = handle.read().splitlines()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         # An unreadable file in the agents directory must not read as "no front matter":
         # the workflow path filter would still ship it. Fail closed.
+        #
+        # UnicodeDecodeError is caught alongside OSError deliberately: a wrapper saved in
+        # UTF-16/Latin-1 (or any file whose bytes are not UTF-8) otherwise unwound all the
+        # way out of read_roster as an unhandled exception — the gate died with a traceback
+        # that never named the offending file, which is a worse operator experience than the
+        # drift it was meant to report. Here it becomes one named integrity problem.
         raise FrontmatterError(
             f"cannot be read ({exc.__class__.__name__}: {exc}), so its front matter cannot "
             f"be parsed strictly"
@@ -432,14 +443,32 @@ def _read_frontmatter(path: str) -> "tuple[dict[str, str] | None, list[str]]":
         if match is None:
             if line[:1] in (" ", "\t") and frontmatter:
                 continue  # indented continuation under a recognised top-level key
+            hint = ""
+            if line.startswith("- "):
+                # A column-0 `- item` is a block sequence written flush against its key
+                # (`tools:\n- Read`). Real YAML reads the list; this reader cannot, so it
+                # must still reject — but a rule with no remedy just strands the operator,
+                # and the fix (indent the items) is one keystroke.
+                hint = " (indent block-sequence items under their key)"
             raise FrontmatterError(
                 f"has front matter the gate cannot parse strictly (line {offset}: "
-                f"{stripped!r}); use plain `key: value` lines at column 0"
+                f"{stripped!r}); use plain `key: value` lines at column 0{hint}"
             )
         key = match.group(1)
         value = line[len(key) + 1 :].strip()
         if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
-            value = value[1:-1]
+            value = value[1:-1]  # quoted: the quotes delimit the value, `#` included
+        else:
+            # An UNQUOTED scalar ends at a ` #`: YAML reads the rest of the line as a
+            # comment, so `permissionMode: default  # normal` is the mode `default`. Keeping
+            # the comment made the gate reject a wrapper that is legal, safe and correct —
+            # a false positive on the permission-mode allowlist, which is exactly the kind
+            # of "the gate is wrong again" signal that trains people to route around it.
+            # A value that is ONLY a comment (`model:  # tbd`) becomes the empty string,
+            # which is what YAML reads there too.
+            comment = re.search(r"(^|\s)#", value)
+            if comment is not None:
+                value = value[: comment.start()].rstrip()
         if key in frontmatter:
             if key not in duplicates:
                 duplicates.append(key)
@@ -497,6 +526,16 @@ def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "lis
                 f"understand may configure execution with no permission prompt"
             )
     return problems
+
+
+# Clauses :func:`read_roster` appends to its "no persona wrappers found" FileNotFoundError
+# when that emptiness is explained by integrity problems (nested wrappers, or unparseable /
+# nameless ones) rather than by an absent directory. :func:`main` keys the EXIT CODE off
+# them: integrity problems are DRIFT (exit 1, "fix the repo"), while a genuinely empty or
+# missing agents directory is a data error the gate cannot run against (exit 2, which the
+# workflow documents as "could not verify" and an operator reads as an outage). Conflating
+# the two sends a responder hunting a GitHub outage that never happened.
+INTEGRITY_CLAUSE_MARKERS = ("other integrity problem(s)", "found and ignored")
 
 
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
@@ -1627,7 +1666,8 @@ def _selftest() -> int:
         os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
         _wrapper(os.path.join(tmp, "sub"), "nested.md", "---\nname: nested-persona\n---\n")
         os.makedirs(os.path.join(tmp, ".hidden"), exist_ok=True)
-        _wrapper(os.path.join(tmp, ".hidden"), "h.md", "---\nname: hidden-persona\n---\n")
+        _wrapper(os.path.join(tmp, ".hidden"), "h.md",
+                 "---\nname: hidden-persona\nhooks: curl evil\n---\n")
         _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
         _nested = [p for p in roster_problems if "is nested" in p]
         check(
@@ -1641,6 +1681,18 @@ def _selftest() -> int:
         check(
             _ok and roster_slugs == {"product-manager"},
             "nested wrapper is NOT counted as a roster entry (roster stays flat)",
+        )
+        # A nested wrapper is not a roster entry, but it IS shipped by the workflow path
+        # filter, so the front-matter policy must run on it too. `.hidden/h.md` carries a
+        # `hooks:` key: if the policy call on the nested branch is dropped (the mutant), the
+        # wrapper is reported only as "nested" and its hook sails through unnamed.
+        check(
+            _ok
+            and any(
+                "'hooks'" in p and os.path.join(".hidden", "h.md") in p
+                for p in roster_problems
+            ),
+            "a nested wrapper's forbidden key is policed too (nesting is not an amnesty)",
         )
 
     # (f2) R3-F3: an agents dir whose ONLY wrappers are nested must not read as "empty" — the
@@ -1657,6 +1709,65 @@ def _selftest() -> int:
         check(
             "nested.md" in _nested_only_msg and "found and ignored" in _nested_only_msg,
             "nested-only agents dir names the ignored nested wrapper in the raised message",
+        )
+
+    # (f2b) RS-F1a: the policy runs on a nested wrapper whether or not it has a `name:`.
+    # Both spellings matter operationally: `name:`-less nested files are the ones a flat
+    # reader dismissed as "not a persona" while the recursive `.claude/agents/**` path filter
+    # still shipped them. Killing mutant for both: replacing the nested branch's
+    # `problems.extend(validate_agent_frontmatter(...))` with a bare `continue`.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        _wrapper(os.path.join(tmp, "sub"), "n.md", "---\nhooks: curl evil\n---\n")
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
+        _nested_rel = os.path.join("sub", "n.md")
+        check(
+            _ok
+            and roster_slugs == {"product-manager"}
+            and any(
+                _nested_rel in p and "'hooks'" in p and "executable/config-bearing" in p
+                for p in roster_problems
+            ),
+            "a NAMELESS nested wrapper is still policed (names the file and the key)",
+        )
+        check(
+            _ok and not any("is nested" in p for p in roster_problems),
+            "a nameless nested file is not reported as a nested PERSONA wrapper",
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        _wrapper(os.path.join(tmp, "sub"), "n.md",
+                 "---\nname: n\npermissionMode: bypassPermissions\n---\n")
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
+        _nested_rel = os.path.join("sub", "n.md")
+        check(
+            _ok
+            and any("is nested" in p and _nested_rel in p for p in roster_problems)
+            and any(
+                "bypassPermissions" in p and "default or plan" in p and _nested_rel in p
+                for p in roster_problems
+            ),
+            "a NAMED nested wrapper reports BOTH the nesting and its policy violation",
+        )
+
+    # (f2c) RS-F1c: an agents dir holding ONLY an unparseable wrapper must not raise a bare
+    # "empty directory" — the problem that made it look empty has to travel with the raise or
+    # the operator is told to add a wrapper that is already there, just unreadable. Killing
+    # mutant: `other = []` in read_roster's empty-roster branch.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "broken.md", "---\n\"permissionMode\": bypassPermissions\n---\n")
+        _unparseable_only_msg = ""
+        try:
+            read_roster(tmp)
+        except FileNotFoundError as exc:
+            _unparseable_only_msg = str(exc)
+        check(
+            "other integrity problem(s)" in _unparseable_only_msg
+            and "broken.md" in _unparseable_only_msg
+            and "cannot parse strictly" in _unparseable_only_msg,
+            "an unparseable-only agents dir carries the integrity problem into the raise",
         )
 
     # (f3) R4-F3: a symlinked subdirectory pointing at its OWN PARENT (`sub/loop -> ..`) must
@@ -1896,6 +2007,96 @@ def _selftest() -> int:
             "tools: [Read, Grep]\n---\nbody\n"
         ) == [],
         "a legitimate wrapper (folded scalar, comment, blank line) parses with 0 problems",
+    )
+
+    # (f6) RS-F1b: a wrapper the gate cannot READ must be one named integrity problem, never
+    # a silent skip — the workflow path filter ships whatever is in `.claude/agents/`, so a
+    # file this gate could not open is a file Claude Code may still parse. Two portable
+    # fixtures for the two ways "cannot be read" happens in practice.
+    #
+    # (i) An OSError on open: a DANGLING SYMLINK `agent.md -> missing.md` (what a moved or
+    # half-restored wrapper looks like on disk). os.walk lists it among the FILENAMES — a
+    # DIRECTORY named `agent.md` would NOT work as a fixture here, because os.walk sorts it
+    # into dirnames and the reader is never handed it. chmod-based fixtures are not portable
+    # either (they do not deny root, which is what a container job often runs as). Killing
+    # mutant: turning the raise in _read_frontmatter's `except` into `return (None, [])`,
+    # which files the entry under "plain markdown, not a persona wrapper" and ships it.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        _dangling_made = True
+        try:
+            os.symlink("missing.md", os.path.join(tmp, "agent.md"))
+        except (OSError, NotImplementedError, AttributeError):
+            _dangling_made = False  # platform without symlink support: fixture degrades
+        _ok, _slugs, _problems = _read_roster_safe(tmp)
+        check(
+            _ok
+            and _slugs == {"product-manager"}
+            and (
+                any("cannot be read" in p and "agent.md" in p for p in _problems)
+                if _dangling_made
+                else _problems == []
+            ),
+            "an unreadable wrapper is an integrity problem naming the file (not a skip)"
+            + ("" if _dangling_made else " [symlink unsupported: fixture degraded]"),
+        )
+
+    # (ii) A wrapper whose BYTES are not UTF-8 (saved as UTF-16/Latin-1). Before the
+    # UnicodeDecodeError was caught it escaped read_roster entirely: the gate died with a
+    # traceback that never named the file, and the operator got exit 2 ("could not run")
+    # for what is a one-file, one-line fix. Killing mutant: catching only OSError.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        with open(os.path.join(tmp, "agent.md"), "wb") as handle:
+            handle.write(b"---\nname: agent\ndescription: caf\xe9\n---\n")
+        _ok, _slugs, _problems = _read_roster_safe(tmp)
+        check(
+            _ok
+            and _slugs == {"product-manager"}
+            and any("cannot be read" in p and "agent.md" in p for p in _problems),
+            "a non-UTF-8 wrapper is a named integrity problem (no traceback, no exit 2)",
+        )
+
+    # (f7) RS-F2: a trailing ` #` comment is NOT part of an unquoted scalar. YAML reads
+    # `permissionMode: plan  # ok` as the mode `plan`; the gate used to read it as the mode
+    # "plan  # ok" and reject a wrapper that is legal and safe. A false positive on the
+    # permission allowlist is not a harmless nit — it is what teaches people the gate is
+    # noise. Killing mutant: dropping the comment strip.
+    check(
+        _wrapper_problems("permissionMode: plan  # ok\n") == [],
+        "a trailing `# comment` on an unquoted scalar is not part of the value",
+    )
+    # ...but a QUOTED value keeps everything inside the quotes, comment marker included, so
+    # the strip cannot become a way to smuggle a value past the allowlist. Killing mutant:
+    # stripping comments before/regardless of the quote check.
+    check(
+        any(
+            "permissionMode" in p and "default or plan" in p
+            for p in _wrapper_problems('permissionMode: "plan # ok"\n')
+        ),
+        "a quoted scalar keeps its `#` (comment strip applies only to unquoted values)",
+    )
+
+    # (f8) RS-F3: a column-0 block sequence (`tools:\n- Read`) is valid YAML that this reader
+    # cannot follow, so it must still be rejected — but the message has to say what to change.
+    # Killing mutant: dropping the hint clause.
+    _block_seq = _raw_wrapper_problems("---\nname: agent\ntools:\n- Read\n---\n")
+    check(
+        any(
+            "cannot parse strictly" in p
+            and "indent block-sequence items under their key" in p
+            for p in _block_seq
+        ),
+        "a column-0 block sequence is rejected WITH the fix (indent the items)",
+    )
+    check(
+        not any(
+            "indent block-sequence items" in p
+            for p in _raw_wrapper_problems(
+                '---\nname: agent\n"permissionMode": bypassPermissions\n---\n'
+            )
+        ),
+        "the block-sequence hint is not bolted onto unrelated unparseable lines",
     )
 
     # And the policy must be ATTESTED as having run: read_roster reports how many top-level
@@ -2276,6 +2477,47 @@ def _selftest() -> int:
         )
         check(settings_result(_dirty).status == "fail", "settings-permissions check FAILS on a dirty settings file")
 
+    # --- RS-F4: EXIT-CODE TAXONOMY. The workflow documents exit 2 as "the gate could not
+    # run" (remote outage / missing input) and exit 1 as drift. An agents directory whose
+    # only wrappers are unparseable or nested is DRIFT — the repo is wrong and the author can
+    # fix it — but it reaches main as the same FileNotFoundError an empty directory raises.
+    # Paging on it as an outage sends the responder to the wrong runbook and invites a
+    # retry-until-green reflex. main therefore keys off the integrity clauses the raise
+    # carries. Killing mutant: reverting main to a flat `return 2`.
+    def _main_exit(agents_dir: str) -> int:
+        """main() for one fixture, with stdout captured.
+
+        The capture matters: main emits `::error::` annotations, which inside the selftest
+        step would render as inline PR errors for fixtures that are behaving exactly as
+        designed. --offline plus an explicit --repo keeps this call local (no gh, no network).
+        """
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            return main(["--offline", "--repo", DEFAULT_REPO, "--agents-dir", agents_dir])
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "broken.md", "---\n\"permissionMode\": bypassPermissions\n---\n")
+        check(
+            _main_exit(tmp) == 1,
+            "exit 1 (drift) when the agents dir holds only an UNPARSEABLE wrapper",
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        _wrapper(os.path.join(tmp, "sub"), "nested.md", "---\nname: nested-persona\n---\n")
+        check(
+            _main_exit(tmp) == 1,
+            "exit 1 (drift) when every wrapper is NESTED (the raise names them)",
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        check(
+            _main_exit(tmp) == 2,
+            "exit 2 (cannot run) for a genuinely EMPTY agents dir — no integrity clause",
+        )
+        check(
+            _main_exit(os.path.join(tmp, "does-not-exist")) == 2,
+            "exit 2 (cannot run) for a MISSING agents dir",
+        )
+
     # --- Finding 7a: resolve_repo must NOT shell out to gh under --offline.
     mod = sys.modules[__name__]
     original_gh = mod._gh
@@ -2382,6 +2624,18 @@ def main(argv: "list[str] | None" = None) -> int:
         results = run_checks(args)
     except (FileNotFoundError, ValueError) as exc:
         _error(str(exc))
+        if any(marker in str(exc) for marker in INTEGRITY_CLAUSE_MARKERS):
+            # The roster came up empty BECAUSE of integrity problems the gate found and
+            # named (nested / unparseable / nameless wrappers). That is repo drift the
+            # author can fix, so it exits 1 like every other drift — exit 2 is reserved for
+            # "the gate could not run" (missing or genuinely empty agents dir, remote
+            # outage), and mislabelling drift as an outage sends the responder to the wrong
+            # runbook and invites a retry-until-green reflex.
+            _error(
+                "the agents directory yielded no roster entry because of the integrity "
+                "problem(s) above — this is DRIFT to fix in the repo, not a remote outage"
+            )
+            return 1
         return 2
 
     _print_summary(results)

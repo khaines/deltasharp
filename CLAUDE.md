@@ -99,6 +99,8 @@ boundary as the `dotnet` grant; the gate rejects them in the tracked file.
 Persona wrappers in `.claude/agents/` sit inside that boundary too: the gate
 lets them set only a `default`/`plan` `permissionMode` and rejects `hooks`,
 `mcpServers`, `isolation` (it runs `git worktree add` unprompted), and `env`.
+Any other front-matter key, and front matter the strict reader cannot parse
+(quoted key, `key :`, flow or indented mapping, duplicate key), fails the gate.
 
 ## Architecture — the big picture
 
