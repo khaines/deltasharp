@@ -169,8 +169,10 @@ the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when
 of three reconciliations or the three local validations (`settings-permissions`,
 `command-skill-frontmatter`, `tracked-startup-config`) breaks:
 
-1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
-   matching `persona:<slug>` label and vice-versa. `.claude/agents/` holds persona
+1. **Roster ↔ persona labels** (two checks at runtime: `roster<->documented-labels`
+   against the committed list below, and `roster<->live-labels` against GitHub).
+   Every `.claude/agents/*.md` wrapper must have a matching `persona:<slug>` label
+   and vice-versa. `.claude/agents/` holds persona
    wrappers only: the gate counts every `*.md` there that carries a frontmatter
    `name:` and ignores markdown with no front-matter fence at all (e.g. a README);
    a file that *opens* a `---` fence but declares no `name:` is a persona candidate
@@ -181,7 +183,7 @@ of three reconciliations or the three local validations (`settings-permissions`,
    runtime configuration: `permissionMode` may only be `default` or `plan`
    (`bypassPermissions`/`acceptEdits`/`dontAsk`/`auto` skip the permission prompt),
    `hooks`, `mcpServers`, `isolation` (it runs `git worktree add` unprompted), and
-   `env` are rejected by name, and any other unrecognised key fails — a wrapper is
+   `env` are rejected by name, and any other unrecognized key fails — a wrapper is
    a persona brief, not an execution-config surface. The front matter is read
    strictly: a quoted key, a space before the colon, a flow mapping, a wholly
    indented mapping, or a duplicate key is reported rather than skipped, because a
@@ -249,35 +251,36 @@ of three reconciliations or the three local validations (`settings-permissions`,
    "clean". The index is **listed once from the work-tree root with no pathspec** (so
    no pathspec magic — `GIT_LITERAL_PATHSPECS` and friends are scrubbed alongside
    `GIT_DIR`, while the discovery-narrowing `GIT_CEILING_DIRECTORIES` is deliberately
-   honoured), and **every entry that case- or normalisation-folds onto `.claude/…` or
+   honored), and **every entry that case- or normalization-folds onto `.claude/…` or
    `.mcp.json` is compared against the canonical spelling**: on an APFS/NTFS checkout
    a tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md`,
    `.claude/Settings.local.json` or `.mcp.jſon` (U+017F, which neither `:(icase)` nor
-   `.lower()` sees) materialises at the path the CLI reads, so it fails as "rename it"
+   `.lower()` sees) materializes at the path the CLI reads, so it fails as "rename it"
    whatever its index mode — and "is it tracked?" is asked of the checked-out path the
    same way, so a committed `.claude/Settings.local.json` is not filed as harmless
    per-machine state. The same fold decides file **names**, in the walks as well as
    the index: a manifest committed as `.claude/skills/<x>/ſkill.md` is what APFS
    resolves `SKILL.md` to and what the CLI loads, so it is scanned like any other
    manifest and the index may hold only the canonical `SKILL.md` spelling; a tracked
-   path whose bytes are not valid UTF-8 is reported rather than decoded. All three
-   local checks ask the `.claude` question — over `.claude` and its policed children,
-   never over the whole repository, with `.mcp.json` owned by
-   `tracked-startup-config` — so a finding is reported wherever the reader looks, once
-   per check, and a spelling the checkout merges into a policed path is reported as
-   the collision it is rather than twice. Git's answer must also COVER what the walks
-   read: a path outside the work tree git answered from, a `.claude` whose checkout
-   tracks nothing at or under any policed child (an export dropped inside an enclosing
-   checkout), a `.claude` under an *uninitialised submodule* (a gitlink above it, so the
-   files on disk came from somewhere other than that index), and an index git cannot
-   read are unverified rather than clean — and "unverified" is reported *alongside*
-   whatever git did name, never instead of it, so a tracked link in a tree the checkout
-   does not own is still a failure — while an
-   untracked subtree inside a `.claude` that checkout does own is walked, policed and
-   noted rather than skipped (`git add` is the remedy there, not "run inside the
-   checkout"); a collapsed sparse-index entry is unverified too, should git ever
-   return one — git ≥2.35 expands a sparse index for `ls-files`, so that branch is
-   defence in depth rather than a shape seen in practice. The walks
+   path whose bytes are not valid UTF-8 is reported rather than decoded. Three checks
+   ask the `.claude` question — the roster walk in `roster<->documented-labels`, both
+   front-matter walks in this check, and `tracked-startup-config`, which owns
+   `.mcp.json` (`settings-permissions` opens nothing but `.claude/settings.json`
+   itself) — over `.claude` and its policed children, never over the whole repository,
+   so a finding is reported wherever the reader looks, once per check, and a spelling
+   the checkout merges into a policed path is reported as the collision it is rather
+   than twice. Git's answer must also COVER what the walks read: a path outside the
+   work tree git answered from, a `.claude` whose checkout tracks nothing at or under
+   any policed child (an export dropped inside an enclosing checkout), a `.claude`
+   under an *uninitialized submodule* (a gitlink above it, so the files on disk came
+   from somewhere other than that index), and an index git cannot read are unverified
+   rather than clean — and "unverified" is reported *alongside* whatever git did name,
+   never instead of it, so a tracked link in a tree the checkout does not own is still
+   a failure — while an untracked subtree inside a `.claude` that checkout does own is
+   walked, policed and noted rather than skipped (`git add` is the remedy there, not
+   "run inside the checkout"); a collapsed sparse-index entry is unverified too, should
+   git ever return one — git ≥2.35 expands a sparse index for `ls-files`, so that
+   branch is defense in depth rather than a shape seen in practice. The walks
    report any link they meet as well (the directory roots themselves, and every file
    entry whatever its name), so the rule still holds where git cannot be asked; links
    are never followed (a loop would hang the gate), and if git cannot answer at all the
@@ -289,7 +292,7 @@ of three reconciliations or the three local validations (`settings-permissions`,
    in the same class as `hooks`/`apiKeyHelper`; a tracked `.mcp.json` with a
    non-empty `mcpServers` fails (an empty mapping passes; malformed JSON fails,
    because a startup config the gate cannot read is not evidence that nothing
-   starts). **`.claude/settings.local.json`** is honoured exactly like
+   starts). **`.claude/settings.local.json`** is honored exactly like
    `settings.json` and is where every remedy message in this gate sends a
    per-machine grant — advice that only holds while the file is untracked, so a
    *tracked* one fails. Only tracked files fail: tracking is decided with
@@ -302,15 +305,17 @@ of three reconciliations or the three local validations (`settings-permissions`,
    reason, and `--require-remote` turns that into exit 2 rather than a silent pass.
    Override the path with `--mcp-config`.
 
-**When it runs.** On pull requests and pushes to `main` that touch the governance
-files (roster, `.claude/commands/`, `.claude/skills/`, `CODEOWNERS`, the feature
-form, `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json`, this
-document, the script, or the workflow), on a
-weekly schedule, and on demand — the schedule catches drift introduced
-GitHub-side (a label or milestone renamed in the UI), which no file change would
-otherwise trigger. It uses a least-privilege read-only token
-(`permissions: contents: read`; the default token suffices for labels, milestones, and
-CODEOWNERS on a public repo) and pins its one action by commit SHA.
+**When it runs.** On every pull request and push to `main`, on a weekly schedule,
+and on demand. There is deliberately **no `paths:` filter**: GitHub's path filters are
+case-sensitive and cannot express the fold a macOS/Windows checkout performs, so a PR
+adding only `.Claude/hooks`, `.MCP.json` or `.mcp.jſon` — exactly the shapes the gate
+now fails — would never have triggered the workflow that fails them. The job is stdlib
+Python with no build, so running it always costs less than a filter that cannot enforce
+the rule. The schedule catches drift introduced GitHub-side (a label or milestone
+renamed in the UI), which no file change would otherwise trigger. It uses a
+least-privilege read-only token (`permissions: contents: read`; the default token
+suffices for labels, milestones, and CODEOWNERS on a public repo) and pins its one
+action by commit SHA.
 
 **Run it locally.**
 

@@ -95,7 +95,7 @@ The third local validation is `tracked-startup-config`
 (:func:`validate_startup_config`), which covers the two startup surfaces the settings policy
 never opens: a repo-root `.mcp.json` (every `mcpServers[*].command` is SPAWNED when the CLI
 launches, with no prompt — remote code execution on `git checkout`, ranked with `hooks` and
-`apiKeyHelper`) and `.claude/settings.local.json` (honoured exactly like `settings.json`,
+`apiKeyHelper`) and `.claude/settings.local.json` (honored exactly like `settings.json`,
 and the place every remedy message here sends per-machine grants — advice that holds only
 while it is untracked). Only a TRACKED file FAILS: tracking is decided with
 `git ls-files --error-unmatch` (argv form, run in the checkout), so an untracked local copy
@@ -176,8 +176,9 @@ DEFAULT_REPO = "khaines/deltasharp"
 # Dropdown options that are intentionally NOT backed by a live GitHub milestone.
 SENTINEL_MILESTONE_OPTIONS = frozenset({"Unsure / needs triage"})
 
-# The configuration directory the CLI reads at startup, and the root pathspec every local
-# check asks git about (:func:`claude_root_pathspec`).
+# The configuration directory the CLI reads at startup, and the root path every local check
+# scopes its git question to (:func:`claude_root_pathspec`). Nothing here is handed to git as
+# a pathspec: the index is listed once, unfiltered, and these paths select from the answer.
 CLAUDE_DIR_NAME = ".claude"
 DEFAULT_AGENTS_DIR = os.path.join(CLAUDE_DIR_NAME, "agents")
 DEFAULT_COMMANDS_DIR = os.path.join(".claude", "commands")
@@ -185,7 +186,7 @@ DEFAULT_SKILLS_DIR = os.path.join(".claude", "skills")
 DEFAULT_SETTINGS = os.path.join(".claude", "settings.json")
 # Two startup surfaces the CLI reads that live OUTSIDE `.claude/settings.json` (CERT-F2/F3):
 # `.mcp.json` at the repo root (its `mcpServers[*].command` is spawned when the CLI launches,
-# with no prompt) and `.claude/settings.local.json` (honoured exactly like settings.json but
+# with no prompt) and `.claude/settings.local.json` (honored exactly like settings.json but
 # meant to be per-machine and gitignored — every remedy message in this gate points grants
 # there, which only holds while the file is untracked).
 DEFAULT_MCP_CONFIG = ".mcp.json"
@@ -214,7 +215,7 @@ PERSONA_LABELS_END = "<!-- END persona-labels"
 # `Bash(gh *)`, `Bash(gh api*)` and `Bash(git *)` compile to `^gh.*$` / `^git.*$` and auto-run
 # `gh api` / `git push` with no prompt. The comparison is CASE-INSENSITIVE (`_bash_command`
 # lowercases): on macOS/Windows the filesystem is case-insensitive, so `Bash(GH api:*)`
-# resolves to the real `gh` and Claude Code honours the rule. Allow entries that are neither
+# resolves to the real `gh` and Claude Code honors the rule. Allow entries that are neither
 # listed here nor wildcard/tool-wide grants are NOT policed.
 FORBIDDEN_ALLOW_COMMANDS = (
     "gh api",
@@ -476,7 +477,7 @@ def _read_frontmatter(path: str) -> "tuple[dict[str, str] | None, list[str]]":
     * blank;
     * a `#` comment;
     * an INDENTED continuation (a block scalar's text, a nested mapping/sequence under a
-      recognised top-level key) — allowed only AFTER a top-level key has been seen, so a
+      recognized top-level key) — allowed only AFTER a top-level key has been seen, so a
       mapping that is indented in its entirety cannot hide its keys from this reader. An
       indented `  ---` is such a continuation, NOT the closing fence (see :func:`_is_fence`);
     * a top-level key matching :data:`_FRONTMATTER_KEY_LINE` (`key: value` / `key:`).
@@ -542,7 +543,7 @@ def _read_frontmatter(path: str) -> "tuple[dict[str, str] | None, list[str]]":
         match = _FRONTMATTER_KEY_LINE.match(line)
         if match is None:
             if line[:1] in (" ", "\t") and frontmatter:
-                continue  # indented continuation under a recognised top-level key
+                continue  # indented continuation under a recognized top-level key
             hint = ""
             if line.startswith("- "):
                 # A column-0 `- item` is a block sequence written flush against its key
@@ -656,7 +657,7 @@ class _LinkMessage(str):
     searched with `in`, sorted and compared as ordinary strings everywhere else. The one place
     the distinction matters is de-duplication — and the fact that a message EMBEDDED in a
     larger one (the roster's "no persona wrappers found … because `.claude` is a tracked
-    gitlink") becomes a plain `str` again is the wanted behaviour, not a leak: that sentence is
+    gitlink") becomes a plain `str` again is the wanted behavior, not a leak: that sentence is
     a different finding from the bare gitlink line and must not be dropped as its duplicate
     (PR-901 second round, RT-5).
     """
@@ -716,7 +717,7 @@ def _walk_symlink_problems(kind: str, dirpath: str, dirnames: "list[str]") -> "l
 TRACKED_LINK_MODES = ("120000", "160000")
 
 # The gitlink half of the pair, named because the COVERAGE rule needs to tell it apart from
-# a symlink: an uninitialised submodule directory is populated on disk by something other
+# a symlink: an uninitialized submodule directory is populated on disk by something other
 # than this index, which is a different question from "this path is a link" (PR-901 last
 # round, F-2).
 _GITLINK_MODE = "160000"
@@ -787,7 +788,7 @@ def _tracked_link_problem(mode: str, path: str) -> str:
     if mode == "160000":
         return _LinkMessage(
             f"{path!r} is a tracked gitlink/submodule (git mode 160000); CI checks it out "
-            f"empty and the CLI loads whatever it contains once initialised — vendor the "
+            f"empty and the CLI loads whatever it contains once initialized — vendor the "
             f"files instead",
             path,
             source="index",
@@ -805,7 +806,7 @@ def _case_collision_problem(path: str, expected: str) -> str:
 
     Git's index is case-SENSITIVE and byte-exact, so `.Claude/hooks` is a different path from
     `.claude/hooks`. macOS (APFS) and Windows (NTFS) checkouts are not: they fold CASE, and
-    APFS folds UNICODE NORMALISATION forms too, so the same entry materialises inside the real
+    APFS folds UNICODE NORMALIZATION forms too, so the same entry materializes inside the real
     `.claude/` directory, where Claude Code reads it as configuration. A gate that only ever
     asked about the exact spelling would therefore clear a file the CLI loads, on the two
     platforms most contributors use. The remedy is a rename, not a link replacement, so this
@@ -843,7 +844,7 @@ def _undecodable_problem(path: str) -> str:
     Reported rather than tolerated (PR-901 addendum 2). Such an entry is legal in the index
     and on ext4; what it is not is comparable — this gate, the CLI's own globs, and the
     reviewer reading the diff each see a different name for it, and on a checkout that folds
-    names it may materialise as one the CLI loads. "Cannot be named reliably" is a finding,
+    names it may materialize as one the CLI loads. "Cannot be named reliably" is a finding,
     so it fails CLOSED instead of passing through as an ordinary file.
     """
     return _LinkMessage(
@@ -866,7 +867,7 @@ def _fold(name: str) -> str:
       LONG S) and on `K` (U+212A KELVIN SIGN); `casefold()` maps them to `s` and `k`. A
       tracked `.mcp.jſon` IS `.mcp.json` on APFS — and git's own `:(icase)` pathspec magic
       does not see it either, which is why the folding is done here rather than delegated.
-    * **NFC first.** APFS is normalisation-insensitive, so a decomposed `.claude/agents` (with
+    * **NFC first.** APFS is normalization-insensitive, so a decomposed `.claude/agents` (with
       a combining mark anywhere in the name) resolves to the composed spelling in the working
       tree while the index keeps the bytes it was given.
     """
@@ -950,7 +951,7 @@ def _ls_files(top: str) -> "list[tuple[str, str]] | None":
     `:(literal).claude` — matching nothing, so the query returned zero entries and every
     caller read that as "no findings" and PASSED. Filtering in Python instead means the
     selection rules are this file's own (and are unit-tested), no user-controlled string is
-    ever interpreted as a pattern, and the case/normalisation folding the checkouts actually
+    ever interpreted as a pattern, and the case/normalization folding the checkouts actually
     perform can be applied — which no git pathspec can do (`:(icase)` does not fold `ſ`).
 
     ``-z`` so no path is ever quoted or escaped, ``--full-name`` so one entry has exactly one
@@ -1166,7 +1167,7 @@ def _index_findings(
     * ``("link", mode, path)`` — a tracked SYMLINK (120000) or GITLINK/submodule (160000).
       See :func:`_tracked_link_problem`.
     * ``("case", expected, path)`` — an entry that FOLDS onto a policed path (case, or Unicode
-      normalisation form) without being spelled the way it is. See
+      normalization form) without being spelled the way it is. See
       :func:`_case_collision_problem`. Reported for ANY index mode; when an entry is both, the
       collision wins, because the remedy is the rename and one path must not print twice.
       A skill MANIFEST is held to this rule by its leaf name too: `.claude/skills/x/ſkill.md`
@@ -1190,7 +1191,7 @@ def _index_findings(
     cover what the walks read": git could not be asked at all; a queried DIRECTORY that holds
     files on disk lies in a `.claude` root this index does not OWN (an export dropped inside
     an ENCLOSING checkout — PR-901 second round, RT-4); the queried path lies under an
-    UNINITIALISED SUBMODULE, i.e. a gitlink ABOVE the `.claude` root, so the files on disk
+    UNINITIALIZED SUBMODULE, i.e. a gitlink ABOVE the `.claude` root, so the files on disk
     came from something other than this index (PR-901 last round, F-2); or the index is
     sparse and collapsed the policed tree into a directory entry. Neither ``None`` nor a
     coverage reason is ever collapsed into "no findings": callers report them as UNVERIFIED —
@@ -1236,7 +1237,7 @@ def _index_findings(
         )
         if not _is_within(relocated, top_real):
             return None, (
-                f"pathspec {candidate!r} lies outside the work tree git answered from "
+                f"path {candidate!r} lies outside the work tree git answered from "
                 f"({top_real!r})"
             ), []
         relative = os.path.relpath(relocated, top_real).replace(os.sep, "/")
@@ -1267,7 +1268,7 @@ def _index_findings(
         ]
         # The exception: a GITLINK that lies ABOVE the `.claude` root is not an answer about
         # this tree at all, it is the index saying "that subtree belongs to another
-        # repository I have not initialised". A `vendor` gitlink in an enclosing checkout,
+        # repository I have not initialized". A `vendor` gitlink in an enclosing checkout,
         # with `vendor/deltasharp` populated by hand from an export, made every local check
         # PASS unqualified and called an untracked `.mcp.json` "not policed" — the enclosing
         # index has no entries under it at all, so there was nothing to find (PR-901 last
@@ -1279,7 +1280,7 @@ def _index_findings(
         ):
             unverified.append(
                 f"{spec!r} lies inside a submodule directory this checkout has not "
-                f"initialised — the index in {top_real!r} records a gitlink above it and "
+                f"initialized — the index in {top_real!r} records a gitlink above it and "
                 f"says nothing about the files on disk, which came from somewhere else: "
                 f"unverified rather than clean"
             )
@@ -1379,7 +1380,7 @@ def _folded_index_tracked(path: str) -> "bool | None":
 
     The companion :func:`_git_tracked` needs (PR-901 second round, H-1). That function asks git
     about one byte-exact spelling, which is precisely the question a case- or
-    normalisation-variant defeats: on a macOS clone of a repo that tracks
+    normalization-variant defeats: on a macOS clone of a repo that tracks
     `.claude/Settings.local.json`, the file the CLI reads sits at
     `.claude/settings.local.json` and `git ls-files --error-unmatch` calls it UNTRACKED — so
     the gate reported it as harmless per-machine state while it shipped to every checkout.
@@ -1444,13 +1445,18 @@ def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
 
 
 def claude_root_pathspec(path: str) -> "str | None":
-    """The `.claude` directory a policed path lives in — the pathspec every check adds.
+    """The `.claude` directory a policed path lives in — the root path every check adds.
+
+    The `pathspec` in this function's name is HISTORICAL: the index is listed once with no
+    pathspec at all (see :func:`_index_findings`) and the value returned here is the scoping
+    PREFIX the findings are selected by. The name is kept because the fixtures and the
+    assertions are written against it.
 
     Every local check used to ask git only about its OWN subtree (`.claude/agents`,
     `.claude/commands`, `.claude/skills`) plus three files, while the prose promised "any
     tracked symlink under `.claude/`". The gap was real: a tracked link at `.claude/hooks`,
     `.claude/output-styles/x.md` — or at `.claude` ITSELF — is configuration Claude Code
-    reads and no check named it (LAST-CERT F2). The parent directory pathspec subsumes every
+    reads and no check named it (LAST-CERT F2). The parent directory prefix subsumes every
     subtree AND the root entry, so each check asks about it alongside its own paths; the
     per-check queries stay, because a check must still name a link in the tree it owns even
     when it is pointed somewhere else entirely (a fixture, a `--agents-dir` override).
@@ -1479,8 +1485,10 @@ def claude_root_pathspec(path: str) -> "str | None":
 
 
 def link_query_paths(*paths: str) -> "list[str]":
-    """The pathspecs a check hands git: each policed path AND its `.claude` root, deduped.
+    """The paths a check asks about: each policed path AND its `.claude` root, deduped.
 
+    Despite the historical `pathspec` in :func:`claude_root_pathspec`, none of these reach
+    git as a pathspec — they are the scoping prefixes the once-listed index is filtered by.
     Order matters only for which directory :func:`_tracked_links` runs git from, and the
     policed path comes first so a check pointed at a fixture tree asks from there.
     """
@@ -1541,7 +1549,7 @@ def _normalize_link_path(path: str) -> str:
     The walk-based checks report the path the CALLER passed (often absolute, e.g. a
     `--mcp-config /abs/.mcp.json`), while git reports it repo-root-relative (`.mcp.json`).
     Two spellings of one path therefore produced two `::error::` annotations, which reads as
-    two defects to fix (LAST-CERT F4). Normalising both to the top-level-relative form makes
+    two defects to fix (LAST-CERT F4). Normalizing both to the top-level-relative form makes
     them comparable. A relative path that does not exist under
     the current directory is assumed to be already repo-root-relative (that is exactly what
     `git ls-files --full-name` returns from a fixture repo elsewhere) and is left alone.
@@ -1697,7 +1705,7 @@ def linked_agents_root_problems(agents_dir: str) -> "list[tuple[str, str]]":
 
     Only the two roots count: a link DEEPER in the tree does not explain an empty roster and
     is reported by the roster check's own query. ``[]`` when git cannot answer — the caller
-    keeps its existing behaviour then.
+    keeps its existing behavior then.
     """
     links = _tracked_links(link_query_paths(agents_dir))
     if not links:
@@ -1882,7 +1890,7 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
             # SUBMODULE at `.claude` is a directory here (populated) or an empty one in CI,
             # never a link — so the index is the only place it is visible, and without this
             # clause the operator reads "your roster is empty" about a gitlink that ships
-            # configuration the moment it is initialised (PR-901 F-A).
+            # configuration the moment it is initialized (PR-901 F-A).
             for _path, clause in linked_agents_root_problems(agents_dir):
                 message += "; " + clause
         if nested:
@@ -1897,7 +1905,7 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
         other = [problem for problem in problems if problem not in nested]
         if other:
             # Unparseable/policy problems are not nesting, so they get their own clause
-            # rather than being mislabelled — but they must still be REPORTED here, or a
+            # rather than being mislabeled — but they must still be REPORTED here, or a
             # directory holding only an unreadable wrapper would raise a bare "empty".
             message += (
                 f"; {len(other)} other integrity problem(s): " + "; ".join(other)
@@ -2140,7 +2148,7 @@ def _bash_command(entry: str) -> "str | None":
     LOWERCASED, so an entry cannot dodge the policy below by padding the command with extra
     spaces or a tab, nor by changing its case. Case matters because macOS/Windows
     filesystems are case-INSENSITIVE: ``Bash(GH api:*)`` resolves to the real ``gh`` binary
-    and Claude Code honours the rule, so ``GH api`` must compare equal to ``gh api``
+    and Claude Code honors the rule, so ``GH api`` must compare equal to ``gh api``
     (R5-F3). Non-``Bash`` entries (``Read(...)``, ``WebFetch(...)``) return None — this
     policy is about shell commands.
     """
@@ -2182,7 +2190,7 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
       :data:`FORBIDDEN_ALLOW_COMMANDS`. This rejects the broad ``Bash(gh:*)`` and
       ``Bash(git:*)`` as well as the direct ``Bash(gh api:*)``. The comparison is
       CASE-INSENSITIVE: on a case-insensitive filesystem ``Bash(GH api:*)`` resolves to the
-      real ``gh`` and the CLI honours the rule, so it must not slip past;
+      real ``gh`` and the CLI honors the rule, so it must not slip past;
     * no TOOL-WIDE or unparseable Bash grant (``Bash``, ``Bash()``): a bare tool name allows
       every shell command, which is broader still than ``Bash(*)``;
     * no blanket wildcard (``Bash(*)``, ``Bash(:*)``, an empty command) and no GLOB — a ``*``
@@ -2586,7 +2594,7 @@ def validate_startup_config(
       allowlist. An empty `mcpServers` mapping (or none at all) declares no command and
       passes; malformed JSON FAILS, because a file this gate cannot read is not evidence of
       safety.
-    * **`.claude/settings.local.json`**. The CLI honours it exactly like `settings.json`,
+    * **`.claude/settings.local.json`**. The CLI honors it exactly like `settings.json`,
       and every remedy message in this gate tells the reader to put a per-machine grant
       there. That advice is only safe while the file is UNTRACKED; a committed one silently
       widens the permission surface of every checkout while the policed `settings.json`
@@ -2597,7 +2605,7 @@ def validate_startup_config(
     file whose tracking git cannot determine goes to ``unverified`` — never to ``notes`` as
     if it had been cleared. "Tracked" is asked of the CHECKED-OUT path, not of one byte-exact
     spelling (:func:`_tracked_by_git`): on a macOS clone of a repo that committed
-    `.claude/Settings.local.json`, the file the CLI honours is the one at
+    `.claude/Settings.local.json`, the file the CLI honors is the one at
     `.claude/settings.local.json`, and answering "untracked" about it was how a committed
     per-machine grant read as harmless local state (PR-901 second round, H-1).
     """
@@ -2676,7 +2684,7 @@ def validate_startup_config(
         else:
             problems.append(
                 f"{settings_local_path} is TRACKED (by that spelling, or by one that folds "
-                f"onto it on this checkout); Claude Code honours it exactly like "
+                f"onto it on this checkout); Claude Code honors it exactly like "
                 f"settings.json but it must be gitignored per-machine state — a committed "
                 f"one widens the permission surface of every checkout while the policed "
                 f"settings.json still reads clean; `git rm --cached {settings_local_path}` "
@@ -3065,7 +3073,7 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
 
     # --- Check 4b: tracked startup configuration (local; runs even with --offline) --------
     # `.mcp.json` spawns its servers at CLI LAUNCH and `.claude/settings.local.json` is
-    # honoured like settings.json — two surfaces the settings policy above never opens.
+    # honored like settings.json — two surfaces the settings policy above never opens.
     results.append(
         startup_config_result(
             args.mcp_config, settings_local_path(args.settings), args.settings
@@ -3151,18 +3159,67 @@ def _print_summary(results: "list[Result]") -> None:
 
 # --- Self-test ---------------------------------------------------------------------------
 
+# How many assertions `--selftest` executes when it runs from the ROOT of the git checkout
+# with every fixture available (the CI job and a normal developer run). It is asserted at the
+# end of the run, because a selftest that silently executes FEWER assertions than it used to is
+# indistinguishable from one that still covers everything: an environment guard added to the
+# wrong block, or a fixture group that stopped building, would otherwise go green while its
+# coverage vanished. Bump it deliberately when an assertion is added or removed.
+SELFTEST_ASSERTIONS_IN_CHECKOUT = 327
+# The assertions that can only run there (they exercise the REAL .claude tree through main()).
+# Anywhere else — a `git archive` export, a tarball, a vendored copy, a subdirectory — they
+# are skipped rather than failed, so the floor below is what proves they ran where they can.
+SELFTEST_CHECKOUT_ONLY_ASSERTIONS = 3
+
+
 def _selftest() -> int:
     failures: "list[str]" = []
     # Fixture repositories are BUILT and STAGED between queries in this one process, which no
     # real run does; the `_ls_files` cache is exercised by its own assertion below instead.
     globals()["_LS_FILES_CACHE_ENABLED"] = False
+    # Executed/skipped tallies, so the closing line reports what this run actually covered
+    # rather than an unqualified "all assertions passed" (PR-901 third round, L1/Info-2/3).
+    tally = {"executed": 0, "skipped": 0, "checkout_only": 0}
+    # Can this process see the REAL `.claude` tree through git? Two conditions, asked once so
+    # every assertion below agrees about which environment it is in: the run is at the repo
+    # root (`.claude/agents` and the taxonomy are where the defaults say), and git can answer
+    # about `.claude` — the same probe the fixtures use, where `_tracked_links` returns None
+    # only when git could not answer at all. A `git archive` export, a tarball, a vendored
+    # copy or a run from a subdirectory fails one of them and gets REDUCED coverage.
+    in_checkout = (
+        os.path.isdir(DEFAULT_AGENTS_DIR)
+        and os.path.exists(DEFAULT_TAXONOMY)
+        and _tracked_links([os.path.join(os.getcwd(), CLAUDE_DIR_NAME)]) is not None
+    )
 
     def check(condition: bool, label: str) -> None:
+        tally["executed"] += 1
         if condition:
             _log(f"  ok  - {label}")
         else:
             failures.append(label)
             _log(f" FAIL - {label}")
+
+    def skip(reason: str) -> None:
+        """Record a fixture group this environment cannot run, and say so in the tally."""
+        tally["skipped"] += 1
+        _log(f"  skip - {reason}")
+
+    def check_in_checkout(condition: bool, label: str) -> None:
+        """`check`, but only where the real `.claude` tree can be asked about.
+
+        Outside a checkout git cannot answer, the local checks SKIP by design, and asserting
+        a PASS here would turn a correct fail-closed answer into a red selftest — while a
+        bare `if` would let the run go green with the assertion silently gone. So it is
+        skipped loudly and counted: the floor at the end of `_selftest` requires all
+        :data:`SELFTEST_CHECKOUT_ONLY_ASSERTIONS` of them to have run wherever `in_checkout`
+        says they could (PR-901 third round, L1/Info-2/3).
+        """
+        if not in_checkout:
+            skip(f"not a git checkout at the repo root: {label}")
+            return
+        tally["checkout_only"] += 1
+        check(condition, label)
 
     doc = (
         "GitHub caps label names at 50 characters. "
@@ -3175,7 +3232,7 @@ def _selftest() -> int:
 
     check(derive_truncated_label(long_slug) == trunc, "derive_truncated_label drops -engineer")
     check(derive_truncated_label("product-manager") is None, "derive returns None for short slug")
-    check(truncation_documented(doc, long_slug, trunc), "documented truncation recognised")
+    check(truncation_documented(doc, long_slug, trunc), "documented truncation recognized")
     check(
         not truncation_documented("no mention here", long_slug, trunc),
         "undocumented truncation rejected",
@@ -3905,8 +3962,23 @@ def _selftest() -> int:
     # (g) A HEAD-shaped file (read-only allow entries + the full deny list) passes cleanly.
     check(_settings_problems(_settings()) == [], "validate_settings passes a HEAD-shaped settings.json")
 
+    # (g1) The TOKEN BOUNDARY in `_token_prefix` is the whole policy in one line, and the
+    # end-to-end fixtures below cannot see it: `git` auto-allows `git push` (Claude Code
+    # matches `prefix + " "`), while `git-foo` and `git push-mirror` are DIFFERENT commands a
+    # broadened match would reject for the wrong reason. Killing mutant: a plain
+    # `longer.startswith(shorter)` — it would report `Bash(git-foo:*)` as auto-allowing
+    # `git push`, and the pass/fail fixtures alone would never notice.
+    check(
+        _token_prefix("git", "git push")
+        and _token_prefix("git push", "git push")
+        and not _token_prefix("git", "git-foo")
+        and not _token_prefix("git push", "git push-mirror")
+        and not _token_prefix("git pushing", "git push"),
+        "_token_prefix matches WHOLE tokens: `git` covers `git push`, not `git-foo`",
+    )
+
     # (h) A broad `Bash(gh:*)` auto-allows `gh api` (and `gh pr merge`, `gh release`, ...).
-    # The killing mutant is dropping the token-prefix test in favour of an exact/startswith
+    # The killing mutant is dropping the token-prefix test in favor of an exact/startswith
     # match on the forbidden command: `gh` does not start with `gh api`, so it would pass.
     _broad_gh = _settings_problems(_settings(allow=_head_allow + ["Bash(gh:*)"]))
     check(
@@ -4036,7 +4108,7 @@ def _selftest() -> int:
 
     # (l2) R5-F3: the forbidden-command comparison must be CASE-INSENSITIVE. On the
     # case-insensitive filesystems this repo is developed on (macOS) `GH` resolves to the
-    # real `gh` binary and Claude Code honours the rule, so `Bash(GH api:*)` auto-runs
+    # real `gh` binary and Claude Code honors the rule, so `Bash(GH api:*)` auto-runs
     # `gh api` while a case-sensitive validator sees an unknown command and waves it through.
     # Killing mutant: dropping the `.lower()` in `_bash_command`.
     check(
@@ -4560,7 +4632,7 @@ def _selftest() -> int:
             _buffer = io.StringIO()
             with contextlib.redirect_stdout(_buffer):
                 main(["--offline", "--repo", DEFAULT_REPO, "--skills-dir", DEFAULT_SKILLS_DIR])
-            check(
+            check_in_checkout(
                 "[PASS] command-skill-frontmatter" in _buffer.getvalue(),
                 "the tracked .claude/skills tree passes the check inside a full gate run",
             )
@@ -4588,7 +4660,7 @@ def _selftest() -> int:
         os.makedirs(_agents, exist_ok=True)
         _wrapper(_agents, "product-manager.md", "---\nname: product-manager\n---\n")
         if not _link(_real, os.path.join(_agents, "linked")):
-            _log("  skip - symlink fixtures unavailable on this platform (agents walk)")
+            skip("symlink fixtures unavailable on this platform (agents walk)")
         else:
             _ok, _slugs, _problems = _read_roster_safe(_agents)
             check(
@@ -4624,7 +4696,7 @@ def _selftest() -> int:
         _linked_skill = os.path.join(_skills, "linked")
         _linked_cmd = os.path.join(_commands, "linked")
         if not (_link(_real_skill, _linked_skill) and _link(_real_skill, _linked_cmd)):
-            _log("  skip - symlink fixtures unavailable on this platform (skills/commands walk)")
+            skip("symlink fixtures unavailable on this platform (skills/commands walk)")
         else:
             _problems, _ncmd, _nskill = scan_command_skill_frontmatter(_commands, _skills)
             check(
@@ -4674,7 +4746,7 @@ def _selftest() -> int:
 
     # --- CERT-F2/F3: the TRACKED startup surface. `.mcp.json` spawns its servers when the
     # CLI launches (no prompt, before any tool call) and `.claude/settings.local.json` is
-    # honoured exactly like settings.json — neither is visible to `settings-permissions`.
+    # honored exactly like settings.json — neither is visible to `settings-permissions`.
     # Only a TRACKED file fails: an untracked local one is the developer's own machine state
     # (and settings.local.json is where every remedy message in this gate sends grants), so
     # failing on mere existence would redden every local run and train people to ignore the
@@ -4730,7 +4802,7 @@ def _selftest() -> int:
     _mcp_evil = '{"mcpServers": {"x": {"command": "true"}}}'
     with tempfile.TemporaryDirectory() as tmp:
         if not _git_repo(tmp, {".mcp.json": _mcp_evil}, [".mcp.json"]):
-            _log("  skip - git unavailable: tracked-startup-config fixtures not run")
+            skip("git unavailable: tracked-startup-config fixtures not run")
         else:
             _mcp = os.path.join(tmp, ".mcp.json")
             _local = os.path.join(tmp, ".claude", "settings.local.json")
@@ -4845,13 +4917,13 @@ def _selftest() -> int:
     with tempfile.TemporaryDirectory() as tmp:
         _skill_rel = os.path.join(".claude", "skills", "real", "SKILL.md")
         if not _git_repo(tmp, {_skill_rel: "---\nname: real\ndescription: d\n---\n"}, [_skill_rel]):
-            _log("  skip - git unavailable: tracked-dangling-symlink fixtures not run")
+            skip("git unavailable: tracked-dangling-symlink fixtures not run")
         else:
             _skills = os.path.join(tmp, ".claude", "skills")
             _commands = os.path.join(tmp, ".claude", "commands")
             _linked = os.path.join(_skills, "linked")
             if not _dangling(_linked):
-                _log("  skip - symlink fixtures unavailable on this platform (dangling links)")
+                skip("symlink fixtures unavailable on this platform (dangling links)")
             else:
                 subprocess.run(
                     ["git", "add", "-f", "--", _linked],
@@ -4936,7 +5008,7 @@ def _selftest() -> int:
                     # tracking question (which quotes the ABSOLUTE `--mcp-config` spelling
                     # this fixture passes) and by the git-mode query (which answers
                     # repo-root-relative `.mcp.json`) — so the two messages are distinct
-                    # STRINGS and only a path-normalising dedupe collapses them. Counting the
+                    # STRINGS and only a path-normalizing dedupe collapses them. Counting the
                     # mode marker, not the set size, is what kills the no-dedupe mutant
                     # (LAST-CERT F4).
                     and sum("120000" in x for x in _res.lines) == 1
@@ -5100,7 +5172,7 @@ def _selftest() -> int:
             and _git_run(tmp, "clone", "-q", _outer, _clone)
         )
         if not _built:
-            _log("  skip - git submodule fixtures unavailable: gitlink checks not run")
+            skip("git submodule fixtures unavailable: gitlink checks not run")
         else:
             _clone_skills = os.path.join(_clone, ".claude", "skills")
             _clone_commands = os.path.join(_clone, ".claude", "commands")
@@ -5157,12 +5229,12 @@ def _selftest() -> int:
     ):
         with tempfile.TemporaryDirectory() as tmp:
             if not _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, []):
-                _log("  skip - git unavailable: .claude root pathspec fixtures not run")
+                skip("git unavailable: .claude root pathspec fixtures not run")
                 break
             _link = os.path.join(tmp, _unpoliced)
             os.makedirs(os.path.dirname(_link), exist_ok=True)
             if not _dangling(_link, "../../obj/whatever"):
-                _log("  skip - symlink fixtures unavailable on this platform")
+                skip("symlink fixtures unavailable on this platform")
                 break
             subprocess.run(
                 ["git", "add", "-f", "--", _link],
@@ -5218,7 +5290,7 @@ def _selftest() -> int:
                 _res.status == "fail"
                 and any(line.startswith(repr(".claude") + " is a tracked symlink") for line in _res.lines)
                 # One link, one line: git's verdict AND the islink() walk both see this root,
-                # and the two spellings only collapse once they are normalised (LAST-CERT F4).
+                # and the two spellings only collapse once they are normalized (LAST-CERT F4).
                 and sum("120000" in line for line in _res.lines) == 1,
                 f"`.claude` itself as a tracked link ({_shape}) FAILS once, named as `.claude`",
             )
@@ -5297,7 +5369,7 @@ def _selftest() -> int:
             and _git_run(tmp, "clone", "-q", _outer, _clone)
         )
         if not _built:
-            _log("  skip - git submodule fixtures unavailable: `.claude` gitlink checks not run")
+            skip("git submodule fixtures unavailable: `.claude` gitlink checks not run")
         else:
             check(
                 _tracked_links(
@@ -5394,7 +5466,7 @@ def _selftest() -> int:
 
     # (c) FOLDED SPELLINGS. Git's index is case-SENSITIVE and byte-exact; APFS and NTFS are
     # not. A tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md` or `.mcp.jſon` is a path no
-    # byte-exact query names, which materialises inside the real `.claude/` (or AT
+    # byte-exact query names, which materializes inside the real `.claude/` (or AT
     # `.mcp.json`) where the CLI reads it. The fold is NFC + casefold, applied to both sides
     # and compared SEGMENT-wise, and a collision is reported for ANY index mode — a plain
     # file impersonates a config file just as well as a link.
@@ -5443,7 +5515,7 @@ def _selftest() -> int:
                 tmp, "100644", ".CLAUDE/settings.json", "{}\n"
             )
             if not _staged:
-                _log("  skip - git update-index --cacheinfo unavailable: case fixtures not run")
+                skip("git update-index --cacheinfo unavailable: case fixtures not run")
             else:
                 _lines, _statuses = _local_link_report(tmp)
                 check(
@@ -5492,7 +5564,7 @@ def _selftest() -> int:
 
     # (c2) DEPTH. The fold question used to stop at the anchor's direct children, so every
     # spelling below `.claude/` — the four surfaces the CLI actually loads — passed the whole
-    # gate on Linux CI and materialised at the canonical path on a macOS/Windows clone
+    # gate on Linux CI and materialized at the canonical path on a macOS/Windows clone
     # (PR-901 second round, H-1). Each of these is staged straight into the index with a
     # payload the gate rejects when it is spelled canonically.
     # Killing mutant: dropping POLICED_CLAUDE_CHILDREN from `_policed_prefixes`.
@@ -5516,10 +5588,10 @@ def _selftest() -> int:
             if not _git_repo(
                 tmp, {os.path.join(".claude", "keep"): "x\n"}, [os.path.join(".claude", "keep")]
             ):
-                _log("  skip - git unavailable: depth fold fixtures not run")
+                skip("git unavailable: depth fold fixtures not run")
                 break
             if not _cacheinfo(tmp, _mode, _variant, _body):
-                _log("  skip - git update-index --cacheinfo unavailable: depth fixtures")
+                skip("git update-index --cacheinfo unavailable: depth fixtures")
                 break
             _lines, _statuses = _local_link_report(tmp)
             _named = [
@@ -5571,7 +5643,7 @@ def _selftest() -> int:
                     and repr(".claude/Settings.local.json") in _output
                     and "rename it" in _output,
                     "a tracked `.claude/Settings.local.json` exits 1 named by "
-                    "tracked-startup-config (it is honoured as settings.local.json on a clone)",
+                    "tracked-startup-config (it is honored as settings.local.json on a clone)",
                 )
                 # The CLONE shape: on macOS the same index entry checks out AS
                 # `.claude/settings.local.json`, where `git ls-files --error-unmatch` calls it
@@ -5729,7 +5801,7 @@ def _selftest() -> int:
             # ...and with a CEILING set at the export's parent, git refuses to discover the
             # enclosing repository at all, which must reach the operator as SKIP too. This is
             # why `GIT_CEILING_DIRECTORIES` is NOT scrubbed: it can only NARROW discovery, so
-            # honouring it can only turn a false clean into an unverified. Killing mutant:
+            # honoring it can only turn a false clean into an unverified. Killing mutant:
             # putting GIT_CEILING_DIRECTORIES back in `_SCRUBBED_GIT_ENV` (git then walks up
             # into the enclosing repo and answers about it).
             check(
@@ -6102,7 +6174,7 @@ def _selftest() -> int:
 
     # (e3c) RT-1, on a fixture: TWO index entries whose spellings fold together —
     # `.claude/Skills/evil-x` (an ordinary file, a collision) and `.claude/skills/evil-x`
-    # (mode 120000, a tracked symlink, materialised on disk so the WALK sees it too). Both
+    # (mode 120000, a tracked symlink, materialized on disk so the WALK sees it too). Both
     # index findings must print in EVERY check, and the walk's third line must not: the
     # operator has to learn about the link in the same round as the rename.
     # Killing mutant: keying the fold suppression on the finding's KIND alone, so the
@@ -6429,7 +6501,7 @@ def _selftest() -> int:
     # reported as "not policed". "An entry at or above the queried path is git's whole
     # answer" holds for a gitlink AT the `.claude` root (that submodule IS the tree), not for
     # one ABOVE it, which says only "another repository lives here and I have not
-    # initialised it".
+    # initialized it".
     # Killing mutant: treating an ancestor 160000 entry as coverage (the old unconditional
     # "entry at or above" short-circuit).
     with tempfile.TemporaryDirectory() as tmp:
@@ -6454,7 +6526,7 @@ def _selftest() -> int:
             check(
                 _statuses == ["skip", "skip", "skip"]
                 and sum(
-                    "submodule directory this checkout has not initialised" in line
+                    "submodule directory this checkout has not initialized" in line
                     for line in _lines
                 ) == 3
                 # ...and the narrow `_tracked_links` question keeps its ``None`` contract on a
@@ -6463,7 +6535,7 @@ def _selftest() -> int:
                 and _tracked_links(
                     link_query_paths(os.path.join(_export, ".claude", "agents"))
                 ) is None,
-                "an export under an UNINITIALISED submodule gitlink is UNVERIFIED in all "
+                "an export under an UNINITIALIZED submodule gitlink is UNVERIFIED in all "
                 "three local checks, not cleared by an enclosing index that says nothing "
                 "about it",
             )
@@ -6484,7 +6556,7 @@ def _selftest() -> int:
         with contextlib.redirect_stdout(_buffer):
             _exit = main(["--offline", "--repo", DEFAULT_REPO])
         _out = _buffer.getvalue()
-        check(
+        check_in_checkout(
             _exit == 0
             and _out.count("[PASS] ") == 4
             and "file(s) on disk are not in the index" not in _out,
@@ -6804,7 +6876,7 @@ def _selftest() -> int:
     # `or []` at the call sites; treating unverified as pass in the cmd/skill or roster check.
     with tempfile.TemporaryDirectory() as tmp:
         if _git_toplevel(tmp) is not None:  # pragma: no cover - TMPDIR inside a checkout
-            _log("  skip - the temp directory is inside a git checkout: fail-closed unit tests")
+            skip("the temp directory is inside a git checkout: fail-closed unit tests")
         else:
             _outside = os.path.join(tmp, "skills")
             check(
@@ -6855,7 +6927,7 @@ def _selftest() -> int:
                 except (tarfile.TarError, OSError):  # pragma: no cover - environment
                     _exported = False
             if not _exported:
-                _log("  skip - git archive unavailable: export (non-checkout) fixtures not run")
+                skip("git archive unavailable: export (non-checkout) fixtures not run")
             else:
                 _export_args = [
                     "--offline",
@@ -7065,7 +7137,7 @@ def _selftest() -> int:
             r"under (\S+)",
             _output,
         )
-        check(
+        check_in_checkout(
             "[PASS] command-skill-frontmatter" in _output
             and _scanned is not None
             and int(_scanned.group(1)) >= 1
@@ -7096,11 +7168,42 @@ def _selftest() -> int:
         if saved_repo_env is not None:
             os.environ["GITHUB_REPOSITORY"] = saved_repo_env
 
+    # The FLOOR. A selftest that runs fewer assertions than it did yesterday still prints a
+    # green line, so the count is part of the contract: inside a checkout with every fixture
+    # available the run must execute exactly SELFTEST_ASSERTIONS_IN_CHECKOUT assertions, and
+    # the checkout-only ones must all have run. Outside a checkout the tally is PRINTED
+    # instead — the degradation is then visible in the log rather than hidden behind "all
+    # assertions passed" (PR-901 third round, L1/Info-2/3).
+    def floor(condition: bool, label: str) -> None:
+        """Assert a property OF THE RUN ITSELF; not counted, or it would move the count."""
+        if not condition:
+            failures.append(label)
+            _log(f" FAIL - {label}")
+
+    if in_checkout:
+        floor(
+            tally["checkout_only"] == SELFTEST_CHECKOUT_ONLY_ASSERTIONS,
+            f"selftest floor: {tally['checkout_only']} of "
+            f"{SELFTEST_CHECKOUT_ONLY_ASSERTIONS} checkout-only assertion(s) ran inside a "
+            f"git checkout",
+        )
+        if tally["skipped"] == 0:
+            floor(
+                tally["executed"] == SELFTEST_ASSERTIONS_IN_CHECKOUT,
+                f"selftest floor: {tally['executed']} assertion(s) executed with no fixture "
+                f"skipped, expected {SELFTEST_ASSERTIONS_IN_CHECKOUT} (update "
+                f"SELFTEST_ASSERTIONS_IN_CHECKOUT when adding or removing an assertion)",
+            )
     _log("")
     if failures:
         _error(f"selftest: {len(failures)} assertion(s) failed")
         return 1
-    _log("selftest: all assertions passed")
+    _summary = f"selftest: {tally['executed']} assertion(s) passed"
+    if tally["skipped"]:
+        _summary += f", {tally['skipped']} fixture group(s) skipped"
+    if not in_checkout:
+        _summary += " (not a git checkout at the repo root: coverage is REDUCED)"
+    _log(_summary)
     return 0
 
 
@@ -7204,7 +7307,7 @@ def main(argv: "list[str] | None" = None) -> int:
             # named (nested / unparseable / nameless wrappers). That is repo drift the
             # author can fix, so it exits 1 like every other drift — exit 2 is reserved for
             # "the gate could not run" (missing or genuinely empty agents dir, remote
-            # outage), and mislabelling drift as an outage sends the responder to the wrong
+            # outage), and mislabeling drift as an outage sends the responder to the wrong
             # runbook and invites a retry-until-green reflex.
             _error(
                 "the agents directory yielded no roster entry because of the integrity "

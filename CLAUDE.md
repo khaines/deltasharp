@@ -108,47 +108,53 @@ and skill files, along with any key outside `description`/`argument-hint`/`model
 (skills also `name`); front matter the strict reader cannot parse fails the same
 way, and a skills tree with no manifest is drift, not a pass.
 
-Three more startup surfaces sit inside the same boundary and the gate rejects all
-three. **Links:** any *tracked* symlink **or submodule** (git mode `120000`/`160000`)
-anywhere under `.claude/` — including `.claude` itself — or at `.mcp.json`,
-`.claude/settings.local.json`, or `.claude/settings.json`, fails. The rule is decided
-by the **git index mode**, not by what the path resolves to here, so neither shape can
-hide: a **dangling** link (one pointing at `bin/` or `obj/`) is absent in a
-checkout-only CI job and resolves to real configuration on any machine that has built,
-and a **submodule** is checked out *empty* by CI while `git submodule update --init`
-loads whatever it contains on a developer machine. Git is asked from the directory
-that *contains* `.claude`, never from inside it — a submodule `.claude` would answer
-from the nested repository and a symlinked one from outside the checkout, both
-"clean". The index is **listed once from the work-tree root**, with no pathspec (so
-no pathspec magic — `GIT_LITERAL_PATHSPECS` and friends are scrubbed along with
-`GIT_DIR`) and every entry that **case- or normalisation-folds** onto `.claude/…` or
-`.mcp.json` is compared with the canonical spelling: on an APFS/NTFS checkout a
-tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md`, `.claude/Settings.local.json`
-or `.mcp.jſon` (U+017F) materialises at the path the CLI reads, so it fails as
-"rename it" whatever its index mode — and "is it tracked?" is asked of the
-checked-out path the same way, so a committed `.claude/Settings.local.json` is not
-filed as harmless per-machine state. The same fold decides file *names*, in the
-walks as well as the index: `.claude/skills/<x>/ſkill.md` is the manifest APFS
-resolves `SKILL.md` to and the CLI loads, so it is scanned like any other manifest
-and the index may hold only the canonical `SKILL.md` spelling. The `.claude`
-question is asked by all three local checks, so a finding there is named wherever
-the reader looks (`.mcp.json` is owned by `tracked-startup-config`). Git's answer
-must also *cover* what the walks read: a path outside the work tree git answered
-from, and a `.claude` whose checkout tracks nothing at or under any policed child
-(an export dropped inside an enclosing checkout) are *unverified*, not clean —
-while an untracked subtree inside a `.claude` that checkout *does* own is ordinary
-work in progress, so it is walked, policed and noted rather than skipped. A tracked
-path whose bytes are not valid UTF-8 is reported rather than decoded, and a
-collapsed sparse-index entry, should git ever return one, is unverified too: git
-≥2.35 expands a sparse index for `ls-files`, so that branch is defence in depth
-rather than a shape seen in practice.
-The CLI follows such a link; the gate's walks deliberately do not, so
-it would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
-`mcpServers[*].command` is started when the CLI launches, before any tool call and
-with no prompt. **A tracked `.claude/settings.local.json`:** it is honoured exactly
-like `settings.json`, so the per-machine grants this file keeps recommending there
-are only safe while it stays untracked and gitignored (both paths are in
-`.gitignore`).
+Two more startup surfaces sit inside the same boundary, and one rule — no links —
+applies to them and to every path above. **Links:** any *tracked* symlink **or
+submodule** (git mode `120000`/`160000`) anywhere under `.claude/` — including
+`.claude` itself — or at `.mcp.json`, `.claude/settings.local.json`, or
+`.claude/settings.json`, fails. The CLI follows such a link; the gate's walks
+deliberately do not, so a filesystem-only check would ship unreviewed configuration.
+
+The rule is decided by the **git index mode**, not by what the path resolves to
+here, so neither shape can hide: a **dangling** link (one pointing at `bin/` or
+`obj/`) is absent in a checkout-only CI job and resolves to real configuration on
+any machine that has built, and a **submodule** is checked out *empty* by CI while
+`git submodule update --init` loads whatever it contains on a developer machine.
+Git is asked from the directory that *contains* `.claude`, never from inside it — a
+submodule `.claude` would answer from the nested repository and a symlinked one
+from outside the checkout, both "clean". The index is **listed once from the
+work-tree root**, with no pathspec (so no pathspec magic — `GIT_LITERAL_PATHSPECS`
+and friends are scrubbed along with `GIT_DIR`) and every entry that **case- or
+normalization-folds** onto `.claude/…` or `.mcp.json` is compared with the canonical
+spelling: on an APFS/NTFS checkout a tracked `.Claude/hooks`,
+`.claude/COMMANDS/evil.md`, `.claude/Settings.local.json` or `.mcp.jſon` (U+017F)
+materializes at the path the CLI reads, so it fails as "rename it" whatever its
+index mode — and "is it tracked?" is asked of the checked-out path the same way, so
+a committed `.claude/Settings.local.json` is not filed as harmless per-machine
+state. The same fold decides file *names*, in the walks as well as the index:
+`.claude/skills/<x>/ſkill.md` is the manifest APFS resolves `SKILL.md` to and the
+CLI loads, so it is scanned like any other manifest and the index may hold only the
+canonical `SKILL.md` spelling.
+
+Three checks ask the `.claude` question — the roster walk in
+`roster<->documented-labels`, both front-matter walks in
+`command-skill-frontmatter`, and `tracked-startup-config` (which also owns
+`.mcp.json`; `settings-permissions` only reads `.claude/settings.json` itself) — so
+a finding there is named wherever the reader looks. Git's answer must also *cover*
+what the walks read: a path outside the work tree git answered from, and a `.claude`
+whose checkout tracks nothing at or under any policed child (an export dropped
+inside an enclosing checkout) are *unverified*, not clean — while an untracked
+subtree inside a `.claude` that checkout *does* own is ordinary work in progress, so
+it is walked, policed and noted rather than skipped. A tracked path whose bytes are
+not valid UTF-8 is reported rather than decoded, and a collapsed sparse-index entry,
+should git ever return one, is unverified too: git ≥2.35 expands a sparse index for
+`ls-files`, so that branch is defense in depth rather than a shape seen in practice.
+
+**A tracked root `.mcp.json`:** each `mcpServers[*].command` is started when the CLI
+launches, before any tool call and with no prompt. **A tracked
+`.claude/settings.local.json`:** it is honored exactly like `settings.json`, so the
+per-machine grants this file keeps recommending there are only safe while it stays
+untracked and gitignored (both paths are in `.gitignore`).
 
 ## Architecture — the big picture
 
