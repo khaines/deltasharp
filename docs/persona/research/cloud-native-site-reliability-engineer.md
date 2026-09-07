@@ -112,4 +112,4 @@ Operational readiness should become a release gate. A new scheduler feature, sto
 [^7]: SRE workbook, The Art of SLOs, https://sre.google/resources/practices-and-processes/art-of-slos/
 [^8]: OpenTelemetry documentation, Observability primer, https://opentelemetry.io/docs/concepts/observability-primer/
 [^9]: DORA, software delivery performance metrics, https://dora.dev/guides/dora-metrics-four-keys/
-[^10]: DeltaSharp repository canon: `.github/copilot-instructions.md` and `docs/persona/agents/README.md`.
+[^10]: DeltaSharp repository canon: `CLAUDE.md` and `docs/persona/agents/README.md`.

@@ -1,7 +1,7 @@
 ---
 name: delta-storage-format-engineer
 description: Use for Delta transaction log, Parquet format internals, commit protocol, compaction, time travel, schema evolution, vacuum, and storage-backend semantics.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

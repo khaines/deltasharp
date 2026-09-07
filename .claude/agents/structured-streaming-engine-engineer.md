@@ -1,7 +1,7 @@
 ---
 name: structured-streaming-engine-engineer
 description: Use for DeltaSharp Structured Streaming design and review: micro-batch incremental execution, sources/sinks, offsets, state stores, watermarks, checkpointing, triggers, and exactly-once transactional sink semantics.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

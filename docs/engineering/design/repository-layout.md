@@ -4,7 +4,7 @@
 > ([STORY-01.1.1](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-01-project-build-platform.md#story-0111-root-solution-and-source-tree-skeleton)).
 > Update it whenever the layout or naming conventions change. Grounded in
 > [ADR-0014](../../adr/0014-target-framework-aot.md) and
-> [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md).
+> [`CLAUDE.md`](../../../CLAUDE.md).
 
 ## Top-level layout
 

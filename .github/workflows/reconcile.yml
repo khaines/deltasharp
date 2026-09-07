@@ -3,39 +3,139 @@ name: Reconcile
 # Governance reconciliation gate (STORY-00.6.2, #452). A lightweight, build-free check that
 # fails when the persona roster, the GitHub label taxonomy, CODEOWNERS, and the
 # feature-request milestone dropdown drift out of the manual reconciliation recorded in
-# docs/planning/label-taxonomy.md (#449). It reconciles three sources of drift:
-#   * roster<->labels    — every .github/agents/*.agent.md wrapper has a persona:<slug> label
+# docs/planning/label-taxonomy.md (#449). It runs three reconciliations plus three local
+# validations (settings-permissions, command-skill-frontmatter, tracked-startup-config):
+#   * roster<->labels    — every .claude/agents/*.md wrapper has a persona:<slug> label
 #                          and vice-versa (allowing the ONE documented 50-char truncation),
 #                          reconciled against the committed label list AND the live labels.
+#                          Wrapper front matter is policed too: permissionMode may only be
+#                          default/plan, and hooks/mcpServers/isolation/env (or any unknown
+#                          key) are rejected — Claude Code reads them as runtime config.
 #   * codeowners-errors  — GET /repos/{repo}/codeowners/errors?ref=<PR head> reports no
 #                          parse/owner errors (pinned to the PR head so a breaking PR fails).
 #   * milestone-dropdown — the feature_request.yml milestone options match the live GitHub
 #                          milestones (plus the documented "needs triage" sentinel).
+#   * settings-permissions (a VALIDATION, not a reconciliation) — .claude/settings.json stays
+#                          parseable and permissions.allow/deny stay LISTS of plain strings.
+#                          The file is a positive ALLOWLIST: only `$schema`, `permissions`
+#                          and the listed inert keys may appear at top level, and
+#                          `permissions` may hold only allow/deny/defaultMode — so every
+#                          executable-valued key (`hooks`, `env`, `apiKeyHelper`,
+#                          `statusLine`, the AWS/GCP/proxy helpers, ...) and
+#                          permissions.additionalDirectories are rejected by name, and any
+#                          defaultMode outside default/plan is rejected (bypassPermissions/
+#                          dontAsk skip every prompt; acceptEdits auto-approves writes).
+#                          In `allow` it rejects the enumerated mutating git/gh
+#                          prefixes in FORBIDDEN_ALLOW_COMMANDS (`gh api`, `git push`,
+#                          `gh pr merge`, ... compared CASE-INSENSITIVELY, including
+#                          via a broad `Bash(gh:*)`)
+#                          and any wildcard or TOOL-WIDE Bash grant (`Bash`, `Bash()`,
+#                          `Bash(*)`, `Bash(gh *)` — an unescaped `*` is matched as a GLOB),
+#                          and it requires all 14 REQUIRED_DENY_ENTRIES to be present. Allow
+#                          entries outside those rules are NOT policed — the check bounds the
+#                          file's blast radius, it does not certify the whole permission
+#                          surface. Implemented in
+#                          tools/reconcile/roster-labels.py (validate_settings), so it is
+#                          self-tested and mutation-checked like the reconciliations above.
+#   * command-skill-frontmatter (also a VALIDATION) — the THIRD front-matter surface Claude
+#                          Code reads as runtime configuration: .claude/commands/**/*.md
+#                          slash commands and .claude/skills/**/SKILL.md manifests. A tracked
+#                          command file carrying `allowed-tools: Bash(<cmd>:*)` RUNS that
+#                          command with no permission prompt, invisible to both the settings
+#                          and the wrapper policies above, so `allowed-tools`,
+#                          `permissionMode`, `hooks`, `mcpServers`, `env` and `isolation` are
+#                          rejected by name and any key outside description/argument-hint/
+#                          model (plus `name` for skills) is rejected on sight. Front matter
+#                          is read by the same STRICT reader, so an unparseable fence fails
+#                          rather than being skipped; .claude/commands is optional but a
+#                          skills tree with zero manifests FAILS, and the passing report
+#                          states how many files were scanned. LINKS are rejected and the
+#                          rule is decided BY GIT: any tracked symlink OR submodule (git mode
+#                          120000/160000) anywhere under .claude/ — including .claude itself —
+#                          or at .mcp.json / settings.local.json / settings.json fails on its
+#                          index mode, so neither shape can hide. A DANGLING link (one
+#                          pointing at bin/ or obj/) is absent in this checkout-only job yet
+#                          resolves to real config wherever the target exists, and a SUBMODULE
+#                          is checked out EMPTY here (this job does not init submodules, by
+#                          design) while `git submodule update --init` loads whatever it holds
+#                          on a developer machine. The .claude-wide query lives in
+#                          tracked-startup-config; this check asks it too, and its walks also
+#                          report any link they meet (roots included, whatever the file is
+#                          named); links are never followed, so a link loop cannot hang the
+#                          gate.
+#   * tracked-startup-config (also a VALIDATION) — the two startup surfaces
+#                          settings-permissions never opens: a repo-root `.mcp.json` (each
+#                          `mcpServers[*].command` is SPAWNED when the CLI launches, with no
+#                          prompt) and `.claude/settings.local.json` (honored like
+#                          settings.json, and where every remedy message here sends
+#                          per-machine grants — safe only while it is untracked). Only a
+#                          TRACKED file fails (`git ls-files --error-unmatch`), so an
+#                          untracked local copy is reported, not failed; a tracked malformed
+#                          .mcp.json fails, an empty `mcpServers` passes, and a tracked
+#                          SYMLINK or SUBMODULE at either path (or at .claude/settings.json)
+#                          fails on its git mode (120000/160000) even when it dangles or is
+#                          checked out empty here. This check also carries the .claude ROOT
+#                          PATH — the scoping prefix that is the only way to see .claude
+#                          ITSELF as a link, and the only one covering subtrees no other check
+#                          owns (hooks/, output-styles/): a query scoped THROUGH a symlinked
+#                          directory sees nothing, because the index holds the link, not the
+#                          files "inside" it. The index is listed once with NO pathspec and
+#                          these roots select from the answer; the only per-file question,
+#                          `git ls-files --error-unmatch`, is asked with an absolute path
+#                          after `--`, so no spelling of it can be read as a pathspec. The
+#                          link/index query is asked FROM the directory that contains
+#                          .claude, never from inside it (a submodule .claude answers from
+#                          the nested repository and a symlinked one from outside the
+#                          checkout — both "clean"); only that per-file question runs beside
+#                          the file it asks about. The
+#                          index is LISTED ONCE from the work-tree root with no pathspec (so
+#                          no pathspec magic — GIT_LITERAL_PATHSPECS and friends are scrubbed
+#                          along with GIT_DIR — can blind the query) and every entry that
+#                          case- or normalization-FOLDS onto .claude/... or .mcp.json is
+#                          compared with the canonical spelling: a tracked .Claude/hooks,
+#                          .claude/COMMANDS/evil.md, .claude/Settings.local.json or
+#                          .mcp.jſon (U+017F) merges into the path the CLI reads on an
+#                          APFS/NTFS checkout, so it fails as "rename it" whatever its index
+#                          mode. "Tracked" is asked of the checked-out path the same way, so
+#                          a committed .claude/Settings.local.json is not filed as untracked
+#                          per-machine state. The findings are scoped to those roots, never
+#                          to the whole repository, and git's answer must COVER what the
+#                          walks read: a path outside the work tree git answered from, a
+#                          policed .claude child holding files no index entry folds under
+#                          (an export inside an enclosing checkout, whose .claude root tracks
+#                          no policed child of its own), a .claude under an UNINITIALIZED
+#                          submodule (a gitlink ABOVE it), and a sparse index are all
+#                          UNVERIFIED, not clean — reported ALONGSIDE whatever git did name,
+#                          never instead of it — while untracked WIP inside a root the
+#                          index DOES own is walked, policed and NOTED ("git add them"),
+#                          never skipped with advice to stand where the operator already is.
+#                          A skill manifest is held to its canonical LEAF too
+#                          (.claude/skills/x/ſkill.md folds onto SKILL.md), and a tracked
+#                          path whose bytes are not valid UTF-8 is REPORTED, not tolerated: no
+#                          walk, glob or review can name it reliably. One link reported by more
+#                          than one question is annotated ONCE per check (paths are compared
+#                          repo-root-relative), while two DISTINCT index entries stay two
+#                          findings even when their spellings fold onto each other. If git
+#                          cannot say, the check reports SKIP and --require-remote makes that
+#                          exit 2 —
+#                          and a run with any SKIP ends on a qualified success line, never
+#                          the unqualified "are in step" claim.
 #
-# It runs on PRs and pushes that touch the governance files (drift introduced by a code
-# change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
-# milestone renamed in the UI, which is not a file change). The gate is intentionally NOT a
+# It runs on every pull request TARGETING `main` and every push to `main` (drift introduced
+# by a code change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a
+# label or milestone renamed in the UI, which is not a file change). There is deliberately NO
+# `paths:` filter: GitHub's path filters are case-SENSITIVE and cannot express the folding a
+# macOS/Windows checkout performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or
+# `.mcp.jſon` — exactly the shapes the gate now fails — would never have triggered it
+# (PR-901 second round, RT-3). The job is stdlib Python with no build, so running it always
+# costs less than a filter that cannot enforce the rule. The gate is intentionally NOT a
 # branch-protection required check today (it can be promoted post-merge like the other gates,
 # see label-taxonomy.md). Least-privilege read-only token; the one action is pinned by SHA.
 on:
   push:
     branches: [main]
-    paths:
-      - ".github/agents/**"
-      - ".github/ISSUE_TEMPLATE/feature_request.yml"
-      - ".github/CODEOWNERS"
-      - "docs/planning/label-taxonomy.md"
-      - ".github/workflows/reconcile.yml"
-      - "tools/reconcile/**"
   pull_request:
     branches: [main]
-    paths:
-      - ".github/agents/**"
-      - ".github/ISSUE_TEMPLATE/feature_request.yml"
-      - ".github/CODEOWNERS"
-      - "docs/planning/label-taxonomy.md"
-      - ".github/workflows/reconcile.yml"
-      - "tools/reconcile/**"
   schedule:
     # Weekly, Mondays ~07:17 UTC — catch GitHub-side drift (a label/milestone edited in the
     # UI) that no file change would otherwise trigger.
@@ -63,15 +163,32 @@ jobs:
       # Prove the gate's own reconciliation logic (truncation, dropdown parse, milestone and
       # label diffing) with in-memory fixtures before trusting it on live data — mirrors the
       # coverage and SCA gate self-tests. Stdlib-only Python; nothing to install.
+      # --require-full-coverage makes a SKIPPED fixture group a failure here: on a laptop a
+      # skip means "this machine cannot build that fixture", but in CI it is indistinguishable
+      # from a fixture group that stopped building, or a guard that landed on the wrong block.
       - name: Reconcile gate self-test
-        run: python3 tools/reconcile/roster-labels.py --selftest
+        run: python3 tools/reconcile/roster-labels.py --selftest --require-full-coverage
+
+      # .claude/settings.json is a security-relevant permission surface (an over-broad allow
+      # entry silently widens what runs without a prompt), so it is validated here too. The
+      # rules live in the gate script (validate_settings) rather than in an inline one-liner,
+      # so they are covered by --selftest above and cannot rot unnoticed. Local + stdlib-only;
+      # runs before the live checks so a malformed permission file fails fast.
+      - name: Validate .claude/settings.json
+        run: python3 tools/reconcile/roster-labels.py --validate-settings-only
 
       # The live checks read public repo metadata (labels, milestones, codeowners/errors) via
-      # the GitHub CLI using the default read-only token. --require-remote makes a remote lookup
-      # that could not run a hard failure (exit 2 — a remote outage, distinct from drift) so the
-      # gate cannot silently pass without verifying. --ref pins the CODEOWNERS validation to the
-      # PR head/merge commit (github.sha) so a PR that breaks CODEOWNERS fails the PR gate rather
-      # than only being caught post-merge on the default branch.
+      # the GitHub CLI using the default read-only token. --require-remote makes a lookup that
+      # could not run a hard failure (exit 2 — the gate COULD NOT VERIFY: a remote outage, a
+      # missing/empty .claude/agents directory, OR a local check that could not verify its
+      # input (environment — run the gate inside the git checkout)) so the gate cannot silently
+      # pass without verifying. Each cause prints its own message, because they need different
+      # fixes: wait out an outage, fix the repo, or fix the environment the gate ran in.
+      # Exit 1 is DRIFT to fix in the repo, and that includes roster INTEGRITY
+      # problems (nested, unparseable or nameless wrappers) even when they leave the roster
+      # empty — an author-fixable repo state must never page as an outage. --ref pins the
+      # CODEOWNERS validation to the PR head/merge commit (github.sha) so a PR that breaks
+      # CODEOWNERS fails the PR gate rather than only being caught post-merge on main.
       - name: Reconcile roster, labels, CODEOWNERS, milestones
         env:
           GH_TOKEN: ${{ github.token }}

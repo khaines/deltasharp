@@ -1,7 +1,7 @@
 ---
 name: performance-benchmarking-engineer
 description: Designs DeltaSharp performance methodology, analytics benchmarks, .NET profiling playbooks, regression gates, and capacity models.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

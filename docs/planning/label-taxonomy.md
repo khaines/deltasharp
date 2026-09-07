@@ -53,7 +53,7 @@ triage.
   **list** — 25 roles — is maintained in the [workstream plan](README.md) (the
   source of truth for *which* personas exist); the **canonical per-role specs**
   live in [`docs/persona/agents/README.md`](../persona/agents/README.md) and are
-  mirrored by the wrappers in `.github/agents/*.agent.md`.
+  mirrored by the wrappers in `.claude/agents/*.md`.
 - **One slug is truncated in label form.** GitHub caps label names at 50
   characters. `persona:dotnet-vectorized-columnar-compute-engineer` is 51
   characters, so its label drops the redundant trailing `-engineer`:
@@ -125,7 +125,7 @@ links) is the **source of truth**. STORY-00.6.2 AC3 requires roster changes to b
 tracked there. When a persona is added, removed, or renamed:
 
 1. Update the roster in [`docs/planning/README.md`](README.md) and the canonical
-   spec under `docs/persona/agents/` (plus its `.github/agents/` wrapper).
+   spec under `docs/persona/agents/` (plus its `.claude/agents/` wrapper).
 2. Add or remove the matching `persona:<slug>` label, honoring the 50-character
    truncation rule above.
 3. Update the committed
@@ -135,16 +135,22 @@ tracked there. When a persona is added, removed, or renamed:
 
 ### Reconciliation snapshot (verified)
 
-As of 2026-07-04 the roster and the `persona:` labels agree exactly: 25 roster
-slugs, 25 labels, with the single documented truncation. Reconcile at any time
-(no temporary files needed):
+As of 2026-09-06, with the roster source moved to `.claude/agents/`, the roster
+and the `persona:` labels still agree exactly: 25 roster slugs, 25 labels, with
+the single documented truncation. Reconcile at any time (no temporary files
+needed):
 
 ```bash
 comm -3 \
-  <(ls .github/agents/*.agent.md | sed 's#.*/##; s#\.agent\.md$##' | sort) \
+  <(grep -l '^name:' .claude/agents/*.md | xargs -n1 sed -n 's/^name: *//p' | sort) \
   <(gh label list --limit 200 \
       | awk -F'\t' '$1 ~ /^persona:/ { sub(/^persona:/,"",$1); print $1 }' | sort)
 ```
+
+The left half reads the frontmatter `name:` from the top-level wrappers,
+approximately as the gate does (it does not enforce the frontmatter fence or
+strip quotes); `python3 tools/reconcile/roster-labels.py --offline` is
+authoritative.
 
 The only expected difference is the truncated slug — roster-only
 `dotnet-vectorized-columnar-compute-engineer` versus label-only
@@ -160,18 +166,37 @@ labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
 (STORY-00.6.2, #452). The gate is the stdlib-only script
 [`tools/reconcile/roster-labels.py`](../../tools/reconcile/roster-labels.py), run by
 the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
-of three reconciliations breaks:
+of three reconciliations or the three local validations (`settings-permissions`,
+`command-skill-frontmatter`, `tracked-startup-config`) breaks:
 
-1. **Roster ↔ persona labels.** Every `.github/agents/*.agent.md` wrapper must have a
-   matching `persona:<slug>` label and vice-versa. The one 50-character truncation
+1. **Roster ↔ persona labels** (two checks at runtime: `roster<->documented-labels`
+   against the committed list below, and `roster<->live-labels` against GitHub).
+   Every `.claude/agents/*.md` wrapper must have a matching `persona:<slug>` label
+   and vice-versa. `.claude/agents/` holds persona
+   wrappers only: the gate counts every `*.md` there that carries a frontmatter
+   `name:` and ignores markdown with no front-matter fence at all (e.g. a README);
+   a file that *opens* a `---` fence but declares no `name:` is a persona candidate
+   and fails. Wrappers must sit directly in `.claude/agents/`; a `name:`-bearing
+   file in a subdirectory fails the gate, and hidden (dot-prefixed) subdirectories
+   are scanned too, so a wrapper hidden under one cannot slip past. Wrapper front
+   matter is held to a policy as well, because Claude Code reads parts of it as
+   runtime configuration: `permissionMode` may only be `default` or `plan`
+   (`bypassPermissions`/`acceptEdits`/`dontAsk`/`auto` skip the permission prompt),
+   `hooks`, `mcpServers`, `isolation` (it runs `git worktree add` unprompted), and
+   `env` are rejected by name, and any other unrecognized key fails — a wrapper is
+   a persona brief, not an execution-config surface. The front matter is read
+   strictly: a quoted key, a space before the colon, a flow mapping, a wholly
+   indented mapping, or a duplicate key is reported rather than skipped, because a
+   real YAML parser reads the dangerous key out of every one of those spellings.
+   The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone
-   truncated label out of this file, so an *undocumented* truncation still fails. The
-   roster is reconciled against both the committed
+   truncated label out of this file, so an *undocumented* truncation still fails.
+   The roster is reconciled against both the committed
    [persona label set](#the-persona-label-set-committed-source-for-offline-reconciliation)
-   above (so `--offline` still catches a removed/added persona) and the **live** GitHub
-   labels (so a label renamed/deleted in the UI is caught too). Any other roster/label
-   difference fails.
+   above (so `--offline` still catches a removed/added persona) and the **live**
+   GitHub labels (so a label renamed/deleted in the UI is caught too). Any other
+   roster/label difference fails.
 2. **`CODEOWNERS` parse errors.** `GET /repos/<repo>/codeowners/errors` (the same check
    in [Code ownership](#code-ownership-codeowners)) must return an empty `errors`
    array; a syntax or unknown-owner error fails. In CI the check is pinned to the PR
@@ -183,14 +208,114 @@ of three reconciliations breaks:
    the live **open** GitHub milestones plus the documented `Unsure / needs triage`
    sentinel. A stale/renamed option, or a live milestone missing from the dropdown,
    fails.
+4. **`settings-permissions`** (a validation, not a reconciliation). The file
+   must parse as JSON, `permissions` must be an object, and `allow`/`deny` must
+   be lists of plain strings (the list type is checked before iteration). It holds
+   `.claude/settings.json` to a positive allowlist: the top level may contain only
+   `$schema`, `permissions`, and inert keys (`model`, `cleanupPeriodDays`,
+   `includeCoAuthoredBy`, `attribution`, `outputStyle`, `language`,
+   `spinnerTipsEnabled`), and `permissions` only `allow`, `deny`, and `defaultMode`.
+   Any other key fails, with a specific message for each executable-valued one
+   (`hooks`, `env`, `apiKeyHelper`, `statusLine`, the AWS/GCP credential and proxy
+   helpers) — those run commands as soon as the branch is checked out, `apiKeyHelper`
+   at CLI startup before any tool call. Inside `allow`, the enumerated mutating
+   `git`/`gh` prefixes (compared case-insensitively), any wildcard, and any tool-wide
+   `Bash` grant fail; a `defaultMode` other than `default`/`plan` fails
+   (`bypassPermissions`/`dontAsk` skip every prompt, `acceptEdits` auto-approves
+   file writes); the destructive-spelling deny entries must be present. Allow
+   entries outside that enumeration are *not* policed and still need human review.
+   Run it alone with `--validate-settings-only`.
+5. **`command-skill-frontmatter`** (also a validation). Slash commands
+   (`.claude/commands/**/*.md`) and skill manifests (`.claude/skills/**/SKILL.md`)
+   are the third front matter Claude Code reads as runtime configuration: a tracked
+   command file carrying `allowed-tools: Bash(<cmd>:*)` *runs* that command with no
+   permission prompt, which neither of the policies above can see. The gate reads
+   both with the same strict reader (an unparseable fence fails) and rejects
+   `allowed-tools`, `permissionMode`, `hooks`, `mcpServers`, `env`, and `isolation`
+   by name, plus any key outside `description`/`argument-hint`/`model` (skills may
+   also carry `name`). `.claude/commands/` is optional; `.claude/skills/` is not — a
+   skills tree that yields zero manifests fails the check, and the passing report
+   states how many files were scanned. Both walks — and the roster walk in 1 — also
+   reject **links**, and the rule is decided **by git**: any tracked symlink or
+   submodule (git mode `120000`/`160000`) anywhere under `.claude/` — including
+   `.claude` itself — or at `.mcp.json`, `.claude/settings.local.json`,
+   `.claude/settings.json`, fails the gate, because git records the index mode whether
+   or not the path resolves here, so neither a **dangling** link nor a **submodule**
+   can hide. That is the point: a link pointing at `bin/`, `obj/` or `artifacts/` is
+   absent in the checkout-only CI job and resolves to real configuration on every
+   machine that has run `dotnet build`, and a submodule is checked out *empty* by that
+   job while `git submodule update --init` loads whatever it contains — a
+   filesystem-only check passes both. The link and index query is asked from the
+   directory that *contains* `.claude`, never from inside it — a submodule `.claude`
+   would answer from the nested repository and a symlinked one from outside the
+   checkout, both "clean". The index is **listed once from the work-tree root with no pathspec** (so
+   no pathspec magic — `GIT_LITERAL_PATHSPECS` and friends are scrubbed alongside
+   `GIT_DIR`, while the discovery-narrowing `GIT_CEILING_DIRECTORIES` is deliberately
+   honored), and **every entry that case- or normalization-folds onto `.claude/…` or
+   `.mcp.json` is compared against the canonical spelling**: on an APFS/NTFS checkout
+   a tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md`,
+   `.claude/Settings.local.json` or `.mcp.jſon` (U+017F, which neither `:(icase)` nor
+   `.lower()` sees) materializes at the path the CLI reads, so it fails as "rename it"
+   whatever its index mode — and "is it tracked?" is asked of the checked-out path the
+   same way, so a committed `.claude/Settings.local.json` is not filed as harmless
+   per-machine state. The same fold decides file **names**, in the walks as well as
+   the index: a manifest committed as `.claude/skills/<x>/ſkill.md` is what APFS
+   resolves `SKILL.md` to and what the CLI loads, so it is scanned like any other
+   manifest and the index may hold only the canonical `SKILL.md` spelling; a tracked
+   path whose bytes are not valid UTF-8 is reported rather than decoded. Three checks
+   ask the `.claude` question — the roster walk in `roster<->documented-labels`, both
+   front-matter walks in this check, and `tracked-startup-config`, which owns
+   `.mcp.json` (`settings-permissions` opens nothing but `.claude/settings.json`
+   itself) — over `.claude` and its policed children, never over the whole repository,
+   so a finding is reported wherever the reader looks, once per check, and a spelling
+   the checkout merges into a policed path is reported as the collision it is rather
+   than twice. Git's answer must also COVER what the walks read: a path outside the
+   work tree git answered from, a `.claude` whose checkout tracks nothing at or under
+   any policed child (an export dropped inside an enclosing checkout), a `.claude`
+   under an *uninitialized submodule* (a gitlink above it, so the files on disk came
+   from somewhere other than that index), and an index git cannot read are unverified
+   rather than clean — and "unverified" is reported *alongside* whatever git did name,
+   never instead of it, so a tracked link in a tree the checkout does not own is still
+   a failure — while an untracked subtree inside a `.claude` that checkout does own is
+   walked, policed and noted rather than skipped (`git add` is the remedy there, not
+   "run inside the checkout"); a collapsed sparse-index entry is unverified too, should
+   git ever return one — git ≥2.35 expands a sparse index for `ls-files`, so that
+   branch is defense in depth rather than a shape seen in practice. The walks
+   report any link they meet as well (the directory roots themselves, and every file
+   entry whatever its name), so the rule still holds where git cannot be asked; links
+   are never followed (a loop would hang the gate), and if git cannot answer at all the
+   git half reports **skip** with the reason rather than a pass.
+6. **`tracked-startup-config`** (also a validation). Two startup surfaces the
+   settings policy never opens. A repo-root **`.mcp.json`** has every
+   `mcpServers[*].command` *spawned when the CLI launches* — before any tool call,
+   with no permission prompt — so a tracked one is code execution on `git checkout`,
+   in the same class as `hooks`/`apiKeyHelper`; a tracked `.mcp.json` with a
+   non-empty `mcpServers` fails (an empty mapping passes; malformed JSON fails,
+   because a startup config the gate cannot read is not evidence that nothing
+   starts). **`.claude/settings.local.json`** is honored exactly like
+   `settings.json` and is where every remedy message in this gate sends a
+   per-machine grant — advice that only holds while the file is untracked, so a
+   *tracked* one fails. Only tracked files fail: tracking is decided with
+   `git ls-files --error-unmatch`, so a developer's untracked local copy is reported
+   in the detail line rather than reddening their run, while in CI — where the
+   checkout holds tracked files only — a committed one is caught. A **tracked symlink**
+   at either path (or at `.claude/settings.json`) fails on its git mode `120000`, so a
+   link that dangles in this checkout but resolves on another machine cannot pass. If
+   git cannot answer (no `git`, not a checkout) the check reports **skip** with the
+   reason, and `--require-remote` turns that into exit 2 rather than a silent pass.
+   Override the path with `--mcp-config`.
 
-**When it runs.** On pull requests and pushes to `main` that touch the governance
-files (roster, `CODEOWNERS`, the feature form, this document, the script, or the
-workflow), on a weekly schedule, and on demand — the schedule catches drift
-introduced GitHub-side (a label or milestone renamed in the UI), which no file change
-would otherwise trigger. It uses a least-privilege read-only token
-(`permissions: contents: read`; the default token suffices for labels, milestones, and
-CODEOWNERS on a public repo) and pins its one action by commit SHA.
+**When it runs.** On every pull request targeting `main` and every push to `main`,
+on a weekly schedule, and on demand. There is deliberately **no `paths:` filter**:
+GitHub's path filters are case-sensitive and cannot express the fold a macOS/Windows
+checkout performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or `.mcp.jſon` —
+exactly the shapes the gate now fails — would never have triggered the workflow that
+fails them. The job is stdlib Python with no build, so running it always costs less
+than a filter that cannot enforce the rule. The schedule catches drift introduced
+GitHub-side (a label or milestone renamed in the UI), which no file change would
+otherwise trigger. It uses a least-privilege read-only token (`permissions: contents:
+read`; the default token suffices for labels, milestones, and CODEOWNERS on a public
+repo) and pins its one action by commit SHA.
 
 **Run it locally.**
 
@@ -199,6 +324,14 @@ python3 tools/reconcile/roster-labels.py            # remote checks need `gh` au
 python3 tools/reconcile/roster-labels.py --selftest # prove the gate's logic, no network
 ```
 
+A local `--selftest` reports fixture groups this machine cannot build (no `git archive`,
+no symlink privilege, a `TMPDIR` inside a checkout) as counted **skips** and still exits
+`0`. CI adds `--require-full-coverage`, which turns any skip — and any run with reduced
+coverage — into a failure, because there a skipped fixture group is indistinguishable
+from one that quietly stopped building. The flag is also on by default whenever
+`GITHUB_ACTIONS` or `CI` is set in the environment, so a shell that exports `CI` gets
+the strict behavior locally too.
+
 The live GitHub-API checks degrade gracefully: without `gh` (or a token) they are
 **skipped** with a warning so local dev works offline, while the script still parses the
 roster and the milestone dropdown **and reconciles the roster against the committed persona
@@ -206,7 +339,9 @@ label set above** (so `--offline` still catches roster↔label drift). CI passes
 `--require-remote`, so a remote check that could not run there is a hard failure — reported
 as a **remote outage (exit 2), distinct from drift**, so a `gh`/API outage is never
 miscounted as roster drift. Exit codes: `0` reconciled, `1` drift detected, `2` usage/data
-error **or** a required remote check could not run (a remote outage under `--require-remote`).
+error **or** a required remote check could not run (a remote outage under `--require-remote`)
+**or** a local check that could not verify its input (environment — run the gate inside the
+git checkout). Each exit-2 cause carries its own message, because they need different fixes.
 
 **Promotion to a required check.** The gate is not a branch-protection required check
 today; like `coverage` and the supply-chain scans it can be promoted post-merge once it

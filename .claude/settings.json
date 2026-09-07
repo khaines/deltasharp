@@ -1,0 +1,46 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dotnet restore:*)",
+      "Bash(dotnet build:*)",
+      "Bash(dotnet test:*)",
+      "Bash(dotnet format:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git show:*)",
+      "Bash(git branch --show-current)",
+      "Bash(git branch --list:*)",
+      "Bash(git branch -vv)",
+      "Bash(git branch -a)",
+      "Bash(git branch -a --list:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git rev-parse:*)",
+      "Bash(git rev-list:*)",
+      "Bash(git merge-base:*)",
+      "Bash(git worktree list:*)",
+      "Bash(gh pr view:*)",
+      "Bash(gh pr diff:*)",
+      "Bash(gh pr list:*)",
+      "Bash(gh pr checks:*)",
+      "Bash(gh issue view:*)",
+      "Bash(gh issue list:*)"
+    ],
+    "deny": [
+      "Bash(git branch -D:*)",
+      "Bash(git branch -d:*)",
+      "Bash(git branch -M:*)",
+      "Bash(git branch -m:*)",
+      "Bash(git push -f:*)",
+      "Bash(git push --force:*)",
+      "Bash(gh api -X POST:*)",
+      "Bash(gh api -X PUT:*)",
+      "Bash(gh api -X PATCH:*)",
+      "Bash(gh api -X DELETE:*)",
+      "Bash(gh api --method:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh release:*)",
+      "Bash(gh secret:*)"
+    ]
+  }
+}

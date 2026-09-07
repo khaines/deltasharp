@@ -65,7 +65,7 @@ Because DeltaSharp targets object stores and PersistentVolumes under Kubernetes,
 
 ## Supporting references
 
-- DeltaSharp repository instructions: `.github/copilot-instructions.md`.
+- DeltaSharp repository instructions: `CLAUDE.md`.
 - DeltaSharp persona roster and follow-up note: `docs/persona/agents/README.md`.
 - Microsoft .NET guidance for asynchronous programming, cancellation, diagnostics, logging, and gRPC for .NET.
 - OpenTelemetry .NET guidance for traces, metrics, and distributed context.

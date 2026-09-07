@@ -6,7 +6,7 @@ context, the decision itself, consequences, and the alternatives that were
 weighed and rejected.
 
 Summaries elsewhere — the [engine architecture overview](../engineering/design/engine-architecture.md),
-`.github/copilot-instructions.md`, and the persona specs in
+`CLAUDE.md`, and the persona specs in
 `docs/persona/agents/` — **defer to these ADRs and must not redefine them**. If a
 summary and an ADR disagree, the ADR wins.
 

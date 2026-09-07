@@ -2,7 +2,7 @@
 
 > **Scope:** Repository-wide architecture, project structure, service boundaries, engine topology, foundational interfaces, ADRs, and cross-layer designs.
 > **Priority:** STANDARD.
-> **Owners:** cloud-native-distributed-systems-architect, query-execution-engine-engineer. **Grounded in:** `.github/copilot-instructions.md`, `docs/engineering/design/engine-architecture.md`, ADR-0001, ADR-0002, ADR-0006, ADR-0007, ADR-0008, ADR-0012.
+> **Owners:** cloud-native-distributed-systems-architect, query-execution-engine-engineer. **Grounded in:** `CLAUDE.md`, `docs/engineering/design/engine-architecture.md`, ADR-0001, ADR-0002, ADR-0006, ADR-0007, ADR-0008, ADR-0012.
 
 ## How to use
 Use this checklist when reviewing architecture docs, foundational interfaces, new subsystems, and changes that alter DeltaSharp's layer boundaries. Treat ADRs as the source of truth; if a new foundational decision is needed, require a new ADR before accepting the design.
@@ -77,7 +77,7 @@ Use this checklist when reviewing architecture docs, foundational interfaces, ne
 - Designs that optimize happy-path throughput while ignoring shuffle, commit, retry, or cancellation correctness.
 
 ## References
-- [DeltaSharp Copilot Instructions](../../../.github/copilot-instructions.md)
+- [DeltaSharp Claude Code Instructions](../../../CLAUDE.md)
 - [Engine Architecture Overview](../design/engine-architecture.md)
 - [ADR-0001: Execution strategy](../../adr/0001-execution-strategy.md)
 - [ADR-0002: In-memory columnar batch format](../../adr/0002-columnar-batch-format.md)
@@ -85,5 +85,5 @@ Use this checklist when reviewing architecture docs, foundational interfaces, ne
 - [ADR-0007: SQL frontend — parser and dialect](../../adr/0007-sql-frontend.md)
 - [ADR-0008: Type system and internal row/value representation](../../adr/0008-type-system-row-format.md)
 - [ADR-0012: Plan serialization](../../adr/0012-plan-serialization.md)
-- [Review PR rating rubric](../../../.github/skills/review-pr/rating-rubric.md)
+- [Review PR rating rubric](../../../.claude/skills/review-pr/rating-rubric.md)
 - [02 — Engine Implementation Checklist](02-engine-implementation-checklist.md)

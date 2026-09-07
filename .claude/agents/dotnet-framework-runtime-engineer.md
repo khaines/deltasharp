@@ -1,7 +1,7 @@
 ---
 name: dotnet-framework-runtime-engineer
 description: Use for DeltaSharp C# service/library design, async/concurrency, grpc-dotnet contracts, compatibility, diagnostics, and high-level memory awareness.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

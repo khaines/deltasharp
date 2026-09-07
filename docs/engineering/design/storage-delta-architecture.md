@@ -31,7 +31,7 @@ features (deletion vectors, Change Data Feed, liquid clustering, row tracking, V
 protocol-version negotiation, table maintenance (`OPTIMIZE`, `VACUUM`, write-time statistics), all over
 a **pluggable object-store + Kubernetes-PVC storage abstraction**.
 
-It is the **third pillar** named in the copilot instructions — *native Delta tables* — and the epic that
+It is the **third pillar** named in `CLAUDE.md` — *native Delta tables* — and the epic that
 turns the read/write doors from "records the intent, then fails with a deterministic *EPIC-05 owns this*
 diagnostic" into working table I/O. It is also where DeltaSharp's ACID and consistency claims must be
 **proven, not asserted** (§3): the transaction log — never a directory listing — is the source of truth

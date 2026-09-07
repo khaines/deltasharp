@@ -11,18 +11,18 @@ Kubernetes Operator execution model. `labtested-storage` (a multi-tenant storage
 
 Persona research documents (in `../research/`) define the skills, behaviors,
 traits, and knowledge for each role. These agent specs turn that research into
-reusable operating profiles that can be loaded by different AI runtimes (Claude,
-GitHub Copilot, etc.) without rewriting the underlying role logic each time. The
-library exists to drive **project timelines, implementations, and reviews** with
-consistent, high-judgment roles.
+reusable operating profiles that can be loaded by an AI runtime (Claude Code
+today) without rewriting the underlying role logic each time. The library exists
+to drive **project timelines, implementations, and reviews** with consistent,
+high-judgment roles.
 
 ## Agents vs. skills
 
 - **Agents** are role-shaped personas with goals, judgment, tone, boundaries, and
   preferred outputs (this directory).
 - **Skills** are narrower reusable capabilities that multiple agents share (see
-  `.github/skills/`: `design-doc`, `implement-work-item`, `review-fix-loop`,
-  `review-pr`).
+  `.claude/skills/`: `design-doc`, `implement-work-item`, `review-fix-loop`,
+  `review-pr`, `stacked-pr-chain`).
 
 ## Source of truth and wrappers
 
@@ -31,24 +31,23 @@ consistent, high-judgment roles.
 | Canonical specs | Human-readable source of truth for the role | `docs/persona/agents/*-agent.md` |
 | Research docs | Deep-dive research backing the canonical specs | `docs/persona/research/*.md` |
 | Claude wrappers | Claude Code project subagents derived from the canonical role | `.claude/agents/*.md` |
-| Copilot wrappers | GitHub Copilot custom agent profiles derived from the canonical role | `.github/agents/*.agent.md` |
 
 Wrappers are lightweight pointers to the canonical spec. If a wrapper and its
 canonical spec drift, the canonical spec wins.
 
 ## DeltaSharp domain canon
 
-Every persona internalizes the DeltaSharp architecture (see
-`.github/copilot-instructions.md`): **transformations are lazy, actions are
-eager**; a Catalyst-style pipeline (logical plan → analyzer/optimizer → physical
-plan → execution); stages split at shuffle boundaries; Delta tables backed by
-Parquet and the `_delta_log` transaction log (ACID, time travel, schema
-evolution); a driver coordinating executor pods under a Kubernetes Operator; and
-storage on both cloud object stores (S3/ADLS/GCS) and PersistentVolumes (PVCs).
-Foundational engineering decisions (execution backend, columnar batch format,
-transport, shuffle) are recorded as ADRs in `docs/adr/` and summarized in
-`docs/engineering/design/engine-architecture.md`; every persona **defers** to those
-ADRs rather than redefining them.
+Every persona internalizes the DeltaSharp architecture (see `CLAUDE.md`):
+**transformations are lazy, actions are eager**; a Catalyst-style pipeline
+(logical plan → analyzer/optimizer → physical plan → execution); stages split
+at shuffle boundaries; Delta tables backed by Parquet and the `_delta_log`
+transaction log (ACID, time travel, schema evolution); a driver coordinating
+executor pods under a Kubernetes Operator; and storage on both cloud object
+stores (S3/ADLS/GCS) and PersistentVolumes (PVCs). Foundational engineering
+decisions (execution backend, columnar batch format, transport, shuffle) are
+recorded as ADRs in `docs/adr/` and summarized in
+`docs/engineering/design/engine-architecture.md`; every persona **defers** to
+those ADRs rather than redefining them.
 
 ## Agent roster (25 agents)
 

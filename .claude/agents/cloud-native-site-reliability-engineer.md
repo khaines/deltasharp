@@ -1,7 +1,7 @@
 ---
 name: cloud-native-site-reliability-engineer
 description: Use for DeltaSharp production SLOs, observability, incident response, disaster recovery, rollout safety, and toil reduction.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

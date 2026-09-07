@@ -1,7 +1,7 @@
 ---
 name: query-execution-engine-engineer
 description: Use for DeltaSharp query planning and execution engine work: SQL/DataFrame plans, Catalyst-style optimization, physical strategies, shuffle stages, codegen, caching, and tenant isolation.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

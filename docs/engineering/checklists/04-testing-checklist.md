@@ -2,7 +2,7 @@
 
 > **Scope:** Test strategy, coverage expectations, deterministic validation, and regression policy across unit, integration, parity, storage, distributed, and operator tests.
 > **Priority:** HIGH.
-> **Owners:** reliability-test-chaos-engineer, query-execution-engine-engineer, delta-storage-format-engineer. **Grounded in:** build-test-config, review-pr rating rubric, `.github/copilot-instructions.md`, ADR-0001, ADR-0013.
+> **Owners:** reliability-test-chaos-engineer, query-execution-engine-engineer, delta-storage-format-engineer. **Grounded in:** build-test-config, review-pr rating rubric, `CLAUDE.md`, ADR-0001, ADR-0013.
 
 ## How to use
 Use this checklist to decide whether the right kinds of tests exist before applying 04a or 04b. Missing tests for new behavior are High findings, and missing tests for storage, engine, operator, or tenant-isolation behavior can cap or block approval under the rubric.
@@ -70,6 +70,6 @@ Use this checklist to decide whether the right kinds of tests exist before apply
 - [17 — Delta Storage Format Checklist](17-delta-storage-format-checklist.md)
 - [18 — Kubernetes Operator Checklist](18-kubernetes-operator-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
-- `.github/skills/implement-work-item/build-test-config.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/implement-work-item/build-test-config.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0001: Execution strategy

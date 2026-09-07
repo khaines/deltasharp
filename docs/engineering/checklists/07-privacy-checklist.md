@@ -2,7 +2,7 @@
 
 > **Scope:** PII and regulated data in DataFrames, Datasets, SQL, Delta tables, lineage, logs, metrics, traces, catalogs, caches, shuffle, spill, storage backends, and compliance evidence.
 > **Priority:** STANDARD.
-> **Owners:** privacy-compliance-grc-lead, cloud-native-security-sme, cloud-native-site-reliability-engineer. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009.
+> **Owners:** privacy-compliance-grc-lead, cloud-native-security-sme, cloud-native-site-reliability-engineer. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009.
 
 ## How to use
 Use this checklist for features that ingest, derive, persist, expose, retain, delete, audit, or move data that may contain personal information. Pair it with 05 for protective controls and 14 for tenant boundaries whenever privacy depends on security or isolation.

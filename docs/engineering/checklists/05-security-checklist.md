@@ -2,7 +2,7 @@
 
 > **Scope:** Authentication, authorization, secrets, driver/executor transport, storage access, SQL input handling, supply chain, telemetry, incident response, and any code or manifests crossing a trust boundary.
 > **Priority:** CRITICAL.
-> **Owners:** cloud-native-security-sme, kubernetes-operator-controller-engineer, dotnet-distributed-execution-engineer. **Grounded in:** `.github/copilot-instructions.md`, `SECURITY.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009, ADR-0014.
+> **Owners:** cloud-native-security-sme, kubernetes-operator-controller-engineer, dotnet-distributed-execution-engineer. **Grounded in:** `CLAUDE.md`, `SECURITY.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009, ADR-0014.
 
 ## How to use
 Apply this checklist to every change that can affect credentials, identities, network paths, storage paths, SQL/query text, container artifacts, CRDs, or observability. Treat injection, auth bypass, credential exposure, and cross-tenant access as Critical; cross-check 14 for isolation and 18 for operator controls.
@@ -55,6 +55,43 @@ Apply this checklist to every change that can affect credentials, identities, ne
 - [ ] SBOMs are generated for .NET packages and container images, retained with releases, and scanned against vulnerability policy.
 - [ ] NativeAOT executor images from ADR-0014 use minimal trusted bases and do not smuggle build tools, package managers, or unused shells into runtime layers.
 - [ ] CI workflow permissions are minimal, secrets are scoped to protected branches/environments, and pull-request workflows cannot exfiltrate release credentials.
+- [ ] Agent-harness permission allowlist (`.claude/settings.json`) is least-privilege: no `gh api`, `git push`, `git fetch`, or other write/outbound primitive is auto-approved, except the documented `dotnet` build/test grant whose compensating control (throwaway copy outside the worktree for branches that are not your own) is recorded in `CLAUDE.md`.
+- [ ] The reconcile gate's `settings-permissions` check passes: only `permissions` (plus the listed inert keys) at top level and only `allow`/`deny`/`defaultMode` inside it; destructive-spelling deny entries present; no enumerated mutating prefix (case-insensitive), wildcard, or tool-wide `Bash` grant in `allow`; no `defaultMode` outside `default`/`plan`; no executable-valued key (`hooks`, `env`, `apiKeyHelper`, `statusLine`, …). Allow entries outside that enumeration are reviewed by hand.
+- [ ] Persona wrappers in `.claude/agents/` pass the reconcile gate's front-matter policy: strict `key: value` front matter, `permissionMode` only `default`/`plan`, and no `hooks`, `mcpServers`, `isolation`, `env`, or unrecognized key.
+- [ ] The gate's `tracked-startup-config` check passes: no tracked root `.mcp.json` declaring MCP servers (their `command` is spawned at CLI launch, unprompted), no tracked `.claude/settings.local.json` (it is honored like `settings.json` and must stay gitignored per-machine state), and no tracked symlink **or submodule** (git mode `120000`/`160000`) anywhere under `.claude/` — including `.claude` itself — or at `.mcp.json`/`.claude/settings.local.json`/`.claude/settings.json`. The rule is decided by the **git index mode**, not by what the path resolves to in this checkout, and every entry whose spelling **case- or normalization-folds** onto a policed path (`.Claude/hooks`, `.claude/COMMANDS/evil.md`, `.claude/Settings.local.json`, `.mcp.jſon`, `.claude/skills/<x>/ſkill.md`) is counted as that path.
+- [ ] Slash commands (`.claude/commands/**/*.md`) and skill manifests (`.claude/skills/**/SKILL.md`, plus any leaf that case- or normalization-folds onto `SKILL.md`) pass the gate's `command-skill-frontmatter` policy: strict front matter, no `allowed-tools`, `permissionMode`, `hooks`, `mcpServers`, `env`, or `isolation`, no key outside `description`/`argument-hint`/`model` (skills also `name`), and at least one skill manifest scanned.
+
+**Why those two items are decided by the git index, not by the filesystem.** A tracked link
+need not resolve here to be configuration somewhere else: a **dangling** symlink (one pointing
+at `bin/`, `obj/` or `artifacts/`) is absent in the checkout-only CI job and present after any
+local build, and a **submodule** is checked out empty by CI and populated by
+`git submodule update --init`. Claude Code follows both; the gate's walks deliberately do not,
+so only the index mode names them. Git is therefore asked from the directory that *contains*
+`.claude` (a submodule `.claude` would answer from the nested repository and a symlinked one
+from outside the checkout — both "clean"), the index is listed once from the work-tree root
+with no pathspec (pathspec magic such as `GIT_LITERAL_PATHSPECS` is scrubbed alongside
+`GIT_DIR`; the discovery-narrowing `GIT_CEILING_DIRECTORIES` is deliberately honored), and
+each entry is selected by folded path segments — which is how `.mcp.jſon` (U+017F, seen by
+neither `:(icase)` nor `.lower()`) and a `ſkill.md` manifest are caught, and why "is it
+tracked?" is asked of the checked-out spelling so a committed `.claude/Settings.local.json` is
+not filed as harmless per-machine state. A tracked path whose bytes are not valid UTF-8 is
+reported rather than decoded (decoding it strictly crashed the gate).
+
+**Coverage is part of the verdict.** Three checks ask the `.claude` question — the roster walk
+in `roster<->documented-labels`, both front-matter walks in `command-skill-frontmatter`, and
+`tracked-startup-config`, which owns `.mcp.json` — and their walks also report links they
+meet. Git's answer must COVER what those walks read: a path outside the work tree git answered
+from, a `.claude` whose checkout tracks nothing at or under any policed child (an export
+dropped inside an enclosing checkout), a `.claude` under an uninitialized submodule (a gitlink
+above it), and an index git cannot read are reported as unverified, never as clean — as a skip
+when there is nothing else to say, otherwise as a note carried on the failure, because a
+tracked link git has already named is drift whatever else went unexamined. An untracked
+subtree inside a `.claude` that checkout *does* own is ordinary work in progress: walked,
+policed and noted, with `git add` as the remedy rather than "run inside the checkout". A
+collapsed sparse-index entry is unverified too, should git ever return one; git ≥2.35 expands
+a sparse index for `ls-files`, so that branch is defense in depth rather than a shape seen in
+practice. Full rationale and the fixtures behind each clause:
+[label-taxonomy.md, reconciliation gate items 5-6](../../planning/label-taxonomy.md#automated-reconciliation-gate-ci).
 
 ### Observability, incident response, and disclosure
 - [ ] Security-relevant audit events cover job submission, action authorization, credential issuance, storage access denial, Delta log mutation, image admission, and cross-tenant access attempts.
@@ -79,7 +116,7 @@ Apply this checklist to every change that can affect credentials, identities, ne
 - [10 — Runtime Environment Checklist](10-runtime-environment-checklist.md)
 - [13 — Infrastructure as Code Checklist](13-infrastructure-as-code-checklist.md)
 - `SECURITY.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0003: Data-plane transport
 - ADR-0004: Shuffle architecture
 - ADR-0009: Kubernetes Operator and CRD design

@@ -1,7 +1,7 @@
 ---
 name: sql-language-frontend-engineer
 description: Use for DeltaSharp SQL grammar, ANTLR4 C# lexer/parser, ANSI SQL mode, Spark SQL dialect/function parity, and analyzer name/type resolution into resolved logical plans.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

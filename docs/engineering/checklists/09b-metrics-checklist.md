@@ -2,7 +2,7 @@
 
 > **Scope:** Runtime, engine, storage, Delta, shuffle, Kubernetes Operator, and .NET process metrics used for SLOs, dashboards, alerts, capacity planning, and support.
 > **Priority:** STANDARD.
-> **Owners:** cloud-native-site-reliability-engineer, dotnet-runtime-performance-engineer, dotnet-distributed-execution-engineer. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, 09a, 09c, 14, SRE and .NET runtime persona docs.
+> **Owners:** cloud-native-site-reliability-engineer, dotnet-runtime-performance-engineer, dotnet-distributed-execution-engineer. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, 09a, 09c, 14, SRE and .NET runtime persona docs.
 
 ## How to use
 Use this checklist when adding instruments, dashboards, alerts, counters, or runtime diagnostics. Escalate as High when missing or misleading metrics block production diagnosis, SLO ownership, or benchmark-regression interpretation.
@@ -77,8 +77,8 @@ Use this checklist when adding instruments, dashboards, alerts, counters, or run
 - [09c — Distributed Tracing Checklist](09c-distributed-tracing-checklist.md)
 - [14 — Tenant Isolation Checklist](14-tenant-isolation-checklist.md)
 - [22 — Benchmark Regression Gates Checklist](22-benchmark-regression-gates-checklist.md)
-- `.github/copilot-instructions.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `CLAUDE.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`
 - `docs/persona/agents/dotnet-runtime-performance-engineer-agent.md`
 - `docs/persona/agents/dotnet-distributed-execution-engineer-agent.md`

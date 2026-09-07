@@ -2,7 +2,7 @@
 
 > **Scope:** General DeltaSharp code, tests, samples, docs-adjacent code, project layout, and PR hygiene that is not .NET-specific enough for 03a.
 > **Priority:** HIGH.
-> **Owners:** dotnet-framework-runtime-engineer, developer-experience-api-engineer, query-execution-engine-engineer. **Grounded in:** `.github/copilot-instructions.md`, `CONTRIBUTING.md`, `review-pr/rating-rubric.md`, ADR-0001, ADR-0014.
+> **Owners:** dotnet-framework-runtime-engineer, developer-experience-api-engineer, query-execution-engine-engineer. **Grounded in:** `CLAUDE.md`, `CONTRIBUTING.md`, `review-pr/rating-rubric.md`, ADR-0001, ADR-0014.
 
 ## How to use
 Apply this checklist before using the deeper 03a .NET rules. Treat Critical and High findings from the review rubric as blockers when a convention failure can break Spark semantics, Delta correctness, tenant isolation, or lazy/eager execution.
@@ -69,8 +69,8 @@ Apply this checklist before using the deeper 03a .NET rules. Treat Critical and 
 - [16 — Catalyst Planning Checklist](16-catalyst-planning-checklist.md)
 - [17 — Delta Storage Format Checklist](17-delta-storage-format-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
-- `.github/copilot-instructions.md`
+- `CLAUDE.md`
 - `CONTRIBUTING.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0001: Execution strategy
 - ADR-0014: Target framework and AOT posture

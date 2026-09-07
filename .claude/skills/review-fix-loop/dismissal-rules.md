@@ -87,7 +87,7 @@ Findings in the following domains are **never auto-dismissed** based on low cons
 
 **How to detect**:
 
-- Check whether the finding conflicts with an ADR in `docs/engineering/adr/`.
+- Check whether the finding conflicts with an ADR in `docs/adr/`.
 - Check whether the governing design doc explicitly addresses the pattern.
 - Check whether the PR description explicitly addresses the pattern the finding questions.
 - Check for code comments explaining the design choice near the flagged code.

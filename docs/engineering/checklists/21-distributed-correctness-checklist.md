@@ -2,7 +2,7 @@
 
 > **Scope:** Lazy/eager semantics, physical execution, stages, shuffle, retries, cancellation, distributed fault recovery, and correctness-under-failure evidence.
 > **Priority:** CRITICAL.
-> **Owners:** reliability-test-chaos-engineer, dotnet-distributed-execution-engineer. **Grounded in:** ADR-0001, ADR-0004, ADR-0006, `.github/copilot-instructions.md`.
+> **Owners:** reliability-test-chaos-engineer, dotnet-distributed-execution-engineer. **Grounded in:** ADR-0001, ADR-0004, ADR-0006, `CLAUDE.md`.
 
 ## How to use
 Use this checklist for changes that can affect when work executes, what rows are produced, how shuffle data is found, or how failures are retried. Treat wrong results, eager transformations, lost shuffle data, and Delta isolation violations as Critical findings.

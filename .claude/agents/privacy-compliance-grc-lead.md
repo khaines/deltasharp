@@ -1,7 +1,7 @@
 ---
 name: privacy-compliance-grc-lead
 description: Use for DeltaSharp privacy, regulatory, and GRC questions — PII in DataFrames and Delta tables, GDPR/CCPA/SOC 2/ISO 27001, erasure, retention, residency, lineage, and audit evidence.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

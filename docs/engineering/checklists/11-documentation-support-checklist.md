@@ -2,7 +2,7 @@
 
 > **Scope:** Public docs, API reference, XML comments, tutorials, how-to guides, conceptual docs, runbooks, migration guides, samples, release notes, and support enablement content.
 > **Priority:** SUPPLEMENTARY.
-> **Owners:** technical-writer, developer-experience-api-engineer, cloud-native-site-reliability-engineer. **Grounded in:** `.github/copilot-instructions.md`, ADRs, 09a, 09b, 09c, markdown-style-guide, technical-writer persona docs.
+> **Owners:** technical-writer, developer-experience-api-engineer, cloud-native-site-reliability-engineer. **Grounded in:** `CLAUDE.md`, ADRs, 09a, 09b, 09c, markdown-style-guide, technical-writer persona docs.
 
 ## How to use
 Use this checklist for documentation changes and for code changes that alter public APIs, operational behavior, examples, diagnostics, or migration guidance. Defer product, architecture, and storage decisions to ADRs and owner docs rather than redefining them in narrative pages.
@@ -77,8 +77,8 @@ Use this checklist for documentation changes and for code changes that alter pub
 - [09b — Metrics Checklist](09b-metrics-checklist.md)
 - [09c — Distributed Tracing Checklist](09c-distributed-tracing-checklist.md)
 - [Markdown Style Guide Checklist](markdown-style-guide-checklist.md)
-- `.github/copilot-instructions.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `CLAUDE.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/technical-writer-agent.md`
 - `docs/persona/research/technical-writer.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`

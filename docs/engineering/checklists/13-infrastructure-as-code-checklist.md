@@ -2,7 +2,7 @@
 
 > **Scope:** Helm charts, Kubernetes manifests, Kustomize overlays, Terraform/OpenTofu modules, CI-generated deployment artifacts, environment configuration, RBAC/IAM, secrets references, quotas, and drift controls.
 > **Priority:** STANDARD.
-> **Owners:** cloud-native-site-reliability-engineer, cloud-native-security-sme, compute-storage-finops-engineer, kubernetes-operator-controller-engineer. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009, ADR-0014.
+> **Owners:** cloud-native-site-reliability-engineer, cloud-native-security-sme, compute-storage-finops-engineer, kubernetes-operator-controller-engineer. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009, ADR-0014.
 
 ## How to use
 Apply this checklist to infrastructure definitions that install or configure DeltaSharp on Kubernetes or cloud infrastructure. Validate runtime settings with 10, operator resources with 18, security with 05, and tenant isolation with 14.

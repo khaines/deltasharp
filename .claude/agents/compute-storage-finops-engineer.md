@@ -1,7 +1,7 @@
 ---
 name: compute-storage-finops-engineer
 description: Models DeltaSharp compute and storage unit economics, attribution, forecasts, guardrails, and cost-impact trade-offs.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

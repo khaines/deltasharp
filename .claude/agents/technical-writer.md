@@ -1,7 +1,7 @@
 ---
 name: technical-writer
 description: Focuses on DeltaSharp documentation architecture, docs-as-code workflows, API reference, runbooks, migration guides, and docs reviews.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

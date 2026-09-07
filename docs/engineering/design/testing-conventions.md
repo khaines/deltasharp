@@ -2,7 +2,7 @@
 
 > **Status:** living document. Created with
 > [STORY-01.1.2](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-01-project-build-platform.md#story-0112-test-project-conventions).
-> Grounded in [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md),
+> Grounded in [`CLAUDE.md`](../../../CLAUDE.md),
 > [repository-layout.md](repository-layout.md), [api-governance.md](api-governance.md),
 > and checklists [04](../checklists/04-testing-checklist.md),
 > [04a](../checklists/04a-unit-testing-checklist.md),

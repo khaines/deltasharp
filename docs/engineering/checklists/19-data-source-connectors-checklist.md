@@ -2,7 +2,7 @@
 
 > **Scope:** DataSource-V2-style readers/writers, catalogs, file-format connectors, external systems, and batch/streaming source-sink boundaries.
 > **Priority:** HIGH.
-> **Owners:** data-platform-connectors-engineer. **Grounded in:** `.github/copilot-instructions.md`, ADR-0002, ADR-0006, connector persona guidance.
+> **Owners:** data-platform-connectors-engineer. **Grounded in:** `CLAUDE.md`, ADR-0002, ADR-0006, connector persona guidance.
 
 ## How to use
 Use this checklist when a change exposes external data as DataFrames or writes DeltaSharp results to external systems. Keep connector contracts above Delta internals from 17 and below query-planner implementation from 16.

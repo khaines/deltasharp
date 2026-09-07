@@ -22,7 +22,7 @@ This report draws on Apache Spark DataSource V2 design concepts, Spark SQL data 
 - [Azure Blob Storage data consistency documentation](https://learn.microsoft.com/azure/storage/blobs/concurrency-manage)[^8]
 - [Data Mesh Principles and Logical Architecture — Zhamak Dehghani](https://martinfowler.com/articles/data-mesh-principles.html)[^9]
 - [Schema Evolution and Compatibility — Confluent](https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html)[^10]
-- Internal: `.github/copilot-instructions.md`[^11]
+- Internal: `CLAUDE.md`[^11]
 - Internal: `docs/persona/agents/README.md`[^12]
 
 ## Explanation
@@ -165,5 +165,5 @@ The most important product risk is silent wrongness. Users will forgive an unsup
 [^8]: Azure Blob Storage concurrency and consistency documentation, https://learn.microsoft.com/azure/storage/blobs/concurrency-manage
 [^9]: Data Mesh Principles and Logical Architecture, Zhamak Dehghani, https://martinfowler.com/articles/data-mesh-principles.html
 [^10]: Schema Evolution and Compatibility, Confluent, https://docs.confluent.io/platform/current/schema-registry/fundamentals/schema-evolution.html
-[^11]: `.github/copilot-instructions.md`
+[^11]: `CLAUDE.md`
 [^12]: `docs/persona/agents/README.md`

@@ -153,8 +153,8 @@ The key handoff principle is simple: this role owns what users see and how they 
 
 ## Footnotes
 
-[^1]: `.github/copilot-instructions.md:5-17`
-[^2]: `.github/copilot-instructions.md:49-78`
-[^3]: `.github/copilot-instructions.md:93-108`
+[^1]: `CLAUDE.md` → "Project overview"
+[^2]: `CLAUDE.md` → "Build, test, and lint", "Architecture — the big picture"
+[^3]: `CLAUDE.md` → "Kubernetes execution model", "Engine architecture decisions"
 [^4]: `docs/persona/agents/README.md:39-74`
 [^5]: `docs/persona/agents/README.md:88-90`

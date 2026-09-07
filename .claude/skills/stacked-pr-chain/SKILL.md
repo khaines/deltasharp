@@ -16,12 +16,12 @@ merges as a set. Each item is implemented and driven to PASS on top of the previ
 item is merged during the build** — the human signs off first, then a disciplined merge loop lands
 them bottom-up. Read all supporting files before beginning:
 
-- `.github/skills/stacked-pr-chain/merge-loop.md` — the rebase-onto-main + CI-gate + cleanup mechanics (Phase 4)
-- `.github/skills/implement-work-item/SKILL.md` — implements one issue end-to-end (used per item in Phase 2)
-- `.github/skills/review-fix-loop/SKILL.md` — the per-PR quality gate driven to the PASS bar
-- `.github/skills/review-pr/rating-rubric.md` — the PASS gate (unanimous 5/5 + red-team `NO-MISS-CERTIFIED`)
-- `.github/skills/review-pr/github-review-posting.md` — how each PR's review/report is published
-- `.github/copilot-instructions.md` — DeltaSharp canon + the repo bar (build/test both TFMs, format, locked restore, DCO, determinism)
+- `.claude/skills/stacked-pr-chain/merge-loop.md` — the rebase-onto-main + CI-gate + cleanup mechanics (Phase 4)
+- `.claude/skills/implement-work-item/SKILL.md` — implements one issue end-to-end (used per item in Phase 2)
+- `.claude/skills/review-fix-loop/SKILL.md` — the per-PR quality gate driven to the PASS bar
+- `.claude/skills/review-pr/rating-rubric.md` — the PASS gate (unanimous 5/5 + red-team `NO-MISS-CERTIFIED`)
+- `.claude/skills/review-pr/github-review-posting.md` — how each PR's review/report is published
+- `CLAUDE.md` — DeltaSharp canon + the repo bar (build/test both TFMs, format, locked restore, DCO, determinism)
 
 ---
 
@@ -97,7 +97,7 @@ Every item must pass the full repo bar locally (CI won't run on a stacked PR —
 - `dotnet format --verify-no-changes`; `dotnet restore --locked-mode`;
 - **NativeAOT gate** when the write/executor path is touched;
 - **determinism ban** — no `Guid.NewGuid` / `DateTime.UtcNow` / `System.Random` in `src/`;
-- commits are **DCO-signed** (`-s`) with the Copilot co-author trailer.
+- commits are **DCO-signed** (`-s`); no AI attribution trailers.
 
 ### 2.4 Open the PR scoped to its parent
 
@@ -110,8 +110,8 @@ stack). Item 1's base is `main`.
 
 ### 2.5 Drive to PASS — then STOP (do not merge)
 
-Run `review-fix-loop` on the PR to the PASS bar (unanimous 5/5 across all voting seats + decorrelated
-Gemini 3.1 Pro red-team `NO-MISS-CERTIFIED` + orchestrator anti-forgery re-verification; every deferral a
+Run `review-fix-loop` on the PR to the PASS bar (unanimous 5/5 across all voting seats + blind-first
+Fable red-team `NO-MISS-CERTIFIED` + orchestrator anti-forgery re-verification; every deferral a
 verified-OPEN issue; canonical §6.2 report posted per `github-review-posting.md`).
 
 > **CI reality.** CI only runs on `pull_request` targeting `main`, so a stacked PR (base = parent
@@ -136,7 +136,7 @@ this tip (2.1).
 
 Example:
 
-```
+```text
 Stack root: main @ 3bbb864 (unchanged all build)
 | item | issue | branch                         | PR  | base                    | PASS |
 |------|-------|--------------------------------|-----|-------------------------|------|

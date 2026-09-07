@@ -1,7 +1,7 @@
 ---
 name: kubernetes-operator-controller-engineer
 description: Use for DeltaSharp's KubeOps Kubernetes Operator, DeltaSharpApplication and DeltaSharpSession CRDs, reconcilers, admission webhooks, finalizers, status subresources, RBAC, and driver/executor/shuffle-worker lifecycle orchestration.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

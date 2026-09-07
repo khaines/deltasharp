@@ -2,7 +2,7 @@
 
 > **Scope:** KubeOps operator code, CRDs, reconcilers, admission webhooks, finalizers, status subresources, RBAC, generated manifests, driver/executor/shuffle lifecycle, scaling, rollout, rollback, and operator tests.
 > **Priority:** HIGH.
-> **Owners:** kubernetes-operator-controller-engineer, cloud-native-site-reliability-engineer, cloud-native-security-sme. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009.
+> **Owners:** kubernetes-operator-controller-engineer, cloud-native-site-reliability-engineer, cloud-native-security-sme. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009.
 
 ## How to use
 Use this checklist for every change to operator code or generated Kubernetes API surfaces. Reconciler behavior that can corrupt status, delete running jobs, leak tenant resources, or orphan pods is a red flag; pair with 05 security, 14 tenant isolation, and 10 runtime lifecycle.

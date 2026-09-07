@@ -2,7 +2,7 @@
 
 > **Status:** living document. Created with
 > [STORY-00.5.1](../../planning/epics/EPIC-00-engineering-foundations.md#story-0051-xunit-harness-and-deterministic-seed-policy).
-> Grounded in [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md),
+> Grounded in [`CLAUDE.md`](../../../CLAUDE.md),
 > [testing-conventions.md](testing-conventions.md), [repository-layout.md](repository-layout.md),
 > [quality-gates.md](quality-gates.md), the [`coverlet.runsettings`](../../../coverlet.runsettings)
 > coverage filter, and checklists [04](../checklists/04-testing-checklist.md),

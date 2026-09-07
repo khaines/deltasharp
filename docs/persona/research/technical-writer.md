@@ -133,5 +133,5 @@ Finally, DeltaSharp docs should scale with the codebase. The right system will c
 [^15]: Microsoft Writing Style Guide, developer content, https://learn.microsoft.com/en-us/style-guide/developer-content/
 [^16]: Microsoft Learn, troubleshooting documentation hub, https://learn.microsoft.com/en-us/troubleshoot/
 [^17]: Red Hat supplementary style guide for product documentation, https://redhat-documentation.github.io/supplementary-style-guide/
-[^18]: `.github/copilot-instructions.md:5-108`
+[^18]: `CLAUDE.md` → "Project overview" through "Engine architecture decisions"
 [^19]: `docs/persona/agents/README.md:39-74`

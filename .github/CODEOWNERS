@@ -33,6 +33,7 @@
 /ROADMAP.md                     @khaines
 /docs/rfcs/                     @khaines
 /.github/                       @khaines
+/.claude/                       @khaines
 
 # --- Source tree: subsystem ownership (active) ---
 # Owner is @khaines for now; the trailing comment names the intended persona owner.

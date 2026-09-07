@@ -85,7 +85,7 @@ This file maps file patterns and content signals to the specialist agent persona
 
 | Pattern | Priority | Notes |
 |---|---|---|
-| `docs/engineering/adr/**` | Critical | Architecture Decision Records |
+| `docs/adr/**` | Critical | Architecture Decision Records |
 | `docs/engineering/design/**` | Critical | Component design documents |
 | `docs/**/architecture/**`, `docs/**/topology/**`, `docs/**/system-design/**` | Critical | Architecture documents |
 | `src/**/Driver/**`, `src/**/Cluster/**`, `src/**/Distributed/**` | High | Driver/executor topology |

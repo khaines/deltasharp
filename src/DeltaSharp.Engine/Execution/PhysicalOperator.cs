@@ -5,7 +5,7 @@ namespace DeltaSharp.Engine.Execution;
 /// <summary>
 /// An immutable node in a physical plan and the unit an <see cref="IExecutionBackend"/> evaluates
 /// (STORY-03.1.1). It is a pure descriptor — schema, ordered children, and bound expressions —
-/// carrying no execution state, so analyzer/optimizer immutability (copilot-instructions) holds.
+/// carrying no execution state, so analyzer/optimizer immutability (CLAUDE.md) holds.
 /// The backend turns a node into an <see cref="IBatchStream"/>; each node carries an
 /// <see cref="OperatorMetrics"/> surface the backend updates while running.
 /// </summary>

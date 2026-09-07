@@ -1,7 +1,7 @@
 ---
 name: dotnet-library-platform-engineer
 description: Use for DeltaSharp NuGet packaging, multi-targeting, repository build governance, Roslyn API enforcement, source generators, versioning, strong naming, and trim/Native-AOT readiness.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

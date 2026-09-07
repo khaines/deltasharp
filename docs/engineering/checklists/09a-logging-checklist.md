@@ -2,7 +2,7 @@
 
 > **Scope:** Driver, executor, shuffle, storage, Delta commit, Kubernetes Operator, CLI, and support paths that emit diagnostic logs.
 > **Priority:** STANDARD.
-> **Owners:** cloud-native-site-reliability-engineer, dotnet-distributed-execution-engineer, dotnet-runtime-performance-engineer. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, 05, 07, 09b, 09c, 14, SRE and .NET runtime persona docs.
+> **Owners:** cloud-native-site-reliability-engineer, dotnet-distributed-execution-engineer, dotnet-runtime-performance-engineer. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, 05, 07, 09b, 09c, 14, SRE and .NET runtime persona docs.
 
 ## How to use
 Use this checklist when adding or changing logs, exceptions, diagnostics, or operational runbooks. Escalate as Critical when logs expose secrets, credentials, tenant data, or object-store keys; escalate as High when missing logs block diagnosis of driver, executor, operator, shuffle, or Delta commit failures.
@@ -78,8 +78,8 @@ Use this checklist when adding or changing logs, exceptions, diagnostics, or ope
 - [09b — Metrics Checklist](09b-metrics-checklist.md)
 - [09c — Distributed Tracing Checklist](09c-distributed-tracing-checklist.md)
 - [14 — Tenant Isolation Checklist](14-tenant-isolation-checklist.md)
-- `.github/copilot-instructions.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `CLAUDE.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`
 - `docs/persona/agents/dotnet-distributed-execution-engineer-agent.md`
 - `docs/persona/agents/dotnet-runtime-performance-engineer-agent.md`

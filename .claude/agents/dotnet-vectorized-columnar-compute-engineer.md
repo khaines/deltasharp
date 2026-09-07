@@ -1,7 +1,7 @@
 ---
 name: dotnet-vectorized-columnar-compute-engineer
 description: Use for DeltaSharp vectorized columnar compute, ColumnBatch/ColumnVector design, SIMD kernels, validity bitmaps, selection vectors, dictionary peeling, late materialization, and interpreter-backend kernel correctness.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

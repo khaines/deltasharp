@@ -2,7 +2,7 @@
 
 > **Scope:** Cross-component tests for Delta/Parquet storage, object-store and PVC backends, driver/executor execution, shuffle, Kubernetes operator reconciliation, streaming micro-batches, and tenant isolation.
 > **Priority:** HIGH.
-> **Owners:** reliability-test-chaos-engineer, delta-storage-format-engineer, kubernetes-operator-engineer. **Grounded in:** build-test-config, review-pr rating rubric, `.github/copilot-instructions.md`, ADR-0001, ADR-0013.
+> **Owners:** reliability-test-chaos-engineer, delta-storage-format-engineer, kubernetes-operator-engineer. **Grounded in:** build-test-config, review-pr rating rubric, `CLAUDE.md`, ADR-0001, ADR-0013.
 
 ## How to use
 Run these tests when behavior crosses process, storage, filesystem, object-store, or Kubernetes boundaries. Keep them isolated and deterministic even when they use real emulators or test clusters; use the documented 900s integration timeout budget.
@@ -75,7 +75,7 @@ Run these tests when behavior crosses process, storage, filesystem, object-store
 - [18 — Kubernetes Operator Checklist](18-kubernetes-operator-checklist.md)
 - [19 — Data Source Connectors Checklist](19-data-source-connectors-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
-- `.github/skills/implement-work-item/build-test-config.md`
-- `.github/skills/review-pr/rating-rubric.md`
+- `.claude/skills/implement-work-item/build-test-config.md`
+- `.claude/skills/review-pr/rating-rubric.md`
 - ADR-0001: Execution strategy
 - ADR-0013: Memory model for in-memory batches

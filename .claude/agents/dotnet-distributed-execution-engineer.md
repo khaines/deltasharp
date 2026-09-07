@@ -1,7 +1,7 @@
 ---
 name: dotnet-distributed-execution-engineer
 description: Use for DeltaSharp driver/executor hosting, gRPC task RPC, Kestrel HTTP/2, Generic Host lifecycle, Kubernetes shutdown, channel-based task dispatch, native remote shuffle service, and IDataExchange/Arrow Flight data plane.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

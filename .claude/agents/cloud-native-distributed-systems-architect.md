@@ -1,7 +1,7 @@
 ---
 name: cloud-native-distributed-systems-architect
 description: Designs DeltaSharp's cloud-native driver/executor, Kubernetes Operator, shuffle, tenancy, and reliability architecture.
-tools: [Read, Grep, Glob, Edit, Write]
+tools: [Read, Grep, Glob, Edit, Write, Bash]
 model: sonnet
 ---
 

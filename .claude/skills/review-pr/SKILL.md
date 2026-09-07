@@ -3,10 +3,10 @@ name: review-pr
 description: >-
   Orchestrates world-class pull request reviews using specialist agent personas and engineering checklists.
   Use this when asked to review a PR, review code changes, or assess PR quality.
-  A cheap scout triages and routes; a Claude Opus 5 council
-  reviews complex changes with up to 3 scout-selected domain specialists; a decorrelated Gemini 3.1 Pro
-  red-team executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments
-  + review summary) for remote PRs.
+  A cheap Haiku scout triages and routes; an Opus council reviews complex changes with up to 3
+  scout-selected domain specialists; a blind-first Fable red-team, on a tier no voting seat uses,
+  executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments and a
+  review summary) for remote PRs.
 ---
 
 # PR Review Skill — Orchestration Instructions
@@ -76,15 +76,15 @@ Record the result for use in Phase 3 and Phase 5:
 
 ## Phase 1.6: Scout Triage — the Review Package
 
-Before selecting agents, dispatch the **scout** (`.github/skills/review-pr/scout.md`) to produce
-the **Review Package** — the routing record for the whole review. The scout runs on a cheap
-frontier model (`gemini-3.5-flash` / `gpt-5-mini` / `claude-haiku-4.5`; `agent_type: explore` or
-`general-purpose`) so the voting seats spend their budget reviewing, not triaging.
+Before selecting agents, dispatch the **scout** (`.claude/skills/review-pr/scout.md`) to produce
+the **Review Package** — the routing record for the whole review. The scout runs on the cheap
+tier (`model: haiku`; `subagent_type: Explore` or `general-purpose`) so the voting seats spend their
+budget reviewing, not triaging.
 
-It returns: complexity (Simple/Complex), changed files by domain, the recommended `agent_type`
+It returns: complexity (Simple/Complex), changed files by domain, the recommended `subagent_type`
 per fixed lens, a roster of **≤3 domain specialist seats** (with verified `CANONICAL_SPEC` paths
 from `docs/persona/agents/`), per-seat checklist IDs, the claims to verify (C4/C7), and a red-team
-decorrelation hint. Verify each specialist's `CANONICAL_SPEC` exists; drop any that don't.
+tier check. Verify each specialist's `CANONICAL_SPEC` exists; drop any that don't.
 
 For a trivial (1–2 file, docs-only) change the orchestrator may inline the scout's logic instead
 of dispatching it — but must say so in the triage summary. Phases 2–4 and 8 consume the Review
@@ -96,7 +96,7 @@ Package.
 
 ### 2.1 Load Agent Mapping
 
-Read the agent mapping file at `.github/skills/review-pr/agent-map.md`.
+Read the agent mapping file at `.claude/skills/review-pr/agent-map.md`.
 
 ### 2.2 Match Files to Agents
 
@@ -145,68 +145,92 @@ Use the default model. Run the review through the primary agent persona's lens:
 
 ### Complex Change — Multi-Model Council
 
-Dispatch **4 parallel reviews** using the `task` tool. Each slot has a fixed **role** and **model**; the `agent_type` is selected per-PR from a closed **allowlist** to bring specialist domain expertise to the slot when the PR's primary content warrants it. All 4 calls **must** be made in parallel, not sequentially.
+Dispatch **4 parallel reviews** using the Agent tool. Each slot has a fixed **role** and **model**; the `subagent_type` is selected per-PR from a closed **allowlist** to bring specialist domain expertise to the slot when the PR's primary content warrants it. All 4 calls **must** be made in parallel, not sequentially.
 
-| Slot | Role | Model | `agent_type` allowlist |
+| Slot | Role | Model | `subagent_type` allowlist |
 |---|---|---|---|
-| **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
-| **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
-| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `claude-opus-5` (effort high/xhigh/max) | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
-| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `claude-opus-5` (effort high/xhigh/max) | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
+| **Architect** | Deep reasoning — architecture implications, subtle bugs, design flaws | `opus` | `general-purpose`, `cloud-native-distributed-systems-architect`, `query-execution-engine-engineer`, `delta-storage-format-engineer`, `data-platform-connectors-engineer` |
+| **Balanced** | Code quality, patterns, maintainability, operational pragmatism | `opus` | `general-purpose`, `dotnet-framework-runtime-engineer`, `cloud-native-site-reliability-engineer`, `developer-experience-api-engineer` |
+| **Quality** | Testability, measurability, reliability, alternative pattern recognition | `opus` | `general-purpose`, `reliability-test-chaos-engineer`, `performance-benchmarking-engineer`, `technical-writer` |
+| **Security** | Tenant isolation, auth bypass, injection, supply-chain, cryptographic correctness, privacy/compliance | `opus` | `cloud-native-security-sme`, `privacy-compliance-grc-lead`, `general-purpose` |
 
-> **Models track the newest top-tier of each family** — currently Claude **Opus 5** across all four
-> voting lenses (deep / balanced / quality / security). Update these as families advance.
->
-> **The voting spine is entirely Claude; the gate is entirely Gemini.** The Phase 8 red-team runs on
-> **`gemini-3.1-pro-preview`** (Gemini 3.1 Pro), a family **no voting seat uses** — so the gate is
-> **decorrelated from every voting seat** by construction. See Phase 8.
->
-> **Why the gate moved off GPT (2026-07).** Measured over 5 consecutive red-team runs spanning
-> `gpt-5.6-sol` and `gpt-5.6-terra`: **5/5 returned an empty first response** (one after 3,936 s of
-> work) and **4/5 never discharged C7** — the red-team's defining duty. The failure tracked *long
-> adversarial prose generation*, not adversarial reasoning: the same models emitted fine when asked
-> for terse verdicts, and Claude/Gemini seats produced materially identical adversarial content
-> (real PII payloads, forged log lines, TAG-block smuggling, 16,000 crafted footer mutations) at
-> length without issue. Gemini had already demonstrated the required rigor in the Quality seat (a
-> 106-RED mutation experiment that overturned its own prior 2/5), so the gate moved to the model
-> proven capable of executing it.
->
-> **Trade-off, recorded deliberately:** the council no longer has a non-Claude *voting* perspective.
-> Voting-seat diversity now comes from persona and effort rather than model family. Decorrelation is
-> spent on the gate, where a blind spot is unrecoverable, rather than on a voting seat, where four
-> other seats and the gate can still catch it.
+Model values are the Agent tool's `model` names (`haiku` / `sonnet` / `opus` / `fable`), which
+always override the `model:` line in a persona's frontmatter. The full council shape:
 
-**Models are fixed per slot.** Diverse pattern recognition across the council comes from the model mix; domain specialization comes from the per-slot `agent_type` choice.
+| Seat | Model | Notes |
+|---|---|---|
+| Scout (Phase 1.6) | `haiku` | Routes only; never scores or gates |
+| 4 fixed lenses | `opus` | The voting spine |
+| Specialist seats (≤3) | `opus` | Same tier as the spine; never `fable` |
+| Red-team gate (Phase 8) | `fable` | A tier **no voting seat uses**; blind-first; shell-capable |
+
+> **Models track the newest model in each Claude tier** — currently **Opus 5** on every voting seat,
+> **Fable 5.1** on the gate, **Haiku 4.5** on the scout. Update these as the tiers advance, keeping
+> the gate on a tier distinct from every voting seat.
+>
+> **The voting spine is Opus; the gate is Fable.** The Phase 8 red-team runs on a **different tier
+> from every voting seat**, starts **blind** (it forms its own findings and runs its own
+> C7 repros before it sees any seat verdict), and holds a **shell**. Gate decorrelation is therefore
+> **tier + information + execution**, not vendor. See Phase 8.
+>
+> **Why the gate moved off Gemini (2026-09).** The council moved from GitHub Copilot to Claude Code,
+> whose Agent tool dispatches Claude models only, so a Gemini gate can no longer be dispatched
+> in-session. The 2026-07 record also showed vendor decorrelation bought less than assumed: Claude
+> and Gemini seats produced materially identical adversarial content, and the verdicts that were
+> actually overturned came from **execution** (the 106-RED mutation experiment) and from a seat
+> **willing to disagree** — protocol properties, not model properties. The gate now spends its
+> independence where the protocol can enforce it: a distinct tier, a blind first pass, and mandatory
+> C7 execution whose output is model-agnostic evidence.
+>
+> **Why the gate did not move to GPT.** The 2026-07 measurement stands (5/5 empty first responses,
+> 4/5 never discharged C7); see `red-team.md` → Dispatch. Re-measure before reconsidering.
+>
+> **Trade-off, recorded deliberately:** no seat, voting or gating, runs outside the Claude family. A
+> family-wide blind spot is now caught only by execution evidence, CI, or a human. For
+> **protected-domain** changes (security, tenant isolation, privacy) a **vendor-decorrelated re-run**
+> may be requested as an opt-in out-of-band step (e.g. a GitHub Action that posts a Gemini red-team
+> review); until that exists, the documented human waiver path in `rating-rubric.md` applies.
+
+**Models are fixed per slot.** Diverse pattern recognition across the council comes from persona,
+tier, and the blind-first gate; domain specialization comes from the per-slot `subagent_type` choice.
+
+**Fresh context by construction.** Every seat, specialist, and the red-team is dispatched as a
+**new** subagent with no conversation history. Never dispatch a seat as a `fork` of the
+orchestrator — a forked seat inherits the orchestrator's reading of the diff and is no longer an
+independent reviewer.
 
 **Specialist seats (scout-selected, ≤3).** In addition to the 4 fixed lenses, dispatch each
-domain specialist from the scout's Review Package as an **additional voting seat** on a frontier
-model (`agent_type` = the specialist persona; model = a **voting-spine family (Claude), never
-Gemini** — so the red-team's Gemini-family decorrelation stays *structurally* guaranteed; a
-specialist on Gemini would silently degrade the gate to provisional; e.g. `claude-opus-5`),
-scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
-the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
+domain specialist from the scout's Review Package as an **additional voting seat**
+(`subagent_type` = the specialist persona; `model: opus` — the **voting-spine tier, never `fable`**,
+so the red-team's tier decorrelation stays *structurally* guaranteed; a specialist on `fable` would
+silently degrade the gate to provisional), scoped to its owned files + checklist IDs. The 4 lenses
+are the spine; specialists add depth for the domains the diff actually touches (Delta storage,
+query execution, operator, connectors, …).
 
 **Execution is mandatory for execution-eligible claims (C7).** Any seat verifying an enforcement /
 parity / compat / migration / test-efficacy claim must either **run** a repro (see
 [`rigor-battery.md`](rigor-battery.md)) and quote command + output, or **explicitly defer the claim
 to the red-team** (the canonical C7 executor) — "verified by reading" does not clear a C7-eligible
-claim. A seat expected to execute MUST be dispatched **shell-capable** (`agent_type:
-general-purpose`, or another tool-capable type); a file-view-only persona seat may only review by
-reading and must defer every C7 claim. A seat that silently withholds judgment because it "couldn't
-run it" (instead of deferring, or being re-dispatched shell-capable) is a dispatch error, not a
-finding.
+claim. A seat expected to execute MUST be dispatched **shell-capable**: `general-purpose`, or an
+engineering persona whose `.claude/agents/` frontmatter lists `Bash` (the three non-engineering
+personas — product, program, developer-relations — do not, and must defer every C7 claim;
+`privacy-compliance-grc-lead` carries `Bash` because it sits in the Security lens allowlist). A
+seat that silently withholds judgment because it "couldn't run it" (instead of deferring, or being
+re-dispatched shell-capable) is a dispatch error, not a finding.
 
-**Selection rule for `agent_type`:**
+**Selection rule for `subagent_type`:**
 
 1. Identify the PR's primary content domain from changed files and PR description.
 2. For each slot, pick the allowlist member whose domain most closely matches the PR's primary content. If multiple match, prefer the more-specific specialist. If none matches better than `general-purpose`, use `general-purpose` (or `cloud-native-security-sme` for the Security slot).
-3. Record the choice and a one-sentence justification in the round dispatch record.
+3. Record the choice and a one-sentence justification in the scout's Review Package (`scout.md` output, `recommended subagent_type` line); the composition record carries only the auditable fields listed in §3.1 step 4.
 
 Each model receives the same input package:
 
 - The full PR diff.
 - The relevant agent persona instructions.
 - The applicable checklists.
+- `rigor-battery.md` (C1–C7) — including the C7 trust-boundary rule: PR-supplied code is untrusted;
+  build/run it only in a throwaway dir outside the worktree.
 - The governing design document(s), if any.
 - DeltaSharp canon: Spark parity, lazy/eager semantics, Catalyst-style pipeline, Delta tables, Kubernetes driver/executor/operator, storage across object stores and PVCs.
 - Instructions to return findings in structured format.
@@ -215,12 +239,12 @@ If a model fails or times out, proceed with remaining models and note the gap in
 
 ### 3.1 Council Composition Verification (MANDATORY)
 
-After dispatching the 4 reviewers and **before** reporting any aggregate council result, verify that each slot's actual `(agent_type, model)` pair conforms to the protocol.
+After dispatching the 4 reviewers and **before** reporting any aggregate council result, verify that each slot's actual `(subagent_type, model)` pair conforms to the protocol.
 
-1. **Read back each dispatch.** For each reviewer, look at the actual `agent_type` and `model` arguments passed.
-2. **Validate against the protocol** verbatim. A round is invalid if any slot's model does not match its fixed value or if any `agent_type` is not in its allowlist.
+1. **Read back each dispatch.** For each reviewer, look at the actual `subagent_type` and `model` arguments passed.
+2. **Validate against the protocol** verbatim. A round is invalid if any slot's model does not match its fixed value or if any `subagent_type` is not in its allowlist.
 3. **Correct off-protocol dispatches** by re-dispatching affected slots at the same HEAD SHA when possible; otherwise re-run the full round at current HEAD.
-4. **Capture verified composition** per round: slot name, `agent_type`, `model`, justification, dispatch HEAD SHA, and dispatch timestamp.
+4. **Capture verified composition** per round: slot name, `subagent_type`, `model`, fork flag read back from the dispatch (`yes` if `subagent_type: fork` was used, else `no`), dispatch HEAD SHA, and dispatch timestamp captured with `date -u +%Y-%m-%dT%H:%M:%SZ` at dispatch time. For the red-team seat, also capture the blind-block-returned and verdicts-released timestamps.
 5. **Composition verification gates aggregate-rating claims.** Do not claim unanimity, consensus, or aggregate rating until verified.
 6. **Externalized composition record.** At each round's close, post the verified composition record as a PR comment or persist it in an auditable project-relative path for local-only reviews. Prior records are append-only.
 
@@ -230,7 +254,7 @@ After dispatching the 4 reviewers and **before** reporting any aggregate council
 
 ### 4.1 Load Checklist Mapping
 
-Read `.github/skills/review-pr/checklist-map.md`.
+Read `.claude/skills/review-pr/checklist-map.md`.
 
 ### 4.2 Match Files to Checklists
 
@@ -238,7 +262,7 @@ For each changed file, determine which checklists apply. A single file may trigg
 
 ### 4.3 Load Checklists
 
-Load each applicable checklist from `docs/engineering/checklists/`. If an intended DeltaSharp checklist is not authored yet, record that it was unavailable and apply `.github/copilot-instructions.md` as canon.
+Load each applicable checklist from `docs/engineering/checklists/`. If an intended DeltaSharp checklist is not authored yet, record that it was unavailable and apply `CLAUDE.md` as canon.
 
 ### 4.4 Evaluate Changes Against Checklists
 
@@ -349,7 +373,7 @@ For GitHub PRs, check:
 
 ### 7.1 Load Rating Rubric
 
-Read `.github/skills/review-pr/rating-rubric.md`.
+Read `.claude/skills/review-pr/rating-rubric.md`.
 
 ### 7.2 Calculate Overall Rating
 
@@ -432,17 +456,28 @@ single lightweight/inlined red-team pass — or skip it and record `red-team: n/
 execution-eligible claim`. The **full decorrelated, shell-capable red-team is required for all
 Complex changes** and for any change touching a protected domain.
 
-After the rating, dispatch the **red-team** (`.github/skills/review-pr/red-team.md`) — the council's
-gate-keeper. It runs **last**, **shell-capable** (`agent_type: general-purpose`), on a frontier
-family **distinct from the majority voting spine and ideally used by no voting seat**. With the
-current council (all four voting lenses on Claude), use **`gemini-3.1-pro-preview`** (Gemini 3.1
-Pro) — the Gemini family is used by no voting seat; do not reuse a voting seat's family
-(`claude-opus-5`) as the red-team.
+After the rating, dispatch the **red-team** (`.claude/skills/review-pr/red-team.md`) — the council's
+gate-keeper. It runs **last**, **shell-capable** (`subagent_type: general-purpose`), on **`fable`** —
+a tier **no voting seat uses** (every voting seat is `opus`). Never dispatch it as a `fork`; it must
+start with no conversation history.
 
-Give it the diff, the Review Package, and **every voting seat's full verdict + findings**. It
-assumes the PR is broken, tries to falsify the seats' approvals, hunts the council's historical
-miss-classes, and **executes C7 repros** (it does not reason about them). It returns findings in the
-canonical `Critical|High|Medium|Low|Info` set and a verdict:
+**Blind-first, two passes, one agent.**
+
+1. **Blind pass.** Dispatch the red-team with the diff, the changed files, and the Review Package
+   (design-doc/claim refs) **only** — no seat verdicts, ratings, or findings. It assumes the PR is
+   broken, hunts the council's historical miss-classes, and **executes C7 repros** (it does not
+   reason about them). It returns its **Blind findings** block before seeing anything from the
+   council.
+2. **Falsification pass.** Only after the blind block is back, continue the **same** agent
+   (SendMessage) with **every voting seat's full verdict + findings**. It tries to falsify each
+   approval, diffs its blind findings against the seats' (anything it found that no seat found is a
+   MISS candidate), and finalizes its verdict.
+
+Record both timestamps as **executed** shell output, never model-authored: run
+`date -u +%Y-%m-%dT%H:%M:%SZ` in the shell immediately when the blind block returns, and again
+immediately before the `SendMessage` that releases the seat verdicts, then quote both outputs
+verbatim in the composition record. The second must be later than the first. It returns findings in
+the canonical `Critical|High|Medium|Low|Info` set and a verdict:
 
 - `MISS-FOUND` — with new findings (each `file:line` + EVIDENCE). These are **actionable and
   blocking**; in a fix-loop they go back to the fix phase.
@@ -456,10 +491,11 @@ attestation, and quoted C7 output are self-asserted signals — before accepting
 the orchestrator MUST re-run at least one sampled C7 repro from its evidence block and confirm the
 output matches.
 
-Record which model gated. If the red-team shares the voting spine's family (no decorrelated frontier
-available), its certification is **provisional** and does **not** satisfy the gate for protected-
-domain changes — flag it and require a decorrelated re-run or a documented human waiver. The gate
-(`rating-rubric.md`) requires `NO-MISS-CERTIFIED`.
+Record which model gated and that the blind pass completed before the seat verdicts were released.
+If the red-team ran on a voting-seat tier (`opus`), was forked from the orchestrator, or received
+seat verdicts before returning its blind block, its certification is **provisional** and does
+**not** satisfy the gate for protected-domain changes — flag it and re-run it correctly, or record a
+documented human waiver. The gate (`rating-rubric.md`) requires `NO-MISS-CERTIFIED`.
 
 ---
 
@@ -523,9 +559,9 @@ and fix it. This applies whenever a repository is available, including local-onl
 ## Important Notes
 
 - **Always read supporting files first.** Load `scout.md`, `agent-map.md`, `checklist-map.md`, `rating-rubric.md`, `rigor-battery.md`, `red-team.md`, and `github-review-posting.md` before starting the pipeline.
-- **Scout first, red-team last.** Every Complex review is bracketed by a cheap scout (routing) and a decorrelated red-team (adversarial gate). The scout selects ≤3 specialist seats; the red-team must execute C7 repros and certify (`NO-MISS-CERTIFIED`) before the gate can PASS.
-- **Execution over reading (C7).** Seats and the red-team must RUN execution-eligible claims; dispatch any executing seat shell-capable (`general-purpose`), never a file-view-only persona.
-- **Decorrelate the red-team.** Run it on a frontier family distinct from the majority voting spine; same-family certification is provisional for protected-domain changes.
+- **Scout first, red-team last.** Every Complex review is bracketed by a cheap scout (routing) and a blind-first red-team (adversarial gate). The scout selects ≤3 specialist seats; the red-team must execute C7 repros and certify (`NO-MISS-CERTIFIED`) before the gate can PASS.
+- **Execution over reading (C7).** Seats and the red-team must RUN execution-eligible claims; dispatch any executing seat shell-capable (`general-purpose` or a persona with `Bash`), never a persona without a shell.
+- **Decorrelate the red-team.** Run it on `fable`, a tier no voting seat uses, blind-first, never forked; same-tier or non-blind certification is provisional for protected-domain changes.
 - **Parallel execution in council mode.** The 4 model reviews must run in parallel, not sequentially.
 - **Handle model failures gracefully.** If a model fails or times out, proceed with remaining models and note which were unavailable.
 - **DeltaSharp canon is mandatory.** Reviews must enforce Spark parity, lazy/eager semantics, Catalyst-style planning, Delta/Parquet correctness, Kubernetes driver/executor/operator safety, object-store/PVC storage support, and .NET runtime correctness.
