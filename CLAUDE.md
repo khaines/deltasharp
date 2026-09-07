@@ -70,26 +70,31 @@ per-user override, including the gitignored `.claude/settings.local.json`. Treat
 
 The deny list covers only the explicit destructive spellings — branch
 delete/rename short flags, `git push -f`, `git push --force`, `gh api` with
-`-X POST`/`PUT`/`PATCH`/`DELETE` or `--method`, `gh pr merge`, `gh release`,
-and `gh secret`. Deny matching is word-boundary prefix matching on the *leading*
+`-X POST`/`PUT`/`PATCH`/`DELETE` or `--method`, `gh pr merge`, `gh release`, and
+`gh secret`. Deny matching is word-boundary prefix matching on the *leading*
 spelling, so variant or non-leading flags (`-X post`, `-XPOST`, `--method=POST`,
 `git push origin main -f`) and everything else that writes (`git push`, commit,
-`git worktree add`/`remove`, PR/issue creation, reviews) are unlisted and
-prompt instead. Prompt-on-write is the design, not an
-omission. The `reconcile` workflow's `settings-permissions` check validates this
-file's shape, rejects the enumerated mutating `git`/`gh` prefixes and any
-wildcard or tool-wide `Bash` grant in `allow`, rejects `permissions.defaultMode`
-bypasses, project-level `hooks`, and `permissions.additionalDirectories`, and
-requires the destructive-spelling deny entries; any other `allow` entry (a new
-shell wrapper, `curl`, `git commit`) is unpoliced and needs human review.
+`git worktree add`/`remove`, PR/issue creation, reviews) prompt instead.
+Prompt-on-write is the design, not an omission. The `reconcile` workflow's
+`settings-permissions` check enforces a positive allowlist: top level may hold
+only `$schema`, `permissions`, and inert keys (`model`, `cleanupPeriodDays`,
+`includeCoAuthoredBy`, `attribution`, `outputStyle`, `language`,
+`spinnerTipsEnabled`), `permissions` only `allow`/`deny`/`defaultMode`; every
+other key is rejected, executable-valued ones by name. So are the enumerated
+mutating `git`/`gh` prefixes (case-insensitive), wildcard or tool-wide `Bash`
+grants, and `defaultMode` bypasses; destructive-spelling deny entries are
+required. Any other `allow` entry (`curl`, `git commit`, a new shell wrapper)
+is unpoliced and needs human review.
 
 The `dotnet` grant is intended only for the maintainer's own branches; nothing
 enforces that. `dotnet restore`/`build`/`test`/`format` execute PR-supplied
 MSBuild targets, analyzers, source generators, and `nuget.config` sources
 in-process, so on someone else's branch run them from a throwaway copy outside
-the worktree per `.claude/skills/review-pr/rigor-battery.md` (C7). Project-level
-`hooks` in another author's branch execute on every tool call once that branch
-is checked out, so they fall under the same C7 trust boundary.
+the worktree per `.claude/skills/review-pr/rigor-battery.md` (C7).
+Project-level `hooks`, `env`, `apiKeyHelper`, and the other command-bearing
+keys in another author's branch execute once it is checked out — `apiKeyHelper`
+at startup, before any tool call — so they fall under the same C7 trust
+boundary as the `dotnet` grant; the gate rejects them in the tracked file.
 
 ## Architecture — the big picture
 

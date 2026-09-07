@@ -194,18 +194,26 @@ of three reconciliations or the `settings-permissions` validation breaks:
    the live **open** GitHub milestones plus the documented `Unsure / needs triage`
    sentinel. A stale/renamed option, or a live milestone missing from the dropdown,
    fails.
-4. **`settings-permissions`** (a validation, not a reconciliation). In
-   `.claude/settings.json`, the enumerated mutating `git`/`gh` prefixes, any wildcard or
-   tool-wide `Bash` grant, a `permissions.defaultMode` bypass, project-level `hooks`, and
-   `permissions.additionalDirectories` fail, and the destructive-spelling deny entries
-   must be present; allow entries outside that enumeration are *not* policed and still
-   need human review. Run it alone with `--validate-settings-only`.
+4. **`settings-permissions`** (a validation, not a reconciliation). It holds
+   `.claude/settings.json` to a positive allowlist: the top level may contain only
+   `$schema`, `permissions`, and inert keys (`model`, `cleanupPeriodDays`,
+   `includeCoAuthoredBy`, `attribution`, `outputStyle`, `language`,
+   `spinnerTipsEnabled`), and `permissions` only `allow`, `deny`, and `defaultMode`.
+   Any other key fails, with a specific message for each executable-valued one
+   (`hooks`, `env`, `apiKeyHelper`, `statusLine`, the AWS/GCP credential and proxy
+   helpers) — those run commands as soon as the branch is checked out, `apiKeyHelper`
+   at CLI startup before any tool call. Inside `allow`, the enumerated mutating
+   `git`/`gh` prefixes (compared case-insensitively), any wildcard, and any tool-wide
+   `Bash` grant fail; a `defaultMode` bypass fails; the destructive-spelling deny
+   entries must be present. Allow entries outside that enumeration are *not* policed
+   and still need human review. Run it alone with `--validate-settings-only`.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance
 files (roster, `CODEOWNERS`, the feature form, `.claude/settings.json`, this
 document, the script, or the workflow), on a weekly schedule, and on demand — the
-schedule catches drift introduced GitHub-side (a label or milestone renamed in the UI), which no file change
-would otherwise trigger. It uses a least-privilege read-only token
+schedule catches drift introduced GitHub-side (a label or milestone renamed in the
+UI), which no file change would otherwise trigger. It uses a least-privilege
+read-only token
 (`permissions: contents: read`; the default token suffices for labels, milestones, and
 CODEOWNERS on a public repo) and pins its one action by commit SHA.
 
