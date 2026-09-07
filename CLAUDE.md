@@ -116,10 +116,16 @@ by the **git index mode**, not by what the path resolves to here, so neither sha
 hide: a **dangling** link (one pointing at `bin/` or `obj/`) is absent in a
 checkout-only CI job and resolves to real configuration on any machine that has built,
 and a **submodule** is checked out *empty* by CI while `git submodule update --init`
-loads whatever it contains on a developer machine. The `.claude`-wide query lives in
-the `tracked-startup-config` check (it covers every subtree and the root entry); the
-roster and command/skill checks ask it too, and their walks additionally report any
-link they meet. The CLI follows such a link; the gate's walks deliberately do not, so
+loads whatever it contains on a developer machine. Git is asked from the directory
+that *contains* `.claude`, never from inside it — a submodule `.claude` would answer
+from the nested repository and a symlinked one from outside the checkout, both
+"clean" — and it is asked about `.claude`, `.mcp.json` **and any case-variant of
+either**: on a case-insensitive checkout (macOS/Windows) a tracked `.Claude/hooks`
+materialises inside `.claude/` where the CLI reads it, while the case-sensitive
+`.claude` pathspec never names it, so a collision fails as "rename it" whatever its
+index mode. All three local checks ask, so the link is named wherever the reader
+looks; a path outside the work tree git answered from is *unverified*, not clean.
+The CLI follows such a link; the gate's walks deliberately do not, so
 it would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
 `mcpServers[*].command` is started when the CLI launches, before any tool call and
 with no prompt. **A tracked `.claude/settings.local.json`:** it is honoured exactly

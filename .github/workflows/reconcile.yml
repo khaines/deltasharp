@@ -78,7 +78,16 @@ name: Reconcile
 #                          pathspec, which is the only query that can see .claude ITSELF as a
 #                          link and any subtree no other check owns (hooks/, output-styles/):
 #                          a pathspec spelled THROUGH a symlinked directory matches nothing,
-#                          because the index holds the link, not the files "inside" it. One
+#                          because the index holds the link, not the files "inside" it. Git
+#                          is asked FROM the directory that contains .claude, never from
+#                          inside it (a submodule .claude answers from the nested repository
+#                          and a symlinked one from outside the checkout — both "clean"),
+#                          about .claude, .mcp.json and ANY CASE-VARIANT of either: a tracked
+#                          .Claude/hooks merges into .claude/ on a case-insensitive checkout
+#                          where the CLI reads it, so a collision fails as "rename it"
+#                          whatever its index mode. The query is scoped to those roots, never
+#                          to the whole repository, and a path outside the work tree git
+#                          answered from is UNVERIFIED, not clean. One
 #                          link reported by more than one question is annotated ONCE per
 #                          check (paths are compared repo-root-relative). If git cannot say,
 #                          the check reports SKIP and --require-remote makes that exit 2 —
@@ -98,9 +107,11 @@ on:
       # fails any tracked link/submodule anywhere under it (.claude/hooks, output-styles/),
       # and a filter that never fires cannot enforce that. `.claude` is listed on its own
       # line because `.claude/**` does NOT match the path `.claude` — which is exactly the
-      # path a commit turning the directory itself into a symlink or submodule touches.
+      # path a commit turning the directory itself into a symlink or submodule touches —
+      # as does `.gitmodules`, which is why it is listed too.
       - ".claude"
       - ".claude/**"
+      - ".gitmodules"
       - ".mcp.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
@@ -114,9 +125,11 @@ on:
       # fails any tracked link/submodule anywhere under it (.claude/hooks, output-styles/),
       # and a filter that never fires cannot enforce that. `.claude` is listed on its own
       # line because `.claude/**` does NOT match the path `.claude` — which is exactly the
-      # path a commit turning the directory itself into a symlink or submodule touches.
+      # path a commit turning the directory itself into a symlink or submodule touches —
+      # as does `.gitmodules`, which is why it is listed too.
       - ".claude"
       - ".claude/**"
+      - ".gitmodules"
       - ".mcp.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"

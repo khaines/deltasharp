@@ -243,10 +243,17 @@ of three reconciliations or the three local validations (`settings-permissions`,
    absent in the checkout-only CI job and resolves to real configuration on every
    machine that has run `dotnet build`, and a submodule is checked out *empty* by that
    job while `git submodule update --init` loads whatever it contains — a
-   filesystem-only check passes both. The `.claude`-wide query lives in
-   `tracked-startup-config` (6), which is where the root and any subtree no other check
-   owns (`hooks/`, `output-styles/`) is named; the roster and command/skill checks ask
-   it too, so the link is reported wherever the reader looks, once per check. The walks
+   filesystem-only check passes both. Git is asked from the directory that
+   *contains* `.claude`, never from inside it — a submodule `.claude` would answer
+   from the nested repository and a symlinked one from outside the checkout, both
+   "clean" — and it is asked about `.claude`, `.mcp.json` and **any case-variant of
+   either**: on a case-insensitive checkout (macOS/Windows) a tracked `.Claude/hooks`
+   merges into `.claude/` where the CLI reads it, while the case-sensitive `.claude`
+   pathspec never names it, so a collision fails as "rename it" whatever its index
+   mode. All three local checks ask that question — over `.claude` and its root, never
+   over the whole repository — so the link is reported wherever the reader looks, once
+   per check, and a path outside the work tree git answered from is unverified rather
+   than clean. The walks
    report any link they meet as well (the directory roots themselves, and every file
    entry whatever its name), so the rule still holds where git cannot be asked; links
    are never followed (a loop would hang the gate), and if git cannot answer at all the
