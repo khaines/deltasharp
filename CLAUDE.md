@@ -101,6 +101,10 @@ lets them set only a `default`/`plan` `permissionMode` and rejects `hooks`,
 `mcpServers`, `isolation` (it runs `git worktree add` unprompted), and `env`.
 Any other front-matter key, and front matter the strict reader cannot parse
 (quoted key, `key :`, flow or indented mapping, duplicate key), fails the gate.
+Slash-command files in `.claude/commands/` and `SKILL.md` front matter can grant
+unprompted tool use via `allowed-tools`, so the gate rejects that key (and
+`permissionMode`, `hooks`, `mcpServers`, `env`, `isolation`) in tracked command
+and skill files.
 
 ## Architecture — the big picture
 

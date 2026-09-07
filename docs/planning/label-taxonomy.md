@@ -166,7 +166,8 @@ labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
 (STORY-00.6.2, #452). The gate is the stdlib-only script
 [`tools/reconcile/roster-labels.py`](../../tools/reconcile/roster-labels.py), run by
 the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
-of three reconciliations or the `settings-permissions` validation breaks:
+of three reconciliations or the two local validations (`settings-permissions`,
+`command-skill-frontmatter`) breaks:
 
 1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
    matching `persona:<slug>` label and vice-versa. `.claude/agents/` holds persona
@@ -220,11 +221,21 @@ of three reconciliations or the `settings-permissions` validation breaks:
    file writes); the destructive-spelling deny entries must be present. Allow
    entries outside that enumeration are *not* policed and still need human review.
    Run it alone with `--validate-settings-only`.
+5. **`command-skill-frontmatter`** (also a validation). Slash commands
+   (`.claude/commands/**/*.md`) and skill manifests (`.claude/skills/**/SKILL.md`)
+   are the third front matter Claude Code reads as runtime configuration: a tracked
+   command file carrying `allowed-tools: Bash(<cmd>:*)` *runs* that command with no
+   permission prompt, which neither of the policies above can see. The gate reads
+   both with the same strict reader (an unparseable fence fails) and rejects
+   `allowed-tools`, `permissionMode`, `hooks`, `mcpServers`, `env`, and `isolation`
+   by name, plus any key outside `description`/`argument-hint`/`model` (skills may
+   also carry `name`). Both directories are optional; the passing report states how
+   many files were scanned, so an empty scan is visible rather than silently green.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance
-files (roster, `CODEOWNERS`, the feature form, `.claude/settings.json`, this
-document, the script, or the workflow), on a weekly schedule, and on demand — the
-schedule catches drift introduced GitHub-side (a label or milestone renamed in the
+files (roster, `.claude/commands/`, `.claude/skills/`, `CODEOWNERS`, the feature
+form, `.claude/settings.json`, this document, the script, or the workflow), on a
+weekly schedule, and on demand — the schedule catches drift introduced GitHub-side (a label or milestone renamed in the
 UI), which no file change would otherwise trigger. It uses a least-privilege
 read-only token
 (`permissions: contents: read`; the default token suffices for labels, milestones, and

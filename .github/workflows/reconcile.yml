@@ -3,8 +3,8 @@ name: Reconcile
 # Governance reconciliation gate (STORY-00.6.2, #452). A lightweight, build-free check that
 # fails when the persona roster, the GitHub label taxonomy, CODEOWNERS, and the
 # feature-request milestone dropdown drift out of the manual reconciliation recorded in
-# docs/planning/label-taxonomy.md (#449). It runs three reconciliations plus a
-# settings-permissions validation:
+# docs/planning/label-taxonomy.md (#449). It runs three reconciliations plus two local
+# validations (settings-permissions, command-skill-frontmatter):
 #   * roster<->labels    — every .claude/agents/*.md wrapper has a persona:<slug> label
 #                          and vice-versa (allowing the ONE documented 50-char truncation),
 #                          reconciled against the committed label list AND the live labels.
@@ -37,6 +37,18 @@ name: Reconcile
 #                          it does not certify the whole permission surface. Implemented in
 #                          tools/reconcile/roster-labels.py (validate_settings), so it is
 #                          self-tested and mutation-checked like the reconciliations above.
+#   * command-skill-frontmatter (also a VALIDATION) — the THIRD front-matter surface Claude
+#                          Code reads as runtime configuration: .claude/commands/**/*.md
+#                          slash commands and .claude/skills/**/SKILL.md manifests. A tracked
+#                          command file carrying `allowed-tools: Bash(<cmd>:*)` RUNS that
+#                          command with no permission prompt, invisible to both the settings
+#                          and the wrapper policies above, so `allowed-tools`,
+#                          `permissionMode`, `hooks`, `mcpServers`, `env` and `isolation` are
+#                          rejected by name and any key outside description/argument-hint/
+#                          model (plus `name` for skills) is rejected on sight. Front matter
+#                          is read by the same STRICT reader, so an unparseable fence fails
+#                          rather than being skipped; both directories are optional and the
+#                          passing report states how many files were scanned.
 #
 # It runs on PRs and pushes that touch the governance files (drift introduced by a code
 # change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
@@ -48,6 +60,8 @@ on:
     branches: [main]
     paths:
       - ".claude/agents/**"
+      - ".claude/commands/**"
+      - ".claude/skills/**"
       - ".claude/settings.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
@@ -58,6 +72,8 @@ on:
     branches: [main]
     paths:
       - ".claude/agents/**"
+      - ".claude/commands/**"
+      - ".claude/skills/**"
       - ".claude/settings.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"

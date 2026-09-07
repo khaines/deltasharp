@@ -4,8 +4,9 @@
 PR #449 established `docs/planning/label-taxonomy.md` with a *manual* reconciliation
 of the persona roster, the `persona:<slug>` GitHub labels, `CODEOWNERS`, and the
 feature-request milestone dropdown. This script turns that manual snapshot into a
-lightweight, re-runnable gate so the three reconciliations below — plus a validation of the
-`.claude/settings.json` permission surface — fail CI instead of silently rotting:
+lightweight, re-runnable gate so the three reconciliations below — plus two local validations
+of the `.claude/settings.json` permission surface and of the `.claude/commands` /
+`.claude/skills` front matter — fail CI instead of silently rotting:
 
   1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper (a markdown file
      whose front matter carries a `name:`; fence-less markdown there is ignored) must have a
@@ -40,7 +41,7 @@ lightweight, re-runnable gate so the three reconciliations below — plus a vali
      milestones, plus the documented "needs triage" sentinel. A stale/renamed option or a
      live milestone missing from the dropdown FAILS.
 
-Alongside those three reconciliations the gate runs one local VALIDATION,
+Alongside those three reconciliations the gate runs two local VALIDATIONS. The first is
 `settings-permissions` (:func:`validate_settings`): `.claude/settings.json` must parse and its
 `permissions.allow` / `permissions.deny` must be LISTS OF STRINGS. It then rejects, precisely:
 the enumerated mutating git/gh prefixes in :data:`FORBIDDEN_ALLOW_COMMANDS` (`gh api`,
@@ -62,6 +63,20 @@ Allow entries outside those rules are NOT policed — the check bounds the blast
 file, it does not certify the whole permission surface. It is a policy check on a
 security-relevant file rather than a reconciliation between two sources, but it shares the
 gate's report/exit contract. Run it alone with `--validate-settings-only`.
+
+The second local validation is `command-skill-frontmatter`
+(:func:`scan_command_skill_frontmatter`), which closes the THIRD front-matter surface Claude
+Code reads as runtime configuration: `.claude/commands/**/*.md` slash commands and
+`.claude/skills/**/SKILL.md` manifests. A tracked command file carrying
+`allowed-tools: Bash(<cmd>:*)` was proven to RUN that command with NO permission prompt —
+a grant neither the settings policy nor the wrapper policy above can see. Every such file is
+read by the same STRICT reader (:func:`_read_frontmatter`, so a quoted key or an unclosed
+fence is a problem, not a skip) and held to the same allowlist discipline: the keys in
+:data:`FORBIDDEN_COMMAND_SKILL_KEYS` (`allowed-tools`, `permissionMode`, `hooks`,
+`mcpServers`, `env`, `isolation`) are rejected by name, and any key outside
+:data:`ALLOWED_COMMAND_KEYS` (commands) / :data:`ALLOWED_SKILL_KEYS` (skills) is rejected on
+sight. Both directories are OPTIONAL — a missing one reports 0 files scanned rather than
+passing silently — and the paths are overridable with `--commands-dir` / `--skills-dir`.
 
 Design constraints
 ------------------
@@ -126,6 +141,8 @@ DEFAULT_REPO = "khaines/deltasharp"
 SENTINEL_MILESTONE_OPTIONS = frozenset({"Unsure / needs triage"})
 
 DEFAULT_AGENTS_DIR = os.path.join(".claude", "agents")
+DEFAULT_COMMANDS_DIR = os.path.join(".claude", "commands")
+DEFAULT_SKILLS_DIR = os.path.join(".claude", "skills")
 DEFAULT_SETTINGS = os.path.join(".claude", "settings.json")
 DEFAULT_FEATURE_FORM = os.path.join(".github", "ISSUE_TEMPLATE", "feature_request.yml")
 DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
@@ -273,6 +290,43 @@ ALLOWED_AGENT_KEYS = (
     "model",
     "permissionMode",
 )
+
+# --- .claude/commands/**.md + .claude/skills/**/SKILL.md front-matter policy --------------
+# Slash-command files and skill manifests are the THIRD front-matter surface Claude Code
+# reads as runtime configuration, and this gate did not look at either: a tracked
+# `.claude/commands/<x>.md` carrying `allowed-tools: Bash(extdiff:*)` was proven to RUN that
+# command with NO permission prompt — out of a file `.claude/settings.json` cannot describe,
+# that the `.claude/agents/**` policy never covers, and that the workflow path filter did not
+# even trigger the gate on.
+#
+# `allowed-tools` is the sharpest key here because it is a permission GRANT rather than a
+# narrowing filter: it auto-approves, for every invocation of that file, tool calls the
+# settings allow/deny policy would have prompted for. The rest of the table is the same
+# executable/config-bearing set :data:`FORBIDDEN_AGENT_KEYS` rejects on a persona wrapper.
+FORBIDDEN_COMMAND_SKILL_KEYS = (
+    "allowed-tools",
+    "permissionMode",
+    "hooks",
+    "mcpServers",
+    "env",
+    "isolation",
+)
+# Why each key is rejected, appended to its message so the report is actionable.
+FORBIDDEN_COMMAND_SKILL_KEY_REASONS = {
+    "allowed-tools": "it GRANTS unprompted tool use for every invocation of this file",
+    "permissionMode": "it switches the permission prompt off for the whole invocation",
+    "hooks": "it runs arbitrary commands on tool events with no permission prompt",
+    "mcpServers": "it launches/connects an external MCP server outside the permission gate",
+    "env": "it overrides the environment of every auto-allowed command (PATH, GIT_*, ...)",
+    "isolation": "it provisions a worktree, running `git worktree add` with no permission "
+                 "prompt — a command the settings allow policy refuses to auto-allow",
+}
+# Same allowlist discipline as the settings and wrapper surfaces, and just as MINIMAL: a
+# tracked slash command is a PROMPT and a tracked SKILL.md is a prompt with a name, so only
+# inert descriptive keys may appear. Anything else — including a key a future Claude Code
+# release adds — is rejected on sight, because an unknown key may grant tool use.
+ALLOWED_COMMAND_KEYS = ("description", "argument-hint", "model")
+ALLOWED_SKILL_KEYS = ("name", "description", "argument-hint", "model")
 
 
 # --- Output helpers ----------------------------------------------------------------------
@@ -1156,6 +1210,103 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
     return problems
 
 
+# --- Check 5: .claude/commands + .claude/skills front matter -----------------------------
+
+def validate_command_skill_frontmatter(
+    path: str, frontmatter: "dict[str, str]", kind: str
+) -> "list[str]":
+    """Return policy problems with one command/skill front matter (empty ⇒ clean).
+
+    ``kind`` is ``"command"`` (a `.claude/commands/**/*.md` slash command, held to
+    :data:`ALLOWED_COMMAND_KEYS`) or ``"skill"`` (a `.claude/skills/**/SKILL.md` manifest,
+    held to :data:`ALLOWED_SKILL_KEYS` — a skill is addressed by its ``name``, a command by
+    its filename). Both are held to the same rejection table,
+    :data:`FORBIDDEN_COMMAND_SKILL_KEYS`, with the specific "why" message winning over the
+    generic unknown-key one.
+    """
+    allowed = ALLOWED_SKILL_KEYS if kind == "skill" else ALLOWED_COMMAND_KEYS
+    problems: "list[str]" = []
+    for key in frontmatter:
+        if key in FORBIDDEN_COMMAND_SKILL_KEYS:
+            reason = FORBIDDEN_COMMAND_SKILL_KEY_REASONS.get(key)
+            because = f" ({reason})" if reason else ""
+            problems.append(
+                f"{kind} file {path!r} defines {key!r}{because}; `allowed-tools` and the "
+                f"other keys in this table grant UNPROMPTED tool use, so they must not live "
+                f"in a tracked file — put the grant in the untracked "
+                f".claude/settings.local.json, or make the file prompt and review the tool "
+                f"call by hand; tracked {kind} files may carry only "
+                f"{', '.join(repr(k) for k in allowed)}"
+            )
+        elif key not in allowed:
+            problems.append(
+                f"{kind} file {path!r} carries unknown front-matter key {key!r}; tracked "
+                f"{kind} files may carry only {', '.join(repr(k) for k in allowed)} — a key "
+                f"this gate does not understand may grant unprompted tool use (as "
+                f"`allowed-tools` does)"
+            )
+    return problems
+
+
+def scan_command_skill_frontmatter(
+    commands_dir: str = DEFAULT_COMMANDS_DIR, skills_dir: str = DEFAULT_SKILLS_DIR
+) -> "tuple[list[str], int, int]":
+    """Return (problems, commands scanned, skills scanned) for the command/skill surface.
+
+    Walks `commands_dir` for every `*.md` (a slash command is any markdown file there) and
+    `skills_dir` for every `SKILL.md` (the manifest; a skill's other markdown files are
+    reference material Claude Code does not read as configuration). The walk is RECURSIVE
+    and uses :func:`os.walk` for the same reason :func:`read_roster` does: `.claude/commands/**`
+    ships nested and dot-prefixed directories, which a recursive ``glob`` would skip, and a
+    command file the gate never opens is exactly the file an `allowed-tools:` grant hides in.
+    Symlinked directories are not followed so a link loop cannot hang the gate.
+
+    A MISSING directory is not an error — neither surface is mandatory (there is no
+    `.claude/commands` today), and the count in the passing report attests to how many files
+    the policy actually covered, so "0 scanned" is visible rather than silently green.
+
+    Each file's front matter is read by the SAME strict reader the roster uses
+    (:func:`_read_frontmatter`), so every spelling a real YAML parser reads as configuration
+    but this gate cannot — a quoted `"allowed-tools":`, `allowed-tools : ...`, a flow
+    mapping, a duplicate key — is a problem rather than a silent skip. A file with NO
+    front-matter fence at all carries no keys and is fine (it is a plain prompt).
+    """
+    problems: "list[str]" = []
+    counts = {"command": 0, "skill": 0}
+    for kind, root in (("command", commands_dir), ("skill", skills_dir)):
+        if not os.path.isdir(root):
+            continue
+        paths: "list[str]" = []
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames.sort()  # deterministic traversal order
+            for filename in filenames:
+                wanted = filename.endswith(".md") if kind == "command" else filename == "SKILL.md"
+                if wanted:
+                    paths.append(os.path.join(dirpath, filename))
+        paths.sort()
+        for path in paths:
+            counts[kind] += 1
+            try:
+                frontmatter, duplicate_keys = _read_frontmatter(path)
+            except FrontmatterError as exc:
+                # Fail CLOSED, exactly as the roster does: front matter this gate cannot read
+                # strictly must cost the same as a policy violation, because Claude Code's
+                # real YAML parser may well read an `allowed-tools:` out of it.
+                problems.append(f"{kind} file {path!r} {exc}")
+                continue
+            if frontmatter is None:
+                continue  # no front-matter fence: a plain prompt, no keys to police
+            for key in duplicate_keys:
+                problems.append(
+                    f"{kind} file {path!r} declares duplicate front-matter key {key!r}; YAML "
+                    f"keeps the LAST value while this gate reads the first, so the policy "
+                    f"would validate a value the CLI never uses — keep exactly one {key!r} "
+                    f"line"
+                )
+            problems.extend(validate_command_skill_frontmatter(path, frontmatter, kind))
+    return problems, counts["command"], counts["skill"]
+
+
 # --- gh plumbing -------------------------------------------------------------------------
 
 def _gh(args: "list[str]", timeout: int = 90) -> "tuple[bool, str, str]":
@@ -1285,6 +1436,25 @@ def settings_result(path: str) -> Result:
     return Result("settings-permissions", "fail" if problems else "pass", problems or detail)
 
 
+def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
+    """Wrap :func:`scan_command_skill_frontmatter` as the "command-skill-frontmatter" check.
+
+    Local and stdlib-only like `settings-permissions`, so it runs identically offline and in
+    CI, and the passing detail line reports HOW MANY files were covered — a path filter or a
+    directory rename that silently empties the scan shows up as "0 scanned", not as a pass.
+    """
+    problems, commands, skills = scan_command_skill_frontmatter(commands_dir, skills_dir)
+    detail = [
+        f"{skills} skill manifest(s) under {skills_dir} and {commands} slash-command file(s) "
+        f"under {commands_dir} scanned: strict front-matter parse, no "
+        f"{'/'.join(FORBIDDEN_COMMAND_SKILL_KEYS)}, no unknown key (commands may carry only "
+        f"{', '.join(ALLOWED_COMMAND_KEYS)}; skills also 'name')"
+    ]
+    return Result(
+        "command-skill-frontmatter", "fail" if problems else "pass", problems or detail
+    )
+
+
 def run_checks(args: argparse.Namespace) -> "list[Result]":
     repo = resolve_repo(args.repo, args.offline)
     ref = resolve_ref(args.ref)
@@ -1331,6 +1501,12 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     # --- Check 4: .claude/settings.json permission surface (local; runs even --offline) ---
     # Placed before the remote checks so a malformed/over-broad permission file fails fast.
     results.append(settings_result(args.settings))
+
+    # --- Check 5: .claude/commands + .claude/skills front matter (local; runs --offline) ---
+    # The third front-matter surface Claude Code reads as configuration. `allowed-tools:` in
+    # a tracked slash-command or SKILL.md file runs a tool with no prompt, and neither the
+    # settings policy nor the wrapper policy above can see it.
+    results.append(command_skill_result(args.commands_dir, args.skills_dir))
 
     # --- Check 1b: roster <-> LIVE persona labels (remote; catches GitHub UI-side drift) ---
     early, labels = _remote_or_skip(
@@ -2518,6 +2694,231 @@ def _selftest() -> int:
             "exit 2 (cannot run) for a MISSING agents dir",
         )
 
+    # --- RS2-F1: the COMMAND/SKILL front-matter surface. A tracked `.claude/commands/<x>.md`
+    # carrying `allowed-tools: Bash(extdiff:*)` was proven to RUN that command with no
+    # permission prompt, while `.claude/commands/**` and `.claude/skills/**` were outside the
+    # workflow path filter, outside this gate, and unmentioned in the CLAUDE.md trust
+    # boundary. The fixtures below cover both file kinds, EVERY entry of both allowlists and
+    # of the rejection table, the strict-reader hand-off, and the walk itself.
+    def _command_problems(body: str, filename: str = "extdiff.md") -> "tuple[list[str], int, int]":
+        with tempfile.TemporaryDirectory() as tmp:
+            commands = os.path.join(tmp, "commands")
+            os.makedirs(os.path.dirname(os.path.join(commands, filename)), exist_ok=True)
+            _wrapper(commands, filename, body)
+            return scan_command_skill_frontmatter(commands, os.path.join(tmp, "absent-skills"))
+
+    def _skill_problems(body: str, skill: str = "demo") -> "tuple[list[str], int, int]":
+        with tempfile.TemporaryDirectory() as tmp:
+            skills = os.path.join(tmp, "skills")
+            os.makedirs(os.path.join(skills, skill), exist_ok=True)
+            _wrapper(os.path.join(skills, skill), "SKILL.md", body)
+            return scan_command_skill_frontmatter(os.path.join(tmp, "absent-commands"), skills)
+
+    # (a) The finding itself, on both surfaces: `allowed-tools:` is rejected, the message
+    # NAMES the file and the key and says where a grant may live instead.
+    _problems, _ncmd, _nskill = _skill_problems(
+        "---\nname: demo\ndescription: d\nallowed-tools: Bash(extdiff:*)\n---\nbody\n"
+    )
+    check(
+        len(_problems) == 1
+        and "SKILL.md" in _problems[0]
+        and "allowed-tools" in _problems[0]
+        and "settings.local.json" in _problems[0]
+        and _nskill == 1,
+        "SKILL.md with allowed-tools is a problem naming the file, the key and the remedy",
+    )
+    _problems, _ncmd, _nskill = _command_problems(
+        "---\ndescription: external diff\nallowed-tools: Bash(extdiff:*)\n---\nbody\n"
+    )
+    check(
+        len(_problems) == 1
+        and "extdiff.md" in _problems[0]
+        and "allowed-tools" in _problems[0]
+        and _ncmd == 1,
+        "slash-command file with allowed-tools is a problem naming the file and the key",
+    )
+    # (b) The clean case must stay clean, or the check is just noise nobody can satisfy.
+    _problems, _ncmd, _nskill = _command_problems("---\ndescription: just a prompt\n---\nbody\n")
+    check(_problems == [] and _ncmd == 1, "command with only a description passes (1 scanned)")
+
+    # (c) The tables are pinned LITERALLY before the loops below are driven by them: a mutant
+    # that shrinks a table would otherwise test a weaker policy and stay green (dropping
+    # `model` from ALLOWED_SKILL_KEYS survived until this guard existed), and a mutant that
+    # WIDENS one would admit a key nothing covers. The reasons table must match the rejection
+    # table exactly, or a key is rejected with no explanation (or an explanation with no key).
+    check(
+        tuple(FORBIDDEN_COMMAND_SKILL_KEYS) == (
+            "allowed-tools",
+            "permissionMode",
+            "hooks",
+            "mcpServers",
+            "env",
+            "isolation",
+        ),
+        "FORBIDDEN_COMMAND_SKILL_KEYS still lists every tool-granting command/skill key",
+    )
+    check(
+        tuple(ALLOWED_COMMAND_KEYS) == ("description", "argument-hint", "model"),
+        "ALLOWED_COMMAND_KEYS still lists exactly the inert slash-command keys",
+    )
+    check(
+        tuple(ALLOWED_SKILL_KEYS) == ("name", "description", "argument-hint", "model"),
+        "ALLOWED_SKILL_KEYS still lists exactly the inert SKILL.md keys",
+    )
+    check(
+        set(FORBIDDEN_COMMAND_SKILL_KEY_REASONS) == set(FORBIDDEN_COMMAND_SKILL_KEYS),
+        "FORBIDDEN_COMMAND_SKILL_KEY_REASONS covers exactly FORBIDDEN_COMMAND_SKILL_KEYS",
+    )
+
+    # EVERY entry of the rejection table reddens, on both kinds. Killing mutant: deleting
+    # any single key from FORBIDDEN_COMMAND_SKILL_KEYS (each would then fall through to the
+    # unknown-key branch for commands, and `permissionMode` on a skill would be UNCHECKED).
+    for _key in FORBIDDEN_COMMAND_SKILL_KEYS:
+        _problems, _, _ = _skill_problems(f"---\nname: demo\n{_key}: x\n---\n")
+        check(
+            len(_problems) == 1 and _key in _problems[0] and "unprompted" in _problems[0].lower(),
+            f"skill front-matter key {_key!r} is rejected with the 'grants unprompted use' message",
+        )
+        _problems, _, _ = _command_problems(f"---\n{_key}: x\n---\n")
+        check(len(_problems) == 1 and _key in _problems[0], f"command front-matter key {_key!r} is rejected")
+
+    # (d) EVERY entry of both allowlists is accepted alone. Killing mutant: dropping a key
+    # from ALLOWED_COMMAND_KEYS / ALLOWED_SKILL_KEYS (the real SKILL.md files would then red).
+    for _key in ALLOWED_COMMAND_KEYS:
+        _problems, _, _ = _command_problems(f"---\n{_key}: value\n---\n")
+        check(_problems == [], f"command front-matter key {_key!r} is allowed")
+    for _key in ALLOWED_SKILL_KEYS:
+        _problems, _, _ = _skill_problems(f"---\n{_key}: value\n---\n")
+        check(_problems == [], f"skill front-matter key {_key!r} is allowed")
+
+    # (e) The two allowlists are DISTINCT: a skill is addressed by its `name:`, a command by
+    # its filename, so `name:` in a command file is an unknown key. Killing mutant: using one
+    # table for both kinds.
+    _problems, _, _ = _command_problems("---\nname: extdiff\n---\n")
+    check(
+        len(_problems) == 1 and "unknown front-matter key" in _problems[0] and "'name'" in _problems[0],
+        "command file may not carry 'name' (the skill-only key) — the tables are distinct",
+    )
+    _problems, _, _ = _skill_problems("---\nname: demo\ntoolsets: x\n---\n")
+    check(len(_problems) == 1 and "toolsets" in _problems[0], "unknown skill key rejected on sight")
+
+    # (f) The strict reader is reused, so the spellings that hid a dangerous key from the old
+    # roster regex (VERIFY-F1) cannot hide one here either. Killing mutant: swapping
+    # _read_frontmatter for a tolerant line scan, or treating FrontmatterError as "skip".
+    _problems, _, _nskill = _skill_problems('---\nname: demo\n"allowed-tools": Bash(rm:*)\n---\n')
+    check(
+        len(_problems) == 1 and "cannot parse strictly" in _problems[0] and _nskill == 1,
+        "unparseable SKILL.md fence (quoted key) is a problem, not a silent skip",
+    )
+    _problems, _, _ = _skill_problems("---\nname: demo\nallowed-tools : Bash(rm:*)\n")
+    check(
+        len(_problems) == 1 and "cannot parse strictly" in _problems[0],
+        "SKILL.md whose fence is never closed is a problem",
+    )
+    _problems, _, _ = _command_problems("---\ndescription: a\ndescription: b\n---\n")
+    check(
+        len(_problems) == 1 and "duplicate front-matter key" in _problems[0],
+        "duplicate command front-matter key reported (YAML is last-wins, this reader first-wins)",
+    )
+    _problems, _ncmd, _ = _command_problems("no front matter at all\n")
+    check(_problems == [] and _ncmd == 1, "fence-less command file is scanned and clean")
+
+    # (g) THE WALK. `.claude/commands/**` ships nested and dot-prefixed directories, so a
+    # non-recursive or glob-based scan would leave an `allowed-tools:` file uncovered while
+    # the CLI still loaded it. Killing mutant: replacing os.walk with a flat listdir/glob.
+    with tempfile.TemporaryDirectory() as tmp:
+        _commands = os.path.join(tmp, "commands", ".hidden", "deep")
+        os.makedirs(_commands, exist_ok=True)
+        _wrapper(_commands, "nested.md", "---\nallowed-tools: Bash(rm:*)\n---\n")
+        _skills = os.path.join(tmp, "skills", "grp", "demo")
+        os.makedirs(_skills, exist_ok=True)
+        _wrapper(_skills, "SKILL.md", "---\nname: demo\nallowed-tools: Bash(rm:*)\n---\n")
+        _wrapper(_skills, "reference.md", "---\nallowed-tools: Bash(rm:*)\n---\n")
+        _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
+            os.path.join(tmp, "commands"), os.path.join(tmp, "skills")
+        )
+        check(
+            _ncmd == 1 and _nskill == 1 and len(_problems) == 2,
+            "walk reaches nested/dot-prefixed command files and nested SKILL.md (both policed)",
+        )
+        check(
+            not any("reference.md" in problem for problem in _problems),
+            "a skill's non-manifest markdown is reference material, not scanned",
+        )
+    # (h) Both directories are OPTIONAL (there is no .claude/commands today): a missing one
+    # must not raise, and must report 0 scanned rather than a silent pass over nothing.
+    with tempfile.TemporaryDirectory() as tmp:
+        _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
+            os.path.join(tmp, "none"), os.path.join(tmp, "none-either")
+        )
+        check(
+            _problems == [] and _ncmd == 0 and _nskill == 0,
+            "missing commands/skills directories are not an error (0 scanned, reported)",
+        )
+
+    # (i) The REAL tracked skills must pass this policy, and the check must report as a
+    # named, reddening Result — the gate is only useful if it runs on the shipped files.
+    if os.path.isdir(DEFAULT_SKILLS_DIR):
+        _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
+            DEFAULT_COMMANDS_DIR, DEFAULT_SKILLS_DIR
+        )
+        check(
+            _problems == [] and _nskill >= 1,
+            f"the {_nskill} tracked {DEFAULT_SKILLS_DIR}/*/SKILL.md file(s) satisfy the policy",
+        )
+    with tempfile.TemporaryDirectory() as tmp:
+        _commands = os.path.join(tmp, "commands")
+        os.makedirs(_commands, exist_ok=True)
+        _wrapper(_commands, "clean.md", "---\ndescription: prompt\n---\n")
+        _clean_result = command_skill_result(_commands, os.path.join(tmp, "absent"))
+        _wrapper(_commands, "dirty.md", "---\nallowed-tools: Bash(extdiff:*)\n---\n")
+        _dirty_result = command_skill_result(_commands, os.path.join(tmp, "absent"))
+        check(
+            _clean_result.name == "command-skill-frontmatter" and _clean_result.status == "pass",
+            "command-skill-frontmatter check passes on a clean commands/skills tree",
+        )
+        check(
+            _dirty_result.status == "fail"
+            and any("allowed-tools" in line for line in _dirty_result.lines),
+            "command-skill-frontmatter check FAILS on an allowed-tools grant",
+        )
+
+    # (j) The check is WIRED INTO the gate, not merely importable: run_checks must emit it in
+    # the summary and a violation must redden the run. Killing mutant: deleting the
+    # `results.append(command_skill_result(...))` line — every fixture above would still pass
+    # while the real gate covered nothing. The summary text is asserted rather than the exit
+    # code so an unrelated pre-existing failure in this repo cannot make the assertion
+    # vacuous. Needs the real roster/taxonomy (i.e. a run from the repo root); skipped
+    # elsewhere rather than reported as a false failure.
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+        with tempfile.TemporaryDirectory() as tmp:
+            _dirty_skills = os.path.join(tmp, "skills", "evil")
+            os.makedirs(_dirty_skills, exist_ok=True)
+            _wrapper(_dirty_skills, "SKILL.md", "---\nname: evil\nallowed-tools: Bash(rm:*)\n---\n")
+            _buffer = io.StringIO()
+            with contextlib.redirect_stdout(_buffer):
+                _exit = main(
+                    [
+                        "--offline",
+                        "--repo",
+                        DEFAULT_REPO,
+                        "--skills-dir",
+                        os.path.join(tmp, "skills"),
+                    ]
+                )
+            _output = _buffer.getvalue()
+            check(
+                "[FAIL] command-skill-frontmatter" in _output and _exit == 1,
+                "run_checks reports command-skill-frontmatter and an allowed-tools grant exits 1",
+            )
+            _buffer = io.StringIO()
+            with contextlib.redirect_stdout(_buffer):
+                main(["--offline", "--repo", DEFAULT_REPO, "--skills-dir", DEFAULT_SKILLS_DIR])
+            check(
+                "[PASS] command-skill-frontmatter" in _buffer.getvalue(),
+                "the tracked .claude/skills tree passes the check inside a full gate run",
+            )
+
     # --- Finding 7a: resolve_repo must NOT shell out to gh under --offline.
     mod = sys.modules[__name__]
     original_gh = mod._gh
@@ -2558,6 +2959,18 @@ def main(argv: "list[str] | None" = None) -> int:
     )
     parser.add_argument("--repo", default=None, help="OWNER/REPO (default: env or gh or khaines/deltasharp)")
     parser.add_argument("--agents-dir", default=DEFAULT_AGENTS_DIR)
+    parser.add_argument(
+        "--commands-dir",
+        default=DEFAULT_COMMANDS_DIR,
+        help="directory of slash-command markdown files whose front matter is policed "
+        f"(default: {DEFAULT_COMMANDS_DIR}; absent is fine)",
+    )
+    parser.add_argument(
+        "--skills-dir",
+        default=DEFAULT_SKILLS_DIR,
+        help="directory of skills whose SKILL.md front matter is policed "
+        f"(default: {DEFAULT_SKILLS_DIR}; absent is fine)",
+    )
     parser.add_argument("--feature-form", default=DEFAULT_FEATURE_FORM)
     parser.add_argument("--taxonomy", default=DEFAULT_TAXONOMY)
     parser.add_argument(
