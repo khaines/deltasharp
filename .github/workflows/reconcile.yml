@@ -121,11 +121,20 @@ name: Reconcile
 #                          and a run with any SKIP ends on a qualified success line, never
 #                          the unqualified "are in step" claim.
 #
+# A sixth local check, `copilot-frontmatter`, applies the same policy to the GENERATED
+# Copilot mirror (`.github/agents/*.agent.md`, `.github/skills/**/SKILL.md`): strict front
+# matter (only `name`/`description`/`tools`, `model` rejected by name), stem matches `name:`,
+# an empty tree is drift, and the same tracked-symlink/gitlink/case-fold question over
+# `.github` — scoped to the AI-config children and the root ENTRY only, so `.github/workflows`,
+# `CODEOWNERS`, `ISSUE_TEMPLATE` and `dependabot.yml` are deliberately NOT policed here. It
+# checks SHAPE; whether the mirror still matches its source is the generator step above.
+#
 # It runs on every pull request TARGETING `main` and every push to `main` (drift introduced
 # by a code change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a
 # label or milestone renamed in the UI, which is not a file change). There is deliberately NO
 # `paths:` filter: GitHub's path filters are case-SENSITIVE and cannot express the folding a
-# macOS/Windows checkout performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or
+# macOS/Windows checkout performs, so a PR adding only `.Claude/hooks`, `.GitHub/agents`,
+# `.MCP.json` or
 # `.mcp.jſon` — exactly the shapes the gate now fails — would never have triggered it
 # (PR-901 second round, RT-3). The job is stdlib Python with no build, so running it always
 # costs less than a filter that cannot enforce the rule. The gate is intentionally NOT a
@@ -176,6 +185,22 @@ jobs:
       # runs before the live checks so a malformed permission file fails fast.
       - name: Validate .claude/settings.json
         run: python3 tools/reconcile/roster-labels.py --validate-settings-only
+
+      # The Copilot tree (.github/agents, .github/skills, .github/copilot-instructions.md) is
+      # GENERATED from the canonical .claude/** and CLAUDE.md, so a hand-edit there is drift
+      # that no amount of front-matter policing would notice: the file would be perfectly
+      # well-formed and simply disagree with its source. The generator owns that question
+      # (roster-labels.py owns config SECURITY, this owns SYNC), so it carries its own
+      # self-test on the same terms as the gate's. --require-full-coverage for the same reason:
+      # in CI a skipped fixture group is indistinguishable from one that stopped building.
+      - name: Copilot generator self-test
+        run: python3 tools/aiconfig/generate-copilot.py --selftest --require-full-coverage
+
+      # Exit 1 = STALE (edit .claude/** and re-run the generator with --write, never hand-edit
+      # .github/**); exit 2 = COULD NOT VERIFY (a missing canonical tree, an unreadable
+      # override) which must never read as "in sync". The diff of every stale file is printed.
+      - name: Copilot config is in sync
+        run: python3 tools/aiconfig/generate-copilot.py --check
 
       # The live checks read public repo metadata (labels, milestones, codeowners/errors) via
       # the GitHub CLI using the default read-only token. --require-remote makes a lookup that

@@ -50,7 +50,8 @@ dotnet test --filter "FullyQualifiedName~DataFrameTests"
 dotnet test --filter "Name=Select_ProjectsColumns"
 ```
 
-> See `CLAUDE.md` for the conventions summary and `docs/adr/` for the current
+> See `CLAUDE.md` (or its generated Copilot mirror,
+> `.github/copilot-instructions.md`) for the conventions summary and `docs/adr/` for the current
 > architecture.
 
 ## Project layout
@@ -70,7 +71,8 @@ dotnet test --filter "Name=Select_ProjectsColumns"
   format`; keep public-AOT/trim annotations clean (see the
   `dotnet-library-platform-engineer` conventions). Run `dotnet format` to fix
   formatting locally before pushing.
-- Mirror the Apache Spark public API where practical (see `CLAUDE.md`);
+- Mirror the Apache Spark public API where practical (see `CLAUDE.md`, or
+  `.github/copilot-instructions.md` if you work through Copilot);
   document any deliberate deviation.
 - Preserve the engine invariant: **transformations are lazy, actions are eager.**
 

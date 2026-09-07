@@ -141,6 +141,22 @@ state. The same fold decides file *names*, in the walks as well as the index:
 CLI loads, so it is scanned like any other manifest and the index may hold only the
 canonical `SKILL.md` spelling.
 
+**The generated Copilot tree.** `.github/agents/*.agent.md`, `.github/skills/**` and
+`.github/copilot-instructions.md` are generated from `.claude/**` and this file by
+`tools/aiconfig/generate-copilot.py` — edit the canonical tree and re-run it with `--write`;
+never hand-edit the mirror. Those files are read and executed by Copilot on the same machines,
+so they sit inside the same C7 trust boundary, and a sixth check, `copilot-frontmatter`, holds
+them to the same policy: strict front matter (a wrapper may carry only
+`name`/`description`/`tools`, a manifest only `name`/`description`, with `model` rejected by
+name), the filename stem matching `name:`, an empty tree treated as drift, and the same
+tracked-symlink/gitlink/case-fold question over `.github`. That question is scoped to the three
+AI-config children plus the `.github` root ENTRY (so a link or submodule *at* `.github` cannot
+hide the tree behind it) and deliberately **not** to `.github/workflows`, `CODEOWNERS`,
+`ISSUE_TEMPLATE` or `dependabot.yml`, which are reviewed on their own path. Whether the mirror
+still matches its source is a separate workflow step,
+`tools/aiconfig/generate-copilot.py --check`: this gate owns configuration security, the
+generator owns sync.
+
 Three checks ask the `.claude` question — the roster walk in
 `roster<->documented-labels`, both front-matter walks in
 `command-skill-frontmatter`, and `tracked-startup-config` (which also owns

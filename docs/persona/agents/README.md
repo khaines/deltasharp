@@ -11,18 +11,18 @@ Kubernetes Operator execution model. `labtested-storage` (a multi-tenant storage
 
 Persona research documents (in `../research/`) define the skills, behaviors,
 traits, and knowledge for each role. These agent specs turn that research into
-reusable operating profiles that can be loaded by an AI runtime (Claude Code
-today) without rewriting the underlying role logic each time. The library exists
-to drive **project timelines, implementations, and reviews** with consistent,
-high-judgment roles.
+reusable operating profiles that can be loaded by different AI runtimes (Claude
+Code and GitHub Copilot) without rewriting the underlying role logic each time.
+The library exists to drive **project timelines, implementations, and reviews**
+with consistent, high-judgment roles.
 
 ## Agents vs. skills
 
 - **Agents** are role-shaped personas with goals, judgment, tone, boundaries, and
   preferred outputs (this directory).
 - **Skills** are narrower reusable capabilities that multiple agents share (see
-  `.claude/skills/`: `design-doc`, `implement-work-item`, `review-fix-loop`,
-  `review-pr`, `stacked-pr-chain`).
+  `.claude/skills/`, mirrored to `.github/skills/`: `design-doc`,
+  `implement-work-item`, `review-fix-loop`, `review-pr`, `stacked-pr-chain`).
 
 ## Source of truth and wrappers
 
@@ -31,9 +31,38 @@ high-judgment roles.
 | Canonical specs | Human-readable source of truth for the role | `docs/persona/agents/*-agent.md` |
 | Research docs | Deep-dive research backing the canonical specs | `docs/persona/research/*.md` |
 | Claude wrappers | Claude Code project subagents derived from the canonical role | `.claude/agents/*.md` |
+| Copilot wrappers | GitHub Copilot custom agent profiles, **generated** from the Claude wrappers | `.github/agents/*.agent.md` |
 
 Wrappers are lightweight pointers to the canonical spec. If a wrapper and its
 canonical spec drift, the canonical spec wins.
+
+### Generated mirrors
+
+`.claude/**` and `CLAUDE.md` are canonical. The Copilot tree —
+`.github/agents/*.agent.md`, `.github/skills/**` and
+`.github/copilot-instructions.md` — is **generated** from them by
+`tools/aiconfig/generate-copilot.py` and committed.
+
+**Edit `.claude/`, never `.github/`.** Then re-run:
+
+```bash
+python3 tools/aiconfig/generate-copilot.py --write
+```
+
+A hand-edit to the generated tree is reverted by the next run, and fails the
+`reconcile` workflow's sync step (`--check`) and its `copilot-frontmatter` check
+in the meantime. Both trees were hand-maintained before the generator existed and
+had drifted apart on 16 of 25 personas, which is what the generator prevents.
+
+Mechanical differences (paths, `agent_type`, the `.agent.md` suffix) come from
+`tools/aiconfig/copilot/substitutions.json`. Text that must genuinely *differ*
+between runtimes is marked in the canonical file with
+`<!-- ai:block <id> -->` … `<!-- ai:endblock <id> -->` and supplied from
+`tools/aiconfig/copilot/blocks/<canonical-path>/<id>.md`. The main such
+difference today is the review council's red-team gate: Claude Code dispatches
+Claude models only, so its gate decorrelates by *tier*, while the Copilot council
+runs the **vendor-decorrelated** gate and is the documented re-run for
+protected-domain changes.
 
 ## DeltaSharp domain canon
 

@@ -166,8 +166,15 @@ labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
 (STORY-00.6.2, #452). The gate is the stdlib-only script
 [`tools/reconcile/roster-labels.py`](../../tools/reconcile/roster-labels.py), run by
 the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
-of three reconciliations or the three local validations (`settings-permissions`,
-`command-skill-frontmatter`, `tracked-startup-config`) breaks:
+of three reconciliations or the four local validations (`settings-permissions`,
+`command-skill-frontmatter`, `copilot-frontmatter`, `tracked-startup-config`) breaks:
+
+> **One roster, one mirror.** The roster is `.claude/agents/` and only that. The Copilot
+> tree `.github/agents/*.agent.md` is **generated** from it by
+> `tools/aiconfig/generate-copilot.py`, so it is not reconciled against the persona labels —
+> its slug set is a function of the roster once the generator's own `--check` step passes, and
+> reconciling it too would double-report every drift with two different remedies. It is still
+> policed for shape and for tracked links by `copilot-frontmatter`.
 
 1. **Roster ↔ persona labels** (two checks at runtime: `roster<->documented-labels`
    against the committed list below, and `roster<->live-labels` against GitHub).
