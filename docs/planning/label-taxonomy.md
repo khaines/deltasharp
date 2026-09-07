@@ -231,8 +231,9 @@ of three reconciliations or the two local validations (`settings-permissions`,
    both with the same strict reader (an unparseable fence fails) and rejects
    `allowed-tools`, `permissionMode`, `hooks`, `mcpServers`, `env`, and `isolation`
    by name, plus any key outside `description`/`argument-hint`/`model` (skills may
-   also carry `name`). Both directories are optional; the passing report states how
-   many files were scanned, so an empty scan is visible rather than silently green.
+   also carry `name`). `.claude/commands/` is optional; `.claude/skills/` is not — a
+   skills tree that yields zero manifests fails the check, and the passing report
+   states how many files were scanned.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance
 files (roster, `.claude/commands/`, `.claude/skills/`, `CODEOWNERS`, the feature

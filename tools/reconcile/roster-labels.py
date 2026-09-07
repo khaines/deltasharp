@@ -1269,9 +1269,10 @@ def scan_command_skill_frontmatter(
     command file the gate never opens is exactly the file an `allowed-tools:` grant hides in.
     Symlinked directories are not followed so a link loop cannot hang the gate.
 
-    A MISSING directory is not an error — neither surface is mandatory (there is no
-    `.claude/commands` today), and the count in the passing report attests to how many files
-    the policy actually covered, so "0 scanned" is visible rather than silently green.
+    A MISSING directory does not raise here — this scanner only counts. The CALLER
+    (`command_skill_result`) turns zero skill manifests into a failure, because the repo
+    tracks `.claude/skills`; `.claude/commands` stays optional (nothing tracked lives there
+    today). The counts in the passing report attest to how many files the policy covered.
 
     Each file's front matter is read by the SAME strict reader the roster uses
     (:func:`_read_frontmatter`), so every spelling a real YAML parser reads as configuration
