@@ -90,6 +90,14 @@ do not reason about them.
    - a **claim only *execution* can falsify** — a config that passes validation but fails at
      runtime; a CHANGELOG/migration note whose stated behavior the code contradicts; an
      allowlist/exemption that silently never matches (or matches too much). **RUN it.**
+   - a **config-surface bypass** (PR #901) — a gate over a startup-config surface that asks
+     the *filesystem* what git *tracks*: a tracked symlink, gitlink (git mode `120000` /
+     `160000`), or case- / Unicode-folded spelling (`.Claude/`, `ſkill.md`, `.mcp.jſon`)
+     that is absent or empty in CI yet loads on a developer machine; a git query run from
+     inside the directory under test, trusting ambient `GIT_*` env or a pathspec-magic
+     prefix, or comparing names with `.lower()` where the filesystem uses `casefold()`.
+     For every fold / scope / coverage claim, execute BOTH halves (index and walk) and
+     re-run the previous tip's fixture set — a fix applied to one half certifies nothing.
 3. Re-read the actual files; do not trust the other seats' reading. Cite `file:line` +
    EVIDENCE.
 4. **In a fix-loop (round ≥2):** treat every hunk changed since the previous review as
