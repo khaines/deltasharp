@@ -14,16 +14,21 @@ name: Reconcile
 #                          milestones (plus the documented "needs triage" sentinel).
 #   * settings-permissions (a VALIDATION, not a reconciliation) — .claude/settings.json stays
 #                          parseable and permissions.allow/deny stay LISTS of plain strings.
-#                          It then rejects: the enumerated mutating git/gh prefixes in
+#                          The file is a positive ALLOWLIST: only `$schema`, `permissions`
+#                          and the listed inert keys may appear at top level, and
+#                          `permissions` may hold only allow/deny/defaultMode — so every
+#                          executable-valued key (`hooks`, `env`, `apiKeyHelper`,
+#                          `statusLine`, the AWS/GCP/proxy helpers, ...) and
+#                          permissions.additionalDirectories are rejected by name, and a
+#                          defaultMode of bypassPermissions/dontAsk is rejected. In `allow`
+#                          it rejects the enumerated mutating git/gh prefixes in
 #                          FORBIDDEN_ALLOW_COMMANDS (`gh api`, `git push`, `gh pr merge`, ...
-#                          — including via a broad `Bash(gh:*)`); any wildcard or TOOL-WIDE
-#                          Bash grant (`Bash`, `Bash()`, `Bash(*)`, and `Bash(gh *)` — an
-#                          unescaped `*` is matched as a GLOB); a permissions.defaultMode of
-#                          bypassPermissions/dontAsk; a top-level `hooks` block; and
-#                          permissions.additionalDirectories. It also requires every deny
-#                          entry. Allow entries outside those rules are NOT policed — the
-#                          check bounds the file's blast radius, it does not certify the whole
-#                          permission surface. Implemented in
+#                          compared CASE-INSENSITIVELY, including via a broad `Bash(gh:*)`)
+#                          and any wildcard or TOOL-WIDE Bash grant (`Bash`, `Bash()`,
+#                          `Bash(*)`, `Bash(gh *)` — an unescaped `*` is matched as a GLOB).
+#                          It also requires every deny entry. Allow entries outside those
+#                          rules are NOT policed — the check bounds the file's blast radius,
+#                          it does not certify the whole permission surface. Implemented in
 #                          tools/reconcile/roster-labels.py (validate_settings), so it is
 #                          self-tested and mutation-checked like the reconciliations above.
 #
