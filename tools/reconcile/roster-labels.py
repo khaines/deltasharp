@@ -1451,10 +1451,21 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
     """Wrap :func:`scan_command_skill_frontmatter` as the "command-skill-frontmatter" check.
 
     Local and stdlib-only like `settings-permissions`, so it runs identically offline and in
-    CI, and the passing detail line reports HOW MANY files were covered — a path filter or a
-    directory rename that silently empties the scan shows up as "0 scanned", not as a pass.
+    CI, and the passing detail line reports HOW MANY files were covered. A skills tree that
+    yields zero manifests FAILS the check (the repo tracks .claude/skills), so a rename that
+    empties the scan reddens the gate instead of passing with "0 scanned".
     """
     problems, commands, skills = scan_command_skill_frontmatter(commands_dir, skills_dir)
+    # The repo TRACKS .claude/skills, so a vanished or empty skills tree is drift, not "0
+    # scanned, pass": a directory rename (this PR itself moved .github/skills there) must
+    # redden the gate rather than silently reduce coverage to nothing. .claude/commands
+    # stays optional because nothing tracked lives there yet.
+    if skills == 0:
+        problems = problems + [
+            f"no SKILL.md manifest found under {skills_dir!r} — the repo tracks its skills "
+            f"there, so an empty or missing skills tree means the scan covered nothing "
+            f"(directory moved or renamed?); fix the path or pass --skills-dir"
+        ]
     detail = [
         f"{skills} skill manifest(s) under {skills_dir} and {commands} slash-command file(s) "
         f"under {commands_dir} scanned: strict front-matter parse, no "
@@ -2736,6 +2747,15 @@ def _selftest() -> int:
         _p, _c, _k = scan_command_skill_frontmatter(os.path.join(_tmp, "absent"), _skills)
         check(_k == 1 and any("allowed-tools" in x and "skill.md" in x for x in _p),
               "a lowercase `skill.md` manifest is scanned and its allowed-tools grant rejected")
+    # Roster walk: an `.MD` wrapper is scanned too. Killing mutant: `filename.endswith(".md")`.
+    with tempfile.TemporaryDirectory() as _tmp:
+        _agents = os.path.join(_tmp, "agents")
+        os.makedirs(_agents, exist_ok=True)
+        _wrapper(_agents, "ok.md", "---\nname: ok\n---\n")
+        _wrapper(_agents, "shout.MD", "---\nname: shout\npermissionMode: bypassPermissions\n---\n")
+        _s, _p, _n = read_roster(_agents)
+        check(any("shout.MD" in x and "permissionMode" in x for x in _p),
+              "an upper-case `.MD` wrapper is walked and its permissionMode rejected")
     _problems, _ncmd, _nskill = _command_problems(
         "---\ndescription: d\nallowed-tools: Bash(id:*)\n---\nbody\n", filename="probe.MD"
     )
@@ -2886,12 +2906,21 @@ def _selftest() -> int:
         )
         check(
             _problems == [] and _ncmd == 0 and _nskill == 0,
-            "missing commands/skills directories are not an error (0 scanned, reported)",
+            "missing commands/skills directories scan as 0 (the scan itself does not raise)",
+        )
+        # ...but the RESULT wrapper treats zero skill manifests as drift. Killing mutant:
+        # drop the `if skills == 0` block in command_skill_result.
+        _res = command_skill_result(os.path.join(_tmp, "no-commands"), os.path.join(_tmp, "no-skills"))
+        check(
+            _res.status == "fail" and any("no SKILL.md manifest found" in d for d in _res.lines),
+            "command-skill-frontmatter FAILS when the skills tree yields zero manifests",
         )
 
     # (i) The REAL tracked skills must pass this policy, and the check must report as a
     # named, reddening Result — the gate is only useful if it runs on the shipped files.
-    if os.path.isdir(DEFAULT_SKILLS_DIR):
+    # Deliberately NOT guarded on isdir(DEFAULT_SKILLS_DIR): if the tracked skills tree
+    # vanished, this assertion must redden --selftest rather than silently skip (SRE CERT).
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
         _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
             DEFAULT_COMMANDS_DIR, DEFAULT_SKILLS_DIR
         )
@@ -2903,9 +2932,14 @@ def _selftest() -> int:
         _commands = os.path.join(tmp, "commands")
         os.makedirs(_commands, exist_ok=True)
         _wrapper(_commands, "clean.md", "---\ndescription: prompt\n---\n")
-        _clean_result = command_skill_result(_commands, os.path.join(tmp, "absent"))
+        # A clean tree needs at least one skill manifest: zero manifests is drift (the repo
+        # tracks .claude/skills), so give the fixture one compliant SKILL.md.
+        _skills_ok = os.path.join(tmp, "skills")
+        os.makedirs(os.path.join(_skills_ok, "demo"), exist_ok=True)
+        _wrapper(os.path.join(_skills_ok, "demo"), "SKILL.md", "---\nname: demo\ndescription: d\n---\n")
+        _clean_result = command_skill_result(_commands, _skills_ok)
         _wrapper(_commands, "dirty.md", "---\nallowed-tools: Bash(extdiff:*)\n---\n")
-        _dirty_result = command_skill_result(_commands, os.path.join(tmp, "absent"))
+        _dirty_result = command_skill_result(_commands, _skills_ok)
         check(
             _clean_result.name == "command-skill-frontmatter" and _clean_result.status == "pass",
             "command-skill-frontmatter check passes on a clean commands/skills tree",

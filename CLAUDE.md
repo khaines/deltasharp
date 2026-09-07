@@ -104,7 +104,9 @@ Any other front-matter key, and front matter the strict reader cannot parse
 Slash-command files in `.claude/commands/` and `SKILL.md` front matter can grant
 unprompted tool use via `allowed-tools`, so the gate rejects that key (and
 `permissionMode`, `hooks`, `mcpServers`, `env`, `isolation`) in tracked command
-and skill files.
+and skill files, along with any key outside `description`/`argument-hint`/`model`
+(skills also `name`); front matter the strict reader cannot parse fails the same
+way, and a skills tree with no manifest is drift, not a pass.
 
 ## Architecture — the big picture
 

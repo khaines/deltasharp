@@ -206,7 +206,9 @@ of three reconciliations or the two local validations (`settings-permissions`,
    the live **open** GitHub milestones plus the documented `Unsure / needs triage`
    sentinel. A stale/renamed option, or a live milestone missing from the dropdown,
    fails.
-4. **`settings-permissions`** (a validation, not a reconciliation). It holds
+4. **`settings-permissions`** (a validation, not a reconciliation). The file
+   must parse as JSON, `permissions` must be an object, and `allow`/`deny` must
+   be lists of plain strings (the list type is checked before iteration). It holds
    `.claude/settings.json` to a positive allowlist: the top level may contain only
    `$schema`, `permissions`, and inert keys (`model`, `cleanupPeriodDays`,
    `includeCoAuthoredBy`, `attribution`, `outputStyle`, `language`,
@@ -235,9 +237,9 @@ of three reconciliations or the two local validations (`settings-permissions`,
 **When it runs.** On pull requests and pushes to `main` that touch the governance
 files (roster, `.claude/commands/`, `.claude/skills/`, `CODEOWNERS`, the feature
 form, `.claude/settings.json`, this document, the script, or the workflow), on a
-weekly schedule, and on demand — the schedule catches drift introduced GitHub-side (a label or milestone renamed in the
-UI), which no file change would otherwise trigger. It uses a least-privilege
-read-only token
+weekly schedule, and on demand — the schedule catches drift introduced
+GitHub-side (a label or milestone renamed in the UI), which no file change would
+otherwise trigger. It uses a least-privilege read-only token
 (`permissions: contents: read`; the default token suffices for labels, milestones, and
 CODEOWNERS on a public repo) and pins its one action by commit SHA.
 
