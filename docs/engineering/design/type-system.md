@@ -32,7 +32,7 @@ EPIC-04 concern and is intentionally **not** exposed from `DeltaSharp.Core` here
    so Spark concepts port over and DeltaSharp can read/write the same schema strings Delta
    stores (checklist 15).
 2. **Determinism.** Equality and hashing are structural and **process-independent** so
-   planning, caching, and tests are reproducible (`.github/copilot-instructions.md`).
+   planning, caching, and tests are reproducible (`CLAUDE.md`).
 3. **A clean physical seam.** A single `DataType → PhysicalLayout` query that the columnar and
    row layers consume, with an explicit *unsupported* path.
 4. **AOT/trim cleanliness.** No reflection-based serialization; the engine's trim/AOT analyzers

@@ -2,7 +2,7 @@
 
 > **Scope:** Public `SparkSession`, `DataFrame`, `Dataset<T>`, `Column`, SQL, functions, reader/writer, configuration, and migration-facing behavior.
 > **Priority:** HIGH.
-> **Owners:** developer-experience-api-engineer, sql-language-frontend-engineer, query-execution-engine-engineer. **Grounded in:** `.github/copilot-instructions.md`, ADR-0007, ADR-0008, [16](16-catalyst-planning-checklist.md), [20](20-developer-experience-api-checklist.md).
+> **Owners:** developer-experience-api-engineer, sql-language-frontend-engineer, query-execution-engine-engineer. **Grounded in:** `CLAUDE.md`, ADR-0007, ADR-0008, [16](16-catalyst-planning-checklist.md), [20](20-developer-experience-api-checklist.md).
 
 ## How to use
 Use this checklist for any user-visible API or semantic change. Spark compatibility is a protected domain in the review rubric: broken Spark semantics or lazy/eager behavior can be Critical.
@@ -79,7 +79,7 @@ Use this checklist for any user-visible API or semantic change. Spark compatibil
 - Breaking public API changes without deprecation, migration path, or [20](20-developer-experience-api-checklist.md) review.
 
 ## References
-- [DeltaSharp Copilot Instructions](../../../.github/copilot-instructions.md)
+- [DeltaSharp Copilot Instructions](../../../CLAUDE.md)
 - [ADR-0007: SQL frontend — parser and dialect](../../adr/0007-sql-frontend.md)
 - [ADR-0008: Type system and internal row/value representation](../../adr/0008-type-system-row-format.md)
 - [16 — Catalyst Planning Checklist](16-catalyst-planning-checklist.md)

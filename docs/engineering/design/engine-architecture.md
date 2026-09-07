@@ -4,7 +4,7 @@ This document stitches DeltaSharp's foundational engineering decisions into one
 picture. It is a **summary that defers to the ADRs** in
 [`docs/adr/`](../../adr/README.md) — if this overview and an ADR disagree, the ADR
 wins. The high-level pillars (Spark parity, native Delta, Kubernetes-native) live
-in `.github/copilot-instructions.md`.
+in `CLAUDE.md`.
 
 ## Decision ledger
 

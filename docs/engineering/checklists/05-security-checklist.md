@@ -2,7 +2,7 @@
 
 > **Scope:** Authentication, authorization, secrets, driver/executor transport, storage access, SQL input handling, supply chain, telemetry, incident response, and any code or manifests crossing a trust boundary.
 > **Priority:** CRITICAL.
-> **Owners:** cloud-native-security-sme, kubernetes-operator-controller-engineer, dotnet-distributed-execution-engineer. **Grounded in:** `.github/copilot-instructions.md`, `SECURITY.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009, ADR-0014.
+> **Owners:** cloud-native-security-sme, kubernetes-operator-controller-engineer, dotnet-distributed-execution-engineer. **Grounded in:** `CLAUDE.md`, `SECURITY.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009, ADR-0014.
 
 ## How to use
 Apply this checklist to every change that can affect credentials, identities, network paths, storage paths, SQL/query text, container artifacts, CRDs, or observability. Treat injection, auth bypass, credential exposure, and cross-tenant access as Critical; cross-check 14 for isolation and 18 for operator controls.

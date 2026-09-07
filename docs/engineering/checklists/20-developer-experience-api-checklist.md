@@ -2,7 +2,7 @@
 
 > **Scope:** Public API ergonomics, IntelliSense, XML docs, nullable annotations, async action APIs, diagnostics, lifecycle attributes, samples, quickstarts, migration guides, and API stability gates.
 > **Priority:** STANDARD.
-> **Owners:** developer-experience-api-engineer, dotnet-library-platform-engineer, technical-writer. **Grounded in:** `.github/copilot-instructions.md`, `developer-experience-api-engineer-agent.md`, [15](15-spark-api-parity-checklist.md), [16](16-catalyst-planning-checklist.md).
+> **Owners:** developer-experience-api-engineer, dotnet-library-platform-engineer, technical-writer. **Grounded in:** `CLAUDE.md`, `developer-experience-api-engineer-agent.md`, [15](15-spark-api-parity-checklist.md), [16](16-catalyst-planning-checklist.md).
 
 ## How to use
 Use this checklist for any PR that changes user-facing APIs or developer-facing documentation. Review Spark parity and idiomatic .NET ergonomics together; packaging mechanics remain in 03a/library-platform unless they directly gate API stability.
@@ -89,7 +89,7 @@ Use this checklist for any PR that changes user-facing APIs or developer-facing 
 - Public APIs leaking internal execution backends, vector formats, protobuf messages, or Kubernetes plumbing by accident.
 
 ## References
-- [DeltaSharp Copilot Instructions](../../../.github/copilot-instructions.md)
+- [DeltaSharp Copilot Instructions](../../../CLAUDE.md)
 - [15 — Spark API Parity Checklist](15-spark-api-parity-checklist.md)
 - [16 — Catalyst Planning Checklist](16-catalyst-planning-checklist.md)
 - [Developer Experience & API Engineer Agent](../../persona/agents/developer-experience-api-engineer-agent.md)

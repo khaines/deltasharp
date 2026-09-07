@@ -2,7 +2,7 @@
 
 > **Scope:** Fast isolated xUnit-style tests for C# APIs, plan nodes, analyzer/optimizer rules, expressions, type coercion, async/disposal units, and storage/operator test doubles.
 > **Priority:** HIGH.
-> **Owners:** reliability-test-chaos-engineer, query-execution-engine-engineer, dotnet-framework-runtime-engineer. **Grounded in:** build-test-config, `.github/copilot-instructions.md`, ADR-0001, ADR-0013, 04 testing checklist.
+> **Owners:** reliability-test-chaos-engineer, query-execution-engine-engineer, dotnet-framework-runtime-engineer. **Grounded in:** build-test-config, `CLAUDE.md`, ADR-0001, ADR-0013, 04 testing checklist.
 
 ## How to use
 Use unit tests to lock down semantics before introducing distributed or storage infrastructure. A unit test should run quickly, isolate one behavior, and fail with enough context to fix the implementation without guessing.
@@ -74,6 +74,6 @@ Use unit tests to lock down semantics before introducing distributed or storage 
 - [16 — Catalyst Planning Checklist](16-catalyst-planning-checklist.md)
 - [21 — Distributed Correctness Checklist](21-distributed-correctness-checklist.md)
 - `.github/skills/implement-work-item/build-test-config.md`
-- `.github/copilot-instructions.md`
+- `CLAUDE.md`
 - ADR-0001: Execution strategy
 - ADR-0013: Memory model for in-memory batches

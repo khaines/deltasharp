@@ -1,4 +1,4 @@
-# DeltaSharp — Copilot Instructions
+# DeltaSharp — Claude Code Instructions
 
 ## Project overview
 
@@ -16,20 +16,24 @@ around three pillars:
    start, managed by a custom Operator and CRDs.
 
 DeltaSharp is **open-source** with a community-driven adoption strategy (Apache-2.0
-assumed; see [ADR-0015](../docs/adr/0015-open-source-positioning.md)).
+assumed; see [ADR-0015](docs/adr/0015-open-source-positioning.md)).
 
-> **Status: M1 scaffolding.** The solution skeleton now exists — `DeltaSharp.sln`
-> with `src/DeltaSharp.Core`, `src/DeltaSharp.Engine`, `src/DeltaSharp.Executor`,
-> and matching test projects. It is intentionally **inert** (no Spark or Delta
-> behavior yet). Most architecture below is still *intended* and steers ongoing
-> implementation. See
-> [repository layout & project conventions](../docs/engineering/design/repository-layout.md),
-> and keep these instructions in sync as real engine code lands.
+> **Status: active implementation.** `DeltaSharp.sln` holds `src/DeltaSharp.Abstractions`,
+> `src/DeltaSharp.Core`, `src/DeltaSharp.Engine`, `src/DeltaSharp.Executor`,
+> `src/DeltaSharp.Storage`, matching `tests/` projects, and `samples/`. The
+> architecture below is the target that steers ongoing implementation; where code
+> and this file disagree, the ADRs in `docs/adr/` win. See
+> [repository layout & project conventions](docs/engineering/design/repository-layout.md),
+> and keep these instructions in sync as engine code lands.
+>
+> **AI-assisted workflows.** Specialist personas live in `.claude/agents/` (canonical
+> role specs in `docs/persona/agents/`), and the orchestration skills — `design-doc`,
+> `implement-work-item`, `review-pr`, `review-fix-loop`, `stacked-pr-chain` — live in
+> `.claude/skills/`.
 
 ## Build, test, and lint
 
-DeltaSharp is a standard .NET solution; use the .NET SDK CLI. (These commands
-apply once the solution/projects are scaffolded.)
+DeltaSharp is a standard .NET solution; use the .NET SDK CLI.
 
 ```bash
 dotnet restore                         # restore NuGet dependencies
@@ -102,20 +106,20 @@ source of truth) and summarized in
 `docs/engineering/design/engine-architecture.md`. Honor these and keep each
 abstraction swappable:
 
-- **Execution backend ([ADR-0001](../docs/adr/0001-execution-strategy.md)):**
+- **Execution backend ([ADR-0001](docs/adr/0001-execution-strategy.md)):**
   pluggable — an AOT-safe **vectorized interpreter** is the default and the
   correctness reference; an **optional JIT codegen tier** (intra-operator
   `Expression.Compile` fusion) is enabled only when
   `RuntimeFeature.IsDynamicCodeSupported`. Keep the codegen tier AOT-elidable
   (`[RequiresDynamicCode]`/`[FeatureGuard]`); both backends must produce identical
   results (parity oracle).
-- **Columnar batches ([ADR-0002](../docs/adr/0002-columnar-batch-format.md)):**
+- **Columnar batches ([ADR-0002](docs/adr/0002-columnar-batch-format.md)):**
   operators bind to an internal **mutable `ColumnBatch`/`ColumnVector`**
   (selection-vector-aware), **Arrow-backed initially**, custom off-heap later —
   **Arrow at the edges** (Parquet, Flight, interop).
-- **Transport ([ADR-0003](../docs/adr/0003-data-plane-transport.md)):** **gRPC
+- **Transport ([ADR-0003](docs/adr/0003-data-plane-transport.md)):** **gRPC
   control plane + Arrow Flight data plane** behind `IDataExchange`.
-- **Shuffle ([ADR-0004](../docs/adr/0004-shuffle-architecture.md)):** a
+- **Shuffle ([ADR-0004](docs/adr/0004-shuffle-architecture.md)):** a
   **.NET-native remote shuffle service** — node-local workers + a **location
   registry** with **dynamic resolution** (never pin a location; re-resolve +
   retry), **drain-migration + configurable eager replication**, object-store
@@ -135,8 +139,8 @@ abstraction swappable:
 - **C#/.NET style.** Enable nullable reference types; PascalCase for public
   members, `_camelCase` for private fields; `async`/`await` for I/O.
 - **Repo layout:** `src/` for framework projects, `tests/` for test projects
-  (one per `src` project, suffixed `.Tests`), `samples/` for example applications
-  (added later), and a single `DeltaSharp.sln` at the root. Engine/executor
+  (one per `src` project, suffixed `.Tests`), `samples/` for example applications,
+  and a single `DeltaSharp.sln` at the root. Engine/executor
   projects target `net10.0`; public libraries multi-target `net8.0;net10.0`
   (ADR-0014). Full conventions:
-  [repository layout](../docs/engineering/design/repository-layout.md).
+  [repository layout](docs/engineering/design/repository-layout.md).

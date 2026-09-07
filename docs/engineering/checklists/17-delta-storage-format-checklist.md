@@ -2,7 +2,7 @@
 
 > **Scope:** Delta transaction log, Parquet IO, checkpoints, table maintenance, storage adapters, and native Delta table read/write correctness.
 > **Priority:** CRITICAL.
-> **Owners:** delta-storage-format-engineer. **Grounded in:** ADR-0011, ADR-0004, ADR-0002, ADR-0006, `.github/copilot-instructions.md`.
+> **Owners:** delta-storage-format-engineer. **Grounded in:** ADR-0011, ADR-0004, ADR-0002, ADR-0006, `CLAUDE.md`.
 
 ## How to use
 Use this checklist for every change that can affect persisted table state, `_delta_log` semantics, Parquet metadata, or storage-backend durability. Treat data loss, corruption, ACID weakening, and silent Delta incompatibility as Critical findings.

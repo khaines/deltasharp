@@ -2,7 +2,7 @@
 
 > **Scope:** Markdown files in docs, engineering checklists, ADRs, persona docs, READMEs, runbooks, release notes, GitHub templates, and support content.
 > **Priority:** SUPPLEMENTARY.
-> **Owners:** technical-writer, developer-experience-api-engineer. **Grounded in:** `.github/copilot-instructions.md`, 11, technical-writer persona docs, accessible documentation and developer style guidance.
+> **Owners:** technical-writer, developer-experience-api-engineer. **Grounded in:** `CLAUDE.md`, 11, technical-writer persona docs, accessible documentation and developer style guidance.
 
 ## How to use
 Use this checklist for Markdown-only changes and as the style layer for 11. Prefer consistency, accessibility, linkability, and reviewability over local formatting preferences.
@@ -90,7 +90,7 @@ Use this checklist for Markdown-only changes and as the style layer for 11. Pref
 ## References
 - [11 — Documentation Support Checklist](11-documentation-support-checklist.md)
 - `docs/engineering/checklists/README.md`
-- `.github/copilot-instructions.md`
+- `CLAUDE.md`
 - `docs/persona/agents/technical-writer-agent.md`
 - `docs/persona/research/technical-writer.md`
 - GitHub Flavored Markdown specification

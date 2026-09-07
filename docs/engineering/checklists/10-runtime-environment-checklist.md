@@ -2,7 +2,7 @@
 
 > **Scope:** .NET runtime configuration, NativeAOT executor images, driver/executor/shuffle containers, Kubernetes probes, shutdown, resources, CI workflow permissions, and deployment-time runtime settings.
 > **Priority:** STANDARD.
-> **Owners:** dotnet-distributed-execution-engineer, cloud-native-site-reliability-engineer, cloud-native-security-sme. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0014.
+> **Owners:** dotnet-distributed-execution-engineer, cloud-native-site-reliability-engineer, cloud-native-security-sme. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0014.
 
 ## How to use
 Use this checklist for container images, runtime hosts, executor or driver process changes, Kubernetes pod specs, CI workflows, and runtime configuration. Cross-check 18 for operator-managed lifecycle, 13 for manifests/IaC, 05 for hardening, and 14 for tenant boundaries.

@@ -2,7 +2,7 @@
 
 > **Scope:** OpenTelemetry traces for client actions, driver scheduling, executor tasks, shuffle, Delta commits, storage I/O, gRPC control traffic, Arrow Flight data transfer, and Kubernetes Operator reconciliation.
 > **Priority:** STANDARD.
-> **Owners:** cloud-native-site-reliability-engineer, dotnet-distributed-execution-engineer, dotnet-runtime-performance-engineer. **Grounded in:** `.github/copilot-instructions.md`, ADR-0003, 09a, 09b, 14, SRE and distributed execution persona docs.
+> **Owners:** cloud-native-site-reliability-engineer, dotnet-distributed-execution-engineer, dotnet-runtime-performance-engineer. **Grounded in:** `CLAUDE.md`, ADR-0003, 09a, 09b, 14, SRE and distributed execution persona docs.
 
 ## How to use
 Use this checklist when adding or changing spans, context propagation, sampling, trace attributes, or trace-to-log/metric correlation. Escalate as High when missing propagation makes distributed failures across driver, executor, shuffle, storage, or operator paths impossible to diagnose.
@@ -75,7 +75,7 @@ Use this checklist when adding or changing spans, context propagation, sampling,
 - [09b — Metrics Checklist](09b-metrics-checklist.md)
 - [14 — Tenant Isolation Checklist](14-tenant-isolation-checklist.md)
 - ADR-0003: Data-plane transport
-- `.github/copilot-instructions.md`
+- `CLAUDE.md`
 - `.github/skills/review-pr/rating-rubric.md`
 - `docs/persona/agents/cloud-native-site-reliability-engineer-agent.md`
 - `docs/persona/agents/dotnet-distributed-execution-engineer-agent.md`

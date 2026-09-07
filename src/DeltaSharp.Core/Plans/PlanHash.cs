@@ -4,7 +4,7 @@ namespace DeltaSharp.Plans;
 /// Deterministic, process-independent hashing for the logical-plan IR. The CLR's
 /// <see cref="string.GetHashCode()"/> and <see cref="System.HashCode"/> are randomized per
 /// process, which would make plan hash codes vary across runs; reproducible planning,
-/// caching, and tests require stable hashes (see <c>.github/copilot-instructions.md</c>), so
+/// caching, and tests require stable hashes (see <c>CLAUDE.md</c>), so
 /// the IR derives its <c>GetHashCode</c> from this FNV-1a implementation instead.
 /// </summary>
 /// <remarks>

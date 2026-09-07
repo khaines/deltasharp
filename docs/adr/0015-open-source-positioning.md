@@ -3,7 +3,7 @@
 - **Status:** Accepted
 - **Date:** 2026-06-27
 - **Deciders:** @khaines
-- **Related:** `docs/persona/agents/README.md`, `.github/copilot-instructions.md`
+- **Related:** `docs/persona/agents/README.md`, `CLAUDE.md`
 
 ## Context
 

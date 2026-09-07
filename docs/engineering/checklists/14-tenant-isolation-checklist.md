@@ -2,7 +2,7 @@
 
 > **Scope:** Multi-tenant boundaries across planning, catalogs, storage, credentials, drivers, executors, shuffle, caches, logs, metrics, Kubernetes namespaces, service accounts, network policies, quotas, and admission controls.
 > **Priority:** CRITICAL.
-> **Owners:** cloud-native-security-sme, kubernetes-operator-controller-engineer, dotnet-distributed-execution-engineer, compute-storage-finops-engineer. **Grounded in:** `.github/copilot-instructions.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009.
+> **Owners:** cloud-native-security-sme, kubernetes-operator-controller-engineer, dotnet-distributed-execution-engineer, compute-storage-finops-engineer. **Grounded in:** `CLAUDE.md`, `review-pr/rating-rubric.md`, ADR-0003, ADR-0004, ADR-0009.
 
 ## How to use
 Apply this checklist whenever a change can mix users, tenants, jobs, sessions, catalogs, storage paths, executors, caches, shuffle blocks, or Kubernetes resources. Any cross-tenant data access, credential reuse, cache leak, shuffle leak, or observability leak is Critical; coordinate with 05 security and 18 operator controls.

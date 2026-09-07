@@ -2,7 +2,7 @@
 
 > **Scope:** Repository-wide architecture, project structure, service boundaries, engine topology, foundational interfaces, ADRs, and cross-layer designs.
 > **Priority:** STANDARD.
-> **Owners:** cloud-native-distributed-systems-architect, query-execution-engine-engineer. **Grounded in:** `.github/copilot-instructions.md`, `docs/engineering/design/engine-architecture.md`, ADR-0001, ADR-0002, ADR-0006, ADR-0007, ADR-0008, ADR-0012.
+> **Owners:** cloud-native-distributed-systems-architect, query-execution-engine-engineer. **Grounded in:** `CLAUDE.md`, `docs/engineering/design/engine-architecture.md`, ADR-0001, ADR-0002, ADR-0006, ADR-0007, ADR-0008, ADR-0012.
 
 ## How to use
 Use this checklist when reviewing architecture docs, foundational interfaces, new subsystems, and changes that alter DeltaSharp's layer boundaries. Treat ADRs as the source of truth; if a new foundational decision is needed, require a new ADR before accepting the design.
@@ -77,7 +77,7 @@ Use this checklist when reviewing architecture docs, foundational interfaces, ne
 - Designs that optimize happy-path throughput while ignoring shuffle, commit, retry, or cancellation correctness.
 
 ## References
-- [DeltaSharp Copilot Instructions](../../../.github/copilot-instructions.md)
+- [DeltaSharp Copilot Instructions](../../../CLAUDE.md)
 - [Engine Architecture Overview](../design/engine-architecture.md)
 - [ADR-0001: Execution strategy](../../adr/0001-execution-strategy.md)
 - [ADR-0002: In-memory columnar batch format](../../adr/0002-columnar-batch-format.md)

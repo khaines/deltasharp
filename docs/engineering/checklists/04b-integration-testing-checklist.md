@@ -2,7 +2,7 @@
 
 > **Scope:** Cross-component tests for Delta/Parquet storage, object-store and PVC backends, driver/executor execution, shuffle, Kubernetes operator reconciliation, streaming micro-batches, and tenant isolation.
 > **Priority:** HIGH.
-> **Owners:** reliability-test-chaos-engineer, delta-storage-format-engineer, kubernetes-operator-engineer. **Grounded in:** build-test-config, review-pr rating rubric, `.github/copilot-instructions.md`, ADR-0001, ADR-0013.
+> **Owners:** reliability-test-chaos-engineer, delta-storage-format-engineer, kubernetes-operator-engineer. **Grounded in:** build-test-config, review-pr rating rubric, `CLAUDE.md`, ADR-0001, ADR-0013.
 
 ## How to use
 Run these tests when behavior crosses process, storage, filesystem, object-store, or Kubernetes boundaries. Keep them isolated and deterministic even when they use real emulators or test clusters; use the documented 900s integration timeout budget.

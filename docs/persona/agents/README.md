@@ -39,7 +39,7 @@ canonical spec drift, the canonical spec wins.
 ## DeltaSharp domain canon
 
 Every persona internalizes the DeltaSharp architecture (see
-`.github/copilot-instructions.md`): **transformations are lazy, actions are
+`CLAUDE.md`): **transformations are lazy, actions are
 eager**; a Catalyst-style pipeline (logical plan → analyzer/optimizer → physical
 plan → execution); stages split at shuffle boundaries; Delta tables backed by
 Parquet and the `_delta_log` transaction log (ACID, time travel, schema

@@ -4,7 +4,7 @@ namespace DeltaSharp.Types;
 /// Deterministic, process-independent hashing for the type system. The CLR's default
 /// <see cref="string.GetHashCode()"/> is randomized per process, which would make type
 /// hash codes vary across runs. Reproducible planning and caching
-/// (see <c>.github/copilot-instructions.md</c>) require stable hashes, so the type
+/// (see <c>CLAUDE.md</c>) require stable hashes, so the type
 /// descriptors derive their <c>GetHashCode</c> from this FNV-1a implementation instead.
 /// </summary>
 /// <remarks>

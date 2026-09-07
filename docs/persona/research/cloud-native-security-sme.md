@@ -115,4 +115,4 @@ This makes the security SME a platform-shaping role rather than a late approval 
 [^7]: Kubernetes documentation, Security overview, https://kubernetes.io/docs/concepts/security/overview/
 [^8]: OWASP, OWASP Top Ten project, https://owasp.org/www-project-top-ten/
 [^9]: SLSA, Levels overview, https://slsa.dev/spec/v1.0/levels
-[^10]: `.github/copilot-instructions.md:3-108`; `docs/persona/agents/README.md:39-74`
+[^10]: `CLAUDE.md:3-108`; `docs/persona/agents/README.md:39-74`

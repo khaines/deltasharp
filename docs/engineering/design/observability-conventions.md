@@ -7,7 +7,7 @@
 > (#111) under
 > [FEAT-00.4](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-00-engineering-foundations.md#feat-004-observability-scaffolding-conventions)
 > (#18). Grounded in
-> [`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md),
+> [`CLAUDE.md`](../../../CLAUDE.md),
 > [ADR-0001](../../adr/0001-execution-strategy.md) (pluggable backends / AOT gating),
 > [ADR-0003](../../adr/0003-data-plane-transport.md) (gRPC control plane + Arrow Flight data plane),
 > [ADR-0004](../../adr/0004-shuffle-architecture.md) (shuffle), and

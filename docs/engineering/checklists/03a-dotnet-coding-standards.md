@@ -2,7 +2,7 @@
 
 > **Scope:** C# projects, public .NET APIs, engine/runtime hot paths, analyzers, packaging settings, and NativeAOT/trim-sensitive code.
 > **Priority:** HIGH.
-> **Owners:** dotnet-library-platform-engineer, dotnet-runtime-performance-engineer, dotnet-framework-runtime-engineer. **Grounded in:** `CONTRIBUTING.md`, `.github/copilot-instructions.md`, ADR-0001, ADR-0013, ADR-0014, .NET persona research.
+> **Owners:** dotnet-library-platform-engineer, dotnet-runtime-performance-engineer, dotnet-framework-runtime-engineer. **Grounded in:** `CONTRIBUTING.md`, `CLAUDE.md`, ADR-0001, ADR-0013, ADR-0014, .NET persona research.
 
 ## How to use
 Use this checklist for every C# change after applying 03. Escalate as High or Critical when a .NET issue can cause deadlocks, unbounded memory growth, AOT publish failure, disposed-resource use, or incorrect query results.

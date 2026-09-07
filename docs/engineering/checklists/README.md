@@ -9,7 +9,7 @@ These checklists **operationalize** the project canon; they defer to the
 [ADRs](../../adr/README.md) (source of truth for decisions), the
 [engine architecture overview](../design/engine-architecture.md), the persona
 specs in [`docs/persona/agents/`](../../persona/agents/README.md), and
-[`.github/copilot-instructions.md`](../../../.github/copilot-instructions.md). If a
+[`CLAUDE.md`](../../../CLAUDE.md). If a
 checklist and an ADR disagree, the ADR wins.
 
 ## How to use
