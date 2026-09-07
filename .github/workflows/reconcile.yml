@@ -97,8 +97,10 @@ name: Reconcile
 #                          walks read: a path outside the work tree git answered from, a
 #                          policed .claude child holding files no index entry folds under
 #                          (an export inside an enclosing checkout, whose .claude root tracks
-#                          no policed child of its own), and a sparse index are all
-#                          UNVERIFIED, not clean — while untracked WIP inside a root the
+#                          no policed child of its own), a .claude under an UNINITIALISED
+#                          submodule (a gitlink ABOVE it), and a sparse index are all
+#                          UNVERIFIED, not clean — reported ALONGSIDE whatever git did name,
+#                          never instead of it — while untracked WIP inside a root the
 #                          index DOES own is walked, policed and NOTED ("git add them"),
 #                          never skipped with advice to stand where the operator already is.
 #                          A skill manifest is held to its canonical LEAF too

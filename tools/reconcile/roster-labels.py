@@ -715,6 +715,12 @@ def _walk_symlink_problems(kind: str, dirpath: str, dirnames: "list[str]") -> "l
 # :func:`_tracked_link_problem`.
 TRACKED_LINK_MODES = ("120000", "160000")
 
+# The gitlink half of the pair, named because the COVERAGE rule needs to tell it apart from
+# a symlink: an uninitialised submodule directory is populated on disk by something other
+# than this index, which is a different question from "this path is a link" (PR-901 last
+# round, F-2).
+_GITLINK_MODE = "160000"
+
 
 # The environment variables that make git answer about a DIFFERENT repository than the one
 # the working directory names, or about a DIFFERENT SET OF PATHS than the ones asked for. An
@@ -992,10 +998,16 @@ def _ls_files(top: str) -> "list[tuple[str, str]] | None":
 # policed by every check, whichever subtree that check owns: `.claude/COMMANDS/evil.md` is
 # configuration the CLI loads on a macOS clone, and it must be named whether the reader is
 # looking at the roster check's report or the startup one's.
+# The one policed child a SKILL.md manifest means anything under; the manifest-leaf rule in
+# :func:`_index_findings` is scoped to it, so `.claude/commands/skills/skill.md` — an
+# ordinary slash-command file in a directory that happens to be called `skills` — is not
+# reported as folding onto a manifest name it is not one of (PR-901 last round, Info).
+SKILLS_CHILD_NAME = "skills"
+
 POLICED_CLAUDE_CHILDREN = (
     "agents",
     "commands",
-    "skills",
+    SKILLS_CHILD_NAME,
     "settings.json",
     "settings.local.json",
 )
@@ -1074,11 +1086,30 @@ def _has_disk_entries(path: str) -> bool:
         return False
 
 
-def _count_disk_files(path: str) -> int:
-    """How many FILES lie under `path` on disk (links counted, never followed)."""
+def _count_uncovered_disk_files(
+    path: str,
+    prefix: "tuple[str, ...]",
+    listed: "list[tuple[str, str, tuple[str, ...]]]",
+) -> int:
+    """How many files under `path` NO index entry folds onto (links counted, never followed).
+
+    The number the `git add` note quotes, and it has to be the number of files the note is
+    ABOUT. Counting every file under the queried root instead reported all 46 files of a
+    `.claude` whose only uncovered child was `skills/` — an operator reading it would go
+    looking for 46 untracked paths, find one, and be left unsure which report was wrong
+    (PR-901 last round, SEC L-1). An entry AT or ABOVE a file is git's answer about it, so
+    only files with no such entry are counted.
+    """
     total = 0
-    for _dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
-        total += len(filenames)
+    for dirpath, _dirnames, filenames in os.walk(path, followlinks=False):
+        relative = os.path.relpath(dirpath, path)
+        base = prefix if relative == os.curdir else prefix + _path_parts(
+            relative.replace(os.sep, "/")
+        )
+        for filename in filenames:
+            parts = base + (filename,)
+            if not any(_folds_under(parts, entry) for _mode, _name, entry in listed):
+                total += 1
     return total
 
 
@@ -1120,9 +1151,15 @@ def _root_owned_by_index(
 def _index_findings(
     paths: "list[str]",
 ) -> "tuple[list[tuple[str, str, str]] | None, str, list[str]]":
-    """`([(kind, detail, path)], "", notes)` for what git's INDEX says about `paths`.
+    """`([(kind, detail, path)], why, notes)` for what git's INDEX says about `paths`.
 
-    ``(None, why, notes)`` when the index cannot answer for them.
+    ``why`` is empty when the index covered every queried path, and otherwise says what it
+    did NOT cover. It is returned ALONGSIDE the findings, never instead of them: git having
+    already named a tracked link is a fact about the tree whatever else was left unexamined,
+    and discarding it turned a FAIL naming `.claude/hooks` into a green SKIP (PR-901 last
+    round, F-1). ``(None, why, notes)`` is reserved for the answers that are not merely
+    incomplete but unusable — no git, no checkout, a sparse index — where there is nothing
+    to report alongside.
 
     Three kinds of finding, all invisible to every filesystem question this gate asks:
 
@@ -1149,13 +1186,17 @@ def _index_findings(
     follow the very link under investigation, and a `.claude` symlink pointing out of the
     tree would then excuse itself from the query it exists to fail.
 
-    Three ways the answer is UNVERIFIED rather than empty, all of them "git's answer does not
+    Four ways the answer is UNVERIFIED rather than empty, all of them "git's answer does not
     cover what the walks read": git could not be asked at all; a queried DIRECTORY that holds
     files on disk lies in a `.claude` root this index does not OWN (an export dropped inside
-    an ENCLOSING checkout — PR-901 second round, RT-4); or the index is sparse and collapsed
-    the policed tree into a directory entry. ``None`` is never collapsed into "no findings":
-    callers report it as UNVERIFIED — the same contract :func:`_git_tracked` keeps — so an
-    environment the gate could not interrogate never reads as an environment it cleared.
+    an ENCLOSING checkout — PR-901 second round, RT-4); the queried path lies under an
+    UNINITIALISED SUBMODULE, i.e. a gitlink ABOVE the `.claude` root, so the files on disk
+    came from something other than this index (PR-901 last round, F-2); or the index is
+    sparse and collapsed the policed tree into a directory entry. Neither ``None`` nor a
+    coverage reason is ever collapsed into "no findings": callers report them as UNVERIFIED —
+    the same contract :func:`_git_tracked` keeps — so an environment the gate could not
+    interrogate never reads as an environment it cleared, and the two middle cases still
+    carry whatever git DID name.
 
     A queried subtree with no index entry under it whose ROOT the index DOES own
     (:func:`_root_owned_by_index`) is ordinary untracked work — a developer's WIP
@@ -1208,8 +1249,11 @@ def _index_findings(
     scope = [_path_parts(spec) for spec in specs]
     prefixes = _policed_prefixes(specs)
     listed = [(mode, name, _path_parts(name)) for mode, name in entries]
-    # COVERAGE first: a clean answer about a tree the index does not hold is not a clean tree.
+    # COVERAGE: a clean answer about a tree the index does not hold is not a clean tree. It
+    # is collected here and reported ALONGSIDE the findings below, never instead of them
+    # (PR-901 last round, F-1).
     notes: "list[str]" = []
+    unverified: "list[str]" = []
     for spec in specs:
         prefix = _path_parts(spec)
         if not prefix or not _has_disk_entries(on_disk[spec]):
@@ -1217,8 +1261,30 @@ def _index_findings(
         # An entry AT or ABOVE the queried path is git's whole answer about everything
         # "inside" it — a gitlink or symlink at `.claude` covers the populated
         # submodule/resolved-link work tree on disk, which must not read as a tree the index
-        # forgot.
-        if any(_folds_under(prefix, parts) for _mode, _name, parts in listed):
+        # forgot — with ONE exception, below.
+        above = [
+            (mode, parts) for mode, _name, parts in listed if _folds_under(prefix, parts)
+        ]
+        # The exception: a GITLINK that lies ABOVE the `.claude` root is not an answer about
+        # this tree at all, it is the index saying "that subtree belongs to another
+        # repository I have not initialised". A `vendor` gitlink in an enclosing checkout,
+        # with `vendor/deltasharp` populated by hand from an export, made every local check
+        # PASS unqualified and called an untracked `.mcp.json` "not policed" — the enclosing
+        # index has no entries under it at all, so there was nothing to find (PR-901 last
+        # round, F-2). An entry at or under the `.claude` root chain still IS git's whole
+        # answer, and the findings loop names it.
+        if any(
+            mode == _GITLINK_MODE and _claude_root_parts(parts) is None
+            for mode, parts in above
+        ):
+            unverified.append(
+                f"{spec!r} lies inside a submodule directory this checkout has not "
+                f"initialised — the index in {top_real!r} records a gitlink above it and "
+                f"says nothing about the files on disk, which came from somewhere else: "
+                f"unverified rather than clean"
+            )
+            continue
+        if above:
             continue
         # An entry UNDER it counts too — but when the queried path is a `.claude` ROOT, one
         # entry anywhere beneath it is NOT the question: each POLICED CHILD that holds files
@@ -1247,18 +1313,19 @@ def _index_findings(
             # Untracked work in the checkout the operator is standing in: a note, and the
             # walk polices the files (PR-901 SRE L-1).
             notes.append(
-                f"{spec}: {_count_disk_files(on_disk[spec])} file(s) on disk are not in the "
-                f"index of {top_real!r} and were walked, not cleared by git — `git add` them "
-                f"(or remove them) if they are meant to ship, because a file the index does "
-                f"not hold cannot be cleared by it"
+                f"{spec}: "
+                f"{_count_uncovered_disk_files(on_disk[spec], prefix, listed)} file(s) on "
+                f"disk are not in the index of {top_real!r} and were walked, not cleared by "
+                f"git — `git add` them (or remove them) if they are meant to ship, because a "
+                f"file the index does not hold cannot be cleared by it"
             )
             continue
-        return None, (
+        unverified.append(
             f"{spec!r} holds files on disk that the work tree git answered from "
             f"({top_real!r}) does not track — its index says nothing about them, and nothing "
             f"under a policed `.claude` child is tracked there either, so this is a tree that "
             f"checkout does not own: unverified rather than clean"
-        ), notes
+        )
     findings: "list[tuple[str, str, str]]" = []
     for mode, name, parts in listed:
         matched = next((prefix for prefix in prefixes if _folds_under(parts, prefix)), None)
@@ -1284,7 +1351,7 @@ def _index_findings(
             matched is not None
             and _is_skill_manifest_name(parts[-1])
             and parts[-1] != SKILL_MANIFEST_NAME
-            and any(_fold(part) == "skills" for part in parts[:-1])
+            and _fold(matched[-1]) == _fold(SKILLS_CHILD_NAME)
         ):
             # The LEAF the CLI resolves by name. `ſkill.md`, `skill.md` and `Skill.MD` are one
             # file to the checkout and to Claude Code, so the index may hold only the
@@ -1295,7 +1362,16 @@ def _index_findings(
             findings.append(("case", expected, name))
         elif mode in TRACKED_LINK_MODES:
             findings.append(("link", mode, name))
-    return sorted(set(findings), key=lambda item: (item[2], item[0], item[1])), "", notes
+    # Findings AND the coverage reason, never one instead of the other. A `.claude` whose
+    # policed children are untracked on disk but whose ONE tracked entry is a `hooks` symlink
+    # used to return `(None, reason)` — three SKIPs, exit 0, and the link git had already
+    # named discarded on the way out (PR-901 last round, F-1). The callers report a FAIL
+    # carrying the reason as an "ALSO UNVERIFIED" note (:func:`_fail_notes`).
+    return (
+        sorted(set(findings), key=lambda item: (item[2], item[0], item[1])),
+        "; ".join(unverified),
+        notes,
+    )
 
 
 def _folded_index_tracked(path: str) -> "bool | None":
@@ -1355,10 +1431,16 @@ def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
     symlink or submodule" is the question the fixtures and the fail-closed contract are
     written against. ``None`` still means "git could not answer", never "no links".
     """
-    findings, _reason, _notes = _index_findings(paths)
+    findings, reason, _notes = _index_findings(paths)
     if findings is None:
         return None
-    return [(detail, path) for kind, detail, path in findings if kind == "link"]
+    links = [(detail, path) for kind, detail, path in findings if kind == "link"]
+    if reason and not links:
+        # Part of the surface was not covered and nothing was found in the rest: "could not
+        # answer", never "no links". A link that WAS found is returned — it is a fact about
+        # the tree regardless of what else went unexamined (PR-901 last round, F-1).
+        return None
+    return links
 
 
 def claude_root_pathspec(path: str) -> "str | None":
@@ -1569,16 +1651,17 @@ def tracked_symlink_problems(
     index DOES own is walked and policed normally, and saying so beats both a silent pass and
     a SKIP telling the operator to go and stand where they already are (PR-901 SRE L-1).
 
-    ``unverified`` is non-empty only when git could not answer, and it carries WHY: "not a
-    git checkout" and "that pathspec is outside the work tree git answered from" send a
-    responder to different fixes, and reporting the second as the first is how a symlinked
+    ``unverified`` is non-empty when git could not answer, or answered about only part of the
+    queried surface — it can therefore accompany real ``problems`` rather than replace them
+    (PR-901 last round, F-1) — and it carries WHY: "not a git checkout" and "that pathspec is
+    outside the work tree git answered from" send a responder to different fixes, and reporting the second as the first is how a symlinked
     `.claude` used to excuse itself from the query (PR-901 F-A). The caller reports SKIP with
     that reason rather than passing, because "no link found" and "could not look" are
     different claims and only one of them is safe to go green on.
     """
     findings, reason, notes = _index_findings(paths)
-    if findings is None:
-        return [], [
+    unverified = (
+        [
             "git could not say whether "
             + ", ".join(sorted(paths))
             + f" hold tracked symlinks, submodules or fold-variants ({reason}) — a "
@@ -1586,11 +1669,20 @@ def tracked_symlink_problems(
             "spelling that folds onto a policed path on this checkout are all INVISIBLE to "
             "the path checks, so this is unverified, not clean; run the gate inside the git "
             "checkout that tracks these files"
-        ], notes
+        ]
+        if reason
+        else []
+    )
+    if findings is None:
+        return [], unverified, notes
+    # Both, when git covered part of the surface and named something in it: the caller fails
+    # on the problems and carries the reason as an "ALSO UNVERIFIED" note, so a tracked
+    # `.claude/hooks` link is reported even though the policed children beside it were
+    # untracked (PR-901 last round, F-1).
     return [
         (path, _index_finding_problem(kind, detail, path))
         for kind, detail, path in findings
-    ], [], notes
+    ], unverified, notes
 
 
 def linked_agents_root_problems(agents_dir: str) -> "list[tuple[str, str]]":
@@ -5951,6 +6043,25 @@ def _selftest() -> int:
         "entries are two findings",
     )
 
+    # ...and the SAME holds for the GITLINK half of the pair. `_tracked_link_problem` has two
+    # branches and only the 120000 one was covered here, so dropping `source="index"` from the
+    # 160000 branch left every RT-1 assertion green while a tracked SUBMODULE at a folding
+    # spelling was silently swallowed by the collision beside it — the shape CI checks out
+    # empty, which is the harder of the two to notice.
+    # Killing mutant: `source="walk"` (the default) in the 160000 branch of
+    # `_tracked_link_problem`.
+    _index_gitlink = _tracked_link_problem("160000", ".claude/skills/evil-sub")
+    _case_gitlink = _case_collision_problem(".claude/Skills/evil-sub", ".claude/skills")
+    check(
+        _index_gitlink.source == "index"
+        and _dedupe_link_problems([_case_gitlink], [_index_gitlink])
+        == [_case_gitlink, _index_gitlink]
+        and _dedupe_link_problems([_index_gitlink], [_case_gitlink])
+        == [_index_gitlink, _case_gitlink],
+        "a tracked GITLINK (160000) is an INDEX finding too: a fold-equivalent collision "
+        "never supersedes it",
+    )
+
     # (e3b) RT-3: de-duplication is not folding-away either. Two DISTINCT links whose paths
     # fold onto each other (`.claude/skills/A` and `.claude/skills/a` — two entries git keeps
     # apart, one path the checkout merges) are two findings from both questions, because
@@ -6113,11 +6224,41 @@ def _selftest() -> int:
                 block.append(line[len("       - ") :])
         return block
 
+    # Every path `main` would otherwise DEFAULT is passed explicitly, because the defaults
+    # are RELATIVE and resolve against the process's current directory: run from anywhere but
+    # the repo root — a CI job that `cd`s, a developer in `tools/` — the taxonomy, settings
+    # and skills tree all vanish and this assertion failed for a reason that has nothing to
+    # do with what it tests (PR-901 last round, SEC L-2).
     with tempfile.TemporaryDirectory() as tmp:
-        _wrapper(tmp, "rogue-persona.md", "---\nname: rogue-persona\nhooks: ./x.sh\n---\n")
+        _agents = os.path.join(tmp, "agents")
+        os.makedirs(_agents, exist_ok=True)
+        _wrapper(_agents, "rogue-persona.md", "---\nname: rogue-persona\nhooks: ./x.sh\n---\n")
+        _tax = os.path.join(tmp, "taxonomy.md")
+        _wrapper(
+            tmp,
+            "taxonomy.md",
+            f"{PERSONA_LABELS_BEGIN} -->\n{PERSONA_PREFIX}rogue-persona\n"
+            f"{PERSONA_LABELS_END} -->\n",
+        )
+        _wrapper(
+            tmp,
+            "feature_request.yml",
+            "body:\n  - type: dropdown\n    id: milestone\n    attributes:\n"
+            "      options:\n        - M0\n",
+        )
         _buffer = io.StringIO()
         with contextlib.redirect_stdout(_buffer):
-            _exit = main(["--offline", "--repo", DEFAULT_REPO, "--agents-dir", tmp])
+            _exit = main([
+                "--offline",
+                "--repo", DEFAULT_REPO,
+                "--agents-dir", _agents,
+                "--taxonomy", _tax,
+                "--settings", os.path.join(tmp, "settings.json"),
+                "--skills-dir", os.path.join(tmp, "skills"),
+                "--commands-dir", os.path.join(tmp, "commands"),
+                "--mcp-config", os.path.join(tmp, ".mcp.json"),
+                "--feature-form", os.path.join(tmp, "feature_request.yml"),
+            ])
         _block = _summary_block(_buffer.getvalue(), "[FAIL] roster<->documented-labels")
         check(
             _exit == 1
@@ -6236,6 +6377,214 @@ def _selftest() -> int:
                 ),
                 "tracked-startup-config reaches the SAME 'does not own' verdict as the other "
                 "local checks on an export inside an enclosing checkout",
+            )
+
+    # (e6a) F-1: a coverage failure must never DISCARD what git already named. A `.claude`
+    # whose only tracked entry is a `hooks` SYMLINK — agents/, skills/ and settings.json
+    # sitting untracked beside it — is a tree this index does not own, and the reason for
+    # saying so is true. But the 120000 entry is ALSO true, and returning `(None, reason)`
+    # threw it away: three SKIPs, exit 0, and a tracked link to `../obj/hooks` never named
+    # in a report whose SKIP text told the operator the checkout "does not own" the very
+    # directory the link is in. Both travel now — a FAIL on the link, the reason attached as
+    # an ALSO UNVERIFIED note.
+    # Killing mutant: returning `None` (dropping `findings`) on a coverage failure.
+    with tempfile.TemporaryDirectory() as tmp:
+        _claude = os.path.join(tmp, ".claude")
+        os.makedirs(os.path.join(_claude, "agents"), exist_ok=True)
+        os.makedirs(os.path.join(_claude, "skills", "demo"), exist_ok=True)
+        _wrapper(os.path.join(_claude, "agents"), "a.md", "---\nname: a\ndescription: d\n---\n")
+        _wrapper(
+            os.path.join(_claude, "skills", "demo"),
+            "SKILL.md",
+            "---\nname: demo\ndescription: d\n---\n",
+        )
+        _wrapper(_claude, "settings.json", '{"permissions": {}}\n')
+        if _git_repo(tmp, {}, []) and _cacheinfo(
+            tmp, "120000", ".claude/hooks", "../obj/hooks"
+        ):
+            _lines, _statuses = _local_link_report(tmp)
+            _sc = startup_config_result(
+                os.path.join(tmp, ".mcp.json"),
+                os.path.join(tmp, ".claude", "settings.local.json"),
+                os.path.join(tmp, ".claude", "settings.json"),
+            )
+            check(
+                _statuses == ["fail", "fail", "fail"]
+                and sum(
+                    ".claude/hooks" in line and "120000" in line for line in _lines
+                ) == 3
+                and any(
+                    "ALSO UNVERIFIED" in note and "does not own" in note
+                    for note in _sc.notes
+                ),
+                "a tracked `.claude/hooks` link is NAMED by all three local checks even when "
+                "the `.claude` around it is a tree the index does not own — the coverage "
+                "reason rides along as an ALSO UNVERIFIED note instead of erasing the link",
+            )
+
+    # (e6b) F-2: an ANCESTOR gitlink is not git's answer about the tree below it. The
+    # enclosing index records `vendor` as mode 160000 and has NOTHING under it, so every
+    # query about `vendor/deltasharp/.claude` came back empty and read as CLEAN — four
+    # unqualified PASSes over an export populated by hand, with a tracked-looking `.mcp.json`
+    # reported as "not policed". "An entry at or above the queried path is git's whole
+    # answer" holds for a gitlink AT the `.claude` root (that submodule IS the tree), not for
+    # one ABOVE it, which says only "another repository lives here and I have not
+    # initialised it".
+    # Killing mutant: treating an ancestor 160000 entry as coverage (the old unconditional
+    # "entry at or above" short-circuit).
+    with tempfile.TemporaryDirectory() as tmp:
+        _export = os.path.join(tmp, "vendor", "deltasharp")
+        os.makedirs(os.path.join(_export, ".claude", "agents"), exist_ok=True)
+        os.makedirs(os.path.join(_export, ".claude", "skills", "demo"), exist_ok=True)
+        _wrapper(
+            os.path.join(_export, ".claude", "agents"),
+            "a.md",
+            "---\nname: a\ndescription: d\n---\n",
+        )
+        _wrapper(
+            os.path.join(_export, ".claude", "skills", "demo"),
+            "SKILL.md",
+            "---\nname: demo\ndescription: d\n---\n",
+        )
+        _wrapper(_export, ".mcp.json", '{"mcpServers": {"x": {"command": "curl evil"}}}\n')
+        if _git_repo(
+            tmp, {os.path.join("docs", "README.md"): "x\n"}, [os.path.join("docs", "README.md")]
+        ) and _cacheinfo(tmp, "160000", "vendor", "gitlink\n"):
+            _lines, _statuses = _local_link_report(_export)
+            check(
+                _statuses == ["skip", "skip", "skip"]
+                and sum(
+                    "submodule directory this checkout has not initialised" in line
+                    for line in _lines
+                ) == 3
+                # ...and the narrow `_tracked_links` question keeps its ``None`` contract on a
+                # PARTIAL answer: "found nothing in the part I could see" is not "there are
+                # no links". Killing mutant: returning the empty list there.
+                and _tracked_links(
+                    link_query_paths(os.path.join(_export, ".claude", "agents"))
+                ) is None,
+                "an export under an UNINITIALISED submodule gitlink is UNVERIFIED in all "
+                "three local checks, not cleared by an enclosing index that says nothing "
+                "about it",
+            )
+
+    # (e6c) F-3: the coverage rule has to be SILENT on a tree the index fully covers. The
+    # `.claude` root rule folds each policed child onto `prefix + (child,)`; spelling it
+    # `(child,)` — a BARE component — matches nothing in a real checkout, so every clean run
+    # of the gate would carry a spurious "`.claude`: 45 file(s) … `git add` them" note about
+    # files that are all tracked. A note that fires on the healthy case is a note operators
+    # learn to ignore.
+    # Killing mutant: `(child,)` instead of `prefix + (child,)` in the per-child root rule.
+    if (
+        os.path.isdir(DEFAULT_AGENTS_DIR)
+        and os.path.exists(DEFAULT_TAXONOMY)
+        and os.path.exists(DEFAULT_FEATURE_FORM)
+    ):
+        _buffer = io.StringIO()
+        with contextlib.redirect_stdout(_buffer):
+            _exit = main(["--offline", "--repo", DEFAULT_REPO])
+        _out = _buffer.getvalue()
+        check(
+            _exit == 0
+            and _out.count("[PASS] ") == 4
+            and "file(s) on disk are not in the index" not in _out,
+            "this checkout's four LOCAL checks all PASS with ZERO coverage notes: the "
+            "`git add` note never fires on a tree the index fully covers",
+        )
+    # ...and the same, on a fixture, so the assertion is not a property of the directory the
+    # selftest happens to be started from.
+    with tempfile.TemporaryDirectory() as tmp:
+        _covered = {
+            os.path.join(".claude", "agents", "a.md"): "---\nname: a\ndescription: d\n---\n",
+            os.path.join(".claude", "commands", "c.md"): "---\ndescription: d\n---\n",
+            os.path.join(".claude", "skills", "demo", "SKILL.md"): (
+                "---\nname: demo\ndescription: d\n---\n"
+            ),
+            os.path.join(".claude", "settings.json"): '{"permissions": {}}\n',
+        }
+        if _git_repo(tmp, _covered, list(_covered)):
+            _sc = startup_config_result(
+                os.path.join(tmp, ".mcp.json"),
+                os.path.join(tmp, ".claude", "settings.local.json"),
+                os.path.join(tmp, ".claude", "settings.json"),
+            )
+            _cs = command_skill_result(
+                os.path.join(tmp, ".claude", "commands"),
+                os.path.join(tmp, ".claude", "skills"),
+            )
+            _rl, _ru, _rn = tracked_symlink_problems(
+                link_query_paths(os.path.join(tmp, ".claude", "agents"))
+            )
+            check(
+                _sc.status == "pass"
+                and _cs.status == "pass"
+                and (_rl, _ru) == ([], [])
+                and not any(
+                    "not in the index" in line
+                    for line in list(_sc.lines) + list(_sc.notes)
+                    + list(_cs.lines) + list(_cs.notes) + list(_rn)
+                ),
+                "a fixture whose four policed children are ALL tracked passes every local "
+                "check with no coverage note",
+            )
+
+    # (e6d) SEC L-1: the `git add` note has to count the files it is ABOUT. Counting every
+    # file under the queried root reported all of a 5-file `.claude` when its one uncovered
+    # child held 2 — sending the reader to look for three untracked paths that do not exist,
+    # and leaving them unsure which half of the report to believe.
+    # Killing mutant: counting every file under the root instead of only the uncovered ones.
+    with tempfile.TemporaryDirectory() as tmp:
+        _tracked = {
+            os.path.join(".claude", "agents", "a.md"): "---\nname: a\ndescription: d\n---\n",
+            os.path.join(".claude", "skills", "demo", "SKILL.md"): (
+                "---\nname: demo\ndescription: d\n---\n"
+            ),
+            os.path.join(".claude", "settings.json"): '{"permissions": {}}\n',
+        }
+        if _git_repo(tmp, _tracked, list(_tracked)):
+            _commands = os.path.join(tmp, ".claude", "commands")
+            os.makedirs(_commands, exist_ok=True)
+            _wrapper(_commands, "wip.md", "---\ndescription: d\n---\n")
+            _wrapper(_commands, "wip2.md", "---\ndescription: d\n---\n")
+            _sc = startup_config_result(
+                os.path.join(tmp, ".mcp.json"),
+                os.path.join(tmp, ".claude", "settings.local.json"),
+                os.path.join(tmp, ".claude", "settings.json"),
+            )
+            # A PASSING check carries its context in `lines` (that IS its evidence) and a
+            # failing one in `notes`, so both are searched: the assertion is about the note's
+            # TEXT, not about which field this verdict happened to put it in.
+            _coverage = [
+                line
+                for line in list(_sc.lines) + list(_sc.notes)
+                if "not in the index" in line
+            ]
+            check(
+                _sc.status == "pass"
+                and len(_coverage) == 1
+                and _coverage[0].startswith(".claude: 2 file(s) on disk are not in the index")
+                and _count_uncovered_disk_files(
+                    os.path.join(tmp, ".claude"), (".claude",), []
+                ) == 5,
+                "the `git add` note counts only the files NO index entry covers (2 of the 5 "
+                "under the root), so the number names the work the remedy asks for",
+            )
+
+    # ...and the manifest-leaf rule stays inside the POLICED skills tree: a slash-command
+    # file at `.claude/commands/skills/skill.md` lives under a directory called `skills`, but
+    # `SKILL.md` means nothing there and telling its author to rename it is a false positive
+    # in the one check whose worth is that its findings are always real.
+    # Killing mutant: matching a `skills` component at ANY depth (the old ancestor scan).
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "commands", "skills", "skill.md")
+        if _git_repo(tmp, {_rel: "---\ndescription: d\n---\n"}, [_rel]):
+            _problems, _unverified, _ = tracked_symlink_problems(
+                link_query_paths(os.path.join(tmp, ".claude", "commands"))
+            )
+            check(
+                not any("folds onto" in message for _path, message in _problems),
+                "a tracked `.claude/commands/skills/skill.md` is NOT a manifest-name "
+                "collision: the leaf rule is scoped to the policed `.claude/skills` tree",
             )
 
     # (e7) SRE L-2: the index listing is cached per work tree, so the several checks that ask

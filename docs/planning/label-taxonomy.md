@@ -268,7 +268,11 @@ of three reconciliations or the three local validations (`settings-permissions`,
    the collision it is rather than twice. Git's answer must also COVER what the walks
    read: a path outside the work tree git answered from, a `.claude` whose checkout
    tracks nothing at or under any policed child (an export dropped inside an enclosing
-   checkout), and an index git cannot read are unverified rather than clean, while an
+   checkout), a `.claude` under an *uninitialised submodule* (a gitlink above it, so the
+   files on disk came from somewhere other than that index), and an index git cannot
+   read are unverified rather than clean — and "unverified" is reported *alongside*
+   whatever git did name, never instead of it, so a tracked link in a tree the checkout
+   does not own is still a failure — while an
    untracked subtree inside a `.claude` that checkout does own is walked, policed and
    noted rather than skipped (`git add` is the remedy there, not "run inside the
    checkout"); a collapsed sparse-index entry is unverified too, should git ever
