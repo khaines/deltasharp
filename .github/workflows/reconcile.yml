@@ -81,61 +81,44 @@ name: Reconcile
 #                          because the index holds the link, not the files "inside" it. Git
 #                          is asked FROM the directory that contains .claude, never from
 #                          inside it (a submodule .claude answers from the nested repository
-#                          and a symlinked one from outside the checkout — both "clean"),
-#                          about .claude, .mcp.json and ANY CASE-VARIANT of either: a tracked
-#                          .Claude/hooks merges into .claude/ on a case-insensitive checkout
-#                          where the CLI reads it, so a collision fails as "rename it"
-#                          whatever its index mode. The query is scoped to those roots, never
-#                          to the whole repository, and a path outside the work tree git
-#                          answered from is UNVERIFIED, not clean. One
+#                          and a symlinked one from outside the checkout — both "clean"). The
+#                          index is LISTED ONCE from the work-tree root with no pathspec (so
+#                          no pathspec magic — GIT_LITERAL_PATHSPECS and friends are scrubbed
+#                          along with GIT_DIR — can blind the query) and every entry that
+#                          case- or normalisation-FOLDS onto .claude/... or .mcp.json is
+#                          compared with the canonical spelling: a tracked .Claude/hooks,
+#                          .claude/COMMANDS/evil.md, .claude/Settings.local.json or
+#                          .mcp.jſon (U+017F) merges into the path the CLI reads on an
+#                          APFS/NTFS checkout, so it fails as "rename it" whatever its index
+#                          mode. "Tracked" is asked of the checked-out path the same way, so
+#                          a committed .claude/Settings.local.json is not filed as untracked
+#                          per-machine state. The findings are scoped to those roots, never
+#                          to the whole repository, and git's answer must COVER what the
+#                          walks read: a path outside the work tree git answered from, a
+#                          directory holding files no index entry folds under (an export
+#                          inside an enclosing checkout), and a sparse index are all
+#                          UNVERIFIED, not clean. One
 #                          link reported by more than one question is annotated ONCE per
 #                          check (paths are compared repo-root-relative). If git cannot say,
 #                          the check reports SKIP and --require-remote makes that exit 2 —
 #                          and a run with any SKIP ends on a qualified success line, never
 #                          the unqualified "are in step" claim.
 #
-# It runs on PRs and pushes that touch the governance files (drift introduced by a code
-# change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
-# milestone renamed in the UI, which is not a file change). The gate is intentionally NOT a
+# It runs on EVERY PR and push to main (drift introduced by a code change), on a weekly
+# schedule and on demand (drift introduced GitHub-side, e.g. a label or milestone renamed in
+# the UI, which is not a file change). There is deliberately NO `paths:` filter: GitHub's
+# path filters are case-SENSITIVE and cannot express the folding a macOS/Windows checkout
+# performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or `.mcp.jſon` — exactly the
+# shapes the gate now fails — would never have triggered the workflow that fails them
+# (PR-901 second round, RT-3). The job is stdlib Python with no build, so running it always
+# costs less than a filter that cannot enforce the rule. The gate is intentionally NOT a
 # branch-protection required check today (it can be promoted post-merge like the other gates,
 # see label-taxonomy.md). Least-privilege read-only token; the one action is pinned by SHA.
 on:
   push:
     branches: [main]
-    paths:
-      # The WHOLE .claude tree, not just the three subtrees the checks walk: the gate now
-      # fails any tracked link/submodule anywhere under it (.claude/hooks, output-styles/),
-      # and a filter that never fires cannot enforce that. `.claude` is listed on its own
-      # line because `.claude/**` does NOT match the path `.claude` — which is exactly the
-      # path a commit turning the directory itself into a symlink or submodule touches —
-      # as does `.gitmodules`, which is why it is listed too.
-      - ".claude"
-      - ".claude/**"
-      - ".gitmodules"
-      - ".mcp.json"
-      - ".github/ISSUE_TEMPLATE/feature_request.yml"
-      - ".github/CODEOWNERS"
-      - "docs/planning/label-taxonomy.md"
-      - ".github/workflows/reconcile.yml"
-      - "tools/reconcile/**"
   pull_request:
     branches: [main]
-    paths:
-      # The WHOLE .claude tree, not just the three subtrees the checks walk: the gate now
-      # fails any tracked link/submodule anywhere under it (.claude/hooks, output-styles/),
-      # and a filter that never fires cannot enforce that. `.claude` is listed on its own
-      # line because `.claude/**` does NOT match the path `.claude` — which is exactly the
-      # path a commit turning the directory itself into a symlink or submodule touches —
-      # as does `.gitmodules`, which is why it is listed too.
-      - ".claude"
-      - ".claude/**"
-      - ".gitmodules"
-      - ".mcp.json"
-      - ".github/ISSUE_TEMPLATE/feature_request.yml"
-      - ".github/CODEOWNERS"
-      - "docs/planning/label-taxonomy.md"
-      - ".github/workflows/reconcile.yml"
-      - "tools/reconcile/**"
   schedule:
     # Weekly, Mondays ~07:17 UTC — catch GitHub-side drift (a label/milestone edited in the
     # UI) that no file change would otherwise trigger.

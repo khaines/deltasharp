@@ -119,12 +119,20 @@ and a **submodule** is checked out *empty* by CI while `git submodule update --i
 loads whatever it contains on a developer machine. Git is asked from the directory
 that *contains* `.claude`, never from inside it — a submodule `.claude` would answer
 from the nested repository and a symlinked one from outside the checkout, both
-"clean" — and it is asked about `.claude`, `.mcp.json` **and any case-variant of
-either**: on a case-insensitive checkout (macOS/Windows) a tracked `.Claude/hooks`
-materialises inside `.claude/` where the CLI reads it, while the case-sensitive
-`.claude` pathspec never names it, so a collision fails as "rename it" whatever its
-index mode. All three local checks ask, so the link is named wherever the reader
-looks; a path outside the work tree git answered from is *unverified*, not clean.
+"clean". The index is **listed once from the work-tree root**, with no pathspec (so
+no pathspec magic — `GIT_LITERAL_PATHSPECS` and friends are scrubbed along with
+`GIT_DIR`) and every entry that **case- or normalisation-folds** onto `.claude/…` or
+`.mcp.json` is compared with the canonical spelling: on an APFS/NTFS checkout a
+tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md`, `.claude/Settings.local.json`
+or `.mcp.jſon` (U+017F) materialises at the path the CLI reads, so it fails as
+"rename it" whatever its index mode — and "is it tracked?" is asked of the
+checked-out path the same way, so a committed `.claude/Settings.local.json` is not
+filed as harmless per-machine state. The `.claude` question is asked by all three
+local checks, so a finding there is named wherever the reader looks (`.mcp.json` is
+owned by `tracked-startup-config`). Git's answer must also *cover* what the walks
+read: a path outside the work tree git answered from, a directory holding files no
+index entry folds under (an export dropped inside an enclosing checkout), and a
+sparse index are all *unverified*, not clean.
 The CLI follows such a link; the gate's walks deliberately do not, so
 it would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
 `mcpServers[*].command` is started when the CLI launches, before any tool call and

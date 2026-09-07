@@ -161,6 +161,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import unicodedata
 import urllib.parse
 
 # --- Constants ---------------------------------------------------------------------------
@@ -637,6 +638,30 @@ def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "lis
 INTEGRITY_CLAUSE_MARKERS = ("other integrity problem(s)", "found and ignored")
 
 
+class _LinkMessage(str):
+    """A problem message that CARRIES the path (and finding kind) it is about.
+
+    Every producer of a link/collision message returns one of these, so
+    :func:`_dedupe_link_problems` can key on `(kind, path)` STRUCTURALLY instead of recovering
+    the path from the rendered text with a regex — which a path containing a quote character
+    defeats (`.claude/skills/a'b"c` printed one link as two annotations, PR-901 F-D / L-1).
+
+    It is a `str` subclass on purpose: these messages travel through lists that are printed,
+    searched with `in`, sorted and compared as ordinary strings everywhere else. The one place
+    the distinction matters is de-duplication — and the fact that a message EMBEDDED in a
+    larger one (the roster's "no persona wrappers found … because `.claude` is a tracked
+    gitlink") becomes a plain `str` again is the wanted behaviour, not a leak: that sentence is
+    a different finding from the bare gitlink line and must not be dropped as its duplicate
+    (PR-901 second round, RT-5).
+    """
+
+    def __new__(cls, message: str, path: str, kind: str = "link") -> "_LinkMessage":
+        text = super().__new__(cls, message)
+        text.path = path
+        text.kind = kind
+        return text
+
+
 def _symlink_problem(kind: str, path: str) -> str:
     """The one message every walk uses for a symlinked config path (CERT-F1).
 
@@ -647,9 +672,10 @@ def _symlink_problem(kind: str, path: str) -> str:
     following the link is right; staying SILENT about it is the defect. Reporting the link
     itself keeps the gate's coverage claim honest — every file it counted, it read.
     """
-    return (
+    return _LinkMessage(
         f"{kind} path {path!r} is a symlink; the gate does not follow links but Claude Code "
-        f"does — replace it with real files or remove it"
+        f"does — replace it with real files or remove it",
+        path,
     )
 
 
@@ -682,11 +708,25 @@ TRACKED_LINK_MODES = ("120000", "160000")
 
 
 # The environment variables that make git answer about a DIFFERENT repository than the one
-# the working directory names. An ambient `GIT_DIR` — a stale `export` in a shell, a CI
-# wrapper, a hook — would silently redirect every query in this file at some other checkout,
-# and a clean answer from the wrong repository reads exactly like a clean answer from this
-# one (PR-901 F-E). They are removed from the environment of every git subprocess below
-# rather than trusted; nothing in this gate wants the redirection they exist to provide.
+# the working directory names, or about a DIFFERENT SET OF PATHS than the ones asked for. An
+# ambient `GIT_DIR` — a stale `export` in a shell, a CI wrapper, a hook — would silently
+# redirect every query in this file at some other checkout, and a clean answer from the wrong
+# repository reads exactly like a clean answer from this one (PR-901 F-E). The pathspec-magic
+# family is the same defect one level down: `GIT_LITERAL_PATHSPECS=1` makes a `:(literal)…`
+# pathspec match NOTHING, so the index query returned zero entries and the gate passed in
+# silence (PR-901 second round, H-2). This file no longer hands git any pathspec at all — it
+# lists the index once and filters in Python — but the variables stay scrubbed so a future
+# pathspec cannot reintroduce the hole, and `GIT_NAMESPACE` is scrubbed because a namespaced
+# ref view is not the checkout the walks read.
+#
+# What is deliberately NOT scrubbed: `GIT_CEILING_DIRECTORIES` and
+# `GIT_DISCOVERY_ACROSS_FILESYSTEM`, which only RESTRICT where git looks for a repository.
+# Removing them can only WIDEN the answer — up into an ENCLOSING repository whose index knows
+# nothing about the tree being walked, which is the false clean this gate must never print
+# (PR-901 second round, RT-4). Left in place they can at worst make git say "not a git
+# repository", which reaches the operator as SKIP/unverified. (Coverage is checked
+# independently in :func:`_index_findings`, so an enclosing repo cannot clear a tree it does
+# not cover even when discovery does widen.)
 _SCRUBBED_GIT_ENV = (
     "GIT_DIR",
     "GIT_WORK_TREE",
@@ -694,8 +734,11 @@ _SCRUBBED_GIT_ENV = (
     "GIT_COMMON_DIR",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_CEILING_DIRECTORIES",
-    "GIT_DISCOVERY_ACROSS_FILESYSTEM",
+    "GIT_NAMESPACE",
+    "GIT_LITERAL_PATHSPECS",
+    "GIT_GLOB_PATHSPECS",
+    "GIT_NOGLOB_PATHSPECS",
+    "GIT_ICASE_PATHSPECS",
 )
 
 
@@ -727,35 +770,76 @@ def _tracked_link_problem(mode: str, path: str) -> str:
     this gate asks.
     """
     if mode == "160000":
-        return (
+        return _LinkMessage(
             f"{path!r} is a tracked gitlink/submodule (git mode 160000); CI checks it out "
             f"empty and the CLI loads whatever it contains once initialised — vendor the "
-            f"files instead"
+            f"files instead",
+            path,
         )
-    return (
+    return _LinkMessage(
         f"{path!r} is a tracked symlink (git mode 120000); the gate cannot see through links "
-        f"that may resolve elsewhere on another machine — replace it with real files"
+        f"that may resolve elsewhere on another machine — replace it with real files",
+        path,
     )
 
 
 def _case_collision_problem(path: str, expected: str) -> str:
-    """The message for an index path that differs from a policed one only in CASE (PR-901 F-C).
+    """The message for an index path that FOLDS onto a policed one (PR-901 F-C, H-1, RT-2).
 
-    Git's index is case-SENSITIVE and its pathspecs are too, so `.Claude/hooks` is a different
-    path from `.claude/hooks` and a `.claude` pathspec never names it. macOS and Windows
-    checkouts are case-INSENSITIVE: the same entry materialises inside the real `.claude/`
-    directory, where Claude Code reads it as configuration. A gate that only ever asked about
-    the exact spelling would therefore clear a file the CLI loads, on the two platforms most
-    contributors use. The remedy is a rename, not a link replacement, so this is its own
-    message and it is reported for ANY index mode — a plain file collides just as effectively
-    as a link.
+    Git's index is case-SENSITIVE and byte-exact, so `.Claude/hooks` is a different path from
+    `.claude/hooks`. macOS (APFS) and Windows (NTFS) checkouts are not: they fold CASE, and
+    APFS folds UNICODE NORMALISATION forms too, so the same entry materialises inside the real
+    `.claude/` directory, where Claude Code reads it as configuration. A gate that only ever
+    asked about the exact spelling would therefore clear a file the CLI loads, on the two
+    platforms most contributors use. The remedy is a rename, not a link replacement, so this
+    is its own message and it is reported for ANY index mode — a plain file impersonates a
+    config file just as effectively as a link does.
     """
-    return (
-        f"{path!r} case-collides with {expected!r} on a case-insensitive checkout "
-        f"(macOS/Windows): git records it as a separate, case-sensitive path that no "
-        f"{expected!r} pathspec names, while the working tree merges it into {expected!r} "
-        f"where Claude Code reads it — rename it"
+    return _LinkMessage(
+        f"{path!r} folds onto {expected!r} on a case-insensitive checkout (macOS/Windows): "
+        f"git records it as a separate, byte-exact path, while the working tree merges it "
+        f"into {expected!r} where Claude Code reads it — rename it",
+        path,
+        "case",
     )
+
+
+def _fold(name: str) -> str:
+    """The ONE key two spellings that name the SAME checked-out path share (PR-901 RT-2).
+
+    `unicodedata.normalize("NFC", …)` then `str.casefold()`, applied to BOTH sides of every
+    comparison in this file:
+
+    * **casefold, not lower.** `str.lower()` is identity on `ſ` (U+017F LATIN SMALL LETTER
+      LONG S) and on `K` (U+212A KELVIN SIGN); `casefold()` maps them to `s` and `k`. A
+      tracked `.mcp.jſon` IS `.mcp.json` on APFS — and git's own `:(icase)` pathspec magic
+      does not see it either, which is why the folding is done here rather than delegated.
+    * **NFC first.** APFS is normalisation-insensitive, so a decomposed `.claude/agents` (with
+      a combining mark anywhere in the name) resolves to the composed spelling in the working
+      tree while the index keeps the bytes it was given.
+    """
+    return unicodedata.normalize("NFC", name).casefold()
+
+
+def _path_parts(path: str) -> "tuple[str, ...]":
+    """`path` split into its non-empty components (`/` and `os.sep` both accepted)."""
+    return tuple(part for part in path.replace(os.sep, "/").split("/") if part and part != ".")
+
+
+def _fold_parts(path: str) -> "tuple[str, ...]":
+    """:func:`_path_parts` with every component :func:`_fold`ed."""
+    return tuple(_fold(part) for part in _path_parts(path))
+
+
+def _folds_under(parts: "tuple[str, ...]", prefix: "tuple[str, ...]") -> bool:
+    """True when `parts` IS `prefix` or lies under it, comparing folded SEGMENTS.
+
+    Segment-wise, never a byte prefix: `.claudex/z` and `.claudeß` (whose casefold is
+    `.claudess`) must NOT match `.claude`, while `.claude/ſkills/x` must.
+    """
+    if len(parts) < len(prefix):
+        return False
+    return all(_fold(part) == _fold(want) for part, want in zip(parts, prefix))
 
 
 def _index_finding_problem(kind: str, detail: str, path: str) -> str:
@@ -788,11 +872,25 @@ def _query_anchor(absolute: "list[str]") -> str:
     return os.path.dirname(base) or os.curdir
 
 
-def _ls_files(top: str, specs: "list[str]") -> "list[tuple[str, str]] | None":
-    """`(mode, repo-relative path)` for `git ls-files -s` in `top`, or ``None`` if it failed."""
+def _ls_files(top: str) -> "list[tuple[str, str]] | None":
+    """Every index entry as `(mode, repo-relative path)` for `top`, or ``None`` if git failed.
+
+    The listing carries NO PATHSPEC on purpose (PR-901 second round, H-2). The previous
+    version handed git `:(literal)…` and `:(icase,literal)…` magic, which an ambient
+    `GIT_LITERAL_PATHSPECS=1` turns into a request for a file literally named
+    `:(literal).claude` — matching nothing, so the query returned zero entries and every
+    caller read that as "no findings" and PASSED. Filtering in Python instead means the
+    selection rules are this file's own (and are unit-tested), no user-controlled string is
+    ever interpreted as a pattern, and the case/normalisation folding the checkouts actually
+    perform can be applied — which no git pathspec can do (`:(icase)` does not fold `ſ`).
+
+    ``-z`` so no path is ever quoted or escaped, ``--full-name`` so one entry has exactly one
+    spelling whatever directory git was invoked from. ``None`` is "git could not answer" — a
+    timeout, a non-zero exit, an unreadable index — and is never collapsed into "no entries".
+    """
     try:
         proc = subprocess.run(
-            ["git", "ls-files", "-s", "-z", "--full-name", "--", *specs],
+            ["git", "ls-files", "-s", "-z", "--full-name", "--"],
             cwd=top,
             capture_output=True,
             text=True,
@@ -802,7 +900,7 @@ def _ls_files(top: str, specs: "list[str]") -> "list[tuple[str, str]] | None":
     except (OSError, subprocess.TimeoutExpired):  # pragma: no cover - environment dependent
         return None
     if proc.returncode != 0:
-        # 128 = not a git repository / an unusable pathspec; anything else is equally
+        # 128 = not a git repository / an unreadable index; anything else is equally
         # unanswerable. Never "clean".
         return None
     entries: "list[tuple[str, str]]" = []
@@ -816,6 +914,65 @@ def _ls_files(top: str, specs: "list[str]") -> "list[tuple[str, str]] | None":
     return entries
 
 
+# The names Claude Code resolves THROUGH THE FILESYSTEM inside a `.claude` directory. They are
+# policed by every check, whichever subtree that check owns: `.claude/COMMANDS/evil.md` is
+# configuration the CLI loads on a macOS clone, and it must be named whether the reader is
+# looking at the roster check's report or the startup one's.
+POLICED_CLAUDE_CHILDREN = (
+    "agents",
+    "commands",
+    "skills",
+    "settings.json",
+    "settings.local.json",
+)
+
+# A sparse index collapses a whole directory into ONE entry (mode 040000, a trailing slash).
+# The files inside it are then absent from the listing, so "no findings under `.claude`" would
+# be an artefact of the index format rather than a fact about the tree.
+_SPARSE_DIR_MODE = "040000"
+
+
+def _policed_prefixes(specs: "list[str]") -> "list[tuple[str, ...]]":
+    """The canonical spellings an index entry is compared against, longest first.
+
+    Each queried path contributes its own spelling, and a `.claude` root additionally
+    contributes every name in :data:`POLICED_CLAUDE_CHILDREN` — that is what extends the
+    case-fold question BELOW the root's direct children, where it used to stop (PR-901 second
+    round, H-1: `.claude/COMMANDS/evil.md` and `.claude/Settings.local.json` passed the whole
+    gate). Longest first so the most specific canonical spelling is the one quoted in the
+    remedy (`.claude/skills`, not `.claude`).
+
+    The prefixes are ANCHOR-RELATIVE-turned-repo-relative spellings (`sub/.claude`), never a
+    bare component: a clean root `.claude` must not mask a `sub/.Claude` under an
+    `--agents-dir sub/.claude/agents`.
+    """
+    prefixes: "list[tuple[str, ...]]" = []
+    for spec in specs:
+        parts = _path_parts(spec)
+        if not parts:
+            continue
+        if parts not in prefixes:
+            prefixes.append(parts)
+        if parts[-1] == CLAUDE_DIR_NAME:
+            for child in POLICED_CLAUDE_CHILDREN:
+                candidate = parts + (child,)
+                if candidate not in prefixes:
+                    prefixes.append(candidate)
+    prefixes.sort(key=len, reverse=True)
+    return prefixes
+
+
+def _has_disk_entries(path: str) -> bool:
+    """True when `path` is a real directory that CONTAINS something (never follows a link)."""
+    if not os.path.isdir(path) or os.path.islink(path):
+        return False
+    try:
+        with os.scandir(path) as scan:
+            return any(True for _entry in scan)
+    except OSError:  # pragma: no cover - defensive: unreadable directory
+        return False
+
+
 def _index_findings(
     paths: "list[str]",
 ) -> "tuple[list[tuple[str, str, str]] | None, str]":
@@ -825,24 +982,30 @@ def _index_findings(
 
     * ``("link", mode, path)`` — a tracked SYMLINK (120000) or GITLINK/submodule (160000).
       See :func:`_tracked_link_problem`.
-    * ``("case", expected, path)`` — an entry that differs from a policed path only in case.
-      See :func:`_case_collision_problem`.
+    * ``("case", expected, path)`` — an entry that FOLDS onto a policed path (case, or Unicode
+      normalisation form) without being spelled the way it is. See
+      :func:`_case_collision_problem`. Reported for ANY index mode; when an entry is both, the
+      collision wins, because the remedy is the rename and one path must not print twice.
 
     Git is asked from the ANCHOR (:func:`_query_anchor`) — the directory that CONTAINS the
     `.claude` root, never `.claude` itself and never anything inside it. `git rev-parse
-    --show-toplevel` is resolved once from there and every queried path is required to lie
-    inside that work tree; a path that does not is reported as UNVERIFIED with that reason,
-    because an index that does not cover a path cannot clear it. Containment is decided
-    LEXICALLY (the queried paths are relocated into the anchor's resolved spelling, so
+    --show-toplevel` is resolved once from there, the index is listed ONCE from that root with
+    no pathspec, and the selection is done here by folded path segments. Every queried path is
+    required to lie inside that work tree; a path that does not is reported as UNVERIFIED with
+    that reason, because an index that does not cover a path cannot clear it. Containment is
+    decided LEXICALLY (the queried paths are relocated into the anchor's resolved spelling, so
     macOS's `/var` -> `/private/var` does not read as "outside"): resolving the leaf would
     follow the very link under investigation, and a `.claude` symlink pointing out of the
     tree would then excuse itself from the query it exists to fail.
 
-    ``--full-name`` makes the reported paths REPO-ROOT-relative, so one entry has one
-    spelling whatever pathspec found it. ``None`` is "git could not answer" and is
-    deliberately NOT collapsed into "no findings": callers report it as UNVERIFIED — the same
-    contract :func:`_git_tracked` keeps — so an environment the gate could not interrogate
-    never reads as an environment it cleared.
+    Three ways the answer is UNVERIFIED rather than empty, all of them "git's answer does not
+    cover what the walks read": git could not be asked at all; a queried DIRECTORY that holds
+    files on disk has no index entry folding under it (an export dropped inside an ENCLOSING
+    checkout — PR-901 second round, RT-4 — or a `.claude` nothing in which is tracked); or the
+    index is sparse and collapsed the policed tree into a directory entry. ``None`` is never
+    collapsed into "no findings": callers report it as UNVERIFIED — the same contract
+    :func:`_git_tracked` keeps — so an environment the gate could not interrogate never reads
+    as an environment it cleared.
     """
     if shutil.which("git") is None:
         return None, "git is not on PATH"
@@ -864,7 +1027,7 @@ def _index_findings(
     if not _is_within(anchor_real, top_real):  # pragma: no cover - defensive
         return None, "the directory git was asked from lies outside the work tree it answered"
     specs: "list[str]" = []
-    expected: "list[str]" = []
+    on_disk: "dict[str, str]" = {}
     for candidate in absolute:
         relocated = os.path.normpath(
             os.path.join(anchor_real, os.path.relpath(candidate, anchor_abs))
@@ -875,42 +1038,105 @@ def _index_findings(
                 f"({top_real!r})"
             )
         relative = os.path.relpath(relocated, top_real).replace(os.sep, "/")
-        # `:(literal)` because a policed path is a PATH, not a glob: a `[` or `*` in a
-        # directory name must not silently change which entries the query covers.
         if relative not in specs:
             specs.append(relative)
-        # Only the direct children of the anchor (`.claude`, `.mcp.json`) get the
-        # case-insensitive question: they are the names the CLI resolves through the
-        # filesystem, so they are the names a case-variant can impersonate.
-        if os.path.dirname(relocated) == anchor_real and relative not in expected:
-            expected.append(relative)
-    pathspecs = [f":(literal){spec}" for spec in specs]
-    pathspecs.extend(f":(icase,literal){spec}" for spec in expected)
-    entries = _ls_files(top_real, pathspecs)
+            on_disk[relative] = candidate
+    entries = _ls_files(top_real)
     if entries is None:
         return None, f"git ls-files could not read the index in {top_real!r}"
+    scope = [_path_parts(spec) for spec in specs]
+    prefixes = _policed_prefixes(specs)
+    listed = [(mode, name, _path_parts(name)) for mode, name in entries]
+    # COVERAGE first: a clean answer about a tree the index does not hold is not a clean tree.
+    for spec in specs:
+        prefix = _path_parts(spec)
+        if not prefix or not _has_disk_entries(on_disk[spec]):
+            continue
+        # Either direction counts as covered: an entry UNDER the queried path, or an entry AT
+        # an ANCESTOR of it — a gitlink or symlink at `.claude` is git's whole answer about
+        # everything "inside" it, and the populated submodule/resolved-link work tree on disk
+        # must not read as a tree the index forgot.
+        if any(
+            _folds_under(parts, prefix) or _folds_under(prefix, parts)
+            for _mode, _name, parts in listed
+        ):
+            continue
+        return None, (
+            f"{spec!r} holds files on disk that the work tree git answered from "
+            f"({top_real!r}) does not track — its index says nothing about them, so they are "
+            f"unverified rather than clean"
+        )
     findings: "list[tuple[str, str, str]]" = []
-    for mode, name in entries:
-        collides = _case_collision(name, expected)
-        if collides is not None:
-            # Reported INSTEAD of the link message when it is both: the fix is the rename,
-            # and one path must not print as two defects.
-            findings.append(("case", collides, name))
+    for mode, name, parts in listed:
+        matched = next((prefix for prefix in prefixes if _folds_under(parts, prefix)), None)
+        if matched is None and not any(_folds_under(parts, spec) for spec in scope):
+            continue
+        if mode == _SPARSE_DIR_MODE or name.endswith("/"):
+            return None, (
+                f"the index in {top_real!r} is SPARSE and collapses {name!r} into a single "
+                f"directory entry, so the files under it are not listed — unverified rather "
+                f"than clean; re-run with `git sparse-checkout disable`"
+            )
+        expected = None
+        if matched is not None and any(
+            part != want for part, want in zip(parts[: len(matched)], matched)
+        ):
+            expected = "/".join(matched)
+        if expected is not None:
+            findings.append(("case", expected, name))
         elif mode in TRACKED_LINK_MODES:
             findings.append(("link", mode, name))
     return sorted(set(findings), key=lambda item: (item[2], item[0], item[1])), ""
 
 
-def _case_collision(name: str, expected: "list[str]") -> "str | None":
-    """The policed spelling `name` collides with only by CASE, or ``None``."""
-    lowered = name.lower()
-    for candidate in expected:
-        if name == candidate or name.startswith(candidate + "/"):
-            return None  # the exact spelling: nothing to report
-        low = candidate.lower()
-        if lowered == low or lowered.startswith(low + "/"):
-            return candidate
-    return None
+def _folded_index_tracked(path: str) -> "bool | None":
+    """Does SOME index entry fold onto `path`? ``True``/``False``, or ``None`` if unanswerable.
+
+    The companion :func:`_git_tracked` needs (PR-901 second round, H-1). That function asks git
+    about one byte-exact spelling, which is precisely the question a case- or
+    normalisation-variant defeats: on a macOS clone of a repo that tracks
+    `.claude/Settings.local.json`, the file the CLI reads sits at
+    `.claude/settings.local.json` and `git ls-files --error-unmatch` calls it UNTRACKED — so
+    the gate reported it as harmless per-machine state while it shipped to every checkout.
+    """
+    if shutil.which("git") is None:
+        return None
+    absolute = os.path.abspath(path)
+    parent = os.path.dirname(absolute) or os.curdir
+    if not os.path.isdir(parent):  # pragma: no cover - defensive
+        return None
+    # The PARENT is resolved, the leaf never is: resolving the leaf would follow the very link
+    # the caller may be asking about.
+    parent_real = os.path.realpath(parent)
+    candidate = os.path.join(parent_real, os.path.basename(absolute))
+    top = _git_toplevel(parent_real)
+    if top is None:
+        return None
+    top_real = os.path.realpath(top)
+    if not _is_within(candidate, top_real):
+        return None
+    entries = _ls_files(top_real)
+    if entries is None:
+        return None
+    wanted = _fold_parts(os.path.relpath(candidate, top_real))
+    return any(_fold_parts(name) == wanted for _mode, name in entries)
+
+
+def _tracked_by_git(path: str) -> "bool | None":
+    """Is `path` tracked, by its own spelling OR by one that folds onto it in the work tree?
+
+    ``None`` when either question could not be answered and the other said "no": an
+    unanswerable question must reach the operator as unverified, never as "untracked, fine".
+    """
+    exact = _git_tracked(path)
+    if exact:
+        return True
+    folded = _folded_index_tracked(path)
+    if folded:
+        return True
+    if exact is None or folded is None:
+        return None
+    return False
 
 
 def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
@@ -1011,13 +1237,11 @@ def _git_toplevel(directory: str) -> "str | None":
     return top
 
 
-# Every link message this gate emits quotes the path before saying what it is; that is what
-# lets one link reported by two different questions be recognised as one link when only the
-# MESSAGE is available. Both quote styles are accepted because `repr` switches to double
-# quotes for a path containing an apostrophe (`.claude/skills/it's`), and a pattern that knew
-# only single quotes silently stopped de-duplicating exactly there (PR-901 F-D). The git-side
-# findings do not rely on this at all: they carry their path structurally.
-_LINK_PATH_RE = re.compile(r"""(?:'([^']*)'|"([^"]*)") is a (?:tracked )?(?:symlink|gitlink)""")
+# Nothing in this file recovers a path from a rendered MESSAGE any more. Every producer of a
+# link or case-collision line returns a :class:`_LinkMessage` carrying the path and the kind
+# structurally, because the pattern that used to do it printed one link as two annotations
+# whenever the path held a quote character (`.claude/skills/a\'b"c`: `repr` escapes rather
+# than switches quote style) — PR-901 F-D and, at the second round, L-1.
 
 
 def _normalize_link_path(path: str) -> str:
@@ -1025,9 +1249,9 @@ def _normalize_link_path(path: str) -> str:
 
     The walk-based checks report the path the CALLER passed (often absolute, e.g. a
     `--mcp-config /abs/.mcp.json`), while git reports it repo-root-relative (`.mcp.json`).
-    Comparing the message STRINGS therefore let one link produce two `::error::` annotations,
-    which reads as two defects to fix (LAST-CERT F4). Normalising both spellings to the
-    top-level-relative form makes them comparable. A relative path that does not exist under
+    Two spellings of one path therefore produced two `::error::` annotations, which reads as
+    two defects to fix (LAST-CERT F4). Normalising both to the top-level-relative form makes
+    them comparable. A relative path that does not exist under
     the current directory is assumed to be already repo-root-relative (that is exactly what
     `git ls-files --full-name` returns from a fixture repo elsewhere) and is left alone.
     """
@@ -1051,36 +1275,38 @@ def _normalize_link_path(path: str) -> str:
 
 
 def _dedupe_link_problems(*groups: "list[str] | list[tuple[str, str]]") -> "list[str]":
-    """Concatenate problem groups, keeping ONE line per link path (LAST-CERT F4).
+    """Concatenate problem groups, keeping ONE line per (kind, link path) (LAST-CERT F4).
 
     Groups are kept in the order given, so a caller puts the message it prefers first — the
     git-mode one, which names the index mode and is decisive, ahead of the walk's "is a
-    symlink". Problems that are not about a link pass through untouched.
+    symlink".
 
-    A group may hold either plain messages or ``(path, message)`` pairs. The pairs are what
-    the index query returns: it KNOWS which path each message is about, so its key is exact
-    rather than recovered from the message text by a regex that a path containing a quote
-    character can defeat (PR-901 F-D). Walk-produced messages still fall back to the pattern.
+    The key is STRUCTURAL and it is the only key: a :class:`_LinkMessage` carries the path and
+    the kind it was built with, and a ``(path, message)`` pair (what the index query returns)
+    carries the path beside it. Nothing is parsed out of the rendered text, so a path holding
+    an apostrophe AND a double quote still collapses to one line (PR-901 F-D / L-1), and the
+    KIND is part of the key so a link and a collision at one path stay distinguishable.
+
+    Anything else — an integrity sentence that happens to QUOTE a link clause, such as the
+    roster's "no persona wrappers found … because `.claude` is a tracked gitlink" — is a
+    different finding and passes through untouched (deduplicated only against an identical
+    string). Dropping it as "the same link" is how an operator lost the one line that
+    explained an empty roster (PR-901 second round, RT-5).
     """
-    seen: "set[str]" = set()
+    seen: "set[tuple[str, str]]" = set()
     kept: "list[str]" = []
     for group in groups:
         for problem in group:
             if isinstance(problem, tuple):
                 path, message = problem
-                key = _normalize_link_path(path)
             else:
                 message = problem
-                match = _LINK_PATH_RE.search(problem)
-                key = (
-                    None
-                    if match is None
-                    else _normalize_link_path(match.group(1) or match.group(2))
-                )
-            if key is None:
+                path = getattr(problem, "path", None)
+            if path is None:
                 if message not in kept:
                     kept.append(message)
                 continue
+            key = (getattr(message, "kind", "link"), _normalize_link_path(path))
             if key in seen:
                 continue
             seen.add(key)
@@ -1111,10 +1337,11 @@ def tracked_symlink_problems(
         return [], [
             "git could not say whether "
             + ", ".join(sorted(paths))
-            + f" hold tracked symlinks, submodules or case-variants ({reason}) — a "
-            "link whose target is absent here, and a submodule CI checks out empty, are both "
-            "INVISIBLE to the path checks, so this is unverified, not clean; run the gate "
-            "inside the git checkout"
+            + f" hold tracked symlinks, submodules or fold-variants ({reason}) — a "
+            "link whose target is absent here, a submodule CI checks out empty, and a "
+            "spelling that folds onto a policed path on this checkout are all INVISIBLE to "
+            "the path checks, so this is unverified, not clean; run the gate inside the git "
+            "checkout that tracks these files"
         ]
     return [
         (path, _index_finding_problem(kind, detail, path))
@@ -2021,7 +2248,11 @@ def validate_startup_config(
     Only TRACKED files fail. An untracked local copy is reported in ``notes`` ("present
     locally, untracked") so a responder reading a green run still knows it is there, and a
     file whose tracking git cannot determine goes to ``unverified`` — never to ``notes`` as
-    if it had been cleared.
+    if it had been cleared. "Tracked" is asked of the CHECKED-OUT path, not of one byte-exact
+    spelling (:func:`_tracked_by_git`): on a macOS clone of a repo that committed
+    `.claude/Settings.local.json`, the file the CLI honours is the one at
+    `.claude/settings.local.json`, and answering "untracked" about it was how a committed
+    per-machine grant read as harmless local state (PR-901 second round, H-1).
     """
     problems: "list[str]" = []
     notes: "list[str]" = []
@@ -2037,7 +2268,7 @@ def validate_startup_config(
         # A link is not read THROUGH: what the target holds here says nothing about what it
         # holds elsewhere. Tracking decides — a tracked link is reported by the caller's
         # git-mode check, an untracked one is the developer's own machine state.
-        tracked = _git_tracked(mcp_path)
+        tracked = _tracked_by_git(mcp_path)
         if tracked is None:
             unverified.append(
                 f"{mcp_path} is a symlink and git cannot say whether it is tracked (git "
@@ -2051,7 +2282,7 @@ def validate_startup_config(
                 f"committed one ships to everyone); its target was not read"
             )
     else:
-        tracked = _git_tracked(mcp_path)
+        tracked = _tracked_by_git(mcp_path)
         if tracked is None:
             unverified.append(
                 f"{mcp_path} exists but git cannot say whether it is tracked (git missing or "
@@ -2084,7 +2315,7 @@ def validate_startup_config(
     if not os.path.lexists(settings_local_path):
         notes.append(f"no {settings_local_path} in the checkout")
     else:
-        tracked = _git_tracked(settings_local_path)
+        tracked = _tracked_by_git(settings_local_path)
         if tracked is None:
             unverified.append(
                 f"{settings_local_path} exists but git cannot say whether it is tracked (git "
@@ -2097,7 +2328,8 @@ def validate_startup_config(
             )
         else:
             problems.append(
-                f"{settings_local_path} is TRACKED; Claude Code honours it exactly like "
+                f"{settings_local_path} is TRACKED (by that spelling, or by one that folds "
+                f"onto it on this checkout); Claude Code honours it exactly like "
                 f"settings.json but it must be gitignored per-machine state — a committed "
                 f"one widens the permission surface of every checkout while the policed "
                 f"settings.json still reads clean; `git rm --cached {settings_local_path}` "
@@ -4631,8 +4863,8 @@ def _selftest() -> int:
     # holds no gitlink, so the check reports "clean"), and a SYMLINK out of the tree puts it
     # outside any checkout (so the check SKIPs with "not a git checkout" — a false
     # environment problem). The query is now anchored ABOVE the `.claude` root
-    # (:func:`_query_anchor`), asks about case-variants too, and refuses to answer "clean"
-    # for a pathspec outside the work tree it read.
+    # (:func:`_query_anchor`), folds every index entry onto the policed spellings, and
+    # refuses to answer "clean" for a path the index it read does not cover.
     def _relink(target: str, linkname: str) -> bool:
         """Create a symlink, False where the platform cannot (the name `_link` is rebound
         by the `.claude` root-pathspec loop above, so these fixtures carry their own)."""
@@ -4778,11 +5010,32 @@ def _selftest() -> int:
                 "(zero skips, never 'not a git checkout')",
             )
 
-    # (c) CASE COLLISION. Git's index and its pathspecs are case-SENSITIVE; macOS and Windows
-    # checkouts are not. A tracked `.Claude/hooks` is therefore a path no `.claude` pathspec
-    # names, which materialises inside the real `.claude/` where the CLI reads it. Reported
-    # for ANY index mode — a plain file impersonates a config file just as well as a link.
-    # Killing mutant: dropping the `:(icase,...)` pathspecs (or the collision filter).
+    # (c) FOLDED SPELLINGS. Git's index is case-SENSITIVE and byte-exact; APFS and NTFS are
+    # not. A tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md` or `.mcp.jſon` is a path no
+    # byte-exact query names, which materialises inside the real `.claude/` (or AT
+    # `.mcp.json`) where the CLI reads it. The fold is NFC + casefold, applied to both sides
+    # and compared SEGMENT-wise, and a collision is reported for ANY index mode — a plain
+    # file impersonates a config file just as well as a link.
+    # Killing mutants: `.lower()` instead of `.casefold()`; folding only the anchor's direct
+    # children (the old `expected` list); byte-prefix instead of segment comparison; dropping
+    # POLICED_CLAUDE_CHILDREN; reporting collisions only for link modes.
+    check(
+        _fold("ſ") == "s"
+        and _fold("K") == "k"
+        and "ſ".lower() != "s"
+        and _fold(".mcp.jſon") == _fold(".mcp.json")
+        and _fold(unicodedata.normalize("NFD", "café")) == _fold("café"),
+        "_fold is NFC+casefold (ſ->s, KELVIN->k, NFD==NFC), which `.lower()` is not",
+    )
+    check(
+        _folds_under(_path_parts(".claude/ſkills/x"), (".claude", "skills"))
+        and _folds_under(_path_parts(".CLAUDE"), (".claude",))
+        and not _folds_under(_path_parts(".claudex/z"), (".claude",))
+        and not _folds_under(_path_parts(".claudeß"), (".claude",))
+        and not _folds_under(_path_parts(".claude"), (".claude", "skills")),
+        "folding compares whole SEGMENTS: `.claudex/z` and `.claudeß` are not under `.claude`",
+    )
+
     def _cacheinfo(repo: str, mode: str, path: str, body: str) -> bool:
         """Stage `path` with `mode` straight into the index (no working-tree entry needed)."""
         try:
@@ -4801,6 +5054,7 @@ def _selftest() -> int:
             return False
         return staged.returncode == 0
 
+    _hooks_payload = '{"hooks": {"SessionStart": "curl evil"}, "permissions": {}}'
     with tempfile.TemporaryDirectory() as tmp:
         if _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, [os.path.join(".claude", "keep")]):
             _staged = _cacheinfo(tmp, "120000", ".Claude/hooks", "../obj/hooks") and _cacheinfo(
@@ -4813,25 +5067,28 @@ def _selftest() -> int:
                 check(
                     _statuses == ["fail", "fail", "fail"]
                     and sum(
-                        line.startswith(repr(".Claude/hooks") + " case-collides with '.claude'")
+                        line.startswith(repr(".Claude/hooks") + " folds onto '.claude'")
                         for line in _lines
                     ) == 3,
-                    "a tracked `.Claude/hooks` is named as a case collision by all three "
-                    "local checks (the `.claude` pathspec alone never sees it)",
+                    "a tracked `.Claude/hooks` is named as a fold collision by all three "
+                    "local checks (a byte-exact `.claude` query never sees it)",
                 )
                 check(
                     sum(
-                        repr(".CLAUDE/settings.json") in line and "case-collides" in line
+                        repr(".CLAUDE/settings.json") in line and "folds onto" in line
                         for line in _lines
                     ) == 3
                     and not any(
                         repr(".CLAUDE/settings.json") in line and "120000" in line
                         for line in _lines
                     ),
-                    "a case collision is reported for ANY index mode, not only for links",
+                    "a fold collision is reported for ANY index mode, not only for links",
                 )
-                # `.mcp.json` gets the same treatment, from the check that owns it.
-                if _cacheinfo(tmp, "100644", ".MCP.json", '{"mcpServers": {"x": {"command": "true"}}}'):
+                # `.mcp.json` gets the same treatment, from the check that owns it — and the
+                # Unicode variant no `:(icase)` pathspec and no `.lower()` can see.
+                if _cacheinfo(
+                    tmp, "100644", ".MCP.json", '{"mcpServers": {"x": {"command": "true"}}}'
+                ) and _cacheinfo(tmp, "100644", ".mcp.jſon", '{"mcpServers": {"y": {}}}'):
                     _res = startup_config_result(
                         os.path.join(tmp, ".mcp.json"),
                         os.path.join(tmp, ".claude", "settings.local.json"),
@@ -4840,11 +5097,149 @@ def _selftest() -> int:
                     check(
                         _res.status == "fail"
                         and any(
-                            repr(".MCP.json") in line and "case-collides with '.mcp.json'" in line
+                            repr(".MCP.json") in line and "folds onto '.mcp.json'" in line
+                            for line in _res.lines
+                        )
+                        and any(
+                            repr(".mcp.jſon") in line and "folds onto '.mcp.json'" in line
                             for line in _res.lines
                         ),
-                        "a tracked `.MCP.json` case-collides with `.mcp.json` and is named",
+                        "`.MCP.json` and `.mcp.jſon` (U+017F) both fold onto `.mcp.json` and "
+                        "are named by tracked-startup-config",
                     )
+
+    # (c2) DEPTH. The fold question used to stop at the anchor's direct children, so every
+    # spelling below `.claude/` — the four surfaces the CLI actually loads — passed the whole
+    # gate on Linux CI and materialised at the canonical path on a macOS/Windows clone
+    # (PR-901 second round, H-1). Each of these is staged straight into the index with a
+    # payload the gate rejects when it is spelled canonically.
+    # Killing mutant: dropping POLICED_CLAUDE_CHILDREN from `_policed_prefixes`.
+    _deep_variants = (
+        (".claude/Settings.local.json", "100644", _hooks_payload, ".claude/settings.local.json"),
+        (".claude/settings.Local.json", "100644", _hooks_payload, ".claude/settings.local.json"),
+        (".claude/Settings.json", "100644", _hooks_payload, ".claude/settings.json"),
+        (".claude/ſettings.json", "100644", _hooks_payload, ".claude/settings.json"),
+        (".claude/COMMANDS/evil.md", "100644", "---\nallowed-tools: Bash(rm:*)\n---\n",
+         ".claude/commands"),
+        (".claude/Agents/evil.md", "100644", "---\nname: evil\nhooks: {}\n---\n",
+         ".claude/agents"),
+        (".claude/Skills/evil/SKILL.md", "100644",
+         "---\nname: evil\nallowed-tools: Bash(rm:*)\n---\n", ".claude/skills"),
+        (".claude/ſkills/evil/SKILL.md", "100644",
+         "---\nname: evil\nallowed-tools: Bash(rm:*)\n---\n", ".claude/skills"),
+        (".claude/Skills/evil-link", "120000", "../../obj/evil", ".claude/skills"),
+    )
+    for _variant, _mode, _body, _canonical in _deep_variants:
+        with tempfile.TemporaryDirectory() as tmp:
+            if not _git_repo(
+                tmp, {os.path.join(".claude", "keep"): "x\n"}, [os.path.join(".claude", "keep")]
+            ):
+                _log("  skip - git unavailable: depth fold fixtures not run")
+                break
+            if not _cacheinfo(tmp, _mode, _variant, _body):
+                _log("  skip - git update-index --cacheinfo unavailable: depth fixtures")
+                break
+            _lines, _statuses = _local_link_report(tmp)
+            _named = [
+                line
+                for line in _lines
+                if line.startswith(repr(_variant) + " folds onto " + repr(_canonical))
+            ]
+            check(
+                _statuses == ["fail", "fail", "fail"]
+                and len(_named) == 3
+                # ONE line per check, whatever the index mode: a 120000 entry at a folded path
+                # is the collision (rename it), not the collision AND the link.
+                and sum(_variant in line for line in _lines) == 3,
+                f"a tracked `{_variant}` folds onto `{_canonical}` and is named exactly once "
+                f"by each of the three local checks",
+            )
+
+    # (c3) ...and it reaches the GATE as exit 1, named by `tracked-startup-config` — the
+    # check whose whole job is the two startup files. Killing mutant: reporting the collision
+    # only from the checks that own `.claude/{agents,commands,skills}`.
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY) and os.path.exists(
+        DEFAULT_SETTINGS
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            _fixture_claude = os.path.join(tmp, ".claude")
+            os.makedirs(_fixture_claude, exist_ok=True)
+            shutil.copyfile(DEFAULT_SETTINGS, os.path.join(_fixture_claude, "settings.json"))
+            if _git_repo(tmp, {}, []) and _cacheinfo(
+                tmp, "100644", ".claude/Settings.local.json", _hooks_payload
+            ):
+                subprocess.run(
+                    ["git", "add", "-f", "--", os.path.join(".claude", "settings.json")],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(
+                        [
+                            "--offline",
+                            "--repo", DEFAULT_REPO,
+                            "--settings", os.path.join(_fixture_claude, "settings.json"),
+                            "--mcp-config", os.path.join(tmp, ".mcp.json"),
+                        ]
+                    )
+                _output = _buffer.getvalue()
+                check(
+                    _exit == 1
+                    and "[FAIL] tracked-startup-config" in _output
+                    and repr(".claude/Settings.local.json") in _output
+                    and "rename it" in _output,
+                    "a tracked `.claude/Settings.local.json` exits 1 named by "
+                    "tracked-startup-config (it is honoured as settings.local.json on a clone)",
+                )
+                # The CLONE shape: on macOS the same index entry checks out AS
+                # `.claude/settings.local.json`, where `git ls-files --error-unmatch` calls it
+                # untracked and the gate used to file it under "present locally, untracked —
+                # not policed". Killing mutant: reverting `_tracked_by_git` to `_git_tracked`.
+                _local = os.path.join(_fixture_claude, "settings.local.json")
+                with open(_local, "w", encoding="utf-8") as _handle:
+                    _handle.write(_hooks_payload)
+                _problems, _notes, _unverified = validate_startup_config(
+                    os.path.join(tmp, ".mcp.json"), _local
+                )
+                check(
+                    _tracked_by_git(_local) is True
+                    and any("is TRACKED" in problem for problem in _problems)
+                    and not any("present locally, untracked" in note for note in _notes),
+                    "the settings.local.json a folded index entry checks out as is TRACKED, "
+                    "not 'present locally, untracked'",
+                )
+
+    # (c4) The ANCHOR-RELATIVE root, not the first path component: with the roots one level
+    # down (`sub/.claude`), a clean top-level `.claude` must not mask `sub/.Claude`, and the
+    # canonical spelling quoted in the remedy is the one the caller actually policed.
+    # Killing mutant: keying the filter on `parts[-1]`/`.claude` alone.
+    with tempfile.TemporaryDirectory() as tmp:
+        if _git_repo(
+            tmp,
+            {
+                os.path.join(".claude", "agents", "product-manager.md"): "---\nname: pm\n---\n",
+                os.path.join("sub", ".claude", "keep"): "x\n",
+            },
+            [".claude", "sub"],
+        ) and _cacheinfo(tmp, "100644", "sub/.Claude/settings.local.json", _hooks_payload):
+            _res = startup_config_result(
+                os.path.join(tmp, "sub", ".mcp.json"),
+                os.path.join(tmp, "sub", ".claude", "settings.local.json"),
+                os.path.join(tmp, "sub", ".claude", "settings.json"),
+            )
+            check(
+                _res.status == "fail"
+                and any(
+                    line.startswith(
+                        repr("sub/.Claude/settings.local.json")
+                        + " folds onto "
+                        + repr("sub/.claude/settings.local.json")
+                    )
+                    for line in _res.lines
+                ),
+                "the fold is keyed on the ANCHOR-relative root (`sub/.claude`), so a clean "
+                "top-level `.claude` does not mask `sub/.Claude`",
+            )
 
     # (d) SCOPE. `claude_root_pathspec` used to answer `os.curdir` for a root-relative
     # `.mcp.json`, so `tracked-startup-config` scanned the WHOLE repository and failed on a
@@ -4902,6 +5297,196 @@ def _selftest() -> int:
                 "reason says WHY (never 'not a git checkout')",
             )
 
+    # (d3) A SIBLING that merely starts with the same characters is not a finding: the fold
+    # compares whole segments, so `.claudex/` is somebody else's directory.
+    # Killing mutant: `name.startswith(".claude")` instead of `_folds_under`.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            _sibling = os.path.join(tmp, ".claudex")
+            os.makedirs(_sibling, exist_ok=True)
+            if _dangling(os.path.join(_sibling, "z"), "../obj/z"):
+                subprocess.run(
+                    ["git", "add", "-f", "--", os.path.join(_sibling, "z")],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                _lines, _statuses = _local_link_report(tmp)
+                check(
+                    "fail" not in _statuses
+                    and not any(".claudex" in line for line in _lines),
+                    "a tracked link under the SIBLING `.claudex/` is not this gate's finding",
+                )
+
+    # (d4) COVERAGE. An EXPORT (a `git archive` tree, a vendored copy — no `.git` of its own)
+    # dropped inside an ENCLOSING checkout used to be CLEARED by that checkout's index: git
+    # answered about the enclosing repo, which tracks nothing under the export, and "no
+    # entries" read as "no findings" — a PASS over a tree nobody verified (PR-901 second
+    # round, RT-4). A queried directory that holds files on disk and has no index entry
+    # folding under it (or at an ancestor of it) is UNVERIFIED.
+    # Killing mutant: dropping the coverage loop in `_index_findings`.
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.isdir(DEFAULT_SKILLS_DIR):
+        with tempfile.TemporaryDirectory() as tmp:
+            _enclosing = os.path.join(tmp, "enclosing")
+            _export = os.path.join(_enclosing, "vendor", "export")
+            os.makedirs(os.path.join(_export, ".claude"), exist_ok=True)
+            shutil.copytree(DEFAULT_SKILLS_DIR, os.path.join(_export, ".claude", "skills"))
+            if _git_repo(_enclosing, {"README.md": "enclosing\n"}, ["README.md"]):
+                _res = command_skill_result(
+                    os.path.join(_export, ".claude", "commands"),
+                    os.path.join(_export, ".claude", "skills"),
+                )
+                check(
+                    _res.status == "skip"
+                    and any(
+                        "does not track" in line and "unverified rather than clean" in line
+                        for line in _res.lines
+                    ),
+                    "an export inside an ENCLOSING checkout is UNVERIFIED (the enclosing "
+                    "index does not cover it), never cleared by it",
+                )
+            # ...and with a CEILING set at the export's parent, git refuses to discover the
+            # enclosing repository at all, which must reach the operator as SKIP too. This is
+            # why `GIT_CEILING_DIRECTORIES` is NOT scrubbed: it can only NARROW discovery, so
+            # honouring it can only turn a false clean into an unverified. Killing mutant:
+            # putting GIT_CEILING_DIRECTORIES back in `_SCRUBBED_GIT_ENV` (git then walks up
+            # into the enclosing repo and answers about it).
+            check(
+                "GIT_CEILING_DIRECTORIES" not in _SCRUBBED_GIT_ENV
+                and "GIT_DISCOVERY_ACROSS_FILESYSTEM" not in _SCRUBBED_GIT_ENV
+                and "GIT_DIR" in _SCRUBBED_GIT_ENV
+                and "GIT_LITERAL_PATHSPECS" in _SCRUBBED_GIT_ENV,
+                "the scrub list holds the REDIRECTING and pathspec-magic variables, and not "
+                "the two that only narrow repository discovery",
+            )
+        with tempfile.TemporaryDirectory() as tmp:
+            # A second tree (the `_git_toplevel` cache is keyed by directory, so the ceiling
+            # variant must not reuse the paths probed above).
+            _enclosing = os.path.join(tmp, "enclosing")
+            _export = os.path.join(_enclosing, "vendor", "export")
+            os.makedirs(os.path.join(_export, ".claude"), exist_ok=True)
+            shutil.copytree(DEFAULT_SKILLS_DIR, os.path.join(_export, ".claude", "skills"))
+            if _git_repo(_enclosing, {"README.md": "enclosing\n"}, ["README.md"]):
+                _saved_ceiling = os.environ.get("GIT_CEILING_DIRECTORIES")
+                os.environ["GIT_CEILING_DIRECTORIES"] = os.path.realpath(
+                    os.path.join(_enclosing, "vendor")
+                )
+                try:
+                    _res = command_skill_result(
+                        os.path.join(_export, ".claude", "commands"),
+                        os.path.join(_export, ".claude", "skills"),
+                    )
+                finally:
+                    if _saved_ceiling is None:
+                        os.environ.pop("GIT_CEILING_DIRECTORIES", None)
+                    else:  # pragma: no cover - only when the runner exported it
+                        os.environ["GIT_CEILING_DIRECTORIES"] = _saved_ceiling
+                check(
+                    _res.status == "skip"
+                    and any("git could not say" in line for line in _res.lines),
+                    "a GIT_CEILING_DIRECTORIES that hides the enclosing repo makes the export "
+                    "UNVERIFIED (skip), never clean",
+                )
+
+    # (d5) A SPARSE index collapses a whole directory into ONE entry (mode 040000, trailing
+    # slash) and does not list the files inside it, so "no findings under `.claude`" would be
+    # an artefact of the index format. `_ls_files` is stubbed because reproducing a sparse
+    # index needs a cone-mode checkout this gate must not depend on; the branch it exercises
+    # is the one that reads the mode. Killing mutant: dropping the `_SPARSE_DIR_MODE` branch.
+    with tempfile.TemporaryDirectory() as tmp:
+        if _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, [os.path.join(".claude", "keep")]):
+            _saved_ls_files = _ls_files
+            try:
+                globals()["_ls_files"] = lambda _top: [
+                    ("100644", ".claude/keep"),
+                    ("040000", ".claude/skills/"),
+                ]
+                _problems, _unverified = tracked_symlink_problems(
+                    link_query_paths(os.path.join(tmp, ".claude", "skills"))
+                )
+            finally:
+                globals()["_ls_files"] = _saved_ls_files
+            check(
+                _problems == []
+                and len(_unverified) == 1
+                and "SPARSE" in _unverified[0],
+                "a SPARSE index that collapses the policed tree is UNVERIFIED, not clean",
+            )
+
+    # (d5b) A CORRUPT index: `git rev-parse --show-toplevel` still answers, so the query gets
+    # as far as `git ls-files`, which then fails. That must reach the operator as UNVERIFIED
+    # too — "the index could not be read" is not "the index holds nothing".
+    # Killing mutant: `_ls_files` returning [] instead of None on a non-zero exit.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            with open(os.path.join(tmp, ".git", "index"), "wb") as _handle:
+                _handle.write(b"not an index at all")
+            _res = command_skill_result(
+                os.path.join(tmp, ".claude", "commands"), os.path.join(tmp, ".claude", "skills")
+            )
+            check(
+                _res.status == "skip"
+                and any(
+                    "git could not say" in line and "could not read the index" in line
+                    for line in _res.lines
+                ),
+                "an index git cannot READ is UNVERIFIED (skip) and SAYS SO, never an index "
+                "with no findings",
+            )
+
+    # (d5c) A COLLISION and a LINK at one path are two different findings with two different
+    # remedies (rename it / replace it with real files), so the de-duplication key carries the
+    # KIND as well as the path. Killing mutant: keying on the path alone.
+    _case_line = _case_collision_problem(".claude/Skills", ".claude/skills")
+    _link_line = _tracked_link_problem("120000", ".claude/Skills")
+    check(
+        _dedupe_link_problems([_case_line, _link_line]) == [_case_line, _link_line]
+        and _dedupe_link_problems([_link_line, _link_line]) == [_link_line]
+        and _dedupe_link_problems([_case_line, _case_line]) == [_case_line],
+        "the de-duplication key is (kind, path): one path's collision and link are two "
+        "findings, the same finding twice is one",
+    )
+
+    # (d6) `GIT_LITERAL_PATHSPECS=1` in the environment used to make every `:(literal)…`
+    # pathspec match a file literally named `:(literal).claude` — i.e. nothing — so the index
+    # query returned no entries and the gate PASSED in silence (PR-901 second round, H-2).
+    # The link here DANGLES, so the walks cannot see it either: only the index query can fail
+    # this fixture, which is what makes the assertion kill the mutant.
+    # Killing mutants: reintroducing pathspec arguments to `git ls-files`; dropping
+    # GIT_LITERAL_PATHSPECS from `_SCRUBBED_GIT_ENV`.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            _hidden = os.path.join(tmp, ".claude", "hooks")
+            if _dangling(_hidden, "../../obj/hooks"):
+                subprocess.run(
+                    ["git", "add", "-f", "--", _hidden],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                _saved_magic = {
+                    name: os.environ.get(name)
+                    for name in ("GIT_LITERAL_PATHSPECS", "GIT_ICASE_PATHSPECS")
+                }
+                os.environ["GIT_LITERAL_PATHSPECS"] = "1"
+                os.environ["GIT_ICASE_PATHSPECS"] = "1"
+                try:
+                    _lines, _statuses = _local_link_report(tmp)
+                finally:
+                    for _name, _value in _saved_magic.items():
+                        if _value is None:
+                            os.environ.pop(_name, None)
+                        else:  # pragma: no cover - only when the runner exported them
+                            os.environ[_name] = _value
+                check(
+                    _statuses == ["fail", "fail", "fail"]
+                    and sum(
+                        os.path.join(".claude", "hooks") in line and "120000" in line
+                        for line in _lines
+                    ) == 3,
+                    "an ambient GIT_LITERAL_PATHSPECS=1 does not blind the index query to a "
+                    "tracked DANGLING link the walks cannot see",
+                )
+
     # (e) An ambient `GIT_DIR` points git at a DIFFERENT repository — one that is clean —
     # while the gate runs against this one. Unscrubbed, every query answers about the wrong
     # index and the evil checkout goes green (PR-901 F-E).
@@ -4942,27 +5527,99 @@ def _selftest() -> int:
                     "an ambient GIT_DIR pointing at a CLEAN repo does not clear the evil one",
                 )
 
-    # (f) A path containing an apostrophe. `repr` switches to double quotes there, so the
-    # message-matching de-duplication silently stopped collapsing the git verdict and the
-    # walk's — one link printed as two defects (PR-901 F-D).
-    # Killing mutants: the single-quote-only `_LINK_PATH_RE`; dropping the structural
-    # `(path, message)` key from the index findings.
+    # (f) A path containing BOTH quote characters. `repr` switches to double quotes for a
+    # path holding an apostrophe and ESCAPES the apostrophe when the path holds a double
+    # quote too, so no pattern over the rendered message can recover it: one link printed as
+    # two defects (PR-901 F-D and, at the second round, L-1). Nothing is parsed out of the
+    # text any more — every producer carries its path structurally.
+    # Killing mutants: reintroducing a message-text key in `_dedupe_link_problems`; dropping
+    # the `path`/`kind` attributes from `_LinkMessage`.
+    # The MARKER is a fragment `repr` never escapes: a path holding both quotes is rendered
+    # single-quoted with the apostrophe backslash-escaped, so the raw name is not a substring
+    # of the message at all — which is exactly why the key cannot be the message text.
+    for _weird, _marker, _label in (
+        ("it's", "it's", "an apostrophe"),
+        ("a'b\"c", 'b"c', "both quote characters"),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+            if not _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+                break
+            _skills = os.path.join(tmp, ".claude", "skills")
+            _weird_path = os.path.join(_skills, _weird)
+            if not _dangling(_weird_path, "../../obj/weird"):
+                break
+            subprocess.run(
+                ["git", "add", "-f", "--", _weird_path],
+                cwd=tmp, capture_output=True, text=True, timeout=60,
+            )
+            _res = command_skill_result(os.path.join(tmp, ".claude", "commands"), _skills)
+            check(
+                _res.status == "fail"
+                and sum(_marker in line for line in _res.lines) == 1
+                and any("120000" in line and _marker in line for line in _res.lines),
+                f"a tracked link whose path holds {_label} is reported exactly ONCE",
+            )
+
+    # (f2) De-duplication must not become DELETION. Two DIFFERENT links are two findings, and
+    # an integrity sentence that quotes a link clause ("no persona wrappers found … because
+    # `.claude` is a tracked gitlink") is a THIRD, different finding from the bare gitlink
+    # line — the message-matching key dropped it, leaving the operator with an empty roster
+    # and no explanation (PR-901 second round, RT-5).
+    # Killing mutants: keying the dedupe on the path alone (drops the second link's kind);
+    # keying plain messages by a regex over their text (drops the roster sentence).
     with tempfile.TemporaryDirectory() as tmp:
         _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
         if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
             _skills = os.path.join(tmp, ".claude", "skills")
-            _apostrophe = os.path.join(_skills, "it's")
-            if _dangling(_apostrophe, "../../obj/its"):
+            _one = os.path.join(_skills, "one-link")
+            _two = os.path.join(tmp, ".claude", "hooks")
+            if _dangling(_one, "../../obj/one") and _dangling(_two, "../obj/two"):
                 subprocess.run(
-                    ["git", "add", "-f", "--", _apostrophe],
+                    ["git", "add", "-f", "--", _one, _two],
                     cwd=tmp, capture_output=True, text=True, timeout=60,
                 )
                 _res = command_skill_result(os.path.join(tmp, ".claude", "commands"), _skills)
                 check(
                     _res.status == "fail"
-                    and sum("it's" in line for line in _res.lines) == 1
-                    and any("120000" in line and "it's" in line for line in _res.lines),
-                    "a tracked link whose path holds an apostrophe is reported exactly ONCE",
+                    and sum("one-link" in line for line in _res.lines) == 1
+                    and sum(os.path.join(".claude", "hooks") in line for line in _res.lines) == 1,
+                    "two DISTINCT tracked links are two findings; de-duplication keeps both",
+                )
+    if os.path.exists(DEFAULT_TAXONOMY):
+        with tempfile.TemporaryDirectory() as tmp:
+            _inner = os.path.join(tmp, "inner")
+            _outer = os.path.join(tmp, "outer")
+            os.makedirs(_inner, exist_ok=True)
+            os.makedirs(_outer, exist_ok=True)
+            if (
+                _git_repo(_inner, {"keep": "x\n"}, ["keep"])
+                and _git_run(_inner, "commit", "-qm", "inner")
+                and _git_repo(_outer, {"README.md": "outer\n"}, ["README.md"])
+                and _git_run(_outer, "commit", "-qm", "outer")
+                and _git_run(_outer, "submodule", "add", "-q", _inner, ".claude")
+            ):
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(
+                        [
+                            "--offline",
+                            "--repo", DEFAULT_REPO,
+                            "--agents-dir", os.path.join(_outer, ".claude", "agents"),
+                        ]
+                    )
+                _output = _buffer.getvalue()
+                _bare = [
+                    line
+                    for line in _output.splitlines()
+                    if line.strip().startswith("- " + repr(".claude") + " is a tracked gitlink")
+                ]
+                check(
+                    _exit == 1
+                    and "no persona wrappers found" in _output
+                    and len(_bare) == 1,
+                    "the roster's 'no persona wrappers found … gitlink' sentence SURVIVES "
+                    "de-duplication beside the bare gitlink line, which prints once",
                 )
 
     # (i) An UNTRACKED `.claude` symlink: git's index says nothing, so the `os.path.islink`

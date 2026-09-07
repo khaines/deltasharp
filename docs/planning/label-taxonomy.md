@@ -246,14 +246,23 @@ of three reconciliations or the three local validations (`settings-permissions`,
    filesystem-only check passes both. Git is asked from the directory that
    *contains* `.claude`, never from inside it — a submodule `.claude` would answer
    from the nested repository and a symlinked one from outside the checkout, both
-   "clean" — and it is asked about `.claude`, `.mcp.json` and **any case-variant of
-   either**: on a case-insensitive checkout (macOS/Windows) a tracked `.Claude/hooks`
-   merges into `.claude/` where the CLI reads it, while the case-sensitive `.claude`
-   pathspec never names it, so a collision fails as "rename it" whatever its index
-   mode. All three local checks ask that question — over `.claude` and its root, never
-   over the whole repository — so the link is reported wherever the reader looks, once
-   per check, and a path outside the work tree git answered from is unverified rather
-   than clean. The walks
+   "clean". The index is **listed once from the work-tree root with no pathspec** (so
+   no pathspec magic — `GIT_LITERAL_PATHSPECS` and friends are scrubbed alongside
+   `GIT_DIR`, while the discovery-narrowing `GIT_CEILING_DIRECTORIES` is deliberately
+   honoured), and **every entry that case- or normalisation-folds onto `.claude/…` or
+   `.mcp.json` is compared against the canonical spelling**: on an APFS/NTFS checkout
+   a tracked `.Claude/hooks`, `.claude/COMMANDS/evil.md`,
+   `.claude/Settings.local.json` or `.mcp.jſon` (U+017F, which neither `:(icase)` nor
+   `.lower()` sees) materialises at the path the CLI reads, so it fails as "rename it"
+   whatever its index mode — and "is it tracked?" is asked of the checked-out path the
+   same way, so a committed `.claude/Settings.local.json` is not filed as harmless
+   per-machine state. All three local checks ask the `.claude` question — over
+   `.claude` and its policed children, never over the whole repository, with
+   `.mcp.json` owned by `tracked-startup-config` — so a finding is reported wherever
+   the reader looks, once per check. Git's answer must also COVER what the walks read:
+   a path outside the work tree git answered from, a directory holding files no index
+   entry folds under (an export dropped inside an enclosing checkout), a sparse index,
+   and an index git cannot read are all unverified rather than clean. The walks
    report any link they meet as well (the directory roots themselves, and every file
    entry whatever its name), so the rule still holds where git cannot be asked; links
    are never followed (a loop would hang the gate), and if git cannot answer at all the
