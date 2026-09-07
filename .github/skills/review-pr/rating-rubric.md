@@ -288,9 +288,11 @@ and the red-team verdict.
   council's own `NO-MISS-CERTIFIED` / attestations / quoted C7 output are **self-asserted signals**
   and therefore subject to the same C2 anti-forgeability rule the council applies to reviewed code
   (never trust a self-settable signal — the #323 class, applied reflexively);
-- the certifying red-team ran on a **decorrelated** frontier family. A **same-family (provisional)
-  certification does NOT satisfy PASS for protected-domain changes** — it blocks termination pending
-  a decorrelated re-run or a documented human waiver recorded in the composition audit.
+- the certifying red-team ran on a **tier no voting seat uses** (`fable` vs an all-`opus` spine),
+  **blind-first** (its Blind findings block returned before any seat verdict was released), and
+  **not forked**. A **provisional certification** (same tier, non-blind, or forked) **does NOT
+  satisfy PASS for protected-domain changes** — it blocks termination pending a correct re-run or a
+  documented human waiver recorded in the composition audit.
 - **every finding not fixed in-PR is dispositioned** as exactly one of {fixed, dismissed-with-
   rationale, deferred, inherent/won't-fix-documented}, and **every _deferred_ finding has a GitHub
   tracking issue the orchestrator verified exists** — `gh issue view <n>` returns an **open** issue
@@ -306,12 +308,12 @@ CI (vacuous tests, validator↔consumer mismatches, migration notes the code con
 
 ## Decorrelated red-team gate
 
-- The red-team runs **last** on a frontier family **distinct from the majority voting spine**, and
-  **ideally a family used by no voting seat** (true decorrelation). With the current council (all
-  four voting lenses on Claude) use **`gemini-3.1-pro-preview`** — do **not** dispatch the red-team
-  on a family a voting seat already uses (e.g. don't use `claude-opus-5` while the spine is Opus).
-  Do **not** gate on the GPT family: measured over 5 runs it returned an empty first response 5/5
-  and failed to discharge C7 4/5 (see `red-team.md` → Dispatch). A red-team `MISS-FOUND`
+- The red-team runs **last** on **`fable`** — a tier **no voting seat uses** (every voting seat is
+  `opus`) — **blind-first** and **never forked**. Do **not** dispatch the red-team on `opus` while
+  the spine is Opus, and do **not** release seat verdicts to it before its blind block is back.
+  Vendor decorrelation is not available in-session under Claude Code (see `review-pr` → Complex
+  Change, 2026-09 record); the GPT family remains excluded on the 2026-07 measurement (empty first
+  response 5/5, C7 undischarged 4/5; see `red-team.md` → Dispatch). A red-team `MISS-FOUND`
   **always blocks** — its findings are actionable, in the canonical `Critical|High|Medium|Low|Info`
   set (the red-team does not emit `blocking/major/minor`).
 - `NO-MISS-CERTIFIED` is valid only with a fully-populated Falsification-Attempts block and a C7

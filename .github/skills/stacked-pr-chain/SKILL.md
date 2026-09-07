@@ -110,8 +110,8 @@ stack). Item 1's base is `main`.
 
 ### 2.5 Drive to PASS — then STOP (do not merge)
 
-Run `review-fix-loop` on the PR to the PASS bar (unanimous 5/5 across all voting seats + decorrelated
-Gemini 3.1 Pro red-team `NO-MISS-CERTIFIED` + orchestrator anti-forgery re-verification; every deferral a
+Run `review-fix-loop` on the PR to the PASS bar (unanimous 5/5 across all voting seats + blind-first
+Fable red-team `NO-MISS-CERTIFIED` + orchestrator anti-forgery re-verification; every deferral a
 verified-OPEN issue; canonical §6.2 report posted per `github-review-posting.md`).
 
 > **CI reality.** CI only runs on `pull_request` targeting `main`, so a stacked PR (base = parent

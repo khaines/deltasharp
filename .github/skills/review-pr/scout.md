@@ -3,18 +3,15 @@
 > Dispatched by the `review-pr` skill (Phase 1.6) as the **first** pass of a review.
 > The scout does **not** review code quality — it **classifies and routes** so the
 > frontier voting seats spend their budget reviewing, not triaging. Inspired by the
-> pi RFL council's repo-adaptive scout, adapted for DeltaSharp's multi-frontier setup.
+> pi RFL council's repo-adaptive scout, adapted for DeltaSharp's Claude Code council.
 
 ## Dispatch
 
-Run the scout with the `task` tool as a **cheap but capable frontier** model (it only
-reads/classifies — no deep reasoning needed):
+Run the scout with the `task` tool on the **cheap tier** (it only reads/classifies — no deep
+reasoning needed):
 
-- Preferred models: `gemini-3.5-flash`, `gpt-5-mini`, or `claude-haiku-4.5`. (These are real
-  `task`-tool model IDs. The scout only **routes** — it never scores or gates — so its family is
-  immaterial to council decorrelation, including the red-team's Gemini family. Note Gemini
-  **flash** and **pro** tiers version independently: the scout's `gemini-3.5-flash` and the
-  red-team's `gemini-3.1-pro-preview` are both current, not a typo.)
+- Model: `haiku`. The scout only **routes** — it never scores or gates — so its tier is
+  immaterial to council decorrelation.
 - `agent_type`: `explore` (read/grep/glob/bash) or `general-purpose`.
 - Always run the scout, even for small PRs — its Review Package is the audit record of
   *why* each seat was (or was not) selected. For a trivial 1–2 file docs-only change the
@@ -72,7 +69,7 @@ changed-file list.
   1. DOMAIN=<…>  CANONICAL_SPEC=<abs path, verified>  OWNS=<files>  CHECKLIST_IDS=<…>
 - Per-seat checklist IDs: architect=<…> balanced=<…> quality=<…> security=<…> <specialists…>
 - Claims to verify (C4/C7): <design-doc fields | issue-closure claims | migration notes | enforcement/parity/efficacy claims>
-- Red-team model family hint: voting seats are mostly <family>; run red-team on a DIFFERENT frontier family (e.g. <suggestion>).
+- Red-team tier check: voting seats are all `opus`; red-team runs on `fable` (a tier no voting seat uses), blind-first, not forked.
 ```
 
 The scout classifies and routes only. It never reviews code quality, scores, or edits files.

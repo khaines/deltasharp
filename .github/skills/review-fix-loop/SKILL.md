@@ -33,8 +33,8 @@ Read all supporting files before beginning:
 | `auto_dismiss_out_of_diff` | true | Auto-dismiss findings referencing code not in the PR diff |
 
 > **Council shape (via `review-pr`).** Each round runs a **scout** (cheap routing), the 4 fixed
-> frontier lenses + up to **3 scout-selected specialist seats**, and a **decorrelated red-team
-> gate** that executes C7 repros. Termination is the **PASS gate**, not a bare rating — see
+> `opus` lenses + up to **3 scout-selected specialist seats**, and a **blind-first `fable` red-team
+> gate** (a tier no voting seat uses) that executes C7 repros. Termination is the **PASS gate**, not a bare rating — see
 > `review-pr/rating-rubric.md` (Rigor battery & the PASS gate).
 
 ---
@@ -332,7 +332,8 @@ Compile the full round-by-round progression:
 
 | Round | Slot | `agent_type` | `model` | Dispatch HEAD | Dispatch Timestamp (UTC) | Verification |
 |-------|------|--------------|---------|---------------|--------------------------|--------------|
-| R1 | Architect | `{agent_type}` | `{model}` | `{sha}` | `{iso8601}` | ✓ |
+| R1 | Architect | `{agent_type}` | `opus` | `{sha}` | `{iso8601}` | ✓ |
+| R1 | Red-team | `general-purpose` | `fable` | `{sha}` | `{iso8601}` blind block returned / `{iso8601}` verdicts released | ✓ |
 
 ### Findings Addressed
 {For each fixed finding across all rounds}
@@ -400,7 +401,7 @@ Before declaring the loop terminated, audit the council composition record produ
 
 1. Enumerate every counted round in the progression report.
 2. For each round, locate the per-slot composition row.
-3. Verify each row lists an exact `(agent_type, model)` pair from the protocol table in `review-pr` §3.1.
+3. Verify each row lists an exact `(agent_type, model)` pair from the protocol table in `review-pr` §3.1, and that the red-team row shows `fable`, a blind-block timestamp earlier than the verdicts-released timestamp, and no fork.
 4. Missing or off-protocol composition data invalidates the round and requires corrective review at the current HEAD or the original HEAD when recoverable.
 5. After any corrective dispatch, regenerate, repost, and re-verify the report before terminating.
 
