@@ -109,14 +109,18 @@ and skill files, along with any key outside `description`/`argument-hint`/`model
 way, and a skills tree with no manifest is drift, not a pass.
 
 Three more startup surfaces sit inside the same boundary and the gate rejects all
-three: a **symlinked** directory or file under `.claude/agents/`,
-`.claude/commands/`, or `.claude/skills/` (the CLI follows it, the gate's walks
-deliberately do not, so the link would ship unreviewed configuration), a tracked
-root **`.mcp.json`** (each `mcpServers[*].command` is started when the CLI
-launches, before any tool call and with no prompt), and a tracked
-**`.claude/settings.local.json`** (honoured exactly like `settings.json`, so the
-per-machine grants this file keeps recommending there are only safe while it stays
-untracked and gitignored).
+three. **Symlinks:** any *tracked* symlink under `.claude/`, or at `.mcp.json`,
+`.claude/settings.local.json`, or `.claude/settings.json`, fails — the rule is
+decided by the **git mode** (`120000`), not by what the link resolves to here, so a
+**dangling** link cannot hide (one pointing at `bin/` or `obj/` is absent in a
+checkout-only CI job and resolves to real configuration on any machine that has
+built). The CLI follows such a link; the gate's walks deliberately do not, so it
+would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
+`mcpServers[*].command` is started when the CLI launches, before any tool call and
+with no prompt. **A tracked `.claude/settings.local.json`:** it is honoured exactly
+like `settings.json`, so the per-machine grants this file keeps recommending there
+are only safe while it stays untracked and gitignored (both paths are in
+`.gitignore`).
 
 ## Architecture — the big picture
 

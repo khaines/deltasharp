@@ -71,3 +71,6 @@ __pycache__/
 
 # Claude Code per-user overrides — machine-local permission tweaks stay out of the repo
 .claude/settings.local.json
+
+# Claude Code MCP config — each mcpServers[*].command is spawned at CLI launch, unprompted
+/.mcp.json

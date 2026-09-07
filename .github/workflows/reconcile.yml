@@ -49,11 +49,14 @@ name: Reconcile
 #                          is read by the same STRICT reader, so an unparseable fence fails
 #                          rather than being skipped; .claude/commands is optional but a
 #                          skills tree with zero manifests FAILS, and the passing report
-#                          states how many files were scanned. Both walks also REPORT
-#                          symlinks (they are not followed, so a link loop cannot hang the
-#                          gate — but Claude Code follows them, so a symlinked
-#                          .claude/{agents,commands,skills} entry ships config the walk
-#                          never opened).
+#                          states how many files were scanned. SYMLINKS are rejected and the
+#                          rule is decided BY GIT: any tracked symlink under .claude/ (or at
+#                          .mcp.json / settings.local.json / settings.json) fails on its index
+#                          mode 120000, so a DANGLING link cannot hide — one pointing at bin/
+#                          or obj/ is absent in this checkout-only job yet resolves to real
+#                          config wherever the target exists. The walks also report any link
+#                          they see (roots included, whatever the file is named); links are
+#                          never followed, so a link loop cannot hang the gate.
 #   * tracked-startup-config (also a VALIDATION) — the two startup surfaces
 #                          settings-permissions never opens: a repo-root `.mcp.json` (each
 #                          `mcpServers[*].command` is SPAWNED when the CLI launches, with no
@@ -62,7 +65,9 @@ name: Reconcile
 #                          per-machine grants — safe only while it is untracked). Only a
 #                          TRACKED file fails (`git ls-files --error-unmatch`), so an
 #                          untracked local copy is reported, not failed; a tracked malformed
-#                          .mcp.json fails, an empty `mcpServers` passes. If git cannot say,
+#                          .mcp.json fails, an empty `mcpServers` passes, and a tracked
+#                          SYMLINK at either path (or at .claude/settings.json) fails on its
+#                          git mode 120000 even when it dangles here. If git cannot say,
 #                          the check reports SKIP and --require-remote makes that exit 2.
 #
 # It runs on PRs and pushes that touch the governance files (drift introduced by a code
@@ -138,10 +143,13 @@ jobs:
         run: python3 tools/reconcile/roster-labels.py --validate-settings-only
 
       # The live checks read public repo metadata (labels, milestones, codeowners/errors) via
-      # the GitHub CLI using the default read-only token. --require-remote makes a remote lookup
-      # that could not run a hard failure (exit 2 — the gate COULD NOT VERIFY: a remote outage,
-      # or a missing/empty .claude/agents directory) so the gate cannot silently pass without
-      # verifying. Exit 1 is DRIFT to fix in the repo, and that includes roster INTEGRITY
+      # the GitHub CLI using the default read-only token. --require-remote makes a lookup that
+      # could not run a hard failure (exit 2 — the gate COULD NOT VERIFY: a remote outage, a
+      # missing/empty .claude/agents directory, OR a local check that could not verify its
+      # input (environment — run the gate inside the git checkout)) so the gate cannot silently
+      # pass without verifying. Each cause prints its own message, because they need different
+      # fixes: wait out an outage, fix the repo, or fix the environment the gate ran in.
+      # Exit 1 is DRIFT to fix in the repo, and that includes roster INTEGRITY
       # problems (nested, unparseable or nameless wrappers) even when they leave the roster
       # empty — an author-fixable repo state must never page as an outage. --ref pins the
       # CODEOWNERS validation to the PR head/merge commit (github.sha) so a PR that breaks

@@ -78,10 +78,18 @@ fence is a problem, not a skip) and held to the same allowlist discipline: the k
 :data:`ALLOWED_COMMAND_KEYS` (commands) / :data:`ALLOWED_SKILL_KEYS` (skills) is rejected on
 sight. Both directories are OPTIONAL — a missing one reports 0 files scanned rather than
 passing silently — and the paths are overridable with `--commands-dir` / `--skills-dir`.
-Both walks REPORT symlinks (CERT-F1): `followlinks=False` keeps a link loop from hanging the
-gate, but Claude Code follows a symlinked `.claude/{agents,commands,skills}/<x>` and loads
-configuration the walk never opened, so the link itself is an integrity problem naming the
-link — otherwise the gate's "N files scanned" claim covers files it never read.
+
+SYMLINKS are rejected, and the rule is decided BY GIT: any tracked symlink under `.claude/`
+or at `.mcp.json` / `.claude/settings.local.json` / `.claude/settings.json` FAILS, because git
+records the link as index mode `120000` whether or not it currently resolves — so a DANGLING
+link cannot hide (FINAL-CERT F1). That mattered: every path check here asks the filesystem
+(`os.path.lexists`, an `os.walk` name match), and a link pointing at `bin/`, `obj/` or
+`artifacts/` is absent in the checkout-only CI job while resolving to real configuration on
+every machine that has run `dotnet build`. The walks additionally report ANY symlink they see
+— the directory roots themselves, and every `filenames` entry regardless of name — so the
+rule also holds where git cannot be asked, while `followlinks=False` keeps a link loop from
+hanging the gate. When git cannot answer at all (no git, not a checkout) the git half is a
+SKIP with the reason, never a pass.
 
 The third local validation is `tracked-startup-config`
 (:func:`validate_startup_config`), which covers the two startup surfaces the settings policy
@@ -105,8 +113,9 @@ Design constraints
   GitHub issue-form structure (see `parse_milestone_options`).
 * **Degrades gracefully off-network.** The roster read, the dropdown parse, and the roster ↔
   *documented*-labels reconciliation are local (filesystem) and always run. So is
-  `tracked-startup-config`, whose one subprocess is `git ls-files` in the checkout — local,
-  not a network call, and reported as an explicit SKIP (never a pass) if git cannot answer. The LIVE
+  `tracked-startup-config`, whose only subprocesses are `git ls-files` calls in the checkout
+  (tracking, and the `120000` symlink query) — local, not network, and reported as an explicit
+  SKIP (never a pass) if git cannot answer. The LIVE
   GitHub-API lookups (labels, milestones, codeowners/errors) shell out to `gh`; if `gh` is
   missing or unauthenticated they are SKIPPED with a warning so local dev works without a
   token. Pass `--require-remote` (CI does) to turn a remote check that could not RUN into a
@@ -130,7 +139,10 @@ Usage
 Exit codes: 0 = reconciled (no drift), 1 = drift detected (a check FAILED), 2 = usage/data
 error, OR a required remote check could not run (`--require-remote` with `gh`/the GitHub API
 unavailable) — a remote outage, reported distinctly from drift so an outage never reads as
-roster drift. The split is by WHO ACTS, not by where the error was raised: roster INTEGRITY
+roster drift — OR a local check that could not verify its input (environment — run the gate
+inside the git checkout). The three exit-2 causes carry different messages because they send
+the responder to different runbooks: wait out an outage, fix the repo, or fix the environment
+the gate ran in. The split is by WHO ACTS, not by where the error was raised: roster INTEGRITY
 problems (nested / unparseable / nameless wrappers) exit 1 even when they leave the roster
 empty, because the author fixes them in the repo; only a MISSING or genuinely empty agents
 directory — nothing to verify against — exits 2 alongside the remote-outage case.
@@ -658,6 +670,98 @@ def _walk_symlink_problems(kind: str, dirpath: str, dirnames: "list[str]") -> "l
     return problems
 
 
+def _tracked_symlink_problem(path: str) -> str:
+    """The message for a symlink GIT tracks (index mode 120000), whatever it resolves to.
+
+    The path-based checks in this gate all ask the FILESYSTEM a question — ``os.path.exists``,
+    an ``os.walk`` name match — and a symlink whose target is absent answers "nothing here".
+    That is exactly the shape of a link pointing at `bin/`, `obj/` or `artifacts/`: present on
+    every developer machine after a `dotnet build`, ABSENT in the checkout-only CI job, so the
+    tracked link sails through the gate and still resolves to real configuration the moment a
+    developer builds. Git, by contrast, records the link itself as index mode ``120000``
+    regardless of whether it currently resolves, which is why tracking (not resolution) is the
+    question this gate asks (FINAL-CERT F1).
+    """
+    return (
+        f"{path!r} is a tracked symlink (git mode 120000); the gate cannot see through links "
+        f"that may resolve elsewhere on another machine — replace it with real files"
+    )
+
+
+def _tracked_symlinks(paths: "list[str]") -> "list[str] | None":
+    """Paths git records with index mode ``120000`` under `paths`, or ``None`` if git cannot say.
+
+    One `git ls-files -s -z -- <paths>` (argv form, no shell) run inside the checkout. A
+    DIRECTORY pathspec matches every tracked entry beneath it, so `.claude/skills` covers both
+    a link nested in the tree and the directory entry itself when `.claude/skills` IS the link
+    — the case an `os.walk` cannot see at all, because a dangling directory link is not a
+    directory. ``--full-name`` makes the reported paths REPO-ROOT-relative (git otherwise
+    spells them relative to the directory it ran in, which would name the same link
+    differently depending on which pathspec happened to be asked about first), sorted.
+
+    ``None`` is "git could not answer" (git missing, not a checkout, a pathspec outside this
+    repository) and is deliberately NOT collapsed into "no symlinks": callers report it as
+    UNVERIFIED — the same contract :func:`_git_tracked` keeps — so an environment the gate
+    could not interrogate never reads as an environment it cleared.
+    """
+    if shutil.which("git") is None:
+        return None
+    absolute = [os.path.abspath(path) for path in paths if path]
+    if not absolute:
+        return []
+    cwd = None
+    for candidate in absolute:
+        directory = os.path.dirname(candidate) or os.curdir
+        if os.path.isdir(directory):
+            cwd = directory
+            break
+    if cwd is None:  # pragma: no cover - defensive: nothing to ask git about
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "-s", "-z", "--full-name", "--", *absolute],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):  # pragma: no cover - environment dependent
+        return None
+    if proc.returncode != 0:
+        # 128 = not a git repository / pathspec outside it; anything else is equally
+        # unanswerable. Never "clean".
+        return None
+    links: "list[str]" = []
+    for entry in proc.stdout.split("\0"):
+        if not entry:
+            continue
+        meta, tab, name = entry.partition("\t")
+        if not tab or not name:  # pragma: no cover - defensive: unexpected ls-files output
+            continue
+        if meta.split(" ", 1)[0] == "120000":
+            links.append(name)
+    return sorted(set(links))
+
+
+def tracked_symlink_problems(paths: "list[str]") -> "tuple[list[str], list[str]]":
+    """Return (problems, unverified) for every tracked symlink under `paths` (FINAL-CERT F1).
+
+    ``unverified`` is non-empty only when git could not answer; the caller reports SKIP with
+    that reason rather than passing, because "no link found" and "could not look" are
+    different claims and only one of them is safe to go green on.
+    """
+    links = _tracked_symlinks(paths)
+    if links is None:
+        return [], [
+            "git could not say whether "
+            + ", ".join(sorted(paths))
+            + " hold tracked symlinks (git missing, or not a git checkout) — a link whose "
+            "target is absent here is INVISIBLE to the path checks, so this is unverified, "
+            "not clean; run the gate inside the git checkout"
+        ]
+    return [_tracked_symlink_problem(link) for link in links], []
+
+
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
     """Return (persona slugs, integrity problems, wrappers policed) from `.claude/agents/*.md`.
 
@@ -706,20 +810,29 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
     """
     all_paths: "list[str]" = []
     link_problems: "list[str]" = []
+    # The agents directory ITSELF may be the link. `os.walk` on a dangling one yields
+    # nothing at all, so without this the roster would read as "empty" (or, once the target
+    # exists on a developer's machine, as a clean pass over files CI never saw).
+    if os.path.islink(agents_dir):
+        link_problems.append(_symlink_problem("agent", agents_dir))
     for dirpath, dirnames, filenames in os.walk(agents_dir, followlinks=False):
         dirnames.sort()  # deterministic traversal order
         # A symlinked SUBDIRECTORY is listed but not descended into (followlinks=False),
         # while Claude Code reads straight through it — report the link (CERT-F1).
         link_problems.extend(_walk_symlink_problems("agent", dirpath, dirnames))
         for filename in filenames:
+            path = os.path.join(dirpath, filename)
+            # EVERY entry is link-checked, not only the `.md` ones: `os.walk` lists a
+            # DANGLING link (of any name) among `filenames` whatever it points at, and a
+            # link named `README` today can be repointed at a wrapper tomorrow. Deciding by
+            # the name would let the link's own spelling choose whether it is inspected.
+            if os.path.islink(path):
+                # A symlinked WRAPPER is still read and policed below when it resolves (the
+                # read fails closed if it dangles); the link itself is reported because what
+                # CI reviews is the link, not the target.
+                link_problems.append(_symlink_problem("agent wrapper", path))
             # Case-insensitive: Claude Code loads `Foo.MD` too, so the gate must see it.
             if filename.lower().endswith(".md"):
-                path = os.path.join(dirpath, filename)
-                if os.path.islink(path):
-                    # A symlinked WRAPPER is still read and policed below (the link
-                    # resolves, or the read fails closed if it dangles); the link itself is
-                    # reported because what CI reviews is the link, not the target.
-                    link_problems.append(_symlink_problem("agent wrapper", path))
                 all_paths.append(path)
     all_paths.sort()
     slugs: "set[str]" = set()
@@ -1365,22 +1478,33 @@ def scan_command_skill_frontmatter(
     problems: "list[str]" = []
     counts = {"command": 0, "skill": 0}
     for kind, root in (("command", commands_dir), ("skill", skills_dir)):
+        link_problems: "list[str]" = []
+        # `.claude/commands` / `.claude/skills` may BE the link. A dangling one is not a
+        # directory, so `os.path.isdir` would skip it as "absent" and the commands scan —
+        # which is allowed to find nothing — would pass over a link that resolves to a live
+        # command tree on any machine where the target exists (FINAL-CERT F1).
+        if os.path.islink(root):
+            link_problems.append(_symlink_problem(kind, root))
         if not os.path.isdir(root):
+            problems.extend(link_problems)
             continue
         paths: "list[str]" = []
-        link_problems: "list[str]" = []
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()  # deterministic traversal order
             link_problems.extend(_walk_symlink_problems(kind, dirpath, dirnames))
             for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                # EVERY entry is link-checked before the name match: a DANGLING link is
+                # listed here under whatever name it carries, and letting the name decide
+                # whether the link is even looked at is how one that resolves on another
+                # machine stays invisible.
+                if os.path.islink(path):
+                    link_problems.append(_symlink_problem(f"{kind} file", path))
                 # Case-insensitive on purpose: Claude Code 2.1.263 loads a manifest committed as
                 # `skill.md` or a command as `x.MD`, so a case-sensitive match would fail GREEN.
                 lowered = filename.lower()
                 wanted = lowered.endswith(".md") if kind == "command" else lowered == "skill.md"
                 if wanted:
-                    path = os.path.join(dirpath, filename)
-                    if os.path.islink(path):
-                        link_problems.append(_symlink_problem(f"{kind} file", path))
                     paths.append(path)
         paths.sort()
         problems.extend(sorted(link_problems))
@@ -1487,8 +1611,29 @@ def validate_startup_config(
     notes: "list[str]" = []
     unverified: "list[str]" = []
 
-    if not os.path.exists(mcp_path):
+    # `lexists`, not `exists`: a DANGLING symlink at .mcp.json exists as a repo entry (git
+    # tracks it as mode 120000 and Claude Code resolves it on any machine where the target is
+    # present) while `exists` reports False and would emit the flatly untrue note below
+    # (FINAL-CERT F1).
+    if not os.path.lexists(mcp_path):
         notes.append(f"no {mcp_path} in the checkout (no MCP server is started at launch)")
+    elif os.path.islink(mcp_path):
+        # A link is not read THROUGH: what the target holds here says nothing about what it
+        # holds elsewhere. Tracking decides — a tracked link is reported by the caller's
+        # git-mode check, an untracked one is the developer's own machine state.
+        tracked = _git_tracked(mcp_path)
+        if tracked is None:
+            unverified.append(
+                f"{mcp_path} is a symlink and git cannot say whether it is tracked (git "
+                f"missing or not a git checkout) — NOT verified; re-run inside the git checkout"
+            )
+        elif tracked:
+            problems.append(_tracked_symlink_problem(mcp_path))
+        else:
+            notes.append(
+                f"{mcp_path} present locally as an untracked symlink — not policed (only a "
+                f"committed one ships to everyone); its target was not read"
+            )
     else:
         tracked = _git_tracked(mcp_path)
         if tracked is None:
@@ -1516,7 +1661,11 @@ def validate_startup_config(
             else:
                 notes.append(f"{mcp_path} is tracked but declares no MCP server")
 
-    if not os.path.exists(settings_local_path):
+    # `lexists` again: a dangling `.claude/settings.local.json` link is a tracked repo entry
+    # the CLI resolves wherever the target exists, and "no settings.local.json in the
+    # checkout" would be a false all-clear (FINAL-CERT F1). Its content is never read here,
+    # so tracking alone decides — as it already did for the non-link case.
+    if not os.path.lexists(settings_local_path):
         notes.append(f"no {settings_local_path} in the checkout")
     else:
         tracked = _git_tracked(settings_local_path)
@@ -1654,12 +1803,27 @@ REMOTE_CHECK_NAMES = frozenset(
 
 
 class Result:
-    """Outcome of a single check: status is 'pass' | 'fail' | 'skip'."""
+    """Outcome of a single check: status is 'pass' | 'fail' | 'skip'.
 
-    def __init__(self, name: str, status: str, lines: "list[str] | None" = None) -> None:
+    ``lines`` are the check's VERDICT lines — the problems when it failed, the reason when it
+    skipped, the evidence when it passed — and they are what :func:`_print_summary` turns into
+    a GitHub `::error::`/`::warning::` annotation. ``notes`` are context that is true whatever
+    the verdict ("no .mcp.json in the checkout"); they are printed as plain detail lines and
+    NEVER annotated, so a failing check does not raise an inline PR error against a
+    reassuring fact and send a reviewer looking for a defect in it (FINAL-CERT F5).
+    """
+
+    def __init__(
+        self,
+        name: str,
+        status: str,
+        lines: "list[str] | None" = None,
+        notes: "list[str] | None" = None,
+    ) -> None:
         self.name = name
         self.status = status
         self.lines = lines or []
+        self.notes = notes or []
 
 
 def _remote_or_skip(
@@ -1708,12 +1872,22 @@ def settings_result(path: str) -> Result:
 def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
     """Wrap :func:`scan_command_skill_frontmatter` as the "command-skill-frontmatter" check.
 
-    Local and stdlib-only like `settings-permissions`, so it runs identically offline and in
-    CI, and the passing detail line reports HOW MANY files were covered. A skills tree that
-    yields zero manifests FAILS the check (the repo tracks .claude/skills), so a rename that
-    empties the scan reddens the gate instead of passing with "0 scanned".
+    Local and stdlib-only like `settings-permissions` — its one subprocess is a `git ls-files`
+    query in the checkout, not a network call — so it runs identically offline and in CI, and
+    the passing detail line reports HOW MANY files were covered. A skills tree that yields zero
+    manifests FAILS the check (the repo tracks .claude/skills), so a rename that empties the
+    scan reddens the gate instead of passing with "0 scanned".
+
+    Status is ``skip`` — with the reason — when git could not be asked whether either tree
+    holds a TRACKED SYMLINK (FINAL-CERT F1): the walk alone cannot rule one out, because a
+    link that dangles here resolves wherever its target exists. Under ``--require-remote``
+    (CI) `main` turns that skip into exit 2.
     """
     problems, commands, skills = scan_command_skill_frontmatter(commands_dir, skills_dir)
+    # Ask GIT as well as the filesystem: a tracked link under either tree whose target is
+    # absent in this checkout is invisible to the walk above (FINAL-CERT F1).
+    link_problems, link_unverified = tracked_symlink_problems([commands_dir, skills_dir])
+    problems = problems + link_problems
     # The repo TRACKS .claude/skills, so a vanished or empty skills tree is drift, not "0
     # scanned, pass": a directory rename (this PR itself moved .github/skills there) must
     # redden the gate rather than silently reduce coverage to nothing. .claude/commands
@@ -1730,26 +1904,57 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
         f"{'/'.join(FORBIDDEN_COMMAND_SKILL_KEYS)}, no unknown key (commands may carry only "
         f"{', '.join(ALLOWED_COMMAND_KEYS)}; skills also 'name')"
     ]
-    return Result(
-        "command-skill-frontmatter", "fail" if problems else "pass", problems or detail
-    )
+    if problems:
+        return Result("command-skill-frontmatter", "fail", problems, notes=detail)
+    if link_unverified:
+        # "Could not look for tracked links" is not "there are none": SKIP with the reason,
+        # which --require-remote turns into exit 2 in CI.
+        return Result("command-skill-frontmatter", "skip", link_unverified, notes=detail)
+    return Result("command-skill-frontmatter", "pass", detail)
 
 
-def startup_config_result(mcp_path: str, settings_local_path: str) -> Result:
+def startup_config_result(
+    mcp_path: str, settings_local_path: str, settings_path: "str | None" = None
+) -> Result:
     """Wrap :func:`validate_startup_config` as the "tracked-startup-config" check.
 
     Local and stdlib-only (it shells only to `git ls-files`, argv form, in the checkout), so
-    it runs identically offline and in CI. Status is ``skip`` — with the reason on the
-    line — when a file is present but its tracking could not be determined: an unanswerable
-    question must read as unanswered, not as clean. Under ``--require-remote`` (CI) `main`
-    turns that skip into a hard exit 2, so CI can never go green on an unverified startup
-    surface.
+    it runs identically offline and in CI. Beyond the tracking question, the three paths — and
+    the directory they live in — are checked for TRACKED SYMLINKS by git index mode `120000`,
+    which is the only way to see a link whose target is absent in this checkout but present on
+    the machine that committed it (FINAL-CERT F1); `settings_path` is derived from
+    `settings_local_path` when the caller does not pass it, so a redirected fixture never
+    drags the real checkout's settings.json into a foreign tree's query.
+
+    Status is ``skip`` — with the reason on the line — when a file is present but its tracking
+    (or the symlink question) could not be determined: an unanswerable question must read as
+    unanswered, not as clean. Under ``--require-remote`` (CI) `main` turns that skip into a
+    hard exit 2, so CI can never go green on an unverified startup surface.
     """
     problems, notes, unverified = validate_startup_config(mcp_path, settings_local_path)
+    if settings_path is None:
+        # Derived, never defaulted to the repo path: a fixture that redirects the pair must
+        # not drag the real checkout's settings.json into a foreign tree's git query.
+        directory = os.path.dirname(settings_local_path)
+        settings_path = os.path.join(directory, "settings.json") if directory else "settings.json"
+    # The three files are ALSO asked about by git: a tracked symlink at any of them is
+    # configuration the CLI resolves and this gate cannot read (FINAL-CERT F1). The directory
+    # they live in (`.claude/`) is link-checked directly — if it is the link, git records one
+    # 120000 entry for the directory and none for the files inside it.
+    link_problems, link_unverified = tracked_symlink_problems(
+        [mcp_path, settings_local_path, settings_path]
+    )
+    settings_dir = os.path.dirname(settings_path)
+    if settings_dir and os.path.islink(settings_dir):
+        link_problems = link_problems + [_symlink_problem("settings", settings_dir)]
+    # De-duplicated: a tracked link at `.mcp.json` is seen both by the per-file tracking
+    # question above and by this git-mode query, and one finding must read as one line.
+    problems = problems + [p for p in link_problems if p not in problems]
+    unverified = unverified + link_unverified
     if problems:
-        return Result("tracked-startup-config", "fail", problems + notes)
+        return Result("tracked-startup-config", "fail", problems, notes=notes)
     if unverified:
-        return Result("tracked-startup-config", "skip", unverified + notes)
+        return Result("tracked-startup-config", "skip", unverified, notes=notes)
     return Result("tracked-startup-config", "pass", notes)
 
 
@@ -1782,7 +1987,10 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     # Catches a persona added/removed vs the taxonomy the project commits. Local roster
     # integrity problems ride along here (this check always runs).
     problems, allowed = reconcile_roster_labels(roster, documented_labels, taxonomy_text)
-    problems = integrity + problems
+    # A tracked symlink under the agents tree is roster integrity too: git sees the link
+    # (mode 120000) whether or not it resolves in this checkout (FINAL-CERT F1).
+    link_problems, link_unverified = tracked_symlink_problems([args.agents_dir])
+    problems = integrity + link_problems + problems
     detail = [
         f"{len(roster)} roster slug(s), {len(documented_labels)} documented persona "
         f"label(s) in {os.path.basename(args.taxonomy)}",
@@ -1792,9 +2000,12 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     ]
     for slug, trunc in allowed:
         detail.append(f"allowed documented truncation: {slug} -> {PERSONA_PREFIX}{trunc}")
-    results.append(
-        Result("roster<->documented-labels", "fail" if problems else "pass", problems or detail)
-    )
+    if problems:
+        results.append(Result("roster<->documented-labels", "fail", problems, notes=detail))
+    elif link_unverified:
+        results.append(Result("roster<->documented-labels", "skip", link_unverified, notes=detail))
+    else:
+        results.append(Result("roster<->documented-labels", "pass", detail))
 
     # --- Check 4: .claude/settings.json permission surface (local; runs even --offline) ---
     # Placed before the remote checks so a malformed/over-broad permission file fails fast.
@@ -1803,7 +2014,11 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     # --- Check 4b: tracked startup configuration (local; runs even with --offline) --------
     # `.mcp.json` spawns its servers at CLI LAUNCH and `.claude/settings.local.json` is
     # honoured like settings.json — two surfaces the settings policy above never opens.
-    results.append(startup_config_result(args.mcp_config, settings_local_path(args.settings)))
+    results.append(
+        startup_config_result(
+            args.mcp_config, settings_local_path(args.settings), args.settings
+        )
+    )
 
     # --- Check 5: .claude/commands + .claude/skills front matter (local; runs --offline) ---
     # The third front-matter surface Claude Code reads as configuration. `allowed-tools:` in
@@ -1877,6 +2092,9 @@ def _print_summary(results: "list[Result]") -> None:
                 _error(f"{result.name}: {line}")
             elif result.status == "skip":
                 _warning(f"{result.name}: {line}")
+        for note in result.notes:
+            # Context, not verdict: printed for the reader, never annotated (FINAL-CERT F5).
+            _log(f"       - {note}")
 
 
 # --- Self-test ---------------------------------------------------------------------------
@@ -3233,8 +3451,14 @@ def _selftest() -> int:
         _wrapper(_commands, "dirty.md", "---\nallowed-tools: Bash(extdiff:*)\n---\n")
         _dirty_result = command_skill_result(_commands, _skills_ok)
         check(
-            _clean_result.name == "command-skill-frontmatter" and _clean_result.status == "pass",
-            "command-skill-frontmatter check passes on a clean commands/skills tree",
+            _clean_result.name == "command-skill-frontmatter"
+            and _clean_result.status != "fail"
+            and (
+                _clean_result.status == "pass"
+                or any("git could not say" in line for line in _clean_result.lines)
+            ),
+            "command-skill-frontmatter check does not fail a clean commands/skills tree "
+            "(SKIP outside a git checkout, where tracked links cannot be ruled out)",
         )
         check(
             _dirty_result.status == "fail"
@@ -3511,6 +3735,306 @@ def _selftest() -> int:
         and settings_local_path("settings.json") == "settings.local.json",
         "settings.local.json is resolved beside the policed settings.json",
     )
+    # --- FINAL-CERT F1: a tracked DANGLING symlink. Every path check above asks the
+    # FILESYSTEM (os.path.exists, an os.walk name match), and a link pointing at `bin/`,
+    # `obj/` or `artifacts/` answers "nothing here" in the checkout-only CI job while
+    # resolving to real configuration on every machine that has run `dotnet build`. Git
+    # records the link as index mode 120000 either way, so the gate asks GIT. The fixtures
+    # below build the four shapes that PASSED before: a dangling directory link under
+    # .claude/skills, a dangling .mcp.json, a dangling .claude/settings.local.json, and
+    # .claude/commands itself as a dangling link. `git add -f` because .gitignore lists
+    # .mcp.json / settings.local.json — the fixture must assert something.
+    def _dangling(linkname: str, target: str = "../../../nowhere-after-a-clean-checkout") -> bool:
+        """Create a link to a target that does NOT exist here; False if unsupported."""
+        try:
+            os.symlink(target, linkname)
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return os.path.islink(linkname) and not os.path.exists(linkname)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _skill_rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if not _git_repo(tmp, {_skill_rel: "---\nname: real\ndescription: d\n---\n"}, [_skill_rel]):
+            _log("  skip - git unavailable: tracked-dangling-symlink fixtures not run")
+        else:
+            _skills = os.path.join(tmp, ".claude", "skills")
+            _commands = os.path.join(tmp, ".claude", "commands")
+            _linked = os.path.join(_skills, "linked")
+            if not _dangling(_linked):
+                _log("  skip - symlink fixtures unavailable on this platform (dangling links)")
+            else:
+                subprocess.run(
+                    ["git", "add", "-f", "--", _linked],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                # Killing mutant: drop the mode-120000 filter (or the git query entirely) —
+                # os.walk cannot classify a dangling link as a directory, so the walk's
+                # "0 problems, 1 manifest scanned" was the whole finding.
+                check(
+                    _tracked_symlinks([_skills]) == [
+                        os.path.join(".claude", "skills", "linked")
+                    ],
+                    "_tracked_symlinks reports a tracked DANGLING dir-link by git mode 120000",
+                )
+                _res = command_skill_result(_commands, _skills)
+                check(
+                    _res.status == "fail"
+                    and any(
+                        "tracked symlink (git mode 120000)" in line and "linked" in line
+                        for line in _res.lines
+                    ),
+                    "a tracked dangling dir-link under .claude/skills FAILS, naming the link",
+                )
+                # ... and a link that DOES resolve is still caught by the same query, so the
+                # rule does not depend on the target's absence either way.
+                check(
+                    _tracked_symlinks([os.path.join(tmp, ".claude")]) != []
+                    and _tracked_symlinks([os.path.join(tmp, "nothing-here")]) == [],
+                    "the git query is scoped to its pathspec (a clean subtree reports none)",
+                )
+    with tempfile.TemporaryDirectory() as tmp:
+        # A dangling `.claude/commands` — the DIRECTORY itself is the link. os.path.isdir is
+        # False, so the optional-commands branch used to skip it in silence.
+        # Killing mutant: drop the islink(root) check (git still catches it here, so the
+        # assertion below names the git message; the islink half is killed by the non-git
+        # fixture further down).
+        if _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, []):
+            _commands = os.path.join(tmp, ".claude", "commands")
+            _skills = os.path.join(tmp, ".claude", "skills")
+            if _dangling(_commands, "../../build-output/commands"):
+                subprocess.run(
+                    ["git", "add", "-f", "--", _commands],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                _problems, _ncmd, _nskill = scan_command_skill_frontmatter(_commands, _skills)
+                _res = command_skill_result(_commands, _skills)
+                check(
+                    os.path.isdir(_commands) is False
+                    and any(_commands in x and "is a symlink" in x for x in _problems)
+                    and _res.status == "fail"
+                    and any("tracked symlink (git mode 120000)" in x for x in _res.lines),
+                    "`.claude/commands` as a tracked dangling link FAILS (islink + git mode)",
+                )
+    with tempfile.TemporaryDirectory() as tmp:
+        # A dangling `.mcp.json` link. `os.path.exists` says "absent" and the check emitted
+        # the flatly untrue note "no .mcp.json in the checkout".
+        # Killing mutants: `exists` instead of `lexists`; dropping the git-mode query.
+        if _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, []):
+            _mcp = os.path.join(tmp, ".mcp.json")
+            _local = os.path.join(tmp, ".claude", "settings.local.json")
+            if _dangling(_mcp, "obj/mcp/.mcp.json"):
+                subprocess.run(
+                    ["git", "add", "-f", "--", _mcp],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                _problems, _notes, _unverified = validate_startup_config(_mcp, _local)
+                check(
+                    not any("no " + _mcp + " in the checkout" in note for note in _notes),
+                    "a dangling .mcp.json is never reported as 'no .mcp.json in the checkout'",
+                )
+                _res = startup_config_result(_mcp, _local, os.path.join(tmp, ".claude", "settings.json"))
+                check(
+                    _res.status == "fail"
+                    and any("tracked symlink (git mode 120000)" in x for x in _res.lines)
+                    and any(".mcp.json" in x for x in _res.lines)
+                    # One finding, one line: the link is seen by both the tracking question
+                    # and the git-mode query, and a doubled annotation reads as two defects.
+                    and len(_res.lines) == len(set(_res.lines)),
+                    "a tracked dangling .mcp.json link FAILS once, naming the link",
+                )
+    with tempfile.TemporaryDirectory() as tmp:
+        # A dangling `.claude/settings.local.json` link — same shape, same verdict.
+        if _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, []):
+            _mcp = os.path.join(tmp, ".mcp.json")
+            _local = os.path.join(tmp, ".claude", "settings.local.json")
+            if _dangling(_local, "../bin/settings.local.json"):
+                subprocess.run(
+                    ["git", "add", "-f", "--", _local],
+                    cwd=tmp, capture_output=True, text=True, timeout=60,
+                )
+                _problems, _notes, _unverified = validate_startup_config(_mcp, _local)
+                check(
+                    not any("no " + _local + " in the checkout" in note for note in _notes),
+                    "a dangling settings.local.json is not reported as absent from the checkout",
+                )
+                _res = startup_config_result(_mcp, _local, os.path.join(tmp, ".claude", "settings.json"))
+                check(
+                    _res.status == "fail"
+                    and any("tracked symlink (git mode 120000)" in x for x in _res.lines)
+                    and any("settings.local.json" in x for x in _res.lines),
+                    "a tracked dangling .claude/settings.local.json link FAILS, naming the link",
+                )
+    with tempfile.TemporaryDirectory() as tmp:
+        # NO git here: the islink half must still run. A dangling link whose NAME does not
+        # match (`notes.txt`, not SKILL.md) is listed by os.walk among `filenames` — deciding
+        # by the name would let the link's own spelling choose whether it is inspected.
+        # Killing mutant: islink only inside the `if wanted:` branch.
+        _skills = os.path.join(tmp, "skills")
+        os.makedirs(os.path.join(_skills, "demo"), exist_ok=True)
+        _wrapper(os.path.join(_skills, "demo"), "SKILL.md", "---\nname: demo\ndescription: d\n---\n")
+        if _dangling(os.path.join(_skills, "demo", "notes.txt"), "../../obj/notes.txt"):
+            _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
+                os.path.join(tmp, "absent-commands"), _skills
+            )
+            check(
+                _nskill == 1
+                and any("notes.txt" in x and "is a symlink" in x for x in _problems),
+                "a dangling link with a NON-matching name is still reported by the walk",
+            )
+        _agents = os.path.join(tmp, "agents")
+        os.makedirs(_agents, exist_ok=True)
+        _wrapper(_agents, "product-manager.md", "---\nname: product-manager\n---\n")
+        if _dangling(os.path.join(_agents, "notes.txt"), "../../obj/notes.txt"):
+            _ok, _slugs, _problems = _read_roster_safe(_agents)
+            check(
+                _ok and _slugs == {"product-manager"}
+                and any("notes.txt" in x and "is a symlink" in x for x in _problems),
+                "the roster walk reports a dangling link whatever its name",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        # The agents/skills directory ITSELF as a dangling link, with no git to ask.
+        # Killing mutant: drop islink(agents_dir) / islink(root).
+        _agents = os.path.join(tmp, "agents")
+        if _dangling(_agents, "elsewhere/agents"):
+            # `os.walk` yields NOTHING for a dangling directory link, so read_roster raises
+            # its "no persona wrappers" FileNotFoundError — the raise must carry the link, or
+            # the operator is told the roster is empty and never learns why.
+            try:
+                read_roster(_agents)
+                _raised = ""
+            except FileNotFoundError as exc:
+                _raised = str(exc)
+            check(
+                _agents in _raised
+                and "is a symlink" in _raised
+                and any(marker in _raised for marker in INTEGRITY_CLAUSE_MARKERS),
+                "a dangling `.claude/agents` link is named in the raise (drift, not 'empty')",
+            )
+        _skills = os.path.join(tmp, "skills")
+        if _dangling(_skills, "elsewhere/skills"):
+            _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
+                os.path.join(tmp, "absent-commands"), _skills
+            )
+            check(
+                _nskill == 0 and any(_skills in x and "is a symlink" in x for x in _problems),
+                "a dangling `.claude/skills` link is reported, not read as an absent tree",
+            )
+
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+        with tempfile.TemporaryDirectory() as tmp:
+            # The ROSTER check asks git too, and the question has to be asked from inside
+            # `run_checks` — a helper that is never called protects nothing. This fixture is a
+            # real git repo whose agents tree holds a tracked link to a build-output path, and
+            # the assertion is on the GIT message specifically (the walk raises its own,
+            # different one), so it fails if the roster's git query is dropped.
+            # Killing mutant: deleting the `tracked_symlink_problems([args.agents_dir])` call.
+            _rel = os.path.join(".claude", "agents", "product-manager.md")
+            if _git_repo(tmp, {_rel: "---\nname: product-manager\n---\n"}, [_rel]):
+                _agents = os.path.join(tmp, ".claude", "agents")
+                _linked = os.path.join(_agents, "obj-link.md")
+                if _dangling(_linked, "../../obj/agents/obj-link.md"):
+                    subprocess.run(
+                        ["git", "add", "-f", "--", _linked],
+                        cwd=tmp, capture_output=True, text=True, timeout=60,
+                    )
+                    _buffer = io.StringIO()
+                    with contextlib.redirect_stdout(_buffer):
+                        _exit = main(
+                            ["--offline", "--repo", DEFAULT_REPO, "--agents-dir", _agents]
+                        )
+                    _output = _buffer.getvalue()
+                    check(
+                        _exit == 1
+                        and "[FAIL] roster<->documented-labels" in _output
+                        and "tracked symlink (git mode 120000)" in _output
+                        and os.path.join(".claude", "agents", "obj-link.md") in _output,
+                        "the roster check asks git about tracked symlinks under the agents tree",
+                    )
+
+    # --- FINAL-CERT F2: the SKIP partition. A local check that could not verify its input
+    # exits 2 with the LOCAL message — never the remote-outage one, which would send a
+    # responder to wait out an outage that never happened. `tracked-startup-config` is a
+    # LOCAL check (its one subprocess is `git ls-files` in the checkout), so it must not be
+    # in REMOTE_CHECK_NAMES. Killing mutants: adding it there; reverting the two messages to
+    # a single one; checking the remote partition first.
+    check(
+        "tracked-startup-config" not in REMOTE_CHECK_NAMES
+        and "command-skill-frontmatter" not in REMOTE_CHECK_NAMES
+        and "roster<->documented-labels" not in REMOTE_CHECK_NAMES
+        and REMOTE_CHECK_NAMES
+        == frozenset({"roster<->live-labels", "codeowners-errors", "milestone-dropdown"}),
+        "REMOTE_CHECK_NAMES holds exactly the three GitHub-API checks (literal set)",
+    )
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+        with tempfile.TemporaryDirectory() as tmp:
+            # NOT a git checkout: git cannot say whether this .mcp.json is tracked, so the
+            # local check SKIPs and --require-remote makes that exit 2 with the environment
+            # message. The remote checks are skipped BY REQUEST here (--offline), which is
+            # exactly the case that used to print "remote outage".
+            with open(os.path.join(tmp, ".mcp.json"), "w", encoding="utf-8") as handle:
+                handle.write(_mcp_evil)
+            _buffer = io.StringIO()
+            with contextlib.redirect_stdout(_buffer):
+                _exit = main(
+                    [
+                        "--offline",
+                        "--require-remote",
+                        "--repo",
+                        DEFAULT_REPO,
+                        "--mcp-config",
+                        os.path.join(tmp, ".mcp.json"),
+                    ]
+                )
+            _output = _buffer.getvalue()
+            check(
+                _exit == 2
+                and "local check(s) could not verify their input" in _output
+                and "tracked-startup-config" in _output
+                # The phrase "remote outage" occurs INSIDE the local message ("not a remote
+                # outage"), so what must be absent is the outage VERDICT sentence itself.
+                and "required remote check(s) were unavailable" not in _output,
+                "an unverifiable LOCAL check exits 2 with the environment message, not 'outage'",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        # A tracked `.mcp.json` whose `mcpServers` is a LIST: the gate cannot enumerate what
+        # would start at launch, so it FAILS rather than reading the non-mapping as empty.
+        # Killing mutant: collapsing a non-dict mcpServers into `{}`.
+        if _git_repo(tmp, {".mcp.json": '{"mcpServers": []}'}, [".mcp.json"]):
+            _problems, _, _unverified = validate_startup_config(
+                os.path.join(tmp, ".mcp.json"), os.path.join(tmp, ".claude", "settings.local.json")
+            )
+            check(
+                len(_problems) == 1
+                and "'mcpServers' is list, not an object" in _problems[0]
+                and _unverified == [],
+                "a tracked .mcp.json whose mcpServers is a LIST fails, not reads as empty",
+            )
+
+    # --- FINAL-CERT F5: notes are context, not verdict. A failing check must not raise an
+    # `::error::` annotation against "no .claude/settings.local.json in the checkout" — an
+    # inline PR error on a reassuring FACT sends a reviewer hunting a defect in it.
+    # Killing mutant: `Result(..., "fail", problems + notes)`.
+    with tempfile.TemporaryDirectory() as tmp:
+        if _git_repo(tmp, {".mcp.json": _mcp_evil}, [".mcp.json"]):
+            _local = os.path.join(tmp, ".claude", "settings.local.json")
+            _res = startup_config_result(
+                os.path.join(tmp, ".mcp.json"), _local, os.path.join(tmp, ".claude", "settings.json")
+            )
+            _buffer = io.StringIO()
+            with contextlib.redirect_stdout(_buffer):
+                _print_summary([_res])
+            _annotations = [
+                line for line in _buffer.getvalue().splitlines() if line.startswith("::error::")
+            ]
+            check(
+                _res.status == "fail"
+                and any("no " + _local + " in the checkout" in note for note in _res.notes)
+                and _annotations
+                and not any("in the checkout" in line for line in _annotations)
+                and any("in the checkout" in line for line in _buffer.getvalue().splitlines()),
+                "a failing check annotates its problems only; notes print as plain detail",
+            )
+
     # The real checkout must be clean on this surface, and the check must be WIRED INTO the
     # gate: a tracked .mcp.json has to redden a full run. Killing mutant: deleting the
     # `results.append(startup_config_result(...))` line in run_checks.
@@ -3536,17 +4060,32 @@ def _selftest() -> int:
         with contextlib.redirect_stdout(_buffer):
             _exit = main(["--offline", "--repo", DEFAULT_REPO])
         _output = _buffer.getvalue()
-        # The LITERAL paths are asserted, not the constants: comparing the output against
-        # the same constant that produced it is self-referential and would survive a typo in
-        # the default. These three strings are the paths the workflow path filters and the
-        # docs name, so a default that drifts from them is caught here.
+        # FINAL-CERT F3: assert the GATE, not the ambient machine. A developer may keep an
+        # UNTRACKED local .mcp.json (that is the supported way to run an MCP server here), and
+        # a selftest that demands the "no .mcp.json in the checkout" note turns red on their
+        # machine for a state the gate deliberately allows — training people to ignore a red
+        # selftest. What must hold is that the check did not FAIL, and that the default path
+        # is the repo-root .mcp.json: the note then reads either way.
         check(
-            "[PASS] tracked-startup-config" in _output
-            and _exit == 0
-            and "no .mcp.json in the checkout" in _output
+            "[FAIL] tracked-startup-config" not in _output and _exit == 0,
+            "this checkout is clean on the tracked-startup-config surface",
+        )
+        check(
+            "no .mcp.json in the checkout" in _output
+            or ".mcp.json present locally" in _output,
+            "the report states the .mcp.json situation (absent, or present and untracked)",
+        )
+        # The defaults are asserted against LITERAL paths, never against the constants that
+        # produced the output: comparing a run's output with the same constant it came from is
+        # self-referential and would survive a typo in the default. These are the paths the
+        # workflow path filters and the docs name, so a default that drifts is caught here.
+        check(
+            DEFAULT_MCP_CONFIG == ".mcp.json"
+            and DEFAULT_SETTINGS == os.path.join(".claude", "settings.json")
+            and settings_local_path(DEFAULT_SETTINGS)
+            == os.path.join(".claude", "settings.local.json")
             and os.path.join(".claude", "settings.local.json") in _output,
-            "this checkout has no tracked .mcp.json and no tracked settings.local.json "
-            "(and --mcp-config defaults to the repo-root .mcp.json)",
+            "--mcp-config/--settings default to the repo-root .mcp.json and .claude/settings*.json",
         )
         # CERT-F4: the argparse DEFAULTS for --skills-dir/--commands-dir are themselves a
         # policy surface — a typo there would scan nothing while the gate still said PASS.
@@ -3721,6 +4260,24 @@ def main(argv: "list[str] | None" = None) -> int:
     if failed:
         _error(f"reconciliation FAILED: {len(failed)} check(s) drifted — see annotations above")
         return 1
+    if args.require_remote and local_skipped:
+        # A LOCAL check that could not verify its input (e.g. git could not say whether a
+        # startup config is tracked, or whether a path is a tracked symlink) must not go
+        # green in CI: CI is precisely where those questions are knowable and decisive.
+        #
+        # Reported BEFORE the remote partition on purpose. The local one is the runner's own
+        # environment — actionable right now, by the person running the gate — while a remote
+        # outage is "wait and retry"; and `--offline` (a deliberate request to skip the remote
+        # checks) puts every remote check in the skip bucket, so leading with the outage
+        # message there would hand a responder a runbook for an outage that never happened.
+        _error(
+            f"reconciliation could not run: {len(local_skipped)} local check(s) could not "
+            f"verify their input ("
+            + "; ".join(r.name for r in local_skipped)
+            + ") — this is an environment problem, not a remote outage and not drift; run "
+            f"the gate inside the git checkout"
+        )
+        return 2
     if args.require_remote and remote_skipped:
         # A required remote check could not RUN. This is a gh/API OUTAGE, not roster drift:
         # exit 2 (distinct from the exit-1 drift signal) so an outage never reads as drift.
@@ -3728,18 +4285,6 @@ def main(argv: "list[str] | None" = None) -> int:
             f"reconciliation could not run: {len(remote_skipped)} required remote check(s) "
             f"were unavailable (gh missing or a GitHub API error) — this is a remote outage, "
             f"not drift; retry once `gh` is authenticated and GitHub is reachable"
-        )
-        return 2
-    if args.require_remote and local_skipped:
-        # A LOCAL check that could not verify its input (e.g. git could not say whether a
-        # startup config is tracked) must not go green in CI: CI is precisely where "the file
-        # is tracked" is knowable and decisive.
-        _error(
-            f"reconciliation could not run: {len(local_skipped)} local check(s) could not "
-            f"verify their input ("
-            + "; ".join(r.name for r in local_skipped)
-            + ") — this is an environment problem, not a remote outage and not drift; run "
-            f"the gate inside the git checkout"
         )
         return 2
     if remote_skipped:

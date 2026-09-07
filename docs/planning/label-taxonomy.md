@@ -234,10 +234,17 @@ of three reconciliations or the three local validations (`settings-permissions`,
    also carry `name`). `.claude/commands/` is optional; `.claude/skills/` is not — a
    skills tree that yields zero manifests fails the check, and the passing report
    states how many files were scanned. Both walks — and the roster walk in 1 — also
-   report **symlinks**: links are deliberately not followed (a loop would hang the
-   gate), but Claude Code does follow them, so a symlinked directory or file under
-   `.claude/agents/`, `.claude/commands/`, or `.claude/skills/` ships configuration
-   the walk never opened; the link itself is an integrity problem naming the link.
+   reject **symlinks**, and the rule is decided **by git**: any tracked symlink under
+   `.claude/` — or at `.mcp.json`, `.claude/settings.local.json`,
+   `.claude/settings.json` — fails the gate, because git records the link as index
+   mode `120000` whether or not it resolves here, so a **dangling** link cannot hide.
+   That is the point: a link pointing at `bin/`, `obj/` or `artifacts/` is absent in
+   the checkout-only CI job and resolves to real configuration on every machine that
+   has run `dotnet build`, so a filesystem-only check would pass it. The walks report
+   any link they see as well (the directory roots themselves, and every file entry
+   whatever its name), so the rule still holds where git cannot be asked; links are
+   never followed (a loop would hang the gate), and if git cannot answer at all the
+   git half reports **skip** with the reason rather than a pass.
 6. **`tracked-startup-config`** (also a validation). Two startup surfaces the
    settings policy never opens. A repo-root **`.mcp.json`** has every
    `mcpServers[*].command` *spawned when the CLI launches* — before any tool call,
@@ -251,10 +258,12 @@ of three reconciliations or the three local validations (`settings-permissions`,
    *tracked* one fails. Only tracked files fail: tracking is decided with
    `git ls-files --error-unmatch`, so a developer's untracked local copy is reported
    in the detail line rather than reddening their run, while in CI — where the
-   checkout holds tracked files only — a committed one is caught. If git cannot
-   answer (no `git`, not a checkout) the check reports **skip** with the reason, and
-   `--require-remote` turns that into exit 2 rather than a silent pass. Override the
-   path with `--mcp-config`.
+   checkout holds tracked files only — a committed one is caught. A **tracked symlink**
+   at either path (or at `.claude/settings.json`) fails on its git mode `120000`, so a
+   link that dangles in this checkout but resolves on another machine cannot pass. If
+   git cannot answer (no `git`, not a checkout) the check reports **skip** with the
+   reason, and `--require-remote` turns that into exit 2 rather than a silent pass.
+   Override the path with `--mcp-config`.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance
 files (roster, `.claude/commands/`, `.claude/skills/`, `CODEOWNERS`, the feature
@@ -280,7 +289,9 @@ label set above** (so `--offline` still catches roster↔label drift). CI passes
 `--require-remote`, so a remote check that could not run there is a hard failure — reported
 as a **remote outage (exit 2), distinct from drift**, so a `gh`/API outage is never
 miscounted as roster drift. Exit codes: `0` reconciled, `1` drift detected, `2` usage/data
-error **or** a required remote check could not run (a remote outage under `--require-remote`).
+error **or** a required remote check could not run (a remote outage under `--require-remote`)
+**or** a local check that could not verify its input (environment — run the gate inside the
+git checkout). Each exit-2 cause carries its own message, because they need different fixes.
 
 **Promotion to a required check.** The gate is not a branch-protection required check
 today; like `coverage` and the supply-chain scans it can be promoted post-merge once it
