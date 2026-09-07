@@ -32,6 +32,7 @@
       "Bash(git branch -M:*)",
       "Bash(git branch -m:*)",
       "Bash(git push -f:*)",
+      "Bash(git push --force:*)",
       "Bash(gh api -X POST:*)",
       "Bash(gh api -X PUT:*)",
       "Bash(gh api -X PATCH:*)",

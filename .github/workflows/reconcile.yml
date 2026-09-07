@@ -3,7 +3,8 @@ name: Reconcile
 # Governance reconciliation gate (STORY-00.6.2, #452). A lightweight, build-free check that
 # fails when the persona roster, the GitHub label taxonomy, CODEOWNERS, and the
 # feature-request milestone dropdown drift out of the manual reconciliation recorded in
-# docs/planning/label-taxonomy.md (#449). It reconciles four sources of drift:
+# docs/planning/label-taxonomy.md (#449). It runs three reconciliations plus a
+# settings-permissions validation:
 #   * roster<->labels    — every .claude/agents/*.md wrapper has a persona:<slug> label
 #                          and vice-versa (allowing the ONE documented 50-char truncation),
 #                          reconciled against the committed label list AND the live labels.
@@ -11,9 +12,13 @@ name: Reconcile
 #                          parse/owner errors (pinned to the PR head so a breaking PR fails).
 #   * milestone-dropdown — the feature_request.yml milestone options match the live GitHub
 #                          milestones (plus the documented "needs triage" sentinel).
-#   * settings.json      — .claude/settings.json stays parseable, its permission entries stay
-#                          plain strings, and no `gh api` command is auto-allowed (a mutating
-#                          `gh api` call must always prompt; see the deny list there).
+#   * settings-permissions (a VALIDATION, not a reconciliation) — .claude/settings.json stays
+#                          parseable, permissions.allow/deny stay LISTS of plain strings, no
+#                          allow entry auto-allows a mutating command (`gh api`, `git push`,
+#                          `gh pr merge`, ... — including via a broad `Bash(gh:*)`/`Bash(*)`),
+#                          and the required deny entries are all present. Implemented in
+#                          tools/reconcile/roster-labels.py (validate_settings), so it is
+#                          self-tested and mutation-checked like the reconciliations above.
 #
 # It runs on PRs and pushes that touch the governance files (drift introduced by a code
 # change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
@@ -72,12 +77,12 @@ jobs:
         run: python3 tools/reconcile/roster-labels.py --selftest
 
       # .claude/settings.json is a security-relevant permission surface (an over-broad allow
-      # entry silently widens what runs without a prompt), so it is reconciled here too: it must
-      # parse, every allow/deny entry must be a plain string, and no `gh api` command may be
-      # auto-allowed. Stdlib-only; runs before the live checks so a malformed file fails fast.
+      # entry silently widens what runs without a prompt), so it is validated here too. The
+      # rules live in the gate script (validate_settings) rather than in an inline one-liner,
+      # so they are covered by --selftest above and cannot rot unnoticed. Local + stdlib-only;
+      # runs before the live checks so a malformed permission file fails fast.
       - name: Validate .claude/settings.json
-        run: |
-          python3 -c "import json,sys; d=json.load(open('.claude/settings.json')); p=d['permissions']; assert all(isinstance(x,str) for x in p.get('allow',[])+p.get('deny',[])); assert not any(a.startswith('Bash(gh api') for a in p.get('allow',[])), 'gh api must not be auto-allowed'; print('settings.json OK')"
+        run: python3 tools/reconcile/roster-labels.py --validate-settings-only
 
       # The live checks read public repo metadata (labels, milestones, codeowners/errors) via
       # the GitHub CLI using the default read-only token. --require-remote makes a remote lookup

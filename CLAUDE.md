@@ -63,17 +63,23 @@ projects).
 listings, plus `gh pr view`/`diff`/`list`/`checks` and `gh issue view`/`list`
 — along with `dotnet restore`, `build`, `test`, and `format`.
 
-These are `Bash(prefix:*)` grants, and a prefix match covers everything typed
-after the prefix, so a flag such as `--output=<path>` on `git diff`, `git log`,
-or `git show` can still write a file: the allowlist is a convenience for the
-maintainer's own machine, not a sandbox boundary.
+Most of these are `Bash(prefix:*)` grants (a few branch listings are
+exact-match), and a prefix match covers everything typed after it, so
+`--output=<path>` on `git diff`, `git log`, or `git show` can still write a
+file. The same holds for any per-user override, including the gitignored
+`.claude/settings.local.json`, which widens these grants — so treat `--output`
+on another author's branch exactly like the `dotnet` grant below.
 
 The deny list covers only the explicit destructive spellings — branch
-delete/rename short flags, `git push -f`, `gh api` with
+delete/rename short flags, `git push -f`, `git push --force`, `gh api` with
 `-X POST`/`PUT`/`PATCH`/`DELETE` or `--method`, `gh pr merge`, `gh release`,
-and `gh secret`. Everything else that writes is simply unlisted, so it prompts:
-`git push` always prompts, as do commit, `git worktree add`/`remove`, PR or
-issue creation, and reviews. Prompt-on-write is the design, not an omission.
+and `gh secret`. Deny matching is word-boundary prefix matching on the *leading*
+spelling, so `-X post`, `-XPOST`, `--method=POST`, or `git push origin main -f`
+are not denied — they prompt, because nothing allows them either. Everything
+else that writes is unlisted and prompts too: `git push`, commit,
+`git worktree add`/`remove`, PR or issue creation, reviews. Prompt-on-write is
+the design, not an omission; the `reconcile` workflow also validates this file's
+shape and forbids write/outbound prefixes in `allow`.
 
 The `dotnet` grant is intended only for the maintainer's own branches; nothing
 enforces that. `dotnet restore`/`build`/`test`/`format` execute PR-supplied
@@ -81,8 +87,6 @@ MSBuild targets, analyzers, source generators, and `nuget.config` package
 sources in-process, so when reviewing or verifying someone else's branch, run
 them from a throwaway copy outside the worktree per
 `.claude/skills/review-pr/rigor-battery.md` (C7).
-
-Per-user overrides belong in `.claude/settings.local.json`, which is gitignored.
 
 ## Architecture — the big picture
 

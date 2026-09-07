@@ -147,9 +147,10 @@ comm -3 \
       | awk -F'\t' '$1 ~ /^persona:/ { sub(/^persona:/,"",$1); print $1 }' | sort)
 ```
 
-The left half reads the frontmatter `name:` from the top-level wrappers, exactly
-as the gate does; `python3 tools/reconcile/roster-labels.py --offline` is the
-authoritative check.
+The left half reads the frontmatter `name:` from the top-level wrappers,
+approximately as the gate does (it does not enforce the frontmatter fence or
+strip quotes); `python3 tools/reconcile/roster-labels.py --offline` is
+authoritative.
 
 The only expected difference is the truncated slug — roster-only
 `dotnet-vectorized-columnar-compute-engineer` versus label-only
@@ -172,7 +173,8 @@ of three reconciliations breaks:
    wrappers only: the gate counts every `*.md` there that carries a frontmatter
    `name:` and ignores markdown without one (e.g. a README). Wrappers must sit
    directly in `.claude/agents/`; a `name:`-bearing file in a subdirectory fails
-   the gate. The one 50-character truncation
+   the gate, and hidden (dot-prefixed) subdirectories are scanned too, so a
+   wrapper hidden under one cannot slip past. The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone
    truncated label out of this file, so an *undocumented* truncation still fails. The

@@ -400,7 +400,7 @@ Before declaring the loop terminated, audit the council composition record produ
 
 1. Enumerate every counted round in the progression report.
 2. For each round, locate the per-slot composition row.
-3. Verify each row lists an exact `(subagent_type, model)` pair from the protocol table in `review-pr` §3.1; that the red-team row's `model` column reads `fable`; that the `Forked` column reads `no` on every row; and that, on the red-team row, the **Dispatch Timestamp (UTC)** is at or before the **Blind Block Returned (UTC)** timestamp, which is in turn earlier than the **Verdicts Released (UTC)** timestamp.
+3. Verify each row lists an exact `(subagent_type, model)` pair from the protocol table in `review-pr` §3.1; that the red-team row's `model` column reads `fable`; that the `Forked` column reads `no` and the `Dispatch HEAD` column equals the round's HEAD SHA on every row; and that, on the red-team row, the **Dispatch Timestamp (UTC)** is at or before the **Blind Block Returned (UTC)** timestamp, which is in turn earlier than the **Verdicts Released (UTC)** timestamp.
 4. Missing or off-protocol composition data invalidates the round and requires corrective review at the current HEAD or the original HEAD when recoverable.
 5. After any corrective dispatch, regenerate, repost, and re-verify the report before terminating.
 

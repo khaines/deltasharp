@@ -70,8 +70,8 @@ dotnet test --filter "Name=Select_ProjectsColumns"
   format`; keep public-AOT/trim annotations clean (see the
   `dotnet-library-platform-engineer` conventions). Run `dotnet format` to fix
   formatting locally before pushing.
-- Mirror the Apache Spark public API where practical (see
-  `CLAUDE.md`); document any deliberate deviation.
+- Mirror the Apache Spark public API where practical (see `CLAUDE.md`);
+  document any deliberate deviation.
 - Preserve the engine invariant: **transformations are lazy, actions are eager.**
 
 ## Quality gates

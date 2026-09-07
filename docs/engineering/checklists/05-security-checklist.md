@@ -55,7 +55,7 @@ Apply this checklist to every change that can affect credentials, identities, ne
 - [ ] SBOMs are generated for .NET packages and container images, retained with releases, and scanned against vulnerability policy.
 - [ ] NativeAOT executor images from ADR-0014 use minimal trusted bases and do not smuggle build tools, package managers, or unused shells into runtime layers.
 - [ ] CI workflow permissions are minimal, secrets are scoped to protected branches/environments, and pull-request workflows cannot exfiltrate release credentials.
-- [ ] Agent-harness permission allowlists (`.claude/settings.json`) are least-privilege: no `gh api`, `git push`, `git fetch`, or other write/outbound primitive is auto-approved; the explicit destructive spellings are denied and the file is parse-validated in CI.
+- [ ] Agent-harness permission allowlists (`.claude/settings.json`) are least-privilege: no `gh api`, `git push`, `git fetch`, or other write/outbound primitive is auto-approved, except the documented `dotnet` build/test grant whose compensating control (throwaway copy outside the worktree for branches that are not your own) is recorded in `CLAUDE.md`; the explicit destructive spellings are denied; and the reconcile workflow validates the file's shape and forbids write/outbound prefixes in `allow`.
 
 ### Observability, incident response, and disclosure
 - [ ] Security-relevant audit events cover job submission, action authorization, credential issuance, storage access denial, Delta log mutation, image admission, and cross-tenant access attempts.

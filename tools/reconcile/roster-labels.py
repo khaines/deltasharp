@@ -4,8 +4,8 @@
 PR #449 established `docs/planning/label-taxonomy.md` with a *manual* reconciliation
 of the persona roster, the `persona:<slug>` GitHub labels, `CODEOWNERS`, and the
 feature-request milestone dropdown. This script turns that manual snapshot into a
-lightweight, re-runnable gate so the three sources of drift below fail CI instead of
-silently rotting:
+lightweight, re-runnable gate so the three reconciliations below — plus a validation of the
+`.claude/settings.json` permission surface — fail CI instead of silently rotting:
 
   1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper (a markdown file
      whose front matter carries a `name:`; other markdown there is ignored) must have a
@@ -27,6 +27,15 @@ silently rotting:
      `.github/ISSUE_TEMPLATE/feature_request.yml` must offer exactly the live GitHub
      milestones, plus the documented "needs triage" sentinel. A stale/renamed option or a
      live milestone missing from the dropdown FAILS.
+
+Alongside those three reconciliations the gate runs one local VALIDATION,
+`settings-permissions` (:func:`validate_settings`): `.claude/settings.json` must parse, its
+`permissions.allow` / `permissions.deny` must be LISTS OF STRINGS, no allow entry may
+auto-allow a mutating command (`gh api`, `git push`, `gh pr merge`, ... — including via a
+broad `Bash(gh:*)`/`Bash(git:*)`/`Bash(*)`), and the required deny entries must all be
+present. It is a policy check on a security-relevant file rather than a reconciliation
+between two sources, but it shares the gate's report/exit contract. Run it alone with
+`--validate-settings-only`.
 
 Design constraints
 ------------------
@@ -52,6 +61,9 @@ Usage
     # Prove the gate's own reconciliation logic with in-memory fixtures (no network):
     python3 tools/reconcile/roster-labels.py --selftest
 
+    # Validate ONLY the .claude/settings.json permission surface (local, fail-fast CI step):
+    python3 tools/reconcile/roster-labels.py --validate-settings-only
+
 Exit codes: 0 = reconciled (no drift), 1 = drift detected (a check FAILED), 2 = usage/data
 error, OR a required remote check could not run (`--require-remote` with `gh`/the GitHub API
 unavailable) — a remote outage, reported distinctly from drift so an outage never reads as
@@ -61,7 +73,6 @@ roster drift.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import re
@@ -84,6 +95,7 @@ DEFAULT_REPO = "khaines/deltasharp"
 SENTINEL_MILESTONE_OPTIONS = frozenset({"Unsure / needs triage"})
 
 DEFAULT_AGENTS_DIR = os.path.join(".claude", "agents")
+DEFAULT_SETTINGS = os.path.join(".claude", "settings.json")
 DEFAULT_FEATURE_FORM = os.path.join(".github", "ISSUE_TEMPLATE", "feature_request.yml")
 DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
 
@@ -93,6 +105,44 @@ DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
 # live GitHub label set; remote mode additionally diffs the roster against the LIVE labels.
 PERSONA_LABELS_BEGIN = "<!-- BEGIN persona-labels"
 PERSONA_LABELS_END = "<!-- END persona-labels"
+
+# --- .claude/settings.json permission policy ---------------------------------------------
+# Commands that must NEVER be auto-allowed (they mutate the repo, GitHub state, or the local
+# worktree layout, so they have to prompt). An allow entry is rejected when its command is a
+# TOKEN-PREFIX of one of these (`gh` covers `gh api`; `git` covers `git push`) or when one of
+# these is a token-prefix of it (`gh api repos/x` IS a `gh api` call). Wildcards are rejected
+# outright.
+FORBIDDEN_ALLOW_COMMANDS = (
+    "gh api",
+    "git push",
+    "git fetch",
+    "gh pr merge",
+    "gh release",
+    "gh secret",
+    "git worktree add",
+    "git worktree remove",
+)
+# Deny entries that must be present verbatim. The deny list is the belt to the allow list's
+# braces: an entry deleted here silently re-opens a mutating command to a future broad allow
+# rule or an interactive "yes". Claude Code's matcher is word-boundary aware
+# (`startsWith(prefix + " ")`), so `Bash(git push --force:*)` denies `git push --force ...`
+# WITHOUT catching `git push --force-with-lease`.
+REQUIRED_DENY_ENTRIES = (
+    "Bash(git branch -D:*)",
+    "Bash(git branch -d:*)",
+    "Bash(git branch -M:*)",
+    "Bash(git branch -m:*)",
+    "Bash(git push -f:*)",
+    "Bash(git push --force:*)",
+    "Bash(gh api -X POST:*)",
+    "Bash(gh api -X PUT:*)",
+    "Bash(gh api -X PATCH:*)",
+    "Bash(gh api -X DELETE:*)",
+    "Bash(gh api --method:*)",
+    "Bash(gh pr merge:*)",
+    "Bash(gh release:*)",
+    "Bash(gh secret:*)",
+)
 
 
 # --- Output helpers ----------------------------------------------------------------------
@@ -188,10 +238,24 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
     is: a `name:`-bearing wrapper hidden in a subdirectory would otherwise be silently
     ignored by this gate while still shipping as an agent. Such a NESTED WRAPPER IS AN
     INTEGRITY ERROR, reported here rather than passed over.
+
+    The walk uses :func:`os.walk` rather than a recursive ``glob``: ``glob`` skips
+    DOT-PREFIXED directories, so a wrapper parked in `.claude/agents/.hidden/` would be
+    invisible to this gate while `.claude/agents/**` still shipped it. Symlinked directories
+    are not followed (``followlinks=False``) so a link loop cannot hang the gate.
+
+    When the scan finds NO top-level wrapper, the raised ``FileNotFoundError`` carries any
+    integrity problems collected on the way (e.g. "1 nested wrapper was found and ignored:
+    <path>"), so an agents directory whose wrappers all sit one level down is diagnosed
+    precisely instead of reading as an empty directory.
     """
-    all_paths = sorted(
-        glob.glob(os.path.join(agents_dir, "**", "*.md"), recursive=True)
-    )
+    all_paths: "list[str]" = []
+    for dirpath, dirnames, filenames in os.walk(agents_dir, followlinks=False):
+        dirnames.sort()  # deterministic traversal order
+        for filename in filenames:
+            if filename.endswith(".md"):
+                all_paths.append(os.path.join(dirpath, filename))
+    all_paths.sort()
     slugs: "set[str]" = set()
     problems: "list[str]" = []
     first_seen: "dict[str, str]" = {}
@@ -223,10 +287,20 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
             first_seen[name] = path
         slugs.add(name)
     if not slugs:
-        raise FileNotFoundError(
-            f"no persona wrappers found under {agents_dir!r} "
+        message = (
+            f"no persona wrappers found directly under {agents_dir!r} "
             f"(expected {agents_dir!r}/*.md with a front-matter `name:`)"
         )
+        if problems:
+            # Everything collected here is a wrapper the roster could not accept (a nested
+            # one). Naming it turns "the directory looks empty" into "your wrappers are one
+            # level too deep", which is the actual fix.
+            was = "wrapper was" if len(problems) == 1 else "wrappers were"
+            message += (
+                f"; {len(problems)} nested {was} found and ignored: "
+                + "; ".join(problems)
+            )
+        raise FileNotFoundError(message)
     return slugs, problems
 
 
@@ -454,6 +528,129 @@ def check_codeowners_errors(errors: "list") -> "list[str]":
     return problems
 
 
+# --- Check 4: .claude/settings.json permission surface -----------------------------------
+
+def _bash_command(entry: str) -> "str | None":
+    """Return the normalized command inside a ``Bash(...)`` permission entry, else None.
+
+    ``Bash(gh  api:*)`` → ``gh api``: the ``Bash(...)`` wrapper and the trailing ``:*``
+    argument wildcard are stripped and INTERNAL WHITESPACE IS COLLAPSED, so an entry cannot
+    dodge the policy below by padding the command with extra spaces or a tab. Non-``Bash``
+    entries (``Read(...)``, ``WebFetch(...)``) return None — this policy is about shell
+    commands.
+    """
+    match = re.match(r"^Bash\((.*)\)$", entry.strip(), re.DOTALL)
+    if not match:
+        return None
+    inner = match.group(1)
+    if inner.endswith(":*"):
+        inner = inner[: -len(":*")]
+    return " ".join(inner.split())
+
+
+def _token_prefix(shorter: str, longer: str) -> bool:
+    """True when ``shorter`` equals ``longer`` or is a whole-TOKEN prefix of it.
+
+    Token-aware so ``git`` matches ``git push`` (it would auto-allow it) while ``git-foo``
+    does not — mirroring how Claude Code matches a permission prefix (``prefix + " "``).
+    """
+    return longer == shorter or longer.startswith(shorter + " ")
+
+
+def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
+    """Return problems with `.claude/settings.json`'s permission surface (empty ⇒ clean).
+
+    `.claude/settings.json` is a security-relevant control: an over-broad ``allow`` entry
+    silently widens what an agent runs WITHOUT a prompt, and a deleted ``deny`` entry
+    re-opens a mutating command. The file changes rarely and by hand, which is exactly the
+    profile of a control that rots unwatched — so it is reconciled like any other governance
+    artifact. Everything here is local, so the check runs identically offline and in CI.
+
+    Enforced:
+
+    * the file parses as JSON and ``permissions`` is an object;
+    * ``allow`` and ``deny`` are LISTS OF STRINGS — the list type is asserted BEFORE
+      iterating, so ``"allow": "Bash(gh:*)"`` is reported as a problem instead of being
+      iterated character-by-character (which would vacuously "pass" every string check);
+    * no ``allow`` entry auto-allows a mutating command: an entry is rejected when its
+      normalized command is a token-prefix of (or equal to, or a longer form of) any of
+      :data:`FORBIDDEN_ALLOW_COMMANDS`. This rejects the broad ``Bash(gh:*)`` and
+      ``Bash(git:*)`` as well as the direct ``Bash(gh api:*)``;
+    * no blanket wildcard (``Bash(*)``, ``Bash(:*)``, an empty command);
+    * every entry of :data:`REQUIRED_DENY_ENTRIES` is present verbatim.
+
+    Returns problems rather than raising so a malformed file reports as DRIFT (exit 1) with
+    an actionable message, never as a traceback.
+    """
+    problems: "list[str]" = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except OSError as exc:
+        return [f"{path}: cannot be read ({exc.__class__.__name__}: {exc})"]
+    except json.JSONDecodeError as exc:
+        return [f"{path}: is not valid JSON ({exc}) — fix the syntax"]
+
+    if not isinstance(data, dict):
+        return [f"{path}: top level must be a JSON object, got {type(data).__name__}"]
+    permissions = data.get("permissions")
+    if not isinstance(permissions, dict):
+        return [
+            f"{path}: 'permissions' must be an object, got "
+            f"{type(permissions).__name__} — the permission gate cannot be validated"
+        ]
+
+    lists: "dict[str, list]" = {}
+    for key in ("allow", "deny"):
+        value = permissions.get(key, [])
+        # Type-check BEFORE iterating: a bare string is iterable, so `all(isinstance(x, str)
+        # for x in value)` would be vacuously true for it and the whole policy below would
+        # silently inspect single characters.
+        if not isinstance(value, list):
+            problems.append(
+                f"{path}: 'permissions.{key}' must be a LIST of strings, got "
+                f"{type(value).__name__} — wrap the entry in a JSON array"
+            )
+            continue
+        non_strings = [item for item in value if not isinstance(item, str)]
+        if non_strings:
+            problems.append(
+                f"{path}: 'permissions.{key}' contains {len(non_strings)} non-string "
+                f"entry/entries (e.g. {non_strings[0]!r}) — every entry must be a string"
+            )
+        lists[key] = [item for item in value if isinstance(item, str)]
+
+    for entry in lists.get("allow", []):
+        command = _bash_command(entry)
+        if command is None:
+            continue  # not a Bash(...) rule
+        if command in ("", "*") or command.startswith("*"):
+            problems.append(
+                f"{path}: allow entry {entry!r} is a blanket wildcard — it auto-allows every "
+                f"shell command; list the specific read-only commands instead"
+            )
+            continue
+        for forbidden in FORBIDDEN_ALLOW_COMMANDS:
+            if _token_prefix(command, forbidden) or _token_prefix(forbidden, command):
+                problems.append(
+                    f"{path}: allow entry {entry!r} (command {command!r}) auto-allows "
+                    f"'{forbidden}' — that command mutates repo/GitHub state and must always "
+                    f"prompt; narrow the entry"
+                )
+                break
+
+    deny = lists.get("deny")
+    if deny is not None:
+        present = set(deny)
+        for required in REQUIRED_DENY_ENTRIES:
+            if required not in present:
+                problems.append(
+                    f"{path}: deny list is missing {required!r} — restore it (a removed deny "
+                    f"entry silently re-opens a mutating command)"
+                )
+    return problems
+
+
 # --- gh plumbing -------------------------------------------------------------------------
 
 def _gh(args: "list[str]", timeout: int = 90) -> "tuple[bool, str, str]":
@@ -566,6 +763,16 @@ def _remote_or_skip(
     return None, payload
 
 
+def settings_result(path: str) -> Result:
+    """Wrap :func:`validate_settings` as a reportable check ("settings-permissions")."""
+    problems = validate_settings(path)
+    detail = [
+        f"{path}: allow/deny are string lists, no mutating command auto-allowed, "
+        f"{len(REQUIRED_DENY_ENTRIES)} required deny entries present"
+    ]
+    return Result("settings-permissions", "fail" if problems else "pass", problems or detail)
+
+
 def run_checks(args: argparse.Namespace) -> "list[Result]":
     repo = resolve_repo(args.repo, args.offline)
     ref = resolve_ref(args.ref)
@@ -605,6 +812,10 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     results.append(
         Result("roster<->documented-labels", "fail" if problems else "pass", problems or detail)
     )
+
+    # --- Check 4: .claude/settings.json permission surface (local; runs even --offline) ---
+    # Placed before the remote checks so a malformed/over-broad permission file fails fast.
+    results.append(settings_result(args.settings))
 
     # --- Check 1b: roster <-> LIVE persona labels (remote; catches GitHub UI-side drift) ---
     early, labels = _remote_or_skip(
@@ -830,38 +1041,35 @@ def _selftest() -> int:
         with open(os.path.join(directory, filename), "w", encoding="utf-8") as handle:
             handle.write(body)
 
+    def _read_roster_safe(directory: str) -> "tuple[bool, set[str], list[str]]":
+        """read_roster that records ANY raise as a FAILURE instead of escaping as a traceback.
+
+        Every read_roster fixture below funnels through here so a mutation that makes
+        read_roster raise — FileNotFoundError (nothing matched), or anything else (an
+        OSError from a broken walk, a TypeError from a bad edit) — yields FAIL lines from
+        --selftest rather than an unhandled traceback that obscures which assertions were
+        meant to hold. The exception TYPE NAME is returned as the problem so the FAIL line
+        still says what went wrong.
+        """
+        try:
+            slugs, problems = read_roster(directory)
+        except Exception as exc:  # noqa: BLE001 - selftest harness: report, never propagate
+            return (False, set(), [type(exc).__name__])
+        return (True, slugs, problems)
+
     # (a) Two well-formed `<slug>.md` wrappers → both slugs, zero problems. This assertion is
-    # what fails if the glob is narrowed back to `*.agent.md` (nothing would be found and
+    # what fails if the scan is narrowed back to `*.agent.md` (nothing would be found and
     # read_roster would raise FileNotFoundError).
     with tempfile.TemporaryDirectory() as tmp:
         _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\nbody\n")
         _wrapper(tmp, "release-manager.md", "---\nname: release-manager\ndescription: x\n---\n")
-        _roster_ok = True
-        try:
-            roster_slugs, roster_problems = read_roster(tmp)
-        except FileNotFoundError:
-            _roster_ok = False
-            roster_slugs, roster_problems = set(), ["FileNotFoundError"]
+        _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
         check(
-            _roster_ok
+            _ok
             and roster_slugs == {"product-manager", "release-manager"}
             and roster_problems == [],
             "read_roster finds `<slug>.md` wrappers by front-matter name (0 problems)",
         )
-
-    def _read_roster_safe(directory: str) -> "tuple[bool, set[str], list[str]]":
-        """read_roster that records a raise as a FAILURE instead of escaping as a traceback.
-
-        Every read_roster fixture below funnels through here so a mutation that makes
-        read_roster raise (e.g. reverting the glob to `*.agent.md`, which finds nothing and
-        raises FileNotFoundError) yields FAIL lines from --selftest rather than an
-        unhandled traceback that obscures which assertions were meant to hold.
-        """
-        try:
-            slugs, problems = read_roster(directory)
-        except FileNotFoundError:
-            return (False, set(), ["FileNotFoundError"])
-        return (True, slugs, problems)
 
     # (b) front-matter `name:` != filename stem → exactly one integrity problem.
     with tempfile.TemporaryDirectory() as tmp:
@@ -914,24 +1122,169 @@ def _selftest() -> int:
             "duplicate-slug message names BOTH declaring files (not just the second)",
         )
 
-    # (f) R2-F5c: a `name:`-bearing wrapper NESTED below agents_dir is an integrity error,
-    # not a silent no-op. The workflow path filter (`.claude/agents/**`) is recursive, so a
-    # flat glob here would ship an agent this gate never saw. The roster still counts only
-    # the top-level wrapper. A mutation flattening the glob must redden here.
+    # (f) R2-F5c/R3-F3: a `name:`-bearing wrapper NESTED below agents_dir is an integrity
+    # error, not a silent no-op. The workflow path filter (`.claude/agents/**`) is recursive,
+    # so a flat scan here would ship an agent this gate never saw. The roster still counts
+    # only the top-level wrapper. A mutation flattening the walk must redden here.
+    #
+    # The `.hidden/` fixture pins the os.walk-vs-glob choice: `glob.glob(**)` SKIPS
+    # dot-prefixed directories, so reverting to glob leaves `.hidden/h.md` unseen while
+    # `.claude/agents/**` would still ship it. That mutant must redden the second assertion.
     with tempfile.TemporaryDirectory() as tmp:
         _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
         os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
         _wrapper(os.path.join(tmp, "sub"), "nested.md", "---\nname: nested-persona\n---\n")
+        os.makedirs(os.path.join(tmp, ".hidden"), exist_ok=True)
+        _wrapper(os.path.join(tmp, ".hidden"), "h.md", "---\nname: hidden-persona\n---\n")
         _ok, roster_slugs, roster_problems = _read_roster_safe(tmp)
         _nested = [p for p in roster_problems if "is nested" in p]
         check(
-            _ok and len(_nested) == 1 and "nested.md" in _nested[0],
+            _ok and len(_nested) == 2 and any("nested.md" in p for p in _nested),
             "read_roster flags a nested persona wrapper as an integrity problem",
+        )
+        check(
+            _ok and any(os.path.join(".hidden", "h.md") in p for p in _nested),
+            "read_roster scans DOT-prefixed subdirs too (os.walk, not glob)",
         )
         check(
             _ok and roster_slugs == {"product-manager"},
             "nested wrapper is NOT counted as a roster entry (roster stays flat)",
         )
+
+    # (f2) R3-F3: an agents dir whose ONLY wrappers are nested must not read as "empty" — the
+    # FileNotFoundError has to name the nested wrapper, or the operator is told to add an
+    # agent that is already there (one level too deep).
+    with tempfile.TemporaryDirectory() as tmp:
+        os.makedirs(os.path.join(tmp, "sub"), exist_ok=True)
+        _wrapper(os.path.join(tmp, "sub"), "nested.md", "---\nname: nested-persona\n---\n")
+        _nested_only_msg = ""
+        try:
+            read_roster(tmp)
+        except FileNotFoundError as exc:
+            _nested_only_msg = str(exc)
+        check(
+            "nested.md" in _nested_only_msg and "found and ignored" in _nested_only_msg,
+            "nested-only agents dir names the ignored nested wrapper in the raised message",
+        )
+
+    # --- R3-F1: validate_settings — the .claude/settings.json permission surface. Fixtures
+    # are written to temp files so the checked-in file is never mutated by the selftest.
+    def _settings_problems(payload: object) -> "list[str]":
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "settings.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                if isinstance(payload, str):
+                    handle.write(payload)  # raw text fixture (invalid JSON)
+                else:
+                    json.dump(payload, handle)
+            return validate_settings(path)
+
+    _head_allow = [
+        "Bash(dotnet build:*)",
+        "Bash(git status:*)",
+        "Bash(git branch --show-current)",
+        "Bash(git worktree list:*)",
+        "Bash(gh pr view:*)",
+        "Bash(gh issue list:*)",
+    ]
+
+    def _settings(allow: object = None, deny: object = None) -> "dict":
+        return {
+            "permissions": {
+                "allow": list(_head_allow) if allow is None else allow,
+                "deny": list(REQUIRED_DENY_ENTRIES) if deny is None else deny,
+            }
+        }
+
+    # (g) A HEAD-shaped file (read-only allow entries + the full deny list) passes cleanly.
+    check(_settings_problems(_settings()) == [], "validate_settings passes a HEAD-shaped settings.json")
+
+    # (h) A broad `Bash(gh:*)` auto-allows `gh api` (and `gh pr merge`, `gh release`, ...).
+    # The killing mutant is dropping the token-prefix test in favour of an exact/startswith
+    # match on the forbidden command: `gh` does not start with `gh api`, so it would pass.
+    _broad_gh = _settings_problems(_settings(allow=_head_allow + ["Bash(gh:*)"]))
+    check(
+        any("Bash(gh:*)" in p and "gh api" in p for p in _broad_gh),
+        "validate_settings rejects a broad Bash(gh:*) allow (auto-allows gh api)",
+    )
+    check(
+        any("git push" in p for p in _settings_problems(_settings(allow=["Bash(git:*)"]))),
+        "validate_settings rejects a broad Bash(git:*) allow (auto-allows git push)",
+    )
+    check(
+        any("gh api" in p for p in _settings_problems(_settings(allow=["Bash(gh api repos/x:*)"]))),
+        "validate_settings rejects a direct `gh api` allow",
+    )
+    check(
+        any("gh  api" in p for p in _settings_problems(_settings(allow=["Bash(gh  api:*)"]))),
+        "validate_settings normalizes whitespace inside Bash(...) (padding cannot dodge it)",
+    )
+
+    # (i) `allow` as a STRING must be reported as a problem, NOT iterated character-by-
+    # character (which would make every downstream string check vacuously true) and NOT raise.
+    # The killing mutant is deleting the isinstance-list check before the loop.
+    _string_allow = _settings_problems(_settings(allow="Bash(gh:*)"))
+    check(
+        any("must be a LIST" in p and "allow" in p for p in _string_allow),
+        "validate_settings reports a string `allow` as a problem (no vacuous pass, no raise)",
+    )
+    check(
+        any("must be a LIST" in p for p in _settings_problems(_settings(deny="Bash(gh secret:*)"))),
+        "validate_settings reports a string `deny` as a problem",
+    )
+
+    # (j) A missing required deny entry is drift — the deny list is the backstop for anything
+    # the allow list does not cover. Killing mutant: dropping the deny-presence loop.
+    _short_deny = [d for d in REQUIRED_DENY_ENTRIES if d != "Bash(git push --force:*)"]
+    check(
+        any("Bash(git push --force:*)" in p and "missing" in p
+            for p in _settings_problems(_settings(deny=_short_deny))),
+        "validate_settings flags a missing required deny entry",
+    )
+    check(
+        len(_settings_problems(_settings(deny=[]))) >= len(REQUIRED_DENY_ENTRIES),
+        "validate_settings flags every required deny entry when the deny list is emptied",
+    )
+
+    # (k) Blanket wildcards.
+    check(
+        any("wildcard" in p for p in _settings_problems(_settings(allow=["Bash(*)"]))),
+        "validate_settings rejects the blanket Bash(*) allow",
+    )
+    check(
+        any("wildcard" in p for p in _settings_problems(_settings(allow=["Bash(:*)"]))),
+        "validate_settings rejects the empty-command Bash(:*) allow",
+    )
+
+    # Structural failures are reported as problems, never as tracebacks.
+    check(
+        any("not valid JSON" in p for p in _settings_problems("{not json,,,")),
+        "validate_settings reports unparseable JSON as a problem",
+    )
+    check(
+        any("'permissions' must be an object" in p for p in _settings_problems({"permissions": []})),
+        "validate_settings reports a non-object `permissions` as a problem",
+    )
+    check(
+        any("non-string" in p for p in _settings_problems(_settings(allow=[{"Bash": "*"}]))),
+        "validate_settings reports a non-string allow entry",
+    )
+
+    # The check wrapper must surface as `settings-permissions` in the summary, pass on a
+    # clean file and FAIL on a dirty one (so the workflow step can never be vacuously green).
+    with tempfile.TemporaryDirectory() as tmp:
+        _clean = os.path.join(tmp, "clean.json")
+        _dirty = os.path.join(tmp, "dirty.json")
+        with open(_clean, "w", encoding="utf-8") as handle:
+            json.dump(_settings(), handle)
+        with open(_dirty, "w", encoding="utf-8") as handle:
+            json.dump(_settings(allow=["Bash(gh:*)"]), handle)
+        check(
+            settings_result(_clean).name == "settings-permissions"
+            and settings_result(_clean).status == "pass",
+            "settings-permissions check passes on a clean settings file",
+        )
+        check(settings_result(_dirty).status == "fail", "settings-permissions check FAILS on a dirty settings file")
 
     # --- Finding 7a: resolve_repo must NOT shell out to gh under --offline.
     mod = sys.modules[__name__]
@@ -968,12 +1321,25 @@ def _selftest() -> int:
 def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
         description="Reconcile the DeltaSharp persona roster, persona: labels, CODEOWNERS, "
-        "and the feature-request milestone dropdown against live GitHub state."
+        "and the feature-request milestone dropdown against live GitHub state, and validate "
+        "the .claude/settings.json permission surface."
     )
     parser.add_argument("--repo", default=None, help="OWNER/REPO (default: env or gh or khaines/deltasharp)")
     parser.add_argument("--agents-dir", default=DEFAULT_AGENTS_DIR)
     parser.add_argument("--feature-form", default=DEFAULT_FEATURE_FORM)
     parser.add_argument("--taxonomy", default=DEFAULT_TAXONOMY)
+    parser.add_argument(
+        "--settings",
+        default=DEFAULT_SETTINGS,
+        help="Claude Code settings file whose permission allow/deny lists are validated "
+        f"(default: {DEFAULT_SETTINGS})",
+    )
+    parser.add_argument(
+        "--validate-settings-only",
+        action="store_true",
+        help="run ONLY the settings-permissions check (local, no network) and exit — used by "
+        "the workflow's fail-fast step",
+    )
     parser.add_argument(
         "--ref",
         default=None,
@@ -998,6 +1364,21 @@ def main(argv: "list[str] | None" = None) -> int:
 
     if args.selftest:
         return _selftest()
+
+    if args.validate_settings_only:
+        # Local, offline-safe, and independent of the roster/taxonomy/form inputs, so it can
+        # run as its own fail-fast step without any GitHub state.
+        results = [settings_result(args.settings)]
+        _print_summary(results)
+        _log("")
+        if results[0].status == "fail":
+            _error(
+                "settings validation FAILED: the permission surface in "
+                f"{args.settings} drifted — see annotations above"
+            )
+            return 1
+        _log(f"settings validation PASSED: {args.settings} permission surface is intact")
+        return 0
 
     try:
         results = run_checks(args)
@@ -1027,7 +1408,10 @@ def main(argv: "list[str] | None" = None) -> int:
             f"reconciliation passed locally; {len(skipped)} remote check(s) skipped "
             f"(run with `gh` authenticated to verify labels/milestones/CODEOWNERS)"
         )
-    _log("reconciliation PASSED: roster, labels, CODEOWNERS, and milestones are in step")
+    _log(
+        "reconciliation PASSED: roster, labels, CODEOWNERS, milestones, and the "
+        "settings permission surface are in step"
+    )
     return 0
 
 

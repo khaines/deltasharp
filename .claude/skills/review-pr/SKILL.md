@@ -222,7 +222,7 @@ re-dispatched shell-capable) is a dispatch error, not a finding.
 
 1. Identify the PR's primary content domain from changed files and PR description.
 2. For each slot, pick the allowlist member whose domain most closely matches the PR's primary content. If multiple match, prefer the more-specific specialist. If none matches better than `general-purpose`, use `general-purpose` (or `cloud-native-security-sme` for the Security slot).
-3. Record the choice and a one-sentence justification in the round dispatch record.
+3. Record the choice and a one-sentence justification in the scout's Review Package (`scout.md` output, `recommended subagent_type` line); the composition record carries only the auditable fields listed in §3.1 step 4.
 
 Each model receives the same input package:
 
