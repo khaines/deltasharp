@@ -90,7 +90,7 @@ do not reason about them.
    - a **claim only *execution* can falsify** — a config that passes validation but fails at
      runtime; a CHANGELOG/migration note whose stated behavior the code contradicts; an
      allowlist/exemption that silently never matches (or matches too much). **RUN it.**
-   - a **config-surface bypass** (PR #901) — a gate over a startup-config surface that asks
+   - a **config-surface bypass** — a gate over a startup-config surface that asks
      the *filesystem* what git *tracks*: a tracked symlink, gitlink (git mode `120000` /
      `160000`), or case- / Unicode-folded spelling (`.Claude/`, `ſkill.md`, `.mcp.jſon`)
      that is absent or empty in CI yet loads on a developer machine; a git query run from
