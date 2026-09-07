@@ -639,7 +639,8 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
     for dirpath, dirnames, filenames in os.walk(agents_dir, followlinks=False):
         dirnames.sort()  # deterministic traversal order
         for filename in filenames:
-            if filename.endswith(".md"):
+            # Case-insensitive: Claude Code loads `Foo.MD` too, so the gate must see it.
+            if filename.lower().endswith(".md"):
                 all_paths.append(os.path.join(dirpath, filename))
     all_paths.sort()
     slugs: "set[str]" = set()
@@ -1230,13 +1231,20 @@ def validate_command_skill_frontmatter(
         if key in FORBIDDEN_COMMAND_SKILL_KEYS:
             reason = FORBIDDEN_COMMAND_SKILL_KEY_REASONS.get(key)
             because = f" ({reason})" if reason else ""
+            if key == "allowed-tools":
+                remedy = (
+                    "it grants UNPROMPTED tool use; a per-machine grant belongs in "
+                    "`permissions.allow` of the untracked .claude/settings.local.json, or "
+                    "drop the key so the tool call prompts and is reviewed by hand"
+                )
+            else:
+                remedy = (
+                    "keys in this table configure unprompted tool use or execution, so it "
+                    "must not appear in a tracked file"
+                )
             problems.append(
-                f"{kind} file {path!r} defines {key!r}{because}; `allowed-tools` and the "
-                f"other keys in this table grant UNPROMPTED tool use, so they must not live "
-                f"in a tracked file — put the grant in the untracked "
-                f".claude/settings.local.json, or make the file prompt and review the tool "
-                f"call by hand; tracked {kind} files may carry only "
-                f"{', '.join(repr(k) for k in allowed)}"
+                f"{kind} file {path!r} defines {key!r}{because}; {remedy}; tracked {kind} "
+                f"files may carry only {', '.join(repr(k) for k in allowed)}"
             )
         elif key not in allowed:
             problems.append(
@@ -1280,7 +1288,10 @@ def scan_command_skill_frontmatter(
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()  # deterministic traversal order
             for filename in filenames:
-                wanted = filename.endswith(".md") if kind == "command" else filename == "SKILL.md"
+                # Case-insensitive on purpose: Claude Code 2.1.263 loads a manifest committed as
+                # `skill.md` or a command as `x.MD`, so a case-sensitive match would fail GREEN.
+                lowered = filename.lower()
+                wanted = lowered.endswith(".md") if kind == "command" else lowered == "skill.md"
                 if wanted:
                     paths.append(os.path.join(dirpath, filename))
         paths.sort()
@@ -2714,6 +2725,28 @@ def _selftest() -> int:
             _wrapper(os.path.join(skills, skill), "SKILL.md", body)
             return scan_command_skill_frontmatter(os.path.join(tmp, "absent-commands"), skills)
 
+    # (a0) Filename case must not matter — Claude Code loads `skill.md` and `x.MD`, so a
+    # case-sensitive match would report "0 scanned" and PASS on a live grant.
+    # Killing mutant: `lowered = filename` (or `filename == "SKILL.md"`).
+    with tempfile.TemporaryDirectory() as _tmp:
+        _skills = os.path.join(_tmp, "skills")
+        os.makedirs(os.path.join(_skills, "lower"), exist_ok=True)
+        _wrapper(os.path.join(_skills, "lower"), "skill.md",
+                 "---\nname: lower\ndescription: d\nallowed-tools: Bash(id:*)\n---\nbody\n")
+        _p, _c, _k = scan_command_skill_frontmatter(os.path.join(_tmp, "absent"), _skills)
+        check(_k == 1 and any("allowed-tools" in x and "skill.md" in x for x in _p),
+              "a lowercase `skill.md` manifest is scanned and its allowed-tools grant rejected")
+    _problems, _ncmd, _nskill = _command_problems(
+        "---\ndescription: d\nallowed-tools: Bash(id:*)\n---\nbody\n", filename="probe.MD"
+    )
+    check(_ncmd == 1 and any("allowed-tools" in x for x in _problems),
+          "an upper-case `.MD` command file is scanned and its allowed-tools grant rejected")
+    check(any("permissions.allow" in x for x in _problems),
+          "the allowed-tools remedy names permissions.allow in settings.local.json")
+    _problems, _ncmd, _nskill = _command_problems("---\ndescription: d\nisolation: worktree\n---\nbody\n")
+    check(any("isolation" in x and "settings.local.json" not in x for x in _problems),
+          "a non-grant forbidden key is not told to move to settings.local.json")
+
     # (a) The finding itself, on both surfaces: `allowed-tools:` is rejected, the message
     # NAMES the file and the key and says where a grant may live instead.
     _problems, _ncmd, _nskill = _skill_problems(
@@ -3074,8 +3107,8 @@ def main(argv: "list[str] | None" = None) -> int:
             f"(run with `gh` authenticated to verify labels/milestones/CODEOWNERS)"
         )
     _log(
-        "reconciliation PASSED: roster, labels, CODEOWNERS, milestones, and the "
-        "settings permission surface are in step"
+        "reconciliation PASSED: roster, labels, CODEOWNERS, milestones, the settings "
+        "permission surface, and the command/skill front matter are in step"
     )
     return 0
 
