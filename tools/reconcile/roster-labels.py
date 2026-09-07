@@ -192,6 +192,16 @@ DEFAULT_SETTINGS = os.path.join(".claude", "settings.json")
 # there, which only holds while the file is untracked).
 DEFAULT_MCP_CONFIG = ".mcp.json"
 SETTINGS_LOCAL_NAME = "settings.local.json"
+# The second config root. `.github/agents` and `.github/skills` are the GENERATED Copilot
+# mirror of `.claude/agents` and `.claude/skills` (`tools/aiconfig/generate-copilot.py`), and
+# `.github/copilot-instructions.md` the mirror of `CLAUDE.md`. They are read and executed by
+# Copilot on the same machines the Claude tree runs on, so they sit inside the same C7 trust
+# boundary and are policed the same way. Only these three children are in scope — see
+# :data:`POLICED_GITHUB_CHILDREN`.
+GITHUB_DIR_NAME = ".github"
+DEFAULT_COPILOT_AGENTS_DIR = os.path.join(GITHUB_DIR_NAME, "agents")
+DEFAULT_COPILOT_SKILLS_DIR = os.path.join(GITHUB_DIR_NAME, "skills")
+DEFAULT_COPILOT_INSTRUCTIONS = os.path.join(GITHUB_DIR_NAME, "copilot-instructions.md")
 DEFAULT_FEATURE_FORM = os.path.join(".github", "ISSUE_TEMPLATE", "feature_request.yml")
 DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
 
@@ -1026,6 +1036,57 @@ SKILL_MANIFEST_NAME = "SKILL.md"
 # The suffix that makes a file in `.claude/agents` or `.claude/commands` configuration.
 MARKDOWN_SUFFIX = ".md"
 
+# The suffix that makes a file in `.github/agents` a Copilot persona wrapper. It is the
+# GENERATED mirror of `.claude/agents/<name>.md` (see `tools/aiconfig/generate-copilot.py`),
+# so the gate polices it exactly as it polices the canonical tree — a wrapper is loaded and
+# run by whichever runtime reads it, and Copilot reads this one.
+COPILOT_AGENT_SUFFIX = ".agent.md"
+
+# The second startup-config root. The `.github` directory is NOT policed wholesale the way
+# `.claude` is: it also holds `workflows/`, `CODEOWNERS`, `ISSUE_TEMPLATE/` and
+# `dependabot.yml`, none of which are AI configuration and all of which have their own
+# review path. Policing them here would red every dependabot PR on an unrelated rule. Only
+# the three AI-config children below — plus the `.github` root ENTRY itself, so a tracked
+# symlink or submodule AT `.github` cannot hide the whole tree — are in scope.
+POLICED_GITHUB_CHILDREN = (
+    "agents",
+    SKILLS_CHILD_NAME,
+    "copilot-instructions.md",
+)
+
+# Which children each config root contributes to the case-fold question, keyed on the FOLDED
+# root name so `sub/.Claude/agents` expands its children too (the raw `==` this replaced did
+# not — see :func:`_policed_prefixes`). A root absent from this table contributes only its own
+# spelling, never a child set borrowed from another root: `.github/settings.local.json` is not
+# a Claude permission file, and `.claude/workflows` is not a GitHub Actions directory.
+POLICED_CHILDREN_BY_ROOT = {
+    _fold(CLAUDE_DIR_NAME): POLICED_CLAUDE_CHILDREN,
+    _fold(GITHUB_DIR_NAME): POLICED_GITHUB_CHILDREN,
+}
+
+# Roots whose bare spelling polices the ROOT ENTRY ONLY, never everything beneath it.
+#
+# `.claude` is AI configuration all the way down, so its root prefix deliberately subsumes
+# every subtree — that is how a tracked link at `.claude/hooks`, a path no check names
+# explicitly, is still caught (LAST-CERT F2). `.github` is not: the same breadth would make a
+# tracked symlink at `.github/workflows/ci.yml` or `.github/ISSUE_TEMPLATE/bug.yml` a finding
+# of THIS gate, which reds unrelated PRs on a rule that was never about them and belongs to
+# the workflow review path instead. So the `.github` root entry itself is policed — a symlink
+# or submodule AT `.github` would otherwise hide the whole AI tree behind it — while depth
+# comes only from the three names in :data:`POLICED_GITHUB_CHILDREN`.
+SHALLOW_CONFIG_ROOTS = frozenset({_fold(GITHUB_DIR_NAME)})
+
+
+def _prefix_matches(parts: "tuple[str, ...]", prefix: "tuple[str, ...]") -> bool:
+    """Does `parts` fall under `prefix`, honoring :data:`SHALLOW_CONFIG_ROOTS`?
+
+    A shallow root matches only ITSELF; every other prefix matches itself and everything
+    below it, exactly as :func:`_folds_under` always has.
+    """
+    if len(prefix) == 1 and _fold(prefix[0]) in SHALLOW_CONFIG_ROOTS:
+        return tuple(_fold(part) for part in parts) == tuple(_fold(part) for part in prefix)
+    return _folds_under(parts, prefix)
+
 
 def _is_markdown_name(filename: str) -> bool:
     """Does `filename` name a markdown file on the checkout the CLI reads? (folded suffix)"""
@@ -1043,6 +1104,24 @@ def _is_skill_manifest_name(filename: str) -> bool:
     """
     return _fold(filename) == _fold(SKILL_MANIFEST_NAME)
 
+
+def _is_copilot_agent_name(filename: str) -> bool:
+    """Does `filename` name a Copilot persona wrapper on the checkout Copilot reads? (folded)
+
+    Folded for the same reason :func:`_is_skill_manifest_name` is: `x.AGENT.MD` and a `ſ`
+    spelling are the same file to APFS/NTFS and to the loader, so a wrapper committed under a
+    variant spelling is loaded while a byte-exact scan never sees it. The STEM is free (it is
+    the persona slug); only the suffix has a canonical spelling.
+    """
+    folded = _fold(filename)
+    suffix = _fold(COPILOT_AGENT_SUFFIX)
+    return folded.endswith(suffix) and len(folded) > len(suffix)
+
+
+def _canonical_copilot_agent_name(filename: str) -> str:
+    """`filename` with its `.agent.md` suffix in the canonical spelling (stem untouched)."""
+    return filename[: len(filename) - len(COPILOT_AGENT_SUFFIX)] + COPILOT_AGENT_SUFFIX
+
 # A sparse index collapses a whole directory into ONE entry (mode 040000, a trailing slash).
 # The files inside it are then absent from the listing, so "no findings under `.claude`" would
 # be an artefact of the index format rather than a fact about the tree.
@@ -1052,12 +1131,19 @@ _SPARSE_DIR_MODE = "040000"
 def _policed_prefixes(specs: "list[str]") -> "list[tuple[str, ...]]":
     """The canonical spellings an index entry is compared against, longest first.
 
-    Each queried path contributes its own spelling, and a `.claude` root additionally
-    contributes every name in :data:`POLICED_CLAUDE_CHILDREN` — that is what extends the
+    Each queried path contributes its own spelling, and a CONFIG ROOT additionally contributes
+    every name its entry in :data:`POLICED_CHILDREN_BY_ROOT` lists — that is what extends the
     case-fold question BELOW the root's direct children, where it used to stop (PR-901 second
     round, H-1: `.claude/COMMANDS/evil.md` and `.claude/Settings.local.json` passed the whole
     gate). Longest first so the most specific canonical spelling is the one quoted in the
     remedy (`.claude/skills`, not `.claude`).
+
+    The root is matched FOLDED, and each root contributes only its OWN children: `.github`
+    brings `agents`, `skills` and `copilot-instructions.md` and deliberately NOT `workflows`
+    or `settings.local.json`, so restoring the Copilot mirror does not quietly place every
+    GitHub Actions file under this gate. Folding the root name also fixes a latent gap in the
+    raw `==` this replaced: `--agents-dir sub/.Claude/agents` named a root the checkout
+    resolves but never expanded its children.
 
     The prefixes are ANCHOR-RELATIVE-turned-repo-relative spellings (`sub/.claude`), never a
     bare component: a clean root `.claude` must not mask a `sub/.Claude` under an
@@ -1070,8 +1156,9 @@ def _policed_prefixes(specs: "list[str]") -> "list[tuple[str, ...]]":
             continue
         if parts not in prefixes:
             prefixes.append(parts)
-        if parts[-1] == CLAUDE_DIR_NAME:
-            for child in POLICED_CLAUDE_CHILDREN:
+        children = POLICED_CHILDREN_BY_ROOT.get(_fold(parts[-1]))
+        if children:
+            for child in children:
                 candidate = parts + (child,)
                 if candidate not in prefixes:
                     prefixes.append(candidate)
@@ -1117,24 +1204,49 @@ def _count_uncovered_disk_files(
     return total
 
 
-def _claude_root_parts(parts: "tuple[str, ...]") -> "tuple[str, ...] | None":
-    """The `.claude` root `parts` lives in (folded match on the segment), or ``None``."""
+def _policed_root_parts(
+    parts: "tuple[str, ...]",
+) -> "tuple[tuple[str, ...], tuple[str, ...]] | None":
+    """The config root `parts` lives in and ITS policed children, or ``None``.
+
+    Scans right-to-left so the NEAREST root wins, and matches folded, so the root a
+    case-insensitive checkout resolves is the one answered about. Returns the children tuple
+    alongside the root because every caller needs both and must not borrow another root's set
+    — `.github` owns `agents`/`skills`/`copilot-instructions.md`, `.claude` owns its five.
+    """
     for index in range(len(parts) - 1, -1, -1):
-        if _fold(parts[index]) == _fold(CLAUDE_DIR_NAME):
-            return parts[: index + 1]
+        children = POLICED_CHILDREN_BY_ROOT.get(_fold(parts[index]))
+        if children is not None:
+            return parts[: index + 1], children
     return None
+
+
+def _claude_root_parts(parts: "tuple[str, ...]") -> "tuple[str, ...] | None":
+    """The config root `parts` lives in (folded match on the segment), or ``None``.
+
+    Name kept for the fixtures and assertions written against it; it now answers for any root
+    in :data:`POLICED_CHILDREN_BY_ROOT`, not only `.claude`.
+    """
+    matched = _policed_root_parts(parts)
+    return None if matched is None else matched[0]
 
 
 def _root_owned_by_index(
     parts: "tuple[str, ...]", listed: "list[tuple[str, str, tuple[str, ...]]]"
 ) -> bool:
-    """Does the index actually OWN the `.claude` root that `parts` lives in? (PR-901 SRE L-1)
+    """Does the index actually OWN the config root that `parts` lives in? (PR-901 SRE L-1)
 
     The question that decides whether "this subtree has files on disk and no index entry"
     means *untracked work in the checkout the operator is standing in* or *a foreign tree the
-    checkout knows nothing about*. It is answered only by an entry AT or UNDER one of the
-    POLICED children (`agents`, `commands`, `skills`, `settings.json`,
-    `settings.local.json`) — never by "some entry exists under the root".
+    checkout knows nothing about*. It is answered only by an entry AT or UNDER one of THAT
+    ROOT's policed children (`.claude`: `agents`, `commands`, `skills`, `settings.json`,
+    `settings.local.json`; `.github`: `agents`, `skills`, `copilot-instructions.md`) — never
+    by "some entry exists under the root".
+
+    Taking the children from the matched root matters for `.github`, where a checkout that
+    tracks only `workflows/` and `CODEOWNERS` does NOT thereby own the AI-config tree: a
+    `.github/agents` exported into it stays UNVERIFIED rather than being cleared by unrelated
+    entries that happen to share the root.
 
     That distinction is the whole safety of the rule. An export dropped inside an enclosing
     checkout that happens to track ONE innocuous `export/.claude/keep` would satisfy a
@@ -1142,12 +1254,13 @@ def _root_owned_by_index(
     prevent (PR-901 second round, RT-4). `keep` is not a policed child, so the root is not
     owned and the tree stays UNVERIFIED.
     """
-    root = _claude_root_parts(parts)
-    if root is None:
+    matched = _policed_root_parts(parts)
+    if matched is None:
         return False
+    root, children = matched
     return any(
         _folds_under(entry, root + (child,))
-        for child in POLICED_CLAUDE_CHILDREN
+        for child in children
         for _mode, _name, entry in listed
     )
 
@@ -1302,13 +1415,14 @@ def _index_findings(
         # `.claude/hooks` link, with no policed child on disk at all — still counts as
         # covered, because the index plainly does answer about that tree.
         covered = any(_folds_under(parts, prefix) for _mode, _name, parts in listed)
-        if covered and _claude_root_parts(prefix) == prefix:
+        matched_root = _policed_root_parts(prefix)
+        if covered and matched_root is not None and matched_root[0] == prefix:
             covered = all(
                 any(
                     _folds_under(parts, prefix + (child,))
                     for _mode, _name, parts in listed
                 )
-                for child in POLICED_CLAUDE_CHILDREN
+                for child in matched_root[1]
                 if _has_disk_entries(os.path.join(on_disk[spec], child))
             )
         if covered:
@@ -1332,7 +1446,7 @@ def _index_findings(
         )
     findings: "list[tuple[str, str, str]]" = []
     for mode, name, parts in listed:
-        matched = next((prefix for prefix in prefixes if _folds_under(parts, prefix)), None)
+        matched = next((prefix for prefix in prefixes if _prefix_matches(parts, prefix)), None)
         if matched is None and not any(_folds_under(parts, spec) for spec in scope):
             continue
         if mode == _SPARSE_DIR_MODE or name.endswith("/"):
@@ -1362,6 +1476,17 @@ def _index_findings(
             # canonical spelling — otherwise the reviewer reading `SKILL.md` in the tree and
             # git recording something else are looking at different things (PR-901 F-1).
             expected = "/".join(parts[:-1] + (SKILL_MANIFEST_NAME,))
+        elif (
+            matched is not None
+            and _is_copilot_agent_name(parts[-1])
+            and parts[-1] != _canonical_copilot_agent_name(parts[-1])
+            and _fold(matched[-1]) == _fold("agents")
+        ):
+            # Same rule as the manifest leaf, for the wrapper SUFFIX. `x.AGENT.MD` is the file
+            # Copilot loads on a case-insensitive checkout, so the index may hold only the
+            # canonical `.agent.md` spelling — two of them cannot coexist there, and a
+            # reviewer reading `x.agent.md` in the tree must be reading what git recorded.
+            expected = "/".join(parts[:-1] + (_canonical_copilot_agent_name(parts[-1]),))
         if expected is not None:
             findings.append(("case", expected, name))
         elif mode in TRACKED_LINK_MODES:
@@ -1447,8 +1572,8 @@ def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
     return links
 
 
-def claude_root_pathspec(path: str) -> "str | None":
-    """The `.claude` directory a policed path lives in — the root path every check adds.
+def config_root_pathspec(path: str) -> "str | None":
+    """The config-root directory a policed path lives in — the root path every check adds.
 
     The `pathspec` in this function's name is HISTORICAL: the index is listed once with no
     pathspec at all (see :func:`_index_findings`) and the value returned here is the scoping
@@ -1466,6 +1591,16 @@ def claude_root_pathspec(path: str) -> "str | None":
 
     Duplicate findings across checks are harmless: :func:`_dedupe_link_problems` collapses
     them to one line per link WITHIN each check's report.
+
+    With a SECOND root in play the no-match branch became load-bearing. It used to synthesize
+    `dirname(path)/.claude` for ANY path with no `.claude` ancestor, which is right for the
+    `.mcp.json` sibling it was written for and catastrophically wrong for `.github/agents`:
+    that would have been scoped to `.github/.claude`, a directory that does not exist, so
+    every finding in the Copilot tree would have been selected away and the check would have
+    reported a clean tree it never looked at. So the synthesis is now narrowed to the known
+    `.claude`-sibling leaves, and anything else returns ``None`` — :func:`link_query_paths`
+    skips falsy candidates, leaving such a path queried under its OWN spelling and nothing
+    else. A wrong root is a false green; no root is merely a narrower true answer.
     """
     if not path:
         return None
@@ -1474,17 +1609,26 @@ def claude_root_pathspec(path: str) -> "str | None":
         normalized = normalized.replace(os.altsep, os.sep)
     parts = normalized.split(os.sep)
     for index in range(len(parts) - 1, -1, -1):
-        if parts[index] == CLAUDE_DIR_NAME:
-            # The caller's own spelling up to `.claude`, so the SKIP reason a responder reads
-            # names `.claude` rather than an absolute path they did not type.
+        if _fold(parts[index]) in POLICED_CHILDREN_BY_ROOT:
+            # The caller's own spelling up to the root, so the SKIP reason a responder reads
+            # names `.claude`/`.github` rather than an absolute path they did not type.
             return os.sep.join(parts[: index + 1]) or os.sep
-    # No `.claude` ancestor: the policed path is a SIBLING of the root (the default
-    # `.mcp.json`), so the root is the `.claude` beside it. Answering the path's PARENT here
-    # scoped the query to whatever directory that happened to be — `os.curdir`, i.e. the
-    # WHOLE REPOSITORY, for the root-relative `.mcp.json` this gate actually runs on, which
-    # is how a submodule at `vendor/lib` or a symlink at `docs/x/alias.md` came to fail
-    # `tracked-startup-config` with a `.claude` remedy (PR-901 F-B).
+    if _fold(os.path.basename(normalized)) != _fold(DEFAULT_MCP_CONFIG):
+        # Not a root, and not a known root SIBLING either. Answering the path's PARENT here
+        # scoped the query to whatever directory that happened to be — `os.curdir`, i.e. the
+        # WHOLE REPOSITORY, for the root-relative `.mcp.json` this gate actually runs on,
+        # which is how a submodule at `vendor/lib` or a symlink at `docs/x/alias.md` came to
+        # fail `tracked-startup-config` with a `.claude` remedy (PR-901 F-B). Answering a
+        # SYNTHESIZED root is worse still — see the false-green note above.
+        return None
+    # `.mcp.json` is a startup surface that sits BESIDE the root rather than under it, so the
+    # root it belongs to is the `.claude` next to it (PR-901 F-B).
     return os.path.normpath(os.path.join(os.path.dirname(normalized) or os.curdir, CLAUDE_DIR_NAME))
+
+
+def claude_root_pathspec(path: str) -> "str | None":
+    """Back-compatible name for :func:`config_root_pathspec` (fixtures reference it)."""
+    return config_root_pathspec(path)
 
 
 def link_query_paths(*paths: str) -> "list[str]":
