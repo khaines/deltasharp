@@ -177,8 +177,9 @@ DEFAULT_REPO = "khaines/deltasharp"
 SENTINEL_MILESTONE_OPTIONS = frozenset({"Unsure / needs triage"})
 
 # The configuration directory the CLI reads at startup, and the root path every local check
-# scopes its git question to (:func:`claude_root_pathspec`). Nothing here is handed to git as
-# a pathspec: the index is listed once, unfiltered, and these paths select from the answer.
+# scopes its git question to (:func:`claude_root_pathspec`). The index is listed once with no
+# pathspec and these paths select from the answer; the only per-file question,
+# `git ls-files --error-unmatch`, is asked with an absolute path after `--`.
 CLAUDE_DIR_NAME = ".claude"
 DEFAULT_AGENTS_DIR = os.path.join(CLAUDE_DIR_NAME, "agents")
 DEFAULT_COMMANDS_DIR = os.path.join(".claude", "commands")
@@ -1661,9 +1662,10 @@ def tracked_symlink_problems(
 
     ``unverified`` is non-empty when git could not answer, or answered about only part of the
     queried surface — it can therefore accompany real ``problems`` rather than replace them
-    (PR-901 last round, F-1) — and it carries WHY: "not a git checkout" and "that pathspec is
-    outside the work tree git answered from" send a responder to different fixes, and reporting the second as the first is how a symlinked
-    `.claude` used to excuse itself from the query (PR-901 F-A). The caller reports SKIP with
+    (PR-901 last round, F-1) — and it carries WHY: "'…' is not inside a git checkout" and
+    "path '…' lies outside the work tree git answered from (…)" send a responder to
+    different fixes, and reporting the second as the first is how a symlinked `.claude`
+    used to excuse itself from the query (PR-901 F-A). The caller reports SKIP with
     that reason rather than passing, because "no link found" and "could not look" are
     different claims and only one of them is safe to go green on.
     """
@@ -3161,10 +3163,23 @@ def _print_summary(results: "list[Result]") -> None:
 
 # How many assertions `--selftest` executes when it runs from the ROOT of the git checkout
 # with every fixture available (the CI job and a normal developer run). It is asserted at the
-# end of the run, because a selftest that silently executes FEWER assertions than it used to is
-# indistinguishable from one that still covers everything: an environment guard added to the
-# wrong block, or a fixture group that stopped building, would otherwise go green while its
-# coverage vanished. Bump it deliberately when an assertion is added or removed.
+# end of the run, because a selftest that silently executes FEWER assertions than it used to
+# is indistinguishable from one that still covers everything. Bump it deliberately when an
+# assertion is added or removed.
+#
+# What the floor actually enforces, in each mode (PR-901 fourth round, Q1/F2):
+#   * ALWAYS — every checkout-only assertion ran wherever `in_checkout` says it could, and,
+#     when NOTHING was skipped inside a checkout, the executed count is exactly
+#     SELFTEST_ASSERTIONS_IN_CHECKOUT.
+#   * DEVELOPER (the default) — a skipped fixture group (no `git archive`, no symlink
+#     privilege, a TMPDIR inside a checkout) or reduced coverage relaxes the count floor and
+#     is reported in the closing line instead. That keeps a laptop run useful, and it is why
+#     the count ALONE cannot catch "a guard added to the wrong block" or "a fixture group
+#     that stopped building": both of those SKIP, and a skip disarms the count.
+#   * STRICT (`--require-full-coverage`, which the reconcile workflow passes and which
+#     GITHUB_ACTIONS/CI default on) — those two escapes become failures in their own right:
+#     any skip, and any reduced coverage, FAILS the floor and names what was skipped. So an
+#     automated run either executes the full count or goes red; it cannot go green with less.
 SELFTEST_ASSERTIONS_IN_CHECKOUT = 327
 # The assertions that can only run there (they exercise the REAL .claude tree through main()).
 # Anywhere else — a `git archive` export, a tarball, a vendored copy, a subdirectory — they
@@ -3172,7 +3187,7 @@ SELFTEST_ASSERTIONS_IN_CHECKOUT = 327
 SELFTEST_CHECKOUT_ONLY_ASSERTIONS = 3
 
 
-def _selftest() -> int:
+def _selftest(strict: bool = False) -> int:
     failures: "list[str]" = []
     # Fixture repositories are BUILT and STAGED between queries in this one process, which no
     # real run does; the `_ls_files` cache is exercised by its own assertion below instead.
@@ -3180,17 +3195,38 @@ def _selftest() -> int:
     # Executed/skipped tallies, so the closing line reports what this run actually covered
     # rather than an unqualified "all assertions passed" (PR-901 third round, L1/Info-2/3).
     tally = {"executed": 0, "skipped": 0, "checkout_only": 0}
+    skipped_reasons: "list[str]" = []
     # Can this process see the REAL `.claude` tree through git? Two conditions, asked once so
     # every assertion below agrees about which environment it is in: the run is at the repo
     # root (`.claude/agents` and the taxonomy are where the defaults say), and git can answer
     # about `.claude` — the same probe the fixtures use, where `_tracked_links` returns None
     # only when git could not answer at all. A `git archive` export, a tarball, a vendored
     # copy or a run from a subdirectory fails one of them and gets REDUCED coverage.
+    at_repo_root = os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY)
     in_checkout = (
-        os.path.isdir(DEFAULT_AGENTS_DIR)
-        and os.path.exists(DEFAULT_TAXONOMY)
+        at_repo_root
         and _tracked_links([os.path.join(os.getcwd(), CLAUDE_DIR_NAME)]) is not None
     )
+    # WHY coverage is reduced, decided once and reused by every message that reports it. The
+    # probe already distinguishes the two causes and they send a reader to different fixes:
+    # "git is not on PATH" is fixed by installing git, "not a git checkout at the repo root"
+    # by running from a checkout — and reporting the first as the second sent readers who had
+    # a perfectly good checkout looking for one (PR-901 fourth round, Info-2).
+    coverage_gap = ""
+    if not in_checkout:
+        coverage_gap = (
+            "git is not on PATH"
+            if shutil.which("git") is None
+            else "not a git checkout at the repo root"
+        )
+    # STRICT mode, requested by `--require-full-coverage` (which the reconcile workflow
+    # passes explicitly — the flag, not the environment, is the contract) and defaulted on
+    # under `GITHUB_ACTIONS`/`CI` so an automated run that forgets it still cannot go green
+    # with less. A developer on a machine without `git archive`, without symlink privilege
+    # or with TMPDIR inside a checkout gets counted SKIPs and exit 0; an automated run must
+    # not, because there a skipped fixture group and a fixture group that stopped building
+    # are indistinguishable (PR-901 fourth round, Q1/F2).
+    strict = strict or bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
 
     def check(condition: bool, label: str) -> None:
         tally["executed"] += 1
@@ -3203,7 +3239,21 @@ def _selftest() -> int:
     def skip(reason: str) -> None:
         """Record a fixture group this environment cannot run, and say so in the tally."""
         tally["skipped"] += 1
+        skipped_reasons.append(reason)
         _log(f"  skip - {reason}")
+
+    def needs(available: bool, reason: str) -> bool:
+        """Guard a fixture group on an environment condition, COUNTING the skip if absent.
+
+        A bare `if os.path.isdir(...)` guard silently dropped its assertions from any run
+        that is not at the repo root, so the closing line's skip count claimed full coverage
+        while dozens of assertions had never executed (PR-901 fourth round, I1/Info-1). Every
+        such guard reports through here instead, which is also what makes the strict floor
+        able to see the loss.
+        """
+        if not available:
+            skip(reason)
+        return available
 
     def check_in_checkout(condition: bool, label: str) -> None:
         """`check`, but only where the real `.claude` tree can be asked about.
@@ -3216,7 +3266,7 @@ def _selftest() -> int:
         says they could (PR-901 third round, L1/Info-2/3).
         """
         if not in_checkout:
-            skip(f"not a git checkout at the repo root: {label}")
+            skip(f"{coverage_gap}: {label}")
             return
         tally["checkout_only"] += 1
         check(condition, label)
@@ -4557,7 +4607,10 @@ def _selftest() -> int:
     # named, reddening Result — the gate is only useful if it runs on the shipped files.
     # Deliberately NOT guarded on isdir(DEFAULT_SKILLS_DIR): if the tracked skills tree
     # vanished, this assertion must redden --selftest rather than silently skip (SRE CERT).
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY),
+        "no real roster/taxonomy here: tracked SKILL.md policy fixtures",
+    ):
         _problems, _ncmd, _nskill = scan_command_skill_frontmatter(
             DEFAULT_COMMANDS_DIR, DEFAULT_SKILLS_DIR
         )
@@ -4608,7 +4661,10 @@ def _selftest() -> int:
     # code so an unrelated pre-existing failure in this repo cannot make the assertion
     # vacuous. Needs the real roster/taxonomy (i.e. a run from the repo root); skipped
     # elsewhere rather than reported as a false failure.
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY),
+        "no real roster/taxonomy here: command-skill-frontmatter gate-wiring fixtures",
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             _dirty_skills = os.path.join(tmp, "skills", "evil")
             os.makedirs(_dirty_skills, exist_ok=True)
@@ -4881,16 +4937,23 @@ def _selftest() -> int:
         # NOT a git checkout: the question is unanswerable, so the check reports SKIP with
         # the reason rather than passing silently (which is how CERT-F3 stayed invisible).
         # Killing mutant: collapsing the `None` case into "untracked".
-        with open(os.path.join(tmp, ".mcp.json"), "w", encoding="utf-8") as handle:
-            handle.write(_mcp_evil)
-        _res = startup_config_result(
-            os.path.join(tmp, ".mcp.json"), os.path.join(tmp, "settings.local.json")
-        )
-        check(
-            _res.status == "skip"
-            and any("git cannot say whether it is tracked" in line for line in _res.lines),
-            "an undeterminable startup config reports SKIP with the reason, never a silent pass",
-        )
+        # The fixture IS its own environment assumption, so a TMPDIR that happens to sit
+        # inside a checkout is a group this run cannot build, not a failure (PR-901 fourth
+        # round, F3) — counted as a skip, and fatal under `strict`.
+        if _git_toplevel(tmp) is not None:  # pragma: no cover - TMPDIR inside a checkout
+            skip("the temp directory is inside a git checkout: undeterminable startup config")
+        else:
+            with open(os.path.join(tmp, ".mcp.json"), "w", encoding="utf-8") as handle:
+                handle.write(_mcp_evil)
+            _res = startup_config_result(
+                os.path.join(tmp, ".mcp.json"), os.path.join(tmp, "settings.local.json")
+            )
+            check(
+                _res.status == "skip"
+                and any("git cannot say whether it is tracked" in line for line in _res.lines),
+                "an undeterminable startup config reports SKIP with the reason, never a "
+                "silent pass",
+            )
     check(
         settings_local_path(os.path.join(".claude", "settings.json"))
         == os.path.join(".claude", "settings.local.json")
@@ -4957,7 +5020,7 @@ def _selftest() -> int:
                 check(
                     _tracked_links([os.path.join(tmp, ".claude")]) != []
                     and _tracked_links([os.path.join(tmp, "nothing-here")]) == [],
-                    "the git query is scoped to its pathspec (a clean subtree reports none)",
+                    "the git query is scoped to its root path (a clean subtree reports none)",
                 )
     with tempfile.TemporaryDirectory() as tmp:
         # A dangling `.claude/commands` — the DIRECTORY itself is the link. os.path.isdir is
@@ -5093,7 +5156,10 @@ def _selftest() -> int:
                 "a dangling `.claude/skills` link is reported, not read as an absent tree",
             )
 
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY),
+        "no real roster/taxonomy here: roster tracked-link git-query fixtures",
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             # The ROSTER check asks git too, and the question has to be asked from inside
             # `run_checks` — a helper that is never called protects nothing. This fixture is a
@@ -5193,7 +5259,10 @@ def _selftest() -> int:
                 "tracked submodules AT .claude/commands and UNDER .claude/skills FAIL, named "
                 "by git mode 160000",
             )
-            if os.path.exists(DEFAULT_TAXONOMY):
+            if needs(
+                os.path.exists(DEFAULT_TAXONOMY),
+                "no real taxonomy here: gitlink drift gate-wiring fixtures",
+            ):
                 _buffer = io.StringIO()
                 with contextlib.redirect_stdout(_buffer):
                     _exit = main(
@@ -5229,7 +5298,7 @@ def _selftest() -> int:
     ):
         with tempfile.TemporaryDirectory() as tmp:
             if not _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, []):
-                skip("git unavailable: .claude root pathspec fixtures not run")
+                skip("git unavailable: .claude root path fixtures not run")
                 break
             _link = os.path.join(tmp, _unpoliced)
             os.makedirs(os.path.dirname(_link), exist_ok=True)
@@ -5388,10 +5457,13 @@ def _selftest() -> int:
                 ]
                 check(
                     _statuses == ["fail", "fail", "fail"] and len(_named) == 3,
-                    f"a {_shape} `.claude` SUBMODULE is named by all three local checks "
-                    f"(git mode 160000), none of them skipping",
+                    f"a {_shape} `.claude` SUBMODULE is named by all three link-asking "
+                    f"checks (git mode 160000), none of them skipping",
                 )
-            if os.path.exists(DEFAULT_TAXONOMY):
+            if needs(
+                os.path.exists(DEFAULT_TAXONOMY),
+                "no real taxonomy here: `.claude` gitlink drift gate-wiring fixtures",
+            ):
                 # ...and it reaches the gate as DRIFT (exit 1) rather than the exit-2
                 # "could not run" the bare `read_roster` raise produced: the roster is empty
                 # only BECAUSE of the gitlink, and the gitlink is a repo fix.
@@ -5460,8 +5532,8 @@ def _selftest() -> int:
                 and "skip" not in _statuses
                 and len(_named) == 3
                 and not any("not a git checkout" in line for line in _lines),
-                "a `.claude` symlink resolving OUTSIDE the repo FAILS all three local checks "
-                "(zero skips, never 'not a git checkout')",
+                "a `.claude` symlink resolving OUTSIDE the repo FAILS all three link-asking "
+                "checks (zero skips, never 'not a git checkout')",
             )
 
     # (c) FOLDED SPELLINGS. Git's index is case-SENSITIVE and byte-exact; APFS and NTFS are
@@ -5612,8 +5684,11 @@ def _selftest() -> int:
     # (c3) ...and it reaches the GATE as exit 1, named by `tracked-startup-config` — the
     # check whose whole job is the two startup files. Killing mutant: reporting the collision
     # only from the checks that own `.claude/{agents,commands,skills}`.
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY) and os.path.exists(
-        DEFAULT_SETTINGS
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR)
+        and os.path.exists(DEFAULT_TAXONOMY)
+        and os.path.exists(DEFAULT_SETTINGS),
+        "no real roster/taxonomy here: fold-collision gate-wiring fixtures",
     ):
         with tempfile.TemporaryDirectory() as tmp:
             _fixture_claude = os.path.join(tmp, ".claude")
@@ -5704,7 +5779,7 @@ def _selftest() -> int:
         claude_root_pathspec(DEFAULT_MCP_CONFIG) == CLAUDE_DIR_NAME
         and claude_root_pathspec(DEFAULT_MCP_CONFIG) != os.curdir
         and claude_root_pathspec(DEFAULT_AGENTS_DIR) == CLAUDE_DIR_NAME,
-        "the `.claude` root pathspec of `.mcp.json` is `.claude`, never the whole repo",
+        "the `.claude` root path of `.mcp.json` is `.claude`, never the whole repo",
     )
     with tempfile.TemporaryDirectory() as tmp:
         # A COMPLETE `.claude` (one real skill manifest), so the only thing that could redden
@@ -5778,7 +5853,10 @@ def _selftest() -> int:
     # round, RT-4). A queried directory that holds files on disk and has no index entry
     # folding under it (or at an ancestor of it) is UNVERIFIED.
     # Killing mutant: dropping the coverage loop in `_index_findings`.
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.isdir(DEFAULT_SKILLS_DIR):
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.isdir(DEFAULT_SKILLS_DIR),
+        "no real agents/skills trees here: index coverage fixtures",
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             _enclosing = os.path.join(tmp, "enclosing")
             _export = os.path.join(_enclosing, "vendor", "export")
@@ -6489,8 +6567,8 @@ def _selftest() -> int:
                     "ALSO UNVERIFIED" in note and "does not own" in note
                     for note in _sc.notes
                 ),
-                "a tracked `.claude/hooks` link is NAMED by all three local checks even when "
-                "the `.claude` around it is a tree the index does not own — the coverage "
+                "a tracked `.claude/hooks` link is NAMED by all three link-asking checks even "
+                "when the `.claude` around it is a tree the index does not own — the coverage "
                 "reason rides along as an ALSO UNVERIFIED note instead of erasing the link",
             )
 
@@ -6547,10 +6625,11 @@ def _selftest() -> int:
     # files that are all tracked. A note that fires on the healthy case is a note operators
     # learn to ignore.
     # Killing mutant: `(child,)` instead of `prefix + (child,)` in the per-child root rule.
-    if (
+    if needs(
         os.path.isdir(DEFAULT_AGENTS_DIR)
         and os.path.exists(DEFAULT_TAXONOMY)
-        and os.path.exists(DEFAULT_FEATURE_FORM)
+        and os.path.exists(DEFAULT_FEATURE_FORM),
+        "no real roster/taxonomy here: healthy-checkout silent-notes fixtures",
     ):
         _buffer = io.StringIO()
         with contextlib.redirect_stdout(_buffer):
@@ -6808,7 +6887,10 @@ def _selftest() -> int:
                     and sum(os.path.join(".claude", "hooks") in line for line in _res.lines) == 1,
                     "two DISTINCT tracked links are two findings; de-duplication keeps both",
                 )
-    if os.path.exists(DEFAULT_TAXONOMY):
+    if needs(
+        os.path.exists(DEFAULT_TAXONOMY),
+        "no real taxonomy here: nested-checkout coverage fixtures",
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             _inner = os.path.join(tmp, "inner")
             _outer = os.path.join(tmp, "outer")
@@ -6900,11 +6982,12 @@ def _selftest() -> int:
         )
     finally:
         shutil.which = _saved_which
-    if (
+    if needs(
         os.path.isdir(DEFAULT_AGENTS_DIR)
         and os.path.isdir(DEFAULT_SKILLS_DIR)
         and os.path.exists(DEFAULT_SETTINGS)
-        and os.path.exists(DEFAULT_TAXONOMY)
+        and os.path.exists(DEFAULT_TAXONOMY),
+        "no real .claude tree here: `git archive` export (non-checkout) fixtures",
     ):
         with tempfile.TemporaryDirectory() as tmp:
             _src = os.path.join(tmp, "src")
@@ -7005,36 +7088,46 @@ def _selftest() -> int:
         == frozenset({"roster<->live-labels", "codeowners-errors", "milestone-dropdown"}),
         "REMOTE_CHECK_NAMES holds exactly the three GitHub-API checks (literal set)",
     )
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY),
+        "no real roster/taxonomy here: unverifiable-local exit-2 fixtures",
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             # NOT a git checkout: git cannot say whether this .mcp.json is tracked, so the
             # local check SKIPs and --require-remote makes that exit 2 with the environment
             # message. The remote checks are skipped BY REQUEST here (--offline), which is
             # exactly the case that used to print "remote outage".
-            with open(os.path.join(tmp, ".mcp.json"), "w", encoding="utf-8") as handle:
-                handle.write(_mcp_evil)
-            _buffer = io.StringIO()
-            with contextlib.redirect_stdout(_buffer):
-                _exit = main(
-                    [
-                        "--offline",
-                        "--require-remote",
-                        "--repo",
-                        DEFAULT_REPO,
-                        "--mcp-config",
-                        os.path.join(tmp, ".mcp.json"),
-                    ]
+            # A TMPDIR inside a checkout makes the .mcp.json answerable and the fixture
+            # unbuildable, so this group SKIPs there rather than hard-failing (PR-901 fourth
+            # round, F3); `--require-full-coverage` turns that skip back into a failure.
+            if _git_toplevel(tmp) is not None:  # pragma: no cover - TMPDIR in a checkout
+                skip("the temp directory is inside a git checkout: unverifiable-local exit 2")
+            else:
+                with open(os.path.join(tmp, ".mcp.json"), "w", encoding="utf-8") as handle:
+                    handle.write(_mcp_evil)
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(
+                        [
+                            "--offline",
+                            "--require-remote",
+                            "--repo",
+                            DEFAULT_REPO,
+                            "--mcp-config",
+                            os.path.join(tmp, ".mcp.json"),
+                        ]
+                    )
+                _output = _buffer.getvalue()
+                check(
+                    _exit == 2
+                    and "local check(s) could not verify their input" in _output
+                    and "tracked-startup-config" in _output
+                    # The phrase "remote outage" occurs INSIDE the local message ("not a
+                    # remote outage"), so what must be absent is the outage VERDICT sentence.
+                    and "required remote check(s) were unavailable" not in _output,
+                    "an unverifiable LOCAL check exits 2 with the environment message, not "
+                    "'outage'",
                 )
-            _output = _buffer.getvalue()
-            check(
-                _exit == 2
-                and "local check(s) could not verify their input" in _output
-                and "tracked-startup-config" in _output
-                # The phrase "remote outage" occurs INSIDE the local message ("not a remote
-                # outage"), so what must be absent is the outage VERDICT sentence itself.
-                and "required remote check(s) were unavailable" not in _output,
-                "an unverifiable LOCAL check exits 2 with the environment message, not 'outage'",
-            )
     with tempfile.TemporaryDirectory() as tmp:
         # A tracked `.mcp.json` whose `mcpServers` is a LIST: the gate cannot enumerate what
         # would start at launch, so it FAILS rather than reading the non-mapping as empty.
@@ -7078,7 +7171,10 @@ def _selftest() -> int:
     # The real checkout must be clean on this surface, and the check must be WIRED INTO the
     # gate: a tracked .mcp.json has to redden a full run. Killing mutant: deleting the
     # `results.append(startup_config_result(...))` line in run_checks.
-    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+    if needs(
+        os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY),
+        "no real roster/taxonomy here: tracked .mcp.json gate-wiring fixtures",
+    ):
         with tempfile.TemporaryDirectory() as tmp:
             if _git_repo(tmp, {".mcp.json": _mcp_evil}, [".mcp.json"]):
                 _buffer = io.StringIO()
@@ -7168,12 +7264,12 @@ def _selftest() -> int:
         if saved_repo_env is not None:
             os.environ["GITHUB_REPOSITORY"] = saved_repo_env
 
-    # The FLOOR. A selftest that runs fewer assertions than it did yesterday still prints a
-    # green line, so the count is part of the contract: inside a checkout with every fixture
-    # available the run must execute exactly SELFTEST_ASSERTIONS_IN_CHECKOUT assertions, and
-    # the checkout-only ones must all have run. Outside a checkout the tally is PRINTED
-    # instead — the degradation is then visible in the log rather than hidden behind "all
-    # assertions passed" (PR-901 third round, L1/Info-2/3).
+    # The FLOOR: properties of the RUN, not of the code under test. See
+    # SELFTEST_ASSERTIONS_IN_CHECKOUT for the mode-by-mode contract. In short — the count is
+    # asserted where nothing was skipped, the checkout-only assertions must have run wherever
+    # they could, and under `strict` a skip or reduced coverage is itself a failure, because
+    # in CI a skipped fixture group and a fixture group that stopped building look identical
+    # (PR-901 third round L1/Info-2/3; fourth round Q1/F2).
     def floor(condition: bool, label: str) -> None:
         """Assert a property OF THE RUN ITSELF; not counted, or it would move the count."""
         if not condition:
@@ -7194,6 +7290,21 @@ def _selftest() -> int:
                 f"skipped, expected {SELFTEST_ASSERTIONS_IN_CHECKOUT} (update "
                 f"SELFTEST_ASSERTIONS_IN_CHECKOUT when adding or removing an assertion)",
             )
+    if strict:
+        # The two ways a run can go green having covered less than it should: a fixture group
+        # that could not build (or a guard that landed on the wrong block, which skips), and
+        # an environment where the real `.claude` cannot be asked about at all.
+        floor(
+            tally["skipped"] == 0,
+            f"selftest floor: --require-full-coverage run skipped {tally['skipped']} "
+            f"fixture group(s) — {'; '.join(skipped_reasons)} — a full-coverage selftest "
+            f"must execute every assertion",
+        )
+        floor(
+            in_checkout,
+            f"selftest floor: --require-full-coverage run has REDUCED coverage "
+            f"({coverage_gap}) — run --selftest from the root of the git checkout it tests",
+        )
     _log("")
     if failures:
         _error(f"selftest: {len(failures)} assertion(s) failed")
@@ -7202,7 +7313,7 @@ def _selftest() -> int:
     if tally["skipped"]:
         _summary += f", {tally['skipped']} fixture group(s) skipped"
     if not in_checkout:
-        _summary += " (not a git checkout at the repo root: coverage is REDUCED)"
+        _summary += f" ({coverage_gap}: coverage is REDUCED)"
     _log(_summary)
     return 0
 
@@ -7270,10 +7381,16 @@ def main(argv: "list[str] | None" = None) -> int:
         "this so the gate cannot silently pass without verifying against live state",
     )
     parser.add_argument("--selftest", action="store_true", help="run built-in logic tests and exit")
+    parser.add_argument(
+        "--require-full-coverage",
+        action="store_true",
+        help="with --selftest: fail when any fixture group was skipped or coverage was "
+        "reduced, instead of reporting it (default on under GITHUB_ACTIONS/CI)",
+    )
     args = parser.parse_args(argv)
 
     if args.selftest:
-        return _selftest()
+        return _selftest(strict=args.require_full_coverage)
 
     if args.validate_settings_only:
         # Local, offline-safe, and independent of the roster/taxonomy/form inputs, so it can

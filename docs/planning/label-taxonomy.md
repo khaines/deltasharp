@@ -305,17 +305,17 @@ of three reconciliations or the three local validations (`settings-permissions`,
    reason, and `--require-remote` turns that into exit 2 rather than a silent pass.
    Override the path with `--mcp-config`.
 
-**When it runs.** On every pull request and push to `main`, on a weekly schedule,
-and on demand. There is deliberately **no `paths:` filter**: GitHub's path filters are
-case-sensitive and cannot express the fold a macOS/Windows checkout performs, so a PR
-adding only `.Claude/hooks`, `.MCP.json` or `.mcp.jſon` — exactly the shapes the gate
-now fails — would never have triggered the workflow that fails them. The job is stdlib
-Python with no build, so running it always costs less than a filter that cannot enforce
-the rule. The schedule catches drift introduced GitHub-side (a label or milestone
-renamed in the UI), which no file change would otherwise trigger. It uses a
-least-privilege read-only token (`permissions: contents: read`; the default token
-suffices for labels, milestones, and CODEOWNERS on a public repo) and pins its one
-action by commit SHA.
+**When it runs.** On every pull request targeting `main` and every push to `main`,
+on a weekly schedule, and on demand. There is deliberately **no `paths:` filter**:
+GitHub's path filters are case-sensitive and cannot express the fold a macOS/Windows
+checkout performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or `.mcp.jſon` —
+exactly the shapes the gate now fails — would never have triggered the workflow that
+fails them. The job is stdlib Python with no build, so running it always costs less
+than a filter that cannot enforce the rule. The schedule catches drift introduced
+GitHub-side (a label or milestone renamed in the UI), which no file change would
+otherwise trigger. It uses a least-privilege read-only token (`permissions: contents:
+read`; the default token suffices for labels, milestones, and CODEOWNERS on a public
+repo) and pins its one action by commit SHA.
 
 **Run it locally.**
 
@@ -323,6 +323,12 @@ action by commit SHA.
 python3 tools/reconcile/roster-labels.py            # remote checks need `gh` authenticated
 python3 tools/reconcile/roster-labels.py --selftest # prove the gate's logic, no network
 ```
+
+A local `--selftest` reports fixture groups this machine cannot build (no `git archive`,
+no symlink privilege, a `TMPDIR` inside a checkout) as counted **skips** and still exits
+`0`. CI adds `--require-full-coverage`, which turns any skip — and any run with reduced
+coverage — into a failure, because there a skipped fixture group is indistinguishable
+from one that quietly stopped building.
 
 The live GitHub-API checks degrade gracefully: without `gh` (or a token) they are
 **skipped** with a warning so local dev works offline, while the script still parses the

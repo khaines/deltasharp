@@ -75,11 +75,14 @@ name: Reconcile
 #                          SYMLINK or SUBMODULE at either path (or at .claude/settings.json)
 #                          fails on its git mode (120000/160000) even when it dangles or is
 #                          checked out empty here. This check also carries the .claude ROOT
-#                          PATH, the scoping prefix that is the only query able to see .claude
-#                          ITSELF as a link, plus any subtree no other check owns (hooks/,
-#                          output-styles/): a query scoped THROUGH a symlinked directory sees
-#                          nothing, because the index holds the link, not the files "inside"
-#                          it. Nothing here is handed to git as a pathspec at all. Git is
+#                          PATH — the scoping prefix that is the only way to see .claude
+#                          ITSELF as a link, and the only one covering subtrees no other check
+#                          owns (hooks/, output-styles/): a query scoped THROUGH a symlinked
+#                          directory sees nothing, because the index holds the link, not the
+#                          files "inside" it. The index is listed once with NO pathspec and
+#                          these roots select from the answer; the only per-file question,
+#                          `git ls-files --error-unmatch`, is asked with an absolute path
+#                          after `--`, so no spelling of it can be read as a pathspec. Git is
 #                          asked FROM the directory that contains .claude, never from inside
 #                          it (a submodule .claude answers from the nested repository
 #                          and a symlinked one from outside the checkout — both "clean"). The
@@ -116,12 +119,12 @@ name: Reconcile
 #                          and a run with any SKIP ends on a qualified success line, never
 #                          the unqualified "are in step" claim.
 #
-# It runs on EVERY PR and push to main (drift introduced by a code change), on a weekly
-# schedule and on demand (drift introduced GitHub-side, e.g. a label or milestone renamed in
-# the UI, which is not a file change). There is deliberately NO `paths:` filter: GitHub's
-# path filters are case-SENSITIVE and cannot express the folding a macOS/Windows checkout
-# performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or `.mcp.jſon` — exactly the
-# shapes the gate now fails — would never have triggered the workflow that fails them
+# It runs on every pull request TARGETING `main` and every push to `main` (drift introduced
+# by a code change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a
+# label or milestone renamed in the UI, which is not a file change). There is deliberately NO
+# `paths:` filter: GitHub's path filters are case-SENSITIVE and cannot express the folding a
+# macOS/Windows checkout performs, so a PR adding only `.Claude/hooks`, `.MCP.json` or
+# `.mcp.jſon` — exactly the shapes the gate now fails — would never have triggered it
 # (PR-901 second round, RT-3). The job is stdlib Python with no build, so running it always
 # costs less than a filter that cannot enforce the rule. The gate is intentionally NOT a
 # branch-protection required check today (it can be promoted post-merge like the other gates,
@@ -158,8 +161,11 @@ jobs:
       # Prove the gate's own reconciliation logic (truncation, dropdown parse, milestone and
       # label diffing) with in-memory fixtures before trusting it on live data — mirrors the
       # coverage and SCA gate self-tests. Stdlib-only Python; nothing to install.
+      # --require-full-coverage makes a SKIPPED fixture group a failure here: on a laptop a
+      # skip means "this machine cannot build that fixture", but in CI it is indistinguishable
+      # from a fixture group that stopped building, or a guard that landed on the wrong block.
       - name: Reconcile gate self-test
-        run: python3 tools/reconcile/roster-labels.py --selftest
+        run: python3 tools/reconcile/roster-labels.py --selftest --require-full-coverage
 
       # .claude/settings.json is a security-relevant permission surface (an over-broad allow
       # entry silently widens what runs without a prompt), so it is validated here too. The
