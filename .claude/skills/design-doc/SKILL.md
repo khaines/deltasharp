@@ -14,9 +14,9 @@ Generate a comprehensive design document for a DeltaSharp component or feature. 
 
 - `docs/engineering/design/000-template.md` — the design document template (all sections must be populated)
 - `docs/engineering/design/README.md` — design doc conventions and file placement rules
-- `.github/skills/design-doc/section-map.md` — which agent persona owns which template section
-- `.github/skills/design-doc/checklist-refs.md` — which engineering checklists to cross-reference per section
-- `.github/skills/review-fix-loop/SKILL.md` — the review-fix loop used in Phase 8
+- `.claude/skills/design-doc/section-map.md` — which agent persona owns which template section
+- `.claude/skills/design-doc/checklist-refs.md` — which engineering checklists to cross-reference per section
+- `.claude/skills/review-fix-loop/SKILL.md` — the review-fix loop used in Phase 8
 
 ---
 
@@ -78,7 +78,7 @@ ADRs:        [ADR-NNN, ...] or "None referenced"
 
 ### 2.1 Load Architect Context
 
-Read the section map (`.github/skills/design-doc/section-map.md`) to confirm which sections the Architect agent owns. Load the following reference docs when present:
+Read the section map (`.claude/skills/design-doc/section-map.md`) to confirm which sections the Architect agent owns. Load the following reference docs when present:
 
 - `docs/engineering/best-practices/01-architecture.md`
 - `docs/engineering/best-practices/02-distributed-engine.md`
@@ -113,7 +113,7 @@ Validate the generated architecture sections against the architecture checklist:
 
 ### 3.1 Load Functional Context
 
-Read the checklist references (`.github/skills/design-doc/checklist-refs.md`) for sections §3 and §4. Load when present:
+Read the checklist references (`.claude/skills/design-doc/checklist-refs.md`) for sections §3 and §4. Load when present:
 
 - `docs/engineering/best-practices/04-testing.md`
 - `docs/engineering/best-practices/08-performance.md`
@@ -286,9 +286,7 @@ git commit -m "Design: <Component Name> design document
 Generates design document for <Component Name> from issue #NNN.
 Covers architecture, security, threat model, observability, and rollout.
 
-Refs #NNN
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+Refs #NNN"
 git push -u origin "$BRANCH_NAME"
 ```
 

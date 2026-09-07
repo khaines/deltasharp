@@ -11,13 +11,13 @@ description: >-
 
 Implement a GitHub issue by writing production code and tests, validating the build, and opening a reviewed pull request. Read all supporting files before beginning:
 
-- `.github/skills/implement-work-item/service-agent-map.md` — maps service labels to agent personas and checklists
-- `.github/skills/implement-work-item/build-test-config.md` — build and test configuration for the .NET toolchain
-- `.github/skills/review-pr/agent-map.md` — file-pattern-to-agent mapping (used by fallback rules)
-- `.github/skills/review-fix-loop/SKILL.md` — overview of review-fix loop; consensus and round structure referenced in Phase 8
-- `.github/skills/review-fix-loop/dismissal-rules.md` — dismissal and consensus rules applied in Phase 8 Step B
-- `.github/skills/review-pr/SKILL.md` — the PR review skill invoked during Phase 8
-- `.github/skills/design-doc/SKILL.md` — the design-doc skill invoked in Phase 2 if no design doc exists
+- `.claude/skills/implement-work-item/service-agent-map.md` — maps service labels to agent personas and checklists
+- `.claude/skills/implement-work-item/build-test-config.md` — build and test configuration for the .NET toolchain
+- `.claude/skills/review-pr/agent-map.md` — file-pattern-to-agent mapping (used by fallback rules)
+- `.claude/skills/review-fix-loop/SKILL.md` — overview of review-fix loop; consensus and round structure referenced in Phase 8
+- `.claude/skills/review-fix-loop/dismissal-rules.md` — dismissal and consensus rules applied in Phase 8 Step B
+- `.claude/skills/review-pr/SKILL.md` — the PR review skill invoked during Phase 8
+- `.claude/skills/design-doc/SKILL.md` — the design-doc skill invoked in Phase 2 if no design doc exists
 
 ---
 
@@ -131,7 +131,7 @@ Security:       [key concern from §5]
 
 ### 3.1 Determine Implementation Agent
 
-Read the service-agent-map (`.github/skills/implement-work-item/service-agent-map.md`) and match the issue's `service:*` label to determine:
+Read the service-agent-map (`.claude/skills/implement-work-item/service-agent-map.md`) and match the issue's `service:*` label to determine:
 
 - **Primary implementation agent**: The specialist persona that writes the code.
 - **Secondary agents**: Additional personas needed for multi-domain work.
@@ -268,7 +268,7 @@ Follow project conventions:
 
 ## Phase 6: Build-Test-Fix Loop
 
-This phase ensures the implementation compiles and all tests pass before opening a PR. Read the build-test-config (`.github/skills/implement-work-item/build-test-config.md`) for commands and configuration.
+This phase ensures the implementation compiles and all tests pass before opening a PR. Read the build-test-config (`.claude/skills/implement-work-item/build-test-config.md`) for commands and configuration.
 
 ### 6.1 Restore and Build
 
@@ -364,9 +364,7 @@ Includes tests for all acceptance criteria.
 - <key implementation detail 2>
 - <key implementation detail 3>
 
-Refs #NNN
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+Refs #NNN"
 ```
 
 ### 7.2 Push and Open PR
@@ -396,7 +394,7 @@ Repeat the following cycle until termination (§8.2):
 
 **Step A — Review**: Invoke the `review-pr` skill on the PR. Collect findings.
 
-**Step B — Evaluate**: Apply the review-fix-loop's dismissal and consensus rules (from `.github/skills/review-fix-loop/dismissal-rules.md`) to filter actionable findings. If no actionable findings remain AND the unconditional 5/5 PASS gate is met, terminate with success. If no actionable findings remain but the PR is below 5/5, it is a STOP (never a PASS).
+**Step B — Evaluate**: Apply the review-fix-loop's dismissal and consensus rules (from `.claude/skills/review-fix-loop/dismissal-rules.md`) to filter actionable findings. If no actionable findings remain AND the unconditional 5/5 PASS gate is met, terminate with success. If no actionable findings remain but the PR is below 5/5, it is a STOP (never a PASS).
 
 **Step C — Fix**: Dispatch the appropriate agent persona(s) to fix actionable findings. Agent selection follows the same routing used in Phase 3.
 
@@ -412,8 +410,6 @@ Repeat the following cycle until termination (§8.2):
 
 ```text
 Review fixes (Round N): Address N findings
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>
 ```
 
 Push to the PR branch.

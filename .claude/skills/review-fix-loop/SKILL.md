@@ -14,12 +14,12 @@ This skill automates the iterative cycle of reviewing a pull request, fixing dis
 
 Read all supporting files before beginning:
 
-- `.github/skills/review-pr/SKILL.md` — the review engine (Phases 1–9)
-- `.github/skills/review-pr/agent-map.md` — file → agent mapping
-- `.github/skills/review-pr/checklist-map.md` — file → checklist mapping
-- `.github/skills/review-pr/rating-rubric.md` — severity and rating definitions
-- `.github/skills/review-pr/github-review-posting.md` — how council output is published as a GitHub code review (inline comments + review summary), self-review + thread-resolution rules
-- `.github/skills/review-fix-loop/dismissal-rules.md` — when to dismiss vs. fix findings
+- `.claude/skills/review-pr/SKILL.md` — the review engine (Phases 1–9)
+- `.claude/skills/review-pr/agent-map.md` — file → agent mapping
+- `.claude/skills/review-pr/checklist-map.md` — file → checklist mapping
+- `.claude/skills/review-pr/rating-rubric.md` — severity and rating definitions
+- `.claude/skills/review-pr/github-review-posting.md` — how council output is published as a GitHub code review (inline comments + review summary), self-review + thread-resolution rules
+- `.claude/skills/review-fix-loop/dismissal-rules.md` — when to dismiss vs. fix findings
 
 ---
 
@@ -157,7 +157,7 @@ Update the progression tracker with the round's rating, finding counts by severi
 
 ### 3.1 Load Dismissal Rules
 
-Read `.github/skills/review-fix-loop/dismissal-rules.md` for the complete dismissal logic.
+Read `.claude/skills/review-fix-loop/dismissal-rules.md` for the complete dismissal logic.
 
 ### 3.2 Categorize Each Finding
 
@@ -259,12 +259,10 @@ git commit -s -m "Review fixes (Round {N}): Address {count} findings
 
 Fixed:
 - {finding.id}: {brief description} ({file})
-- ...
-
-Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+- ..."
 ```
 
-`git commit -s` appends the `Signed-off-by:` trailer; keep the `Co-authored-by: Copilot` trailer as well.
+`git commit -s` appends the `Signed-off-by:` trailer. Do not add AI attribution trailers (`Co-authored-by`, `Generated-with`, session links).
 
 ### 5.2 Push
 
@@ -330,9 +328,9 @@ Compile the full round-by-round progression:
 
 ### Council Composition Audit
 
-| Round | Slot | `agent_type` | `model` | Dispatch HEAD | Dispatch Timestamp (UTC) | Verification |
+| Round | Slot | `subagent_type` | `model` | Dispatch HEAD | Dispatch Timestamp (UTC) | Verification |
 |-------|------|--------------|---------|---------------|--------------------------|--------------|
-| R1 | Architect | `{agent_type}` | `opus` | `{sha}` | `{iso8601}` | ✓ |
+| R1 | Architect | `{subagent_type}` | `opus` | `{sha}` | `{iso8601}` | ✓ |
 | R1 | Red-team | `general-purpose` | `fable` | `{sha}` | `{iso8601}` blind block returned / `{iso8601}` verdicts released | ✓ |
 
 ### Findings Addressed
@@ -401,7 +399,7 @@ Before declaring the loop terminated, audit the council composition record produ
 
 1. Enumerate every counted round in the progression report.
 2. For each round, locate the per-slot composition row.
-3. Verify each row lists an exact `(agent_type, model)` pair from the protocol table in `review-pr` §3.1, and that the red-team row shows `fable`, a blind-block timestamp earlier than the verdicts-released timestamp, and no fork.
+3. Verify each row lists an exact `(subagent_type, model)` pair from the protocol table in `review-pr` §3.1, and that the red-team row shows `fable`, a blind-block timestamp earlier than the verdicts-released timestamp, and no fork.
 4. Missing or off-protocol composition data invalidates the round and requires corrective review at the current HEAD or the original HEAD when recoverable.
 5. After any corrective dispatch, regenerate, repost, and re-verify the report before terminating.
 

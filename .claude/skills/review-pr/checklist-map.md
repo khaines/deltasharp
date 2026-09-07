@@ -2,7 +2,7 @@
 
 This file maps file patterns to engineering checklists so the `review-pr` skill knows which checklists to apply when reviewing a pull request. The skill reads this map, matches changed files against the patterns below, and loads the corresponding checklists from `docs/engineering/checklists/`.
 
-> Some referenced checklist files are DeltaSharp equivalents to be authored; when absent, note the missing checklist and apply the project canon from `.github/copilot-instructions.md`.
+> Some referenced checklist files are DeltaSharp equivalents to be authored; when absent, note the missing checklist and apply the project canon from `CLAUDE.md`.
 
 ---
 
@@ -93,7 +93,7 @@ These checklists apply to **every PR** regardless of which files changed:
 
 - **03 — Coding Conventions** applies to all code files. Even if a more specific language checklist (03a) also applies, the general conventions checklist is always included.
 - **05 — Security** receives a lightweight scan on all changes. The full security checklist is applied when security-sensitive patterns match.
-- **DeltaSharp canon** from `.github/copilot-instructions.md` applies to all code and docs: Spark parity, native Delta tables, Kubernetes-native execution, lazy transformations/eager actions, and layer separation.
+- **DeltaSharp canon** from `CLAUDE.md` applies to all code and docs: Spark parity, native Delta tables, Kubernetes-native execution, lazy transformations/eager actions, and layer separation.
 
 ---
 

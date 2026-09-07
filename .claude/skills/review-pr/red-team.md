@@ -39,9 +39,9 @@ manufactures the independent, adversarial error-checking that constructive revie
   future GPT release is retested and emits reliably, this may be revisited — but re-measure before
   re-adopting, and keep the telemetry.
 - **Shell-capable, always.** The red-team MUST hold a real shell to run C7 repros. Dispatch
-  it with `agent_type: general-purpose` (full CLI tools) — **never** a file-view-only
-  persona agent. (A reviewer that cannot execute cannot certify; a file-view-only seat that
-  withholds judgment for "couldn't run it" is a dispatch error, not a finding.)
+  it with `subagent_type: general-purpose` (full CLI tools) — **never** a persona agent without
+  `Bash`. (A reviewer that cannot execute cannot certify; a seat that withholds judgment for
+  "couldn't run it" is a dispatch error, not a finding.)
 
 The orchestrator gives the red-team, **in the blind pass**: the diff + changed files and the
 Review Package (design-doc/claim refs). **In the falsification pass**, after the Blind findings
@@ -49,7 +49,7 @@ block has been returned: **every prior seat's full verdict + findings**.
 
 ## First action
 
-Read `.github/skills/review-pr/rigor-battery.md`. You apply the **entire battery (C1–C7)**,
+Read `.claude/skills/review-pr/rigor-battery.md`. You apply the **entire battery (C1–C7)**,
 not just one domain. You are the council's mandatory **C7 executor**: you *run* repros, you
 do not reason about them.
 
