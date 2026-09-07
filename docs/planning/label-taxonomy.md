@@ -174,7 +174,14 @@ of three reconciliations or the `settings-permissions` validation breaks:
    `name:` and ignores markdown without one (e.g. a README). Wrappers must sit
    directly in `.claude/agents/`; a `name:`-bearing file in a subdirectory fails
    the gate, and hidden (dot-prefixed) subdirectories are scanned too, so a
-   wrapper hidden under one cannot slip past. The one 50-character truncation
+   wrapper hidden under one cannot slip past. Wrapper front matter is held to a
+   policy as well, because Claude Code reads parts of it as runtime
+   configuration: `permissionMode` may only be `default` or `plan`
+   (`bypassPermissions`/`acceptEdits`/`dontAsk`/`auto` skip the permission
+   prompt), `hooks`, `mcpServers`, `isolation` (it runs `git worktree add`
+   unprompted), and `env` are rejected by name, and any other unrecognised key
+   fails — a wrapper is a persona brief, not an execution-config surface.
+   The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone
    truncated label out of this file, so an *undocumented* truncation still fails. The
@@ -204,8 +211,9 @@ of three reconciliations or the `settings-permissions` validation breaks:
    helpers) — those run commands as soon as the branch is checked out, `apiKeyHelper`
    at CLI startup before any tool call. Inside `allow`, the enumerated mutating
    `git`/`gh` prefixes (compared case-insensitively), any wildcard, and any tool-wide
-   `Bash` grant fail; a `defaultMode` bypass fails; the destructive-spelling deny
-   entries must be present. Allow entries outside that enumeration are *not* policed
+   `Bash` grant fail; a `defaultMode` other than `default`/`plan` fails
+   (`bypassPermissions`/`dontAsk` skip every prompt, `acceptEdits` auto-approves
+   file writes); the destructive-spelling deny entries must be present. Allow entries outside that enumeration are *not* policed
    and still need human review. Run it alone with `--validate-settings-only`.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance

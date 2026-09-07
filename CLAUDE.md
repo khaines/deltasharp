@@ -82,9 +82,10 @@ only `$schema`, `permissions`, and inert keys (`model`, `cleanupPeriodDays`,
 `spinnerTipsEnabled`), `permissions` only `allow`/`deny`/`defaultMode`; every
 other key is rejected, executable-valued ones by name. So are the enumerated
 mutating `git`/`gh` prefixes (case-insensitive), wildcard or tool-wide `Bash`
-grants, and `defaultMode` bypasses; destructive-spelling deny entries are
-required. Any other `allow` entry (`curl`, `git commit`, a new shell wrapper)
-is unpoliced and needs human review.
+grants, and any `defaultMode` outside `default`/`plan` (`acceptEdits`
+auto-approves file writes); destructive-spelling deny entries are required.
+Any other `allow` entry (`curl`, `git commit`, a new shell wrapper) is
+unpoliced and needs human review.
 
 The `dotnet` grant is intended only for the maintainer's own branches; nothing
 enforces that. `dotnet restore`/`build`/`test`/`format` execute PR-supplied
@@ -95,6 +96,9 @@ Project-level `hooks`, `env`, `apiKeyHelper`, and the other command-bearing
 keys in another author's branch execute once it is checked out — `apiKeyHelper`
 at startup, before any tool call — so they fall under the same C7 trust
 boundary as the `dotnet` grant; the gate rejects them in the tracked file.
+Persona wrappers in `.claude/agents/` sit inside that boundary too: the gate
+lets them set only a `default`/`plan` `permissionMode` and rejects `hooks`,
+`mcpServers`, `isolation` (it runs `git worktree add` unprompted), and `env`.
 
 ## Architecture — the big picture
 

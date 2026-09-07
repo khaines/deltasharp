@@ -8,6 +8,9 @@ name: Reconcile
 #   * roster<->labels    — every .claude/agents/*.md wrapper has a persona:<slug> label
 #                          and vice-versa (allowing the ONE documented 50-char truncation),
 #                          reconciled against the committed label list AND the live labels.
+#                          Wrapper front matter is policed too: permissionMode may only be
+#                          default/plan, and hooks/mcpServers/isolation/env (or any unknown
+#                          key) are rejected — Claude Code reads them as runtime config.
 #   * codeowners-errors  — GET /repos/{repo}/codeowners/errors?ref=<PR head> reports no
 #                          parse/owner errors (pinned to the PR head so a breaking PR fails).
 #   * milestone-dropdown — the feature_request.yml milestone options match the live GitHub
@@ -19,8 +22,10 @@ name: Reconcile
 #                          `permissions` may hold only allow/deny/defaultMode — so every
 #                          executable-valued key (`hooks`, `env`, `apiKeyHelper`,
 #                          `statusLine`, the AWS/GCP/proxy helpers, ...) and
-#                          permissions.additionalDirectories are rejected by name, and a
-#                          defaultMode of bypassPermissions/dontAsk is rejected. In `allow`
+#                          permissions.additionalDirectories are rejected by name, and any
+#                          defaultMode outside default/plan is rejected (bypassPermissions/
+#                          dontAsk skip every prompt; acceptEdits auto-approves writes).
+#                          In `allow`
 #                          it rejects the enumerated mutating git/gh prefixes in
 #                          FORBIDDEN_ALLOW_COMMANDS (`gh api`, `git push`, `gh pr merge`, ...
 #                          compared CASE-INSENSITIVELY, including via a broad `Bash(gh:*)`)
