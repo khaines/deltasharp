@@ -109,13 +109,18 @@ and skill files, along with any key outside `description`/`argument-hint`/`model
 way, and a skills tree with no manifest is drift, not a pass.
 
 Three more startup surfaces sit inside the same boundary and the gate rejects all
-three. **Symlinks:** any *tracked* symlink under `.claude/`, or at `.mcp.json`,
-`.claude/settings.local.json`, or `.claude/settings.json`, fails — the rule is
-decided by the **git mode** (`120000`), not by what the link resolves to here, so a
-**dangling** link cannot hide (one pointing at `bin/` or `obj/` is absent in a
-checkout-only CI job and resolves to real configuration on any machine that has
-built). The CLI follows such a link; the gate's walks deliberately do not, so it
-would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
+three. **Links:** any *tracked* symlink **or submodule** (git mode `120000`/`160000`)
+anywhere under `.claude/` — including `.claude` itself — or at `.mcp.json`,
+`.claude/settings.local.json`, or `.claude/settings.json`, fails. The rule is decided
+by the **git index mode**, not by what the path resolves to here, so neither shape can
+hide: a **dangling** link (one pointing at `bin/` or `obj/`) is absent in a
+checkout-only CI job and resolves to real configuration on any machine that has built,
+and a **submodule** is checked out *empty* by CI while `git submodule update --init`
+loads whatever it contains on a developer machine. The `.claude`-wide query lives in
+the `tracked-startup-config` check (it covers every subtree and the root entry); the
+roster and command/skill checks ask it too, and their walks additionally report any
+link they meet. The CLI follows such a link; the gate's walks deliberately do not, so
+it would otherwise ship unreviewed configuration. **A tracked root `.mcp.json`:** each
 `mcpServers[*].command` is started when the CLI launches, before any tool call and
 with no prompt. **A tracked `.claude/settings.local.json`:** it is honoured exactly
 like `settings.json`, so the per-machine grants this file keeps recommending there

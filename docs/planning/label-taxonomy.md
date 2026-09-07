@@ -234,16 +234,22 @@ of three reconciliations or the three local validations (`settings-permissions`,
    also carry `name`). `.claude/commands/` is optional; `.claude/skills/` is not — a
    skills tree that yields zero manifests fails the check, and the passing report
    states how many files were scanned. Both walks — and the roster walk in 1 — also
-   reject **symlinks**, and the rule is decided **by git**: any tracked symlink under
-   `.claude/` — or at `.mcp.json`, `.claude/settings.local.json`,
-   `.claude/settings.json` — fails the gate, because git records the link as index
-   mode `120000` whether or not it resolves here, so a **dangling** link cannot hide.
-   That is the point: a link pointing at `bin/`, `obj/` or `artifacts/` is absent in
-   the checkout-only CI job and resolves to real configuration on every machine that
-   has run `dotnet build`, so a filesystem-only check would pass it. The walks report
-   any link they see as well (the directory roots themselves, and every file entry
-   whatever its name), so the rule still holds where git cannot be asked; links are
-   never followed (a loop would hang the gate), and if git cannot answer at all the
+   reject **links**, and the rule is decided **by git**: any tracked symlink or
+   submodule (git mode `120000`/`160000`) anywhere under `.claude/` — including
+   `.claude` itself — or at `.mcp.json`, `.claude/settings.local.json`,
+   `.claude/settings.json`, fails the gate, because git records the index mode whether
+   or not the path resolves here, so neither a **dangling** link nor a **submodule**
+   can hide. That is the point: a link pointing at `bin/`, `obj/` or `artifacts/` is
+   absent in the checkout-only CI job and resolves to real configuration on every
+   machine that has run `dotnet build`, and a submodule is checked out *empty* by that
+   job while `git submodule update --init` loads whatever it contains — a
+   filesystem-only check passes both. The `.claude`-wide query lives in
+   `tracked-startup-config` (6), which is where the root and any subtree no other check
+   owns (`hooks/`, `output-styles/`) is named; the roster and command/skill checks ask
+   it too, so the link is reported wherever the reader looks, once per check. The walks
+   report any link they meet as well (the directory roots themselves, and every file
+   entry whatever its name), so the rule still holds where git cannot be asked; links
+   are never followed (a loop would hang the gate), and if git cannot answer at all the
    git half reports **skip** with the reason rather than a pass.
 6. **`tracked-startup-config`** (also a validation). Two startup surfaces the
    settings policy never opens. A repo-root **`.mcp.json`** has every

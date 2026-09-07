@@ -159,6 +159,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import urllib.parse
 
@@ -670,37 +671,68 @@ def _walk_symlink_problems(kind: str, dirpath: str, dirnames: "list[str]") -> "l
     return problems
 
 
-def _tracked_symlink_problem(path: str) -> str:
-    """The message for a symlink GIT tracks (index mode 120000), whatever it resolves to.
+# The two git index modes that make a tracked path something this gate cannot read but the
+# CLI can: a SYMLINK (120000) and a GITLINK/submodule (160000). Both are recorded by git
+# whatever the working tree currently holds, which is the whole point — see
+# :func:`_tracked_link_problem`.
+TRACKED_LINK_MODES = ("120000", "160000")
+
+
+def _tracked_link_problem(mode: str, path: str) -> str:
+    """The message for a path GIT records as a link (mode 120000) or a gitlink (160000).
 
     The path-based checks in this gate all ask the FILESYSTEM a question — ``os.path.exists``,
-    an ``os.walk`` name match — and a symlink whose target is absent answers "nothing here".
-    That is exactly the shape of a link pointing at `bin/`, `obj/` or `artifacts/`: present on
-    every developer machine after a `dotnet build`, ABSENT in the checkout-only CI job, so the
-    tracked link sails through the gate and still resolves to real configuration the moment a
-    developer builds. Git, by contrast, records the link itself as index mode ``120000``
-    regardless of whether it currently resolves, which is why tracking (not resolution) is the
-    question this gate asks (FINAL-CERT F1).
+    an ``os.walk`` name match — and both shapes answer "nothing here" in a checkout-only CI
+    job while resolving to real configuration elsewhere:
+
+    * **symlink (120000)**: a link pointing at `bin/`, `obj/` or `artifacts/` is absent in CI
+      and present on every developer machine after a `dotnet build`, so the tracked link
+      sails through the gate and still resolves to configuration Claude Code reads.
+    * **gitlink (160000)**: a submodule directory is checked out EMPTY by CI's plain
+      `actions/checkout` (no `submodules: recursive`), so the walk counts zero files and the
+      gate goes green — while `git submodule update --init` on a developer machine populates
+      it with, say, a `SKILL.md` carrying `allowed-tools:` that the CLI then loads
+      (LAST-CERT F1).
+
+    Git records the mode either way, which is why TRACKING (not resolution) is the question
+    this gate asks.
     """
+    if mode == "160000":
+        return (
+            f"{path!r} is a tracked gitlink/submodule (git mode 160000); CI checks it out "
+            f"empty and the CLI loads whatever it contains once initialised — vendor the "
+            f"files instead"
+        )
     return (
         f"{path!r} is a tracked symlink (git mode 120000); the gate cannot see through links "
         f"that may resolve elsewhere on another machine — replace it with real files"
     )
 
 
-def _tracked_symlinks(paths: "list[str]") -> "list[str] | None":
-    """Paths git records with index mode ``120000`` under `paths`, or ``None`` if git cannot say.
+def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
+    """`(mode, path)` for every entry git records as a link under `paths`, or ``None``.
 
-    One `git ls-files -s -z -- <paths>` (argv form, no shell) run inside the checkout. A
-    DIRECTORY pathspec matches every tracked entry beneath it, so `.claude/skills` covers both
-    a link nested in the tree and the directory entry itself when `.claude/skills` IS the link
-    — the case an `os.walk` cannot see at all, because a dangling directory link is not a
-    directory. ``--full-name`` makes the reported paths REPO-ROOT-relative (git otherwise
-    spells them relative to the directory it ran in, which would name the same link
-    differently depending on which pathspec happened to be asked about first), sorted.
+    One `git ls-files -s -z -- <paths>` (argv form, no shell) run inside the checkout, keeping
+    the entries whose index mode is in :data:`TRACKED_LINK_MODES` — symlinks (120000) and
+    gitlinks/submodules (160000). The mode is returned rather than discarded so the caller can
+    say which shape it found; the two need different remedies (replace the link vs vendor the
+    submodule's files).
+
+    A DIRECTORY pathspec matches every tracked entry beneath it, so `.claude` covers a link
+    nested anywhere in the tree AND the directory entry itself when `.claude` IS the link —
+    the case an `os.walk` cannot see at all, because a dangling directory link is not a
+    directory. Note that a pathspec spelled THROUGH a symlinked directory
+    (`.claude/settings.json` when `.claude` is a link) matches nothing at all: git compares
+    against index paths, and the index holds `.claude`, not the files "inside" it. That is why
+    every caller also asks about the `.claude` ROOT (LAST-CERT F2) instead of trusting the
+    per-file spellings alone.
+
+    ``--full-name`` makes the reported paths REPO-ROOT-relative (git otherwise spells them
+    relative to the directory it ran in, which would name the same link differently depending
+    on which pathspec happened to be asked about first), sorted.
 
     ``None`` is "git could not answer" (git missing, not a checkout, a pathspec outside this
-    repository) and is deliberately NOT collapsed into "no symlinks": callers report it as
+    repository) and is deliberately NOT collapsed into "no links": callers report it as
     UNVERIFIED — the same contract :func:`_git_tracked` keeps — so an environment the gate
     could not interrogate never reads as an environment it cleared.
     """
@@ -731,35 +763,174 @@ def _tracked_symlinks(paths: "list[str]") -> "list[str] | None":
         # 128 = not a git repository / pathspec outside it; anything else is equally
         # unanswerable. Never "clean".
         return None
-    links: "list[str]" = []
+    links: "list[tuple[str, str]]" = []
     for entry in proc.stdout.split("\0"):
         if not entry:
             continue
         meta, tab, name = entry.partition("\t")
         if not tab or not name:  # pragma: no cover - defensive: unexpected ls-files output
             continue
-        if meta.split(" ", 1)[0] == "120000":
-            links.append(name)
-    return sorted(set(links))
+        mode = meta.split(" ", 1)[0]
+        if mode in TRACKED_LINK_MODES:
+            links.append((mode, name))
+    return sorted(set(links), key=lambda item: (item[1], item[0]))
+
+
+def claude_root_pathspec(path: str) -> "str | None":
+    """The `.claude` directory a policed path lives in — the pathspec every check adds.
+
+    Every local check used to ask git only about its OWN subtree (`.claude/agents`,
+    `.claude/commands`, `.claude/skills`) plus three files, while the prose promised "any
+    tracked symlink under `.claude/`". The gap was real: a tracked link at `.claude/hooks`,
+    `.claude/output-styles/x.md` — or at `.claude` ITSELF — is configuration Claude Code
+    reads and no check named it (LAST-CERT F2). The parent directory pathspec subsumes every
+    subtree AND the root entry, so each check asks about it alongside its own paths; the
+    per-check queries stay, because a check must still name a link in the tree it owns even
+    when it is pointed somewhere else entirely (a fixture, a `--agents-dir` override).
+
+    Duplicate findings across checks are harmless: :func:`_dedupe_link_problems` collapses
+    them to one line per link WITHIN each check's report.
+    """
+    if not path:
+        return None
+    parent = os.path.dirname(path)
+    if parent:
+        # The caller's own spelling, so the SKIP reason a responder reads names `.claude`
+        # rather than an absolute path they did not type.
+        return parent
+    if os.path.isabs(path):  # pragma: no cover - a path at the filesystem root
+        return os.path.dirname(os.path.abspath(path)) or None
+    return os.curdir
+
+
+def link_query_paths(*paths: str) -> "list[str]":
+    """The pathspecs a check hands git: each policed path AND its `.claude` root, deduped.
+
+    Order matters only for which directory :func:`_tracked_links` runs git from, and the
+    policed path comes first so a check pointed at a fixture tree asks from there.
+    """
+    ordered: "list[str]" = []
+    for path in paths:
+        for candidate in (path, claude_root_pathspec(path)):
+            if candidate and candidate not in ordered:
+                ordered.append(candidate)
+    return ordered
+
+
+# Cache of `git rev-parse --show-toplevel` answers, keyed by the directory asked from, so the
+# de-duplication below spends at most one subprocess per directory per run.
+_TOPLEVEL_CACHE: "dict[str, str | None]" = {}
+
+
+def _git_toplevel(directory: str) -> "str | None":
+    """The work-tree root containing `directory`, or ``None`` (cached; never raises)."""
+    probe = directory
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            return None
+        probe = parent
+    if not probe:
+        return None
+    if probe in _TOPLEVEL_CACHE:
+        return _TOPLEVEL_CACHE[probe]
+    top: "str | None" = None
+    if shutil.which("git") is not None:
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=probe,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):  # pragma: no cover - environment dependent
+            proc = None
+        if proc is not None and proc.returncode == 0 and proc.stdout.strip():
+            top = proc.stdout.strip()
+    _TOPLEVEL_CACHE[probe] = top
+    return top
+
+
+# Every link message this gate emits quotes the path first; that is what lets one link
+# reported by two different questions be recognised as one link.
+_LINK_PATH_RE = re.compile(r"'([^']+)' is a (?:tracked )?(?:symlink|gitlink)")
+
+
+def _normalize_link_path(path: str) -> str:
+    """One spelling for one link: the path relative to the git work-tree root when knowable.
+
+    The walk-based checks report the path the CALLER passed (often absolute, e.g. a
+    `--mcp-config /abs/.mcp.json`), while git reports it repo-root-relative (`.mcp.json`).
+    Comparing the message STRINGS therefore let one link produce two `::error::` annotations,
+    which reads as two defects to fix (LAST-CERT F4). Normalising both spellings to the
+    top-level-relative form makes them comparable. A relative path that does not exist under
+    the current directory is assumed to be already repo-root-relative (that is exactly what
+    `git ls-files --full-name` returns from a fixture repo elsewhere) and is left alone.
+    """
+    if not path:
+        return path
+    absolute = os.path.abspath(path)
+    if not os.path.isabs(path) and not os.path.lexists(absolute):
+        return os.path.normpath(path)
+    # The PARENT is resolved (`/var/folders/...` is a symlink to `/private/var/folders/...`
+    # on macOS, and `git rev-parse` answers with the resolved spelling), the leaf never is:
+    # resolving the leaf would follow the very link under investigation.
+    parent = os.path.realpath(os.path.dirname(absolute))
+    absolute = os.path.join(parent, os.path.basename(absolute))
+    top = _git_toplevel(parent)
+    if top:
+        try:
+            return os.path.normpath(os.path.relpath(absolute, top))
+        except ValueError:  # pragma: no cover - different drives on Windows
+            pass
+    return os.path.normpath(absolute)
+
+
+def _dedupe_link_problems(*groups: "list[str]") -> "list[str]":
+    """Concatenate problem groups, keeping ONE line per link path (LAST-CERT F4).
+
+    Groups are kept in the order given, so a caller puts the message it prefers first — the
+    git-mode one, which names the index mode and is decisive, ahead of the walk's "is a
+    symlink". Problems that are not about a link pass through untouched.
+    """
+    seen: "set[str]" = set()
+    kept: "list[str]" = []
+    for group in groups:
+        for problem in group:
+            match = _LINK_PATH_RE.search(problem)
+            if match is None:
+                if problem not in kept:
+                    kept.append(problem)
+                continue
+            key = _normalize_link_path(match.group(1))
+            if key in seen:
+                continue
+            seen.add(key)
+            kept.append(problem)
+    return kept
 
 
 def tracked_symlink_problems(paths: "list[str]") -> "tuple[list[str], list[str]]":
-    """Return (problems, unverified) for every tracked symlink under `paths` (FINAL-CERT F1).
+    """Return (problems, unverified) for every tracked link under `paths` (LAST-CERT F1).
 
-    ``unverified`` is non-empty only when git could not answer; the caller reports SKIP with
-    that reason rather than passing, because "no link found" and "could not look" are
-    different claims and only one of them is safe to go green on.
+    "Link" is both shapes git can record without the working tree showing them: a SYMLINK
+    (mode 120000) and a GITLINK/submodule (mode 160000). ``unverified`` is non-empty only when
+    git could not answer; the caller reports SKIP with that reason rather than passing,
+    because "no link found" and "could not look" are different claims and only one of them is
+    safe to go green on.
     """
-    links = _tracked_symlinks(paths)
+    links = _tracked_links(paths)
     if links is None:
         return [], [
             "git could not say whether "
             + ", ".join(sorted(paths))
-            + " hold tracked symlinks (git missing, or not a git checkout) — a link whose "
-            "target is absent here is INVISIBLE to the path checks, so this is unverified, "
-            "not clean; run the gate inside the git checkout"
+            + " hold tracked symlinks or submodules (git missing, or not a git checkout) — a "
+            "link whose target is absent here, and a submodule CI checks out empty, are both "
+            "INVISIBLE to the path checks, so this is unverified, not clean; run the gate "
+            "inside the git checkout"
         ]
-    return [_tracked_symlink_problem(link) for link in links], []
+    return [_tracked_link_problem(mode, link) for mode, link in links], []
 
 
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
@@ -905,6 +1076,19 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
             f"no persona wrappers found directly under {agents_dir!r} "
             f"(expected {agents_dir!r}/*.md with a front-matter `name:`)"
         )
+        # A link one level UP is the quietest way for this raise to be misleading: the
+        # directory itself looks ordinary, `os.walk` yields nothing (a dangling parent has no
+        # children), and the operator is told the roster is empty with no hint that what they
+        # are looking at is a link resolving somewhere else — or nowhere at all in a
+        # checkout-only CI job (LAST-CERT F6). Named here because the git-mode query that
+        # would otherwise name it lives in a check this raise pre-empts.
+        parent = os.path.dirname(os.path.abspath(agents_dir))
+        if parent and os.path.islink(parent):
+            message += (
+                f"; its parent {parent!r} is a SYMLINK, so the roster this gate could reach "
+                f"depends on where that link resolves on this machine — replace the link "
+                f"with real directories"
+            )
         if nested:
             # Only NESTING explains "the directory looks empty" — naming those wrappers turns
             # it into "your wrappers are one level too deep", which is the actual fix. Other
@@ -1628,7 +1812,7 @@ def validate_startup_config(
                 f"missing or not a git checkout) — NOT verified; re-run inside the git checkout"
             )
         elif tracked:
-            problems.append(_tracked_symlink_problem(mcp_path))
+            problems.append(_tracked_link_problem("120000", mcp_path))
         else:
             notes.append(
                 f"{mcp_path} present locally as an untracked symlink — not policed (only a "
@@ -1886,8 +2070,13 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
     problems, commands, skills = scan_command_skill_frontmatter(commands_dir, skills_dir)
     # Ask GIT as well as the filesystem: a tracked link under either tree whose target is
     # absent in this checkout is invisible to the walk above (FINAL-CERT F1).
-    link_problems, link_unverified = tracked_symlink_problems([commands_dir, skills_dir])
-    problems = problems + link_problems
+    link_problems, link_unverified = tracked_symlink_problems(
+        link_query_paths(commands_dir, skills_dir)
+    )
+    # Git's verdict first (it names the index mode and is decisive), then the walk's — one
+    # link reported by both questions is ONE finding, so the spellings are compared as
+    # top-level-relative paths rather than as message strings (LAST-CERT F4).
+    problems = _dedupe_link_problems(link_problems, problems)
     # The repo TRACKS .claude/skills, so a vanished or empty skills tree is drift, not "0
     # scanned, pass": a directory rename (this PR itself moved .github/skills there) must
     # redden the gate rather than silently reduce coverage to nothing. .claude/commands
@@ -1942,14 +2131,17 @@ def startup_config_result(
     # they live in (`.claude/`) is link-checked directly — if it is the link, git records one
     # 120000 entry for the directory and none for the files inside it.
     link_problems, link_unverified = tracked_symlink_problems(
-        [mcp_path, settings_local_path, settings_path]
+        link_query_paths(mcp_path, settings_local_path, settings_path)
     )
     settings_dir = os.path.dirname(settings_path)
     if settings_dir and os.path.islink(settings_dir):
         link_problems = link_problems + [_symlink_problem("settings", settings_dir)]
     # De-duplicated: a tracked link at `.mcp.json` is seen both by the per-file tracking
-    # question above and by this git-mode query, and one finding must read as one line.
-    problems = problems + [p for p in link_problems if p not in problems]
+    # question above and by this git-mode query, and one finding must read as one line —
+    # even when the caller spells `--mcp-config` absolutely and git answers repo-root
+    # relative, which string comparison could not match (LAST-CERT F4). Git's verdict is
+    # listed first so the surviving line is the one naming the index mode.
+    problems = _dedupe_link_problems(link_problems, problems)
     unverified = unverified + link_unverified
     if problems:
         return Result("tracked-startup-config", "fail", problems, notes=notes)
@@ -1989,8 +2181,10 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     problems, allowed = reconcile_roster_labels(roster, documented_labels, taxonomy_text)
     # A tracked symlink under the agents tree is roster integrity too: git sees the link
     # (mode 120000) whether or not it resolves in this checkout (FINAL-CERT F1).
-    link_problems, link_unverified = tracked_symlink_problems([args.agents_dir])
-    problems = integrity + link_problems + problems
+    link_problems, link_unverified = tracked_symlink_problems(
+        link_query_paths(args.agents_dir)
+    )
+    problems = _dedupe_link_problems(link_problems, integrity, problems)
     detail = [
         f"{len(roster)} roster slug(s), {len(documented_labels)} documented persona "
         f"label(s) in {os.path.basename(args.taxonomy)}",
@@ -3450,15 +3644,23 @@ def _selftest() -> int:
         _clean_result = command_skill_result(_commands, _skills_ok)
         _wrapper(_commands, "dirty.md", "---\nallowed-tools: Bash(extdiff:*)\n---\n")
         _dirty_result = command_skill_result(_commands, _skills_ok)
+        # The status is pinned to WHICH environment this fixture landed in, rather than
+        # accepting either answer: "pass or skip" would be satisfied by a gate that skipped
+        # everywhere (the fail-open mutant) and by one that passed everywhere (the
+        # fail-closed-check-removed mutant) alike (LAST-CERT F3).
+        _in_checkout = _tracked_links([_commands]) is not None
         check(
             _clean_result.name == "command-skill-frontmatter"
-            and _clean_result.status != "fail"
             and (
                 _clean_result.status == "pass"
-                or any("git could not say" in line for line in _clean_result.lines)
+                if _in_checkout
+                else (
+                    _clean_result.status == "skip"
+                    and any("git could not say" in line for line in _clean_result.lines)
+                )
             ),
-            "command-skill-frontmatter check does not fail a clean commands/skills tree "
-            "(SKIP outside a git checkout, where tracked links cannot be ruled out)",
+            "a clean commands/skills tree PASSES inside a git checkout and SKIPs outside one "
+            "(where tracked links and submodules cannot be ruled out)",
         )
         check(
             _dirty_result.status == "fail"
@@ -3637,6 +3839,33 @@ def _selftest() -> int:
             subprocess.run(["git", "add", "-f", "--", *track], **quiet)
         return True
 
+    def _git_run(directory: str, *argv: str) -> bool:
+        """Run one git command in `directory`; True on success (never raises).
+
+        Identity is supplied inline so a machine with no `user.email` can still COMMIT (the
+        submodule fixtures below need real commits, not just a staged index), and
+        `protocol.file.allow=always` because git 2.38+ refuses `file://` submodules by
+        default — without it the gitlink fixture would silently build nothing and assert
+        nothing.
+        """
+        if shutil.which("git") is None:
+            return False
+        try:
+            proc = subprocess.run(
+                [
+                    "git",
+                    "-c", "protocol.file.allow=always",
+                    "-c", "user.email=selftest@example.invalid",
+                    "-c", "user.name=selftest",
+                    "-c", "commit.gpgsign=false",
+                    *argv,
+                ],
+                cwd=directory, capture_output=True, text=True, timeout=180,
+            )
+        except (OSError, subprocess.TimeoutExpired):  # pragma: no cover - environment
+            return False
+        return proc.returncode == 0
+
     _mcp_evil = '{"mcpServers": {"x": {"command": "true"}}}'
     with tempfile.TemporaryDirectory() as tmp:
         if not _git_repo(tmp, {".mcp.json": _mcp_evil}, [".mcp.json"]):
@@ -3771,10 +4000,10 @@ def _selftest() -> int:
                 # os.walk cannot classify a dangling link as a directory, so the walk's
                 # "0 problems, 1 manifest scanned" was the whole finding.
                 check(
-                    _tracked_symlinks([_skills]) == [
-                        os.path.join(".claude", "skills", "linked")
+                    _tracked_links([_skills]) == [
+                        ("120000", os.path.join(".claude", "skills", "linked"))
                     ],
-                    "_tracked_symlinks reports a tracked DANGLING dir-link by git mode 120000",
+                    "_tracked_links reports a tracked DANGLING dir-link by git mode 120000",
                 )
                 _res = command_skill_result(_commands, _skills)
                 check(
@@ -3782,14 +4011,19 @@ def _selftest() -> int:
                     and any(
                         "tracked symlink (git mode 120000)" in line and "linked" in line
                         for line in _res.lines
-                    ),
-                    "a tracked dangling dir-link under .claude/skills FAILS, naming the link",
+                    )
+                    # ONE line for one link: the walk lists a dangling link among `filenames`
+                    # and reports its own "is a symlink" message under the ABSOLUTE fixture
+                    # path, while git answers repo-root-relative — different strings, same
+                    # link (LAST-CERT F4). Killing mutant: dropping the dedupe here.
+                    and sum("linked" in line for line in _res.lines) == 1,
+                    "a tracked dangling dir-link under .claude/skills FAILS ONCE, naming the link",
                 )
                 # ... and a link that DOES resolve is still caught by the same query, so the
                 # rule does not depend on the target's absence either way.
                 check(
-                    _tracked_symlinks([os.path.join(tmp, ".claude")]) != []
-                    and _tracked_symlinks([os.path.join(tmp, "nothing-here")]) == [],
+                    _tracked_links([os.path.join(tmp, ".claude")]) != []
+                    and _tracked_links([os.path.join(tmp, "nothing-here")]) == [],
                     "the git query is scoped to its pathspec (a clean subtree reports none)",
                 )
     with tempfile.TemporaryDirectory() as tmp:
@@ -3837,10 +4071,16 @@ def _selftest() -> int:
                     _res.status == "fail"
                     and any("tracked symlink (git mode 120000)" in x for x in _res.lines)
                     and any(".mcp.json" in x for x in _res.lines)
-                    # One finding, one line: the link is seen by both the tracking question
-                    # and the git-mode query, and a doubled annotation reads as two defects.
+                    # One finding, one LINE. The link is seen twice — by the per-file
+                    # tracking question (which quotes the ABSOLUTE `--mcp-config` spelling
+                    # this fixture passes) and by the git-mode query (which answers
+                    # repo-root-relative `.mcp.json`) — so the two messages are distinct
+                    # STRINGS and only a path-normalising dedupe collapses them. Counting the
+                    # mode marker, not the set size, is what kills the no-dedupe mutant
+                    # (LAST-CERT F4).
+                    and sum("120000" in x for x in _res.lines) == 1
                     and len(_res.lines) == len(set(_res.lines)),
-                    "a tracked dangling .mcp.json link FAILS once, naming the link",
+                    "a tracked dangling .mcp.json link FAILS ONCE, naming the link (deduped)",
                 )
     with tempfile.TemporaryDirectory() as tmp:
         # A dangling `.claude/settings.local.json` link — same shape, same verdict.
@@ -3947,9 +4187,305 @@ def _selftest() -> int:
                         _exit == 1
                         and "[FAIL] roster<->documented-labels" in _output
                         and "tracked symlink (git mode 120000)" in _output
-                        and os.path.join(".claude", "agents", "obj-link.md") in _output,
-                        "the roster check asks git about tracked symlinks under the agents tree",
+                        and os.path.join(".claude", "agents", "obj-link.md") in _output
+                        # One link, one annotation: the roster WALK also meets this link and
+                        # reports its own "is a symlink" under the absolute fixture path.
+                        # Two lines print per problem (the summary bullet and the ::error::
+                        # annotation), so the deduped report holds exactly two link lines for
+                        # this path. Killing mutant: dropping the dedupe in the roster check.
+                        and sum(
+                            "obj-link.md" in line and "symlink" in line
+                            for line in _output.splitlines()
+                        ) == 2,
+                        "the roster check asks git about tracked symlinks under the agents "
+                        "tree, and reports the link ONCE",
                     )
+
+    # --- LAST-CERT F1: a tracked GITLINK (submodule, git mode 160000). The CI job checks
+    # out with plain `actions/checkout` (no `submodules: recursive`), so the submodule
+    # directory is EMPTY there: the walk counts zero files, every front-matter question has
+    # nothing to answer about, and the gate goes green — while `git submodule update --init`
+    # on any developer machine populates it with a SKILL.md carrying `allowed-tools:` that
+    # the CLI loads. Git records mode 160000 in the index either way, which is the only
+    # place the surface is visible. The fixture builds the three shapes that mattered: a
+    # submodule UNDER .claude/skills, one AT .claude/commands, and one under .claude/agents,
+    # then clones WITHOUT --recurse-submodules to reproduce exactly what CI sees.
+    # Killing mutant: filtering the ls-files output back to mode 120000 only.
+    with tempfile.TemporaryDirectory() as tmp:
+        _inner = os.path.join(tmp, "inner")
+        _outer = os.path.join(tmp, "outer")
+        _clone = os.path.join(tmp, "clone")
+        os.makedirs(_inner, exist_ok=True)
+        os.makedirs(_outer, exist_ok=True)
+        _sub_skill = os.path.join(".claude", "skills", "evil")
+        _sub_commands = os.path.join(".claude", "commands")
+        _sub_agent = os.path.join(".claude", "agents", "evil-sub")
+        _built = (
+            _git_repo(_inner, {"SKILL.md": "---\nname: evil\nallowed-tools: Bash(rm:*)\n---\n"}, ["SKILL.md"])
+            and _git_run(_inner, "commit", "-qm", "inner")
+            and _git_repo(
+                _outer,
+                {
+                    os.path.join(".claude", "agents", "product-manager.md"): "---\nname: product-manager\n---\n",
+                    os.path.join(".claude", "skills", "real", "SKILL.md"): "---\nname: real\ndescription: d\n---\n",
+                },
+                [".claude"],
+            )
+            and _git_run(_outer, "commit", "-qm", "outer")
+            and _git_run(_outer, "submodule", "add", "-q", _inner, _sub_skill)
+            and _git_run(_outer, "submodule", "add", "-q", _inner, _sub_commands)
+            and _git_run(_outer, "submodule", "add", "-q", _inner, _sub_agent)
+            and _git_run(_outer, "commit", "-qm", "submodules")
+            and _git_run(tmp, "clone", "-q", _outer, _clone)
+        )
+        if not _built:
+            _log("  skip - git submodule fixtures unavailable: gitlink checks not run")
+        else:
+            _clone_skills = os.path.join(_clone, ".claude", "skills")
+            _clone_commands = os.path.join(_clone, ".claude", "commands")
+            # The premise, asserted rather than assumed: a non-recursive clone leaves the
+            # submodule directories EMPTY, which is why every filesystem question passes.
+            check(
+                os.listdir(_clone_commands) == []
+                and os.listdir(os.path.join(_clone_skills, "evil")) == [],
+                "a non-recursive clone leaves the submodule directories empty (what CI sees)",
+            )
+            _res = command_skill_result(_clone_commands, _clone_skills)
+            _gitlinks = [line for line in _res.lines if "git mode 160000" in line]
+            check(
+                _res.status == "fail"
+                and any(repr(_sub_skill) in line for line in _gitlinks)
+                and any(repr(_sub_commands) in line for line in _gitlinks)
+                and all("vendor the files instead" in line for line in _gitlinks),
+                "tracked submodules AT .claude/commands and UNDER .claude/skills FAIL, named "
+                "by git mode 160000",
+            )
+            if os.path.exists(DEFAULT_TAXONOMY):
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(
+                        [
+                            "--offline",
+                            "--repo",
+                            DEFAULT_REPO,
+                            "--agents-dir",
+                            os.path.join(_clone, ".claude", "agents"),
+                        ]
+                    )
+                _output = _buffer.getvalue()
+                check(
+                    _exit == 1
+                    and "[FAIL] roster<->documented-labels" in _output
+                    and "git mode 160000" in _output
+                    and _sub_agent in _output,
+                    "a tracked submodule under .claude/agents FAILS the roster check by name",
+                )
+
+    # --- LAST-CERT F2: the `.claude` ROOT pathspec. The prose in CLAUDE.md, the security
+    # checklist, the taxonomy and the workflow all promise that ANY tracked link under
+    # `.claude/` fails — but the checks only ever asked git about `.claude/{agents,commands,
+    # skills}` and three named files. Everything else the CLI reads out of that directory
+    # (`hooks/`, `output-styles/`, a future subdirectory) was unpoliced, and so was `.claude`
+    # ITSELF: a pathspec spelled THROUGH a symlinked directory matches nothing in the index,
+    # because the index holds the link, not the files "inside" it. Every local check now adds
+    # the root pathspec (:func:`link_query_paths`).
+    # Killing mutant: dropping `claude_root_pathspec` from `link_query_paths`.
+    for _unpoliced, _label in (
+        (os.path.join(".claude", "hooks"), "a tracked `.claude/hooks` link"),
+        (os.path.join(".claude", "output-styles", "x.md"), "a tracked `.claude/output-styles/x.md` link"),
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            if not _git_repo(tmp, {os.path.join(".claude", "keep"): "x\n"}, []):
+                _log("  skip - git unavailable: .claude root pathspec fixtures not run")
+                break
+            _link = os.path.join(tmp, _unpoliced)
+            os.makedirs(os.path.dirname(_link), exist_ok=True)
+            if not _dangling(_link, "../../obj/whatever"):
+                _log("  skip - symlink fixtures unavailable on this platform")
+                break
+            subprocess.run(
+                ["git", "add", "-f", "--", _link],
+                cwd=tmp, capture_output=True, text=True, timeout=60,
+            )
+            _res = startup_config_result(
+                os.path.join(tmp, ".mcp.json"),
+                os.path.join(tmp, ".claude", "settings.local.json"),
+                os.path.join(tmp, ".claude", "settings.json"),
+            )
+            check(
+                _res.status == "fail"
+                and any(repr(_unpoliced) in line and "120000" in line for line in _res.lines),
+                f"{_label} FAILS tracked-startup-config, naming the link",
+            )
+            # ...and the OTHER two local checks carry the same root pathspec, so a link in a
+            # part of `.claude/` none of them owns is named wherever the reader looks.
+            _cs = command_skill_result(
+                os.path.join(tmp, ".claude", "commands"), os.path.join(tmp, ".claude", "skills")
+            )
+            _roster_links, _ = tracked_symlink_problems(
+                link_query_paths(os.path.join(tmp, ".claude", "agents"))
+            )
+            check(
+                _cs.status == "fail"
+                and any(repr(_unpoliced) in line for line in _cs.lines)
+                and any(repr(_unpoliced) in line for line in _roster_links),
+                f"{_label} is also named by the command/skill and roster link queries",
+            )
+    for _target, _shape in (("real-claude", "resolving"), ("nowhere-after-checkout", "dangling")):
+        with tempfile.TemporaryDirectory() as tmp:
+            # `.claude` ITSELF as a tracked link. Git records ONE entry — `.claude`, mode
+            # 120000 — and nothing beneath it, so only the root pathspec can see this at all.
+            if not _git_repo(tmp, {os.path.join("real-claude", "settings.json"): "{}\n"}, []):
+                break
+            _root = os.path.join(tmp, ".claude")
+            try:
+                os.symlink(_target, _root)
+            except (OSError, NotImplementedError, AttributeError):
+                break
+            subprocess.run(
+                ["git", "add", "-f", "--", _root],
+                cwd=tmp, capture_output=True, text=True, timeout=60,
+            )
+            _res = startup_config_result(
+                os.path.join(tmp, ".mcp.json"),
+                os.path.join(tmp, ".claude", "settings.local.json"),
+                os.path.join(tmp, ".claude", "settings.json"),
+            )
+            check(
+                _res.status == "fail"
+                and any(line.startswith(repr(".claude") + " is a tracked symlink") for line in _res.lines)
+                # One link, one line: git's verdict AND the islink() walk both see this root,
+                # and the two spellings only collapse once they are normalised (LAST-CERT F4).
+                and sum("120000" in line for line in _res.lines) == 1,
+                f"`.claude` itself as a tracked link ({_shape}) FAILS once, named as `.claude`",
+            )
+            # LAST-CERT F6: `read_roster` raises BEFORE any git query runs, so the raise is
+            # the only message an operator sees here — it must not read as "your roster is
+            # empty" when the truth is "its parent is a link".
+            try:
+                read_roster(os.path.join(tmp, ".claude", "agents"))
+                _raised = ""
+            except FileNotFoundError as exc:
+                _raised = str(exc)
+            check(
+                "no persona wrappers found" in _raised
+                and "is a SYMLINK" in _raised
+                and _root in _raised,
+                f"an empty roster under a symlinked `.claude` ({_shape}) names the parent link",
+            )
+
+    # --- LAST-CERT F3: FAIL-CLOSED. "git could not answer" must reach the operator as SKIP,
+    # never as a pass — the half of the contract that was asserted for the TRACKING question
+    # but never for the LINK question. These are unit-level (independent of the directory the
+    # selftest happens to run from) plus one end-to-end EXPORT fixture: a `git archive` tree
+    # with no `.git` at all, which is what a release tarball or a vendored copy looks like.
+    # Killing mutants: `returncode != 0 -> return []`; `which("git") is None -> []`; an
+    # `or []` at the call sites; treating unverified as pass in the cmd/skill or roster check.
+    with tempfile.TemporaryDirectory() as tmp:
+        if _git_toplevel(tmp) is not None:  # pragma: no cover - TMPDIR inside a checkout
+            _log("  skip - the temp directory is inside a git checkout: fail-closed unit tests")
+        else:
+            _outside = os.path.join(tmp, "skills")
+            check(
+                _tracked_links([_outside]) is None,
+                "_tracked_links returns None (not []) when git cannot answer outside a checkout",
+            )
+            _problems, _unverified = tracked_symlink_problems([_outside])
+            check(
+                _problems == []
+                and len(_unverified) == 1
+                and "git could not say" in _unverified[0]
+                and "submodules" in _unverified[0],
+                "tracked_symlink_problems reports UNVERIFIED, never clean, when git cannot answer",
+            )
+    _saved_which = shutil.which
+    try:
+        shutil.which = lambda *_a, **_k: None
+        check(
+            _tracked_links([os.path.join(os.getcwd(), ".claude")]) is None,
+            "_tracked_links returns None when git is not on PATH (no silent 'no links')",
+        )
+    finally:
+        shutil.which = _saved_which
+    if (
+        os.path.isdir(DEFAULT_AGENTS_DIR)
+        and os.path.isdir(DEFAULT_SKILLS_DIR)
+        and os.path.exists(DEFAULT_SETTINGS)
+        and os.path.exists(DEFAULT_TAXONOMY)
+    ):
+        with tempfile.TemporaryDirectory() as tmp:
+            _src = os.path.join(tmp, "src")
+            _export = os.path.join(tmp, "export")
+            _tar = os.path.join(tmp, "export.tar")
+            os.makedirs(os.path.join(_src, ".claude"), exist_ok=True)
+            os.makedirs(_export, exist_ok=True)
+            shutil.copytree(DEFAULT_AGENTS_DIR, os.path.join(_src, ".claude", "agents"))
+            shutil.copytree(DEFAULT_SKILLS_DIR, os.path.join(_src, ".claude", "skills"))
+            shutil.copyfile(DEFAULT_SETTINGS, os.path.join(_src, ".claude", "settings.json"))
+            _exported = (
+                _git_repo(_src, {}, [".claude"])
+                and _git_run(_src, "commit", "-qm", "export")
+                and _git_run(_src, "archive", "--format=tar", "-o", _tar, "HEAD")
+            )
+            if _exported:
+                try:
+                    with tarfile.open(_tar) as _handle:
+                        _handle.extractall(_export)
+                except (tarfile.TarError, OSError):  # pragma: no cover - environment
+                    _exported = False
+            if not _exported:
+                _log("  skip - git archive unavailable: export (non-checkout) fixtures not run")
+            else:
+                _export_args = [
+                    "--offline",
+                    "--repo",
+                    DEFAULT_REPO,
+                    "--agents-dir", os.path.join(_export, ".claude", "agents"),
+                    "--skills-dir", os.path.join(_export, ".claude", "skills"),
+                    "--commands-dir", os.path.join(_export, ".claude", "commands"),
+                    "--settings", os.path.join(_export, ".claude", "settings.json"),
+                    "--mcp-config", os.path.join(_export, ".mcp.json"),
+                ]
+                _res = command_skill_result(
+                    os.path.join(_export, ".claude", "commands"),
+                    os.path.join(_export, ".claude", "skills"),
+                )
+                check(
+                    _res.status == "skip"
+                    and any("git could not say" in line for line in _res.lines),
+                    "command-skill-frontmatter SKIPs in an export (no .git to ask), never passes",
+                )
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(list(_export_args))
+                _output = _buffer.getvalue()
+                check(
+                    _exit == 0
+                    and "[SKIP] roster<->documented-labels" in _output
+                    and "[SKIP] command-skill-frontmatter" in _output
+                    and "[SKIP] tracked-startup-config" in _output
+                    and "[FAIL]" not in _output,
+                    "an export SKIPs all three link-asking local checks (content still read)",
+                )
+                # LAST-CERT F5: the success line must not claim the surfaces a SKIPPED check
+                # owns are "in step" — that sentence is the one line a passer-by reads.
+                # Killing mutant: restoring the unconditional "are in step" sentence.
+                check(
+                    "reconciliation passed on the checks that ran" in _output
+                    and "check(s) skipped (see warnings above)" in _output
+                    and "are in step" not in _output,
+                    "a run with skips reports a QUALIFIED success line, not 'are in step'",
+                )
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(list(_export_args) + ["--require-remote"])
+                _output = _buffer.getvalue()
+                check(
+                    _exit == 2
+                    and "local check(s) could not verify their input" in _output
+                    and "required remote check(s) were unavailable" not in _output,
+                    "an export under --require-remote exits 2 with the LOCAL environment message",
+                )
 
     # --- FINAL-CERT F2: the SKIP partition. A local check that could not verify its input
     # exits 2 with the LOCAL message — never the remote-outage one, which would send a
@@ -4297,6 +4833,17 @@ def main(argv: "list[str] | None" = None) -> int:
             f"{len(local_skipped)} local check(s) could not verify their input: "
             + "; ".join(r.name for r in local_skipped)
         )
+    if local_skipped or remote_skipped:
+        # The full "are in step" sentence claims every surface was reconciled. When a check
+        # SKIPPED, that claim is false for the surface it owns, and the success line is the
+        # one line a passer-by reads (the warnings scroll past above it). Say exactly what
+        # was established instead (LAST-CERT F5).
+        _log(
+            f"reconciliation passed on the checks that ran; "
+            f"{len(local_skipped) + len(remote_skipped)} check(s) skipped "
+            f"(see warnings above)"
+        )
+        return 0
     _log(
         "reconciliation PASSED: roster, labels, CODEOWNERS, milestones, the settings "
         "permission surface, the command/skill front matter, and the tracked startup "

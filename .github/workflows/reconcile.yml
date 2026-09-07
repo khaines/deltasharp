@@ -49,14 +49,20 @@ name: Reconcile
 #                          is read by the same STRICT reader, so an unparseable fence fails
 #                          rather than being skipped; .claude/commands is optional but a
 #                          skills tree with zero manifests FAILS, and the passing report
-#                          states how many files were scanned. SYMLINKS are rejected and the
-#                          rule is decided BY GIT: any tracked symlink under .claude/ (or at
-#                          .mcp.json / settings.local.json / settings.json) fails on its index
-#                          mode 120000, so a DANGLING link cannot hide — one pointing at bin/
-#                          or obj/ is absent in this checkout-only job yet resolves to real
-#                          config wherever the target exists. The walks also report any link
-#                          they see (roots included, whatever the file is named); links are
-#                          never followed, so a link loop cannot hang the gate.
+#                          states how many files were scanned. LINKS are rejected and the
+#                          rule is decided BY GIT: any tracked symlink OR submodule (git mode
+#                          120000/160000) anywhere under .claude/ — including .claude itself —
+#                          or at .mcp.json / settings.local.json / settings.json fails on its
+#                          index mode, so neither shape can hide. A DANGLING link (one
+#                          pointing at bin/ or obj/) is absent in this checkout-only job yet
+#                          resolves to real config wherever the target exists, and a SUBMODULE
+#                          is checked out EMPTY here (this job does not init submodules, by
+#                          design) while `git submodule update --init` loads whatever it holds
+#                          on a developer machine. The .claude-wide query lives in
+#                          tracked-startup-config; this check asks it too, and its walks also
+#                          report any link they meet (roots included, whatever the file is
+#                          named); links are never followed, so a link loop cannot hang the
+#                          gate.
 #   * tracked-startup-config (also a VALIDATION) — the two startup surfaces
 #                          settings-permissions never opens: a repo-root `.mcp.json` (each
 #                          `mcpServers[*].command` is SPAWNED when the CLI launches, with no
@@ -66,9 +72,18 @@ name: Reconcile
 #                          TRACKED file fails (`git ls-files --error-unmatch`), so an
 #                          untracked local copy is reported, not failed; a tracked malformed
 #                          .mcp.json fails, an empty `mcpServers` passes, and a tracked
-#                          SYMLINK at either path (or at .claude/settings.json) fails on its
-#                          git mode 120000 even when it dangles here. If git cannot say,
-#                          the check reports SKIP and --require-remote makes that exit 2.
+#                          SYMLINK or SUBMODULE at either path (or at .claude/settings.json)
+#                          fails on its git mode (120000/160000) even when it dangles or is
+#                          checked out empty here. This check also carries the .claude-ROOT
+#                          pathspec, which is the only query that can see .claude ITSELF as a
+#                          link and any subtree no other check owns (hooks/, output-styles/):
+#                          a pathspec spelled THROUGH a symlinked directory matches nothing,
+#                          because the index holds the link, not the files "inside" it. One
+#                          link reported by more than one question is annotated ONCE per
+#                          check (paths are compared repo-root-relative). If git cannot say,
+#                          the check reports SKIP and --require-remote makes that exit 2 —
+#                          and a run with any SKIP ends on a qualified success line, never
+#                          the unqualified "are in step" claim.
 #
 # It runs on PRs and pushes that touch the governance files (drift introduced by a code
 # change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
@@ -79,11 +94,13 @@ on:
   push:
     branches: [main]
     paths:
-      - ".claude/agents/**"
-      - ".claude/commands/**"
-      - ".claude/skills/**"
-      - ".claude/settings.json"
-      - ".claude/settings.local.json"
+      # The WHOLE .claude tree, not just the three subtrees the checks walk: the gate now
+      # fails any tracked link/submodule anywhere under it (.claude/hooks, output-styles/),
+      # and a filter that never fires cannot enforce that. `.claude` is listed on its own
+      # line because `.claude/**` does NOT match the path `.claude` — which is exactly the
+      # path a commit turning the directory itself into a symlink or submodule touches.
+      - ".claude"
+      - ".claude/**"
       - ".mcp.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
@@ -93,11 +110,13 @@ on:
   pull_request:
     branches: [main]
     paths:
-      - ".claude/agents/**"
-      - ".claude/commands/**"
-      - ".claude/skills/**"
-      - ".claude/settings.json"
-      - ".claude/settings.local.json"
+      # The WHOLE .claude tree, not just the three subtrees the checks walk: the gate now
+      # fails any tracked link/submodule anywhere under it (.claude/hooks, output-styles/),
+      # and a filter that never fires cannot enforce that. `.claude` is listed on its own
+      # line because `.claude/**` does NOT match the path `.claude` — which is exactly the
+      # path a commit turning the directory itself into a symlink or submodule touches.
+      - ".claude"
+      - ".claude/**"
       - ".mcp.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
