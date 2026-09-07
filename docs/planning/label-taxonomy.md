@@ -166,8 +166,8 @@ labels, `CODEOWNERS`, and the milestone dropdown cannot silently drift apart
 (STORY-00.6.2, #452). The gate is the stdlib-only script
 [`tools/reconcile/roster-labels.py`](../../tools/reconcile/roster-labels.py), run by
 the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when any
-of three reconciliations or the two local validations (`settings-permissions`,
-`command-skill-frontmatter`) breaks:
+of three reconciliations or the three local validations (`settings-permissions`,
+`command-skill-frontmatter`, `tracked-startup-config`) breaks:
 
 1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
    matching `persona:<slug>` label and vice-versa. `.claude/agents/` holds persona
@@ -233,11 +233,33 @@ of three reconciliations or the two local validations (`settings-permissions`,
    by name, plus any key outside `description`/`argument-hint`/`model` (skills may
    also carry `name`). `.claude/commands/` is optional; `.claude/skills/` is not — a
    skills tree that yields zero manifests fails the check, and the passing report
-   states how many files were scanned.
+   states how many files were scanned. Both walks — and the roster walk in 1 — also
+   report **symlinks**: links are deliberately not followed (a loop would hang the
+   gate), but Claude Code does follow them, so a symlinked directory or file under
+   `.claude/agents/`, `.claude/commands/`, or `.claude/skills/` ships configuration
+   the walk never opened; the link itself is an integrity problem naming the link.
+6. **`tracked-startup-config`** (also a validation). Two startup surfaces the
+   settings policy never opens. A repo-root **`.mcp.json`** has every
+   `mcpServers[*].command` *spawned when the CLI launches* — before any tool call,
+   with no permission prompt — so a tracked one is code execution on `git checkout`,
+   in the same class as `hooks`/`apiKeyHelper`; a tracked `.mcp.json` with a
+   non-empty `mcpServers` fails (an empty mapping passes; malformed JSON fails,
+   because a startup config the gate cannot read is not evidence that nothing
+   starts). **`.claude/settings.local.json`** is honoured exactly like
+   `settings.json` and is where every remedy message in this gate sends a
+   per-machine grant — advice that only holds while the file is untracked, so a
+   *tracked* one fails. Only tracked files fail: tracking is decided with
+   `git ls-files --error-unmatch`, so a developer's untracked local copy is reported
+   in the detail line rather than reddening their run, while in CI — where the
+   checkout holds tracked files only — a committed one is caught. If git cannot
+   answer (no `git`, not a checkout) the check reports **skip** with the reason, and
+   `--require-remote` turns that into exit 2 rather than a silent pass. Override the
+   path with `--mcp-config`.
 
 **When it runs.** On pull requests and pushes to `main` that touch the governance
 files (roster, `.claude/commands/`, `.claude/skills/`, `CODEOWNERS`, the feature
-form, `.claude/settings.json`, this document, the script, or the workflow), on a
+form, `.claude/settings.json`, `.claude/settings.local.json`, `.mcp.json`, this
+document, the script, or the workflow), on a
 weekly schedule, and on demand — the schedule catches drift introduced
 GitHub-side (a label or milestone renamed in the UI), which no file change would
 otherwise trigger. It uses a least-privilege read-only token

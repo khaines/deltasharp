@@ -4,9 +4,10 @@
 PR #449 established `docs/planning/label-taxonomy.md` with a *manual* reconciliation
 of the persona roster, the `persona:<slug>` GitHub labels, `CODEOWNERS`, and the
 feature-request milestone dropdown. This script turns that manual snapshot into a
-lightweight, re-runnable gate so the three reconciliations below — plus two local validations
-of the `.claude/settings.json` permission surface and of the `.claude/commands` /
-`.claude/skills` front matter — fail CI instead of silently rotting:
+lightweight, re-runnable gate so the three reconciliations below — plus three local validations
+of the `.claude/settings.json` permission surface, of the `.claude/commands` /
+`.claude/skills` front matter, and of the TRACKED startup configuration (`.mcp.json`,
+`.claude/settings.local.json`) — fail CI instead of silently rotting:
 
   1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper (a markdown file
      whose front matter carries a `name:`; fence-less markdown there is ignored) must have a
@@ -77,6 +78,25 @@ fence is a problem, not a skip) and held to the same allowlist discipline: the k
 :data:`ALLOWED_COMMAND_KEYS` (commands) / :data:`ALLOWED_SKILL_KEYS` (skills) is rejected on
 sight. Both directories are OPTIONAL — a missing one reports 0 files scanned rather than
 passing silently — and the paths are overridable with `--commands-dir` / `--skills-dir`.
+Both walks REPORT symlinks (CERT-F1): `followlinks=False` keeps a link loop from hanging the
+gate, but Claude Code follows a symlinked `.claude/{agents,commands,skills}/<x>` and loads
+configuration the walk never opened, so the link itself is an integrity problem naming the
+link — otherwise the gate's "N files scanned" claim covers files it never read.
+
+The third local validation is `tracked-startup-config`
+(:func:`validate_startup_config`), which covers the two startup surfaces the settings policy
+never opens: a repo-root `.mcp.json` (every `mcpServers[*].command` is SPAWNED when the CLI
+launches, with no prompt — remote code execution on `git checkout`, ranked with `hooks` and
+`apiKeyHelper`) and `.claude/settings.local.json` (honoured exactly like `settings.json`,
+and the place every remedy message here sends per-machine grants — advice that holds only
+while it is untracked). Only a TRACKED file FAILS: tracking is decided with
+`git ls-files --error-unmatch` (argv form, run in the checkout), so an untracked local copy
+is reported in the detail line rather than reddening a developer's run, while in CI — where
+the checkout holds tracked files only — a committed one is caught. A tracked but MALFORMED
+`.mcp.json` fails (an unreadable startup config is not evidence that nothing starts); an
+empty `mcpServers` mapping passes. When git cannot answer (no git, not a checkout) the check
+reports SKIP with the reason and `--require-remote` turns that into exit 2, so "could not
+verify" never reads as "verified clean". Override the path with `--mcp-config`.
 
 Design constraints
 ------------------
@@ -84,7 +104,9 @@ Design constraints
   installs nothing. The milestone dropdown is parsed with a small, targeted reader for the
   GitHub issue-form structure (see `parse_milestone_options`).
 * **Degrades gracefully off-network.** The roster read, the dropdown parse, and the roster ↔
-  *documented*-labels reconciliation are local (filesystem) and always run. The LIVE
+  *documented*-labels reconciliation are local (filesystem) and always run. So is
+  `tracked-startup-config`, whose one subprocess is `git ls-files` in the checkout — local,
+  not a network call, and reported as an explicit SKIP (never a pass) if git cannot answer. The LIVE
   GitHub-API lookups (labels, milestones, codeowners/errors) shell out to `gh`; if `gh` is
   missing or unauthenticated they are SKIPPED with a warning so local dev works without a
   token. Pass `--require-remote` (CI does) to turn a remote check that could not RUN into a
@@ -144,6 +166,13 @@ DEFAULT_AGENTS_DIR = os.path.join(".claude", "agents")
 DEFAULT_COMMANDS_DIR = os.path.join(".claude", "commands")
 DEFAULT_SKILLS_DIR = os.path.join(".claude", "skills")
 DEFAULT_SETTINGS = os.path.join(".claude", "settings.json")
+# Two startup surfaces the CLI reads that live OUTSIDE `.claude/settings.json` (CERT-F2/F3):
+# `.mcp.json` at the repo root (its `mcpServers[*].command` is spawned when the CLI launches,
+# with no prompt) and `.claude/settings.local.json` (honoured exactly like settings.json but
+# meant to be per-machine and gitignored — every remedy message in this gate points grants
+# there, which only holds while the file is untracked).
+DEFAULT_MCP_CONFIG = ".mcp.json"
+SETTINGS_LOCAL_NAME = "settings.local.json"
 DEFAULT_FEATURE_FORM = os.path.join(".github", "ISSUE_TEMPLATE", "feature_request.yml")
 DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
 
@@ -592,6 +621,43 @@ def validate_agent_frontmatter(path: str, frontmatter: "dict[str, str]") -> "lis
 INTEGRITY_CLAUSE_MARKERS = ("other integrity problem(s)", "found and ignored")
 
 
+def _symlink_problem(kind: str, path: str) -> str:
+    """The one message every walk uses for a symlinked config path (CERT-F1).
+
+    Both walks pass ``followlinks=False`` so a link LOOP cannot hang the gate — but Claude
+    Code follows links, so a tracked symlinked directory under `.claude/{agents,commands,
+    skills}` ships real configuration the gate would otherwise never open: the walk does not
+    descend, the target's front matter is never policed, and the run reports PASS. Not
+    following the link is right; staying SILENT about it is the defect. Reporting the link
+    itself keeps the gate's coverage claim honest — every file it counted, it read.
+    """
+    return (
+        f"{kind} path {path!r} is a symlink; the gate does not follow links but Claude Code "
+        f"does — replace it with real files or remove it"
+    )
+
+
+def _walk_symlink_problems(kind: str, dirpath: str, dirnames: "list[str]") -> "list[str]":
+    """Symlink problems for the SUBDIRECTORIES of one :func:`os.walk` step (may be empty).
+
+    ``os.walk(followlinks=False)`` still LISTS a symlinked directory in ``dirnames``; it
+    simply does not recurse into it. That listing is the only place the link is visible, so
+    it is where the problem is raised. Degrades gracefully where the platform cannot answer
+    (``os.path.islink`` is total on every supported platform, but an OSError from a racing
+    unlink must not take the gate down with a traceback).
+    """
+    problems: "list[str]" = []
+    for name in dirnames:
+        candidate = os.path.join(dirpath, name)
+        try:
+            linked = os.path.islink(candidate)
+        except OSError:  # pragma: no cover - defensive: path raced away mid-walk
+            continue
+        if linked:
+            problems.append(_symlink_problem(kind, candidate))
+    return problems
+
+
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
     """Return (persona slugs, integrity problems, wrappers policed) from `.claude/agents/*.md`.
 
@@ -628,7 +694,10 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
     The walk uses :func:`os.walk` rather than a recursive ``glob``: ``glob`` skips
     DOT-PREFIXED directories, so a wrapper parked in `.claude/agents/.hidden/` would be
     invisible to this gate while `.claude/agents/**` still shipped it. Symlinked directories
-    are not followed (``followlinks=False``) so a link loop cannot hang the gate.
+    are not followed (``followlinks=False``) so a link loop cannot hang the gate — but a
+    tracked SYMLINK (a directory, or a wrapper file) is reported as an integrity problem
+    rather than passed over in silence, because Claude Code follows it and would load
+    configuration this walk never opened (CERT-F1, :func:`_symlink_problem`).
 
     When the scan finds NO top-level wrapper, the raised ``FileNotFoundError`` carries any
     integrity problems collected on the way (e.g. "1 nested wrapper was found and ignored:
@@ -636,15 +705,25 @@ def read_roster(agents_dir: str) -> "tuple[set[str], list[str], int]":
     precisely instead of reading as an empty directory.
     """
     all_paths: "list[str]" = []
+    link_problems: "list[str]" = []
     for dirpath, dirnames, filenames in os.walk(agents_dir, followlinks=False):
         dirnames.sort()  # deterministic traversal order
+        # A symlinked SUBDIRECTORY is listed but not descended into (followlinks=False),
+        # while Claude Code reads straight through it — report the link (CERT-F1).
+        link_problems.extend(_walk_symlink_problems("agent", dirpath, dirnames))
         for filename in filenames:
             # Case-insensitive: Claude Code loads `Foo.MD` too, so the gate must see it.
             if filename.lower().endswith(".md"):
-                all_paths.append(os.path.join(dirpath, filename))
+                path = os.path.join(dirpath, filename)
+                if os.path.islink(path):
+                    # A symlinked WRAPPER is still read and policed below (the link
+                    # resolves, or the read fails closed if it dangles); the link itself is
+                    # reported because what CI reviews is the link, not the target.
+                    link_problems.append(_symlink_problem("agent wrapper", path))
+                all_paths.append(path)
     all_paths.sort()
     slugs: "set[str]" = set()
-    problems: "list[str]" = []
+    problems: "list[str]" = sorted(link_problems)
     nested: "list[str]" = []
     policed = 0
     first_seen: "dict[str, str]" = {}
@@ -1267,7 +1346,10 @@ def scan_command_skill_frontmatter(
     and uses :func:`os.walk` for the same reason :func:`read_roster` does: `.claude/commands/**`
     ships nested and dot-prefixed directories, which a recursive ``glob`` would skip, and a
     command file the gate never opens is exactly the file an `allowed-tools:` grant hides in.
-    Symlinked directories are not followed so a link loop cannot hang the gate.
+    Symlinked directories are not followed (a link loop cannot hang the gate) but ARE
+    reported: Claude Code follows a symlinked `.claude/skills/<x>` into a tree whose
+    `allowed-tools:` this walk never reads, so the link is a problem, not a silent skip
+    (CERT-F1).
 
     A MISSING directory does not raise here — this scanner only counts. The CALLER
     (`command_skill_result`) turns zero skill manifests into a failure, because the repo
@@ -1286,16 +1368,22 @@ def scan_command_skill_frontmatter(
         if not os.path.isdir(root):
             continue
         paths: "list[str]" = []
+        link_problems: "list[str]" = []
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
             dirnames.sort()  # deterministic traversal order
+            link_problems.extend(_walk_symlink_problems(kind, dirpath, dirnames))
             for filename in filenames:
                 # Case-insensitive on purpose: Claude Code 2.1.263 loads a manifest committed as
                 # `skill.md` or a command as `x.MD`, so a case-sensitive match would fail GREEN.
                 lowered = filename.lower()
                 wanted = lowered.endswith(".md") if kind == "command" else lowered == "skill.md"
                 if wanted:
-                    paths.append(os.path.join(dirpath, filename))
+                    path = os.path.join(dirpath, filename)
+                    if os.path.islink(path):
+                        link_problems.append(_symlink_problem(f"{kind} file", path))
+                    paths.append(path)
         paths.sort()
+        problems.extend(sorted(link_problems))
         for path in paths:
             counts[kind] += 1
             try:
@@ -1317,6 +1405,167 @@ def scan_command_skill_frontmatter(
                 )
             problems.extend(validate_command_skill_frontmatter(path, frontmatter, kind))
     return problems, counts["command"], counts["skill"]
+
+
+# --- Tracked startup configuration (.mcp.json / .claude/settings.local.json) --------------
+
+def _git_tracked(path: str) -> "bool | None":
+    """Is `path` TRACKED by git? ``True``/``False``, or ``None`` when git cannot say.
+
+    Tracking — not mere existence — is the question that matters (CERT-F3 addendum). A
+    developer legitimately keeps an untracked `.claude/settings.local.json` (or a personal
+    `.mcp.json`) on their machine; that is their business and the gate must not redden a
+    local run over it. What must never happen is one of those files being COMMITTED, because
+    then it ships to every checkout — and in CI the checkout contains tracked files only, so
+    `git ls-files` is authoritative there.
+
+    ``None`` (git missing, or not a git checkout) is deliberately NOT collapsed into
+    "untracked": the caller reports it as UNVERIFIED rather than passing silently, so an
+    environment where the gate cannot answer never looks like an environment where the
+    answer was "clean".
+    """
+    if shutil.which("git") is None:
+        return None
+    absolute = os.path.abspath(path)
+    cwd = os.path.dirname(absolute) or os.curdir
+    if not os.path.isdir(cwd):  # pragma: no cover - defensive
+        return None
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", absolute],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):  # pragma: no cover - environment dependent
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 128:
+        # 128 is "not a git repository" / another fatal git error: cannot determine.
+        return None
+    return False
+
+
+def settings_local_path(settings_path: str = DEFAULT_SETTINGS) -> str:
+    """The `settings.local.json` that sits beside the policed `settings.json`.
+
+    Derived from `--settings` rather than given its own flag so the two can never be pointed
+    at different directories (a fixture — or an operator — that redirects one must redirect
+    both, or the check would police a file the CLI would not read).
+    """
+    directory = os.path.dirname(settings_path)
+    return os.path.join(directory, SETTINGS_LOCAL_NAME) if directory else SETTINGS_LOCAL_NAME
+
+
+def validate_startup_config(
+    mcp_path: str, settings_local_path: str
+) -> "tuple[list[str], list[str], list[str]]":
+    """Return (problems, notes, unverified) for the tracked startup-configuration surface.
+
+    Two files Claude Code reads that `settings-permissions` never looks at:
+
+    * **`.mcp.json`** at the repo root. Every `mcpServers[*].command` is SPAWNED when the CLI
+      launches — before any tool call, with no permission prompt — so a tracked one is remote
+      code execution on `git checkout`, ranking with `hooks`/`apiKeyHelper` in the settings
+      allowlist. An empty `mcpServers` mapping (or none at all) declares no command and
+      passes; malformed JSON FAILS, because a file this gate cannot read is not evidence of
+      safety.
+    * **`.claude/settings.local.json`**. The CLI honours it exactly like `settings.json`,
+      and every remedy message in this gate tells the reader to put a per-machine grant
+      there. That advice is only safe while the file is UNTRACKED; a committed one silently
+      widens the permission surface of every checkout while the policed `settings.json`
+      still reads clean.
+
+    Only TRACKED files fail. An untracked local copy is reported in ``notes`` ("present
+    locally, untracked") so a responder reading a green run still knows it is there, and a
+    file whose tracking git cannot determine goes to ``unverified`` — never to ``notes`` as
+    if it had been cleared.
+    """
+    problems: "list[str]" = []
+    notes: "list[str]" = []
+    unverified: "list[str]" = []
+
+    if not os.path.exists(mcp_path):
+        notes.append(f"no {mcp_path} in the checkout (no MCP server is started at launch)")
+    else:
+        tracked = _git_tracked(mcp_path)
+        if tracked is None:
+            unverified.append(
+                f"{mcp_path} exists but git cannot say whether it is tracked (git missing or "
+                f"not a git checkout) — its MCP servers were NOT verified; re-run inside the "
+                f"git checkout"
+            )
+        elif not tracked:
+            notes.append(
+                f"{mcp_path} present locally, untracked — not policed (a per-machine MCP "
+                f"config is the developer's business; only a committed one ships to everyone)"
+            )
+        else:
+            servers, failure = _read_mcp_servers(mcp_path)
+            if failure is not None:
+                problems.append(failure)
+            elif servers:
+                problems.append(
+                    f"{mcp_path} defines {len(servers)} MCP server command(s) that Claude "
+                    f"Code starts at launch with no prompt; MCP servers must be configured "
+                    f"per machine in settings.local.json / the user config, not tracked "
+                    f"(server(s): {', '.join(sorted(servers))})"
+                )
+            else:
+                notes.append(f"{mcp_path} is tracked but declares no MCP server")
+
+    if not os.path.exists(settings_local_path):
+        notes.append(f"no {settings_local_path} in the checkout")
+    else:
+        tracked = _git_tracked(settings_local_path)
+        if tracked is None:
+            unverified.append(
+                f"{settings_local_path} exists but git cannot say whether it is tracked (git "
+                f"missing or not a git checkout) — NOT verified; re-run inside the git checkout"
+            )
+        elif not tracked:
+            notes.append(
+                f"{settings_local_path} present locally, untracked — not policed (that is "
+                f"exactly where a per-machine grant belongs)"
+            )
+        else:
+            problems.append(
+                f"{settings_local_path} is TRACKED; Claude Code honours it exactly like "
+                f"settings.json but it must be gitignored per-machine state — a committed "
+                f"one widens the permission surface of every checkout while the policed "
+                f"settings.json still reads clean; `git rm --cached {settings_local_path}` "
+                f"and keep it untracked"
+            )
+    return problems, notes, unverified
+
+
+def _read_mcp_servers(path: str) -> "tuple[dict, str | None]":
+    """Return (mcpServers mapping, failure message). A file the gate cannot read FAILS."""
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except (OSError, UnicodeDecodeError, ValueError) as exc:
+        return (
+            {},
+            f"{path} is tracked and could not be read as JSON ({exc.__class__.__name__}: "
+            f"{exc}); Claude Code parses it at launch, so an unreadable tracked startup "
+            f"config is not evidence that no MCP server starts — remove the tracked file",
+        )
+    if not isinstance(payload, dict):
+        return ({}, f"{path} is tracked and is not a JSON object; remove the tracked file")
+    servers = payload.get("mcpServers", {})
+    if servers is None:
+        servers = {}
+    if not isinstance(servers, dict):
+        return (
+            {},
+            f"{path} is tracked and its 'mcpServers' is {type(servers).__name__}, not an "
+            f"object; the gate cannot enumerate what would start at launch — remove the "
+            f"tracked file",
+        )
+    return (servers, None)
 
 
 # --- gh plumbing -------------------------------------------------------------------------
@@ -1395,6 +1644,14 @@ def fetch_codeowners_errors(repo: str, ref: "str | None" = None) -> "tuple[bool,
 
 
 # --- Orchestration -----------------------------------------------------------------------
+
+# The checks that depend on the GitHub API. A `skip` from one of these is an OUTAGE; a skip
+# from any other (local) check is an environment the gate could not interrogate. `main` keeps
+# the two apart so a responder is never sent to the wrong runbook.
+REMOTE_CHECK_NAMES = frozenset(
+    {"roster<->live-labels", "codeowners-errors", "milestone-dropdown"}
+)
+
 
 class Result:
     """Outcome of a single check: status is 'pass' | 'fail' | 'skip'."""
@@ -1478,6 +1735,24 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
     )
 
 
+def startup_config_result(mcp_path: str, settings_local_path: str) -> Result:
+    """Wrap :func:`validate_startup_config` as the "tracked-startup-config" check.
+
+    Local and stdlib-only (it shells only to `git ls-files`, argv form, in the checkout), so
+    it runs identically offline and in CI. Status is ``skip`` — with the reason on the
+    line — when a file is present but its tracking could not be determined: an unanswerable
+    question must read as unanswered, not as clean. Under ``--require-remote`` (CI) `main`
+    turns that skip into a hard exit 2, so CI can never go green on an unverified startup
+    surface.
+    """
+    problems, notes, unverified = validate_startup_config(mcp_path, settings_local_path)
+    if problems:
+        return Result("tracked-startup-config", "fail", problems + notes)
+    if unverified:
+        return Result("tracked-startup-config", "skip", unverified + notes)
+    return Result("tracked-startup-config", "pass", notes)
+
+
 def run_checks(args: argparse.Namespace) -> "list[Result]":
     repo = resolve_repo(args.repo, args.offline)
     ref = resolve_ref(args.ref)
@@ -1524,6 +1799,11 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     # --- Check 4: .claude/settings.json permission surface (local; runs even --offline) ---
     # Placed before the remote checks so a malformed/over-broad permission file fails fast.
     results.append(settings_result(args.settings))
+
+    # --- Check 4b: tracked startup configuration (local; runs even with --offline) --------
+    # `.mcp.json` spawns its servers at CLI LAUNCH and `.claude/settings.local.json` is
+    # honoured like settings.json — two surfaces the settings policy above never opens.
+    results.append(startup_config_result(args.mcp_config, settings_local_path(args.settings)))
 
     # --- Check 5: .claude/commands + .claude/skills front matter (local; runs --offline) ---
     # The third front-matter surface Claude Code reads as configuration. `allowed-tools:` in
@@ -2266,14 +2546,25 @@ def _selftest() -> int:
         "a trailing `# comment` on an unquoted scalar is not part of the value",
     )
     # ...but a QUOTED value keeps everything inside the quotes, comment marker included, so
-    # the strip cannot become a way to smuggle a value past the allowlist. Killing mutant:
-    # stripping comments before/regardless of the quote check.
+    # the strip cannot become a way to smuggle a value past the allowlist. The assertion is
+    # on the PARSED VALUE, verbatim: "some problem was reported" would still hold if the
+    # reader stripped the comment and rejected `plan` for an unrelated reason, so it would
+    # not kill the unconditional-strip mutant (CERT-F5). `plan # ok` must survive intact.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "agent.md", '---\nname: agent\npermissionMode: "plan # ok"\n---\n')
+        _front, _dupes = _read_frontmatter(os.path.join(tmp, "agent.md"))
+        check(
+            _front is not None
+            and _front.get("permissionMode") == "plan # ok"
+            and _dupes == [],
+            "a quoted scalar keeps its `#` verbatim (`plan # ok`, not `plan`)",
+        )
     check(
         any(
             "permissionMode" in p and "default or plan" in p
             for p in _wrapper_problems('permissionMode: "plan # ok"\n')
         ),
-        "a quoted scalar keeps its `#` (comment strip applies only to unquoted values)",
+        "...and that verbatim value is then rejected by the permissionMode allowlist",
     )
 
     # (f8) RS-F3: a column-0 block sequence (`tools:\n- Read`) is valid YAML that this reader
@@ -2987,6 +3278,295 @@ def _selftest() -> int:
                 "the tracked .claude/skills tree passes the check inside a full gate run",
             )
 
+    # --- CERT-F1: SYMLINKED config paths. os.walk(followlinks=False) does not descend into
+    # a symlinked directory, but Claude Code follows it — so a tracked `.claude/skills/x ->
+    # ../elsewhere` shipped an `allowed-tools:` grant the gate reported as 0 problems. The
+    # fix is not to follow links (a loop would hang the gate); it is to REPORT them, so the
+    # coverage counts stay honest. Killing mutant for each: drop the islink check in that
+    # walk. Degrades gracefully where the platform cannot create symlinks (the fixture, not
+    # the gate, is what is unavailable there) — reported as an explicit skip, never as a
+    # silent pass.
+    def _link(target: str, linkname: str) -> bool:
+        try:
+            os.symlink(target, linkname, target_is_directory=os.path.isdir(target))
+        except (OSError, NotImplementedError, AttributeError):
+            return False
+        return os.path.islink(linkname)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _real = os.path.join(tmp, "elsewhere")
+        os.makedirs(_real, exist_ok=True)
+        _wrapper(_real, "sneaky.md", "---\nname: sneaky\npermissionMode: bypassPermissions\n---\n")
+        _agents = os.path.join(tmp, "agents")
+        os.makedirs(_agents, exist_ok=True)
+        _wrapper(_agents, "product-manager.md", "---\nname: product-manager\n---\n")
+        if not _link(_real, os.path.join(_agents, "linked")):
+            _log("  skip - symlink fixtures unavailable on this platform (agents walk)")
+        else:
+            _ok, _slugs, _problems = _read_roster_safe(_agents)
+            check(
+                _ok
+                and _slugs == {"product-manager"}
+                and any(
+                    "is a symlink" in x and os.path.join(_agents, "linked") in x
+                    for x in _problems
+                ),
+                "a symlinked directory under .claude/agents is reported, naming the link",
+            )
+            # And a symlinked WRAPPER FILE is named too — the link is what review sees.
+            _link(os.path.join(_real, "sneaky.md"), os.path.join(_agents, "sneaky.md"))
+            _ok, _slugs, _problems = _read_roster_safe(_agents)
+            check(
+                _ok
+                and any(
+                    "is a symlink" in x and "sneaky.md" in x for x in _problems
+                )
+                and any("permissionMode" in x and "sneaky.md" in x for x in _problems),
+                "a symlinked wrapper file is reported AND still policed (link + its content)",
+            )
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _real_skill = os.path.join(tmp, "outside", "demo")
+        os.makedirs(_real_skill, exist_ok=True)
+        _wrapper(_real_skill, "SKILL.md", "---\nname: demo\nallowed-tools: Bash(rm:*)\n---\n")
+        _skills = os.path.join(tmp, "skills")
+        _commands = os.path.join(tmp, "commands")
+        os.makedirs(os.path.join(_skills, "real"), exist_ok=True)
+        os.makedirs(_commands, exist_ok=True)
+        _wrapper(os.path.join(_skills, "real"), "SKILL.md", "---\nname: real\ndescription: d\n---\n")
+        _linked_skill = os.path.join(_skills, "linked")
+        _linked_cmd = os.path.join(_commands, "linked")
+        if not (_link(_real_skill, _linked_skill) and _link(_real_skill, _linked_cmd)):
+            _log("  skip - symlink fixtures unavailable on this platform (skills/commands walk)")
+        else:
+            _problems, _ncmd, _nskill = scan_command_skill_frontmatter(_commands, _skills)
+            check(
+                any("is a symlink" in x and _linked_skill in x for x in _problems),
+                "a symlinked skills subdirectory is reported, naming the link",
+            )
+            check(
+                any("is a symlink" in x and _linked_cmd in x for x in _problems),
+                "a symlinked commands subdirectory is reported, naming the link",
+            )
+            # The walk still refuses to FOLLOW it: the manifest behind the link is not
+            # counted, which is exactly why the link has to be reported instead.
+            check(
+                _nskill == 1 and _ncmd == 0,
+                "the gate does not follow the link (so the link, not its content, is the finding)",
+            )
+            _res = command_skill_result(_commands, _skills)
+            check(
+                _res.status == "fail" and any("is a symlink" in line for line in _res.lines),
+                "command-skill-frontmatter FAILS on a symlinked config directory",
+            )
+            # A symlinked MANIFEST/command FILE resolves, so it is scanned AND policed — and
+            # the link is still named, because review sees the link, not the target.
+            # Killing mutant: dropping the islink check on files in this walk.
+            _linked_manifest = os.path.join(_skills, "linked-file")
+            os.makedirs(_linked_manifest, exist_ok=True)
+            _link(os.path.join(_real_skill, "SKILL.md"), os.path.join(_linked_manifest, "SKILL.md"))
+            _link(os.path.join(_real_skill, "SKILL.md"), os.path.join(_commands, "linked.md"))
+            _problems, _ncmd, _nskill = scan_command_skill_frontmatter(_commands, _skills)
+            check(
+                any(
+                    "is a symlink" in x and os.path.join(_linked_manifest, "SKILL.md") in x
+                    for x in _problems
+                )
+                and any(
+                    "is a symlink" in x and os.path.join(_commands, "linked.md") in x
+                    for x in _problems
+                ),
+                "a symlinked SKILL.md / command file is reported, naming the link",
+            )
+            check(
+                _nskill == 2
+                and _ncmd == 1
+                and sum("defines 'allowed-tools'" in x for x in _problems) == 2,
+                "a symlinked manifest/command is still read and its allowed-tools rejected",
+            )
+
+    # --- CERT-F2/F3: the TRACKED startup surface. `.mcp.json` spawns its servers when the
+    # CLI launches (no prompt, before any tool call) and `.claude/settings.local.json` is
+    # honoured exactly like settings.json — neither is visible to `settings-permissions`.
+    # Only a TRACKED file fails: an untracked local one is the developer's own machine state
+    # (and settings.local.json is where every remedy message in this gate sends grants), so
+    # failing on mere existence would redden every local run and train people to ignore the
+    # gate. The fixtures therefore build REAL git repos.
+    def _git_repo(directory: str, files: "dict[str, str]", track: "list[str]") -> bool:
+        """Init a git repo with `files` written and `track` staged; False if git is absent."""
+        if shutil.which("git") is None:
+            return False
+        quiet = {"cwd": directory, "capture_output": True, "text": True, "timeout": 60}
+        if subprocess.run(["git", "init", "-q"], **quiet).returncode != 0:
+            return False
+        for name, body in files.items():
+            target = os.path.join(directory, name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "w", encoding="utf-8") as handle:
+                handle.write(body)
+        if track:
+            # Staging is enough for `git ls-files` to report the path as tracked (no commit
+            # and no configured identity needed). `-f` because the repo's own .gitignore —
+            # or the developer's GLOBAL excludes file, which is exactly how a real
+            # settings.local.json stays untracked — would otherwise refuse the add and make
+            # the fixture silently assert nothing.
+            subprocess.run(["git", "add", "-f", "--", *track], **quiet)
+        return True
+
+    _mcp_evil = '{"mcpServers": {"x": {"command": "true"}}}'
+    with tempfile.TemporaryDirectory() as tmp:
+        if not _git_repo(tmp, {".mcp.json": _mcp_evil}, [".mcp.json"]):
+            _log("  skip - git unavailable: tracked-startup-config fixtures not run")
+        else:
+            _mcp = os.path.join(tmp, ".mcp.json")
+            _local = os.path.join(tmp, ".claude", "settings.local.json")
+            check(_git_tracked(_mcp) is True, "_git_tracked reports a staged file as tracked")
+            _problems, _notes, _unverified = validate_startup_config(_mcp, _local)
+            # Killing mutant: drop the mcpServers branch, or fail only on existence.
+            check(
+                _unverified == []
+                and len(_problems) == 1
+                and "1 MCP server command(s)" in _problems[0]
+                and "starts at launch with no prompt" in _problems[0],
+                "a tracked .mcp.json with a server command FAILS, counting the commands",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        # An EMPTY mcpServers mapping declares no command: nothing starts, so it passes.
+        # Killing mutant: failing on the file's presence rather than on its content.
+        if _git_repo(tmp, {".mcp.json": '{"mcpServers": {}}'}, [".mcp.json"]):
+            _problems, _notes, _unverified = validate_startup_config(
+                os.path.join(tmp, ".mcp.json"), os.path.join(tmp, ".claude", "settings.local.json")
+            )
+            check(
+                _problems == [] and _unverified == [],
+                "a tracked .mcp.json with an empty mcpServers mapping passes",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        # Malformed JSON FAILS: a startup config the gate cannot read is not evidence that
+        # no server starts. Killing mutant: treating a parse error as "no servers".
+        if _git_repo(tmp, {".mcp.json": "{not json"}, [".mcp.json"]):
+            _problems, _, _ = validate_startup_config(
+                os.path.join(tmp, ".mcp.json"), os.path.join(tmp, ".claude", "settings.local.json")
+            )
+            check(
+                len(_problems) == 1 and "could not be read as JSON" in _problems[0],
+                "a tracked but malformed .mcp.json FAILS rather than reading as empty",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        # UNTRACKED and present: reported in the detail line, not failed. Killing mutant:
+        # dropping the `_git_tracked` gate (every developer's local run would redden).
+        if _git_repo(tmp, {".mcp.json": _mcp_evil}, []):
+            _problems, _notes, _unverified = validate_startup_config(
+                os.path.join(tmp, ".mcp.json"), os.path.join(tmp, ".claude", "settings.local.json")
+            )
+            check(
+                _problems == []
+                and _unverified == []
+                and any("present locally, untracked" in note for note in _notes),
+                "an UNTRACKED .mcp.json is not policed but is still reported in the detail",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        _files = {os.path.join(".claude", "settings.local.json"): '{"permissions": {}}'}
+        if _git_repo(tmp, _files, [os.path.join(".claude", "settings.local.json")]):
+            _local = os.path.join(tmp, ".claude", "settings.local.json")
+            _problems, _, _ = validate_startup_config(os.path.join(tmp, ".mcp.json"), _local)
+            # Killing mutant: dropping the settings.local.json branch — every remedy message
+            # in this gate points grants there, which is only safe while it stays untracked.
+            check(
+                len(_problems) == 1
+                and "settings.local.json" in _problems[0]
+                and "TRACKED" in _problems[0],
+                "a TRACKED .claude/settings.local.json FAILS, naming the file",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        _files = {os.path.join(".claude", "settings.local.json"): '{"permissions": {}}'}
+        if _git_repo(tmp, _files, []):
+            _local = os.path.join(tmp, ".claude", "settings.local.json")
+            _problems, _notes, _unverified = validate_startup_config(
+                os.path.join(tmp, ".mcp.json"), _local
+            )
+            check(
+                _problems == []
+                and _unverified == []
+                and any("present locally, untracked" in note for note in _notes),
+                "an UNTRACKED settings.local.json is the developer's own state, not drift",
+            )
+    with tempfile.TemporaryDirectory() as tmp:
+        # NOT a git checkout: the question is unanswerable, so the check reports SKIP with
+        # the reason rather than passing silently (which is how CERT-F3 stayed invisible).
+        # Killing mutant: collapsing the `None` case into "untracked".
+        with open(os.path.join(tmp, ".mcp.json"), "w", encoding="utf-8") as handle:
+            handle.write(_mcp_evil)
+        _res = startup_config_result(
+            os.path.join(tmp, ".mcp.json"), os.path.join(tmp, "settings.local.json")
+        )
+        check(
+            _res.status == "skip"
+            and any("git cannot say whether it is tracked" in line for line in _res.lines),
+            "an undeterminable startup config reports SKIP with the reason, never a silent pass",
+        )
+    check(
+        settings_local_path(os.path.join(".claude", "settings.json"))
+        == os.path.join(".claude", "settings.local.json")
+        and settings_local_path("settings.json") == "settings.local.json",
+        "settings.local.json is resolved beside the policed settings.json",
+    )
+    # The real checkout must be clean on this surface, and the check must be WIRED INTO the
+    # gate: a tracked .mcp.json has to redden a full run. Killing mutant: deleting the
+    # `results.append(startup_config_result(...))` line in run_checks.
+    if os.path.isdir(DEFAULT_AGENTS_DIR) and os.path.exists(DEFAULT_TAXONOMY):
+        with tempfile.TemporaryDirectory() as tmp:
+            if _git_repo(tmp, {".mcp.json": _mcp_evil}, [".mcp.json"]):
+                _buffer = io.StringIO()
+                with contextlib.redirect_stdout(_buffer):
+                    _exit = main(
+                        [
+                            "--offline",
+                            "--repo",
+                            DEFAULT_REPO,
+                            "--mcp-config",
+                            os.path.join(tmp, ".mcp.json"),
+                        ]
+                    )
+                check(
+                    "[FAIL] tracked-startup-config" in _buffer.getvalue() and _exit == 1,
+                    "run_checks reports tracked-startup-config and a tracked .mcp.json exits 1",
+                )
+        _buffer = io.StringIO()
+        with contextlib.redirect_stdout(_buffer):
+            _exit = main(["--offline", "--repo", DEFAULT_REPO])
+        _output = _buffer.getvalue()
+        # The LITERAL paths are asserted, not the constants: comparing the output against
+        # the same constant that produced it is self-referential and would survive a typo in
+        # the default. These three strings are the paths the workflow path filters and the
+        # docs name, so a default that drifts from them is caught here.
+        check(
+            "[PASS] tracked-startup-config" in _output
+            and _exit == 0
+            and "no .mcp.json in the checkout" in _output
+            and os.path.join(".claude", "settings.local.json") in _output,
+            "this checkout has no tracked .mcp.json and no tracked settings.local.json "
+            "(and --mcp-config defaults to the repo-root .mcp.json)",
+        )
+        # CERT-F4: the argparse DEFAULTS for --skills-dir/--commands-dir are themselves a
+        # policy surface — a typo there would scan nothing while the gate still said PASS.
+        # This run passes NO directory flags, so it exercises the defaults end to end.
+        # Killing mutant: DEFAULT_SKILLS_DIR = ".claude/skillz" (the skills scan would find
+        # 0 manifests and the command-skill check would fail).
+        _scanned = re.search(
+            r"- (\d+) skill manifest\(s\) under (\S+) and (\d+) slash-command file\(s\) "
+            r"under (\S+)",
+            _output,
+        )
+        check(
+            "[PASS] command-skill-frontmatter" in _output
+            and _scanned is not None
+            and int(_scanned.group(1)) >= 1
+            and _scanned.group(2) == os.path.join(".claude", "skills")
+            and _scanned.group(4) == os.path.join(".claude", "commands"),
+            "the default --skills-dir/--commands-dir scan >= 1 real skill manifest",
+        )
+
     # --- Finding 7a: resolve_repo must NOT shell out to gh under --offline.
     mod = sys.modules[__name__]
     original_gh = mod._gh
@@ -3023,7 +3603,8 @@ def main(argv: "list[str] | None" = None) -> int:
     parser = argparse.ArgumentParser(
         description="Reconcile the DeltaSharp persona roster, persona: labels, CODEOWNERS, "
         "and the feature-request milestone dropdown against live GitHub state, and validate "
-        "the .claude/settings.json permission surface."
+        "the .claude/settings.json permission surface, the command/skill front matter, and "
+        "the tracked startup configuration (.mcp.json, .claude/settings.local.json)."
     )
     parser.add_argument("--repo", default=None, help="OWNER/REPO (default: env or gh or khaines/deltasharp)")
     parser.add_argument("--agents-dir", default=DEFAULT_AGENTS_DIR)
@@ -3046,6 +3627,12 @@ def main(argv: "list[str] | None" = None) -> int:
         default=DEFAULT_SETTINGS,
         help="Claude Code settings file whose permission allow/deny lists are validated "
         f"(default: {DEFAULT_SETTINGS})",
+    )
+    parser.add_argument(
+        "--mcp-config",
+        default=DEFAULT_MCP_CONFIG,
+        help="repo-root MCP config whose tracked mcpServers are rejected — Claude Code "
+        f"spawns each server command at launch with no prompt (default: {DEFAULT_MCP_CONFIG})",
     )
     parser.add_argument(
         "--validate-settings-only",
@@ -3123,27 +3710,52 @@ def main(argv: "list[str] | None" = None) -> int:
 
     failed = [r for r in results if r.status == "fail"]
     skipped = [r for r in results if r.status == "skip"]
+    # A skip is partitioned by WHO must act, exactly as exit 1 vs exit 2 is: a REMOTE skip is
+    # a gh/GitHub outage (wait, retry), a LOCAL skip is an environment this gate could not
+    # interrogate (run it inside the git checkout). Both are "could not verify" — exit 2
+    # under --require-remote — but they send the responder to different runbooks, so they are
+    # never reported with the other's message.
+    remote_skipped = [r for r in skipped if r.name in REMOTE_CHECK_NAMES]
+    local_skipped = [r for r in skipped if r.name not in REMOTE_CHECK_NAMES]
     _log("")
     if failed:
         _error(f"reconciliation FAILED: {len(failed)} check(s) drifted — see annotations above")
         return 1
-    if args.require_remote and skipped:
+    if args.require_remote and remote_skipped:
         # A required remote check could not RUN. This is a gh/API OUTAGE, not roster drift:
         # exit 2 (distinct from the exit-1 drift signal) so an outage never reads as drift.
         _error(
-            f"reconciliation could not run: {len(skipped)} required remote check(s) were "
-            f"unavailable (gh missing or a GitHub API error) — this is a remote outage, not "
-            f"drift; retry once `gh` is authenticated and GitHub is reachable"
+            f"reconciliation could not run: {len(remote_skipped)} required remote check(s) "
+            f"were unavailable (gh missing or a GitHub API error) — this is a remote outage, "
+            f"not drift; retry once `gh` is authenticated and GitHub is reachable"
         )
         return 2
-    if skipped:
+    if args.require_remote and local_skipped:
+        # A LOCAL check that could not verify its input (e.g. git could not say whether a
+        # startup config is tracked) must not go green in CI: CI is precisely where "the file
+        # is tracked" is knowable and decisive.
+        _error(
+            f"reconciliation could not run: {len(local_skipped)} local check(s) could not "
+            f"verify their input ("
+            + "; ".join(r.name for r in local_skipped)
+            + ") — this is an environment problem, not a remote outage and not drift; run "
+            f"the gate inside the git checkout"
+        )
+        return 2
+    if remote_skipped:
         _warning(
-            f"reconciliation passed locally; {len(skipped)} remote check(s) skipped "
+            f"reconciliation passed locally; {len(remote_skipped)} remote check(s) skipped "
             f"(run with `gh` authenticated to verify labels/milestones/CODEOWNERS)"
+        )
+    if local_skipped:
+        _warning(
+            f"{len(local_skipped)} local check(s) could not verify their input: "
+            + "; ".join(r.name for r in local_skipped)
         )
     _log(
         "reconciliation PASSED: roster, labels, CODEOWNERS, milestones, the settings "
-        "permission surface, and the command/skill front matter are in step"
+        "permission surface, the command/skill front matter, and the tracked startup "
+        "configuration (.mcp.json, settings.local.json) are in step"
     )
     return 0
 

@@ -3,8 +3,8 @@ name: Reconcile
 # Governance reconciliation gate (STORY-00.6.2, #452). A lightweight, build-free check that
 # fails when the persona roster, the GitHub label taxonomy, CODEOWNERS, and the
 # feature-request milestone dropdown drift out of the manual reconciliation recorded in
-# docs/planning/label-taxonomy.md (#449). It runs three reconciliations plus two local
-# validations (settings-permissions, command-skill-frontmatter):
+# docs/planning/label-taxonomy.md (#449). It runs three reconciliations plus three local
+# validations (settings-permissions, command-skill-frontmatter, tracked-startup-config):
 #   * roster<->labels    — every .claude/agents/*.md wrapper has a persona:<slug> label
 #                          and vice-versa (allowing the ONE documented 50-char truncation),
 #                          reconciled against the committed label list AND the live labels.
@@ -49,7 +49,21 @@ name: Reconcile
 #                          is read by the same STRICT reader, so an unparseable fence fails
 #                          rather than being skipped; .claude/commands is optional but a
 #                          skills tree with zero manifests FAILS, and the passing report
-#                          states how many files were scanned.
+#                          states how many files were scanned. Both walks also REPORT
+#                          symlinks (they are not followed, so a link loop cannot hang the
+#                          gate — but Claude Code follows them, so a symlinked
+#                          .claude/{agents,commands,skills} entry ships config the walk
+#                          never opened).
+#   * tracked-startup-config (also a VALIDATION) — the two startup surfaces
+#                          settings-permissions never opens: a repo-root `.mcp.json` (each
+#                          `mcpServers[*].command` is SPAWNED when the CLI launches, with no
+#                          prompt) and `.claude/settings.local.json` (honoured like
+#                          settings.json, and where every remedy message here sends
+#                          per-machine grants — safe only while it is untracked). Only a
+#                          TRACKED file fails (`git ls-files --error-unmatch`), so an
+#                          untracked local copy is reported, not failed; a tracked malformed
+#                          .mcp.json fails, an empty `mcpServers` passes. If git cannot say,
+#                          the check reports SKIP and --require-remote makes that exit 2.
 #
 # It runs on PRs and pushes that touch the governance files (drift introduced by a code
 # change), on a weekly schedule and on demand (drift introduced GitHub-side, e.g. a label or
@@ -64,6 +78,8 @@ on:
       - ".claude/commands/**"
       - ".claude/skills/**"
       - ".claude/settings.json"
+      - ".claude/settings.local.json"
+      - ".mcp.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
       - "docs/planning/label-taxonomy.md"
@@ -76,6 +92,8 @@ on:
       - ".claude/commands/**"
       - ".claude/skills/**"
       - ".claude/settings.json"
+      - ".claude/settings.local.json"
+      - ".mcp.json"
       - ".github/ISSUE_TEMPLATE/feature_request.yml"
       - ".github/CODEOWNERS"
       - "docs/planning/label-taxonomy.md"

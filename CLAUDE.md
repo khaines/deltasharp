@@ -108,6 +108,16 @@ and skill files, along with any key outside `description`/`argument-hint`/`model
 (skills also `name`); front matter the strict reader cannot parse fails the same
 way, and a skills tree with no manifest is drift, not a pass.
 
+Three more startup surfaces sit inside the same boundary and the gate rejects all
+three: a **symlinked** directory or file under `.claude/agents/`,
+`.claude/commands/`, or `.claude/skills/` (the CLI follows it, the gate's walks
+deliberately do not, so the link would ship unreviewed configuration), a tracked
+root **`.mcp.json`** (each `mcpServers[*].command` is started when the CLI
+launches, before any tool call and with no prompt), and a tracked
+**`.claude/settings.local.json`** (honoured exactly like `settings.json`, so the
+per-machine grants this file keeps recommending there are only safe while it stays
+untracked and gitignored).
+
 ## Architecture — the big picture
 
 DeltaSharp follows Spark's layered execution model. Keep these layers separate:
