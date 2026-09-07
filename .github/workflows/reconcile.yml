@@ -95,11 +95,20 @@ name: Reconcile
 #                          per-machine state. The findings are scoped to those roots, never
 #                          to the whole repository, and git's answer must COVER what the
 #                          walks read: a path outside the work tree git answered from, a
-#                          directory holding files no index entry folds under (an export
-#                          inside an enclosing checkout), and a sparse index are all
-#                          UNVERIFIED, not clean. One
+#                          policed .claude child holding files no index entry folds under
+#                          (an export inside an enclosing checkout, whose .claude root tracks
+#                          no policed child of its own), and a sparse index are all
+#                          UNVERIFIED, not clean — while untracked WIP inside a root the
+#                          index DOES own is walked, policed and NOTED ("git add them"),
+#                          never skipped with advice to stand where the operator already is.
+#                          A skill manifest is held to its canonical LEAF too
+#                          (.claude/skills/x/ſkill.md folds onto SKILL.md), and a tracked
+#                          path whose bytes are not valid UTF-8 is REPORTED, not tolerated:
+#                          no walk, glob or review can name it reliably. One
 #                          link reported by more than one question is annotated ONCE per
-#                          check (paths are compared repo-root-relative). If git cannot say,
+#                          check (paths are compared repo-root-relative), while two DISTINCT
+#                          index entries stay two findings even when their spellings fold
+#                          onto each other. If git cannot say,
 #                          the check reports SKIP and --require-remote makes that exit 2 —
 #                          and a run with any SKIP ends on a qualified success line, never
 #                          the unqualified "are in step" claim.

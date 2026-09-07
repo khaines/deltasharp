@@ -646,6 +646,12 @@ class _LinkMessage(str):
     the path from the rendered text with a regex — which a path containing a quote character
     defeats (`.claude/skills/a'b"c` printed one link as two annotations, PR-901 F-D / L-1).
 
+    ``source`` records WHICH question produced it — ``"index"`` for git's answer about the
+    index, ``"walk"`` for what an :func:`os.walk` saw on disk. Only a walk finding may be
+    superseded by a fold-equivalent collision: an INDEX finding names a distinct index entry
+    at its own byte-exact spelling, and dropping it left the operator to discover the link
+    only after fixing the collision — two remediation rounds for one review (PR-901 RT-1).
+
     It is a `str` subclass on purpose: these messages travel through lists that are printed,
     searched with `in`, sorted and compared as ordinary strings everywhere else. The one place
     the distinction matters is de-duplication — and the fact that a message EMBEDDED in a
@@ -655,10 +661,13 @@ class _LinkMessage(str):
     (PR-901 second round, RT-5).
     """
 
-    def __new__(cls, message: str, path: str, kind: str = "link") -> "_LinkMessage":
+    def __new__(
+        cls, message: str, path: str, kind: str = "link", source: str = "walk"
+    ) -> "_LinkMessage":
         text = super().__new__(cls, message)
         text.path = path
         text.kind = kind
+        text.source = source
         return text
 
 
@@ -775,11 +784,13 @@ def _tracked_link_problem(mode: str, path: str) -> str:
             f"empty and the CLI loads whatever it contains once initialised — vendor the "
             f"files instead",
             path,
+            source="index",
         )
     return _LinkMessage(
         f"{path!r} is a tracked symlink (git mode 120000); the gate cannot see through links "
         f"that may resolve elsewhere on another machine — replace it with real files",
         path,
+        source="index",
     )
 
 
@@ -801,6 +812,7 @@ def _case_collision_problem(path: str, expected: str) -> str:
         f"into {expected!r} where Claude Code reads it — rename it",
         path,
         "case",
+        "index",
     )
 
 
@@ -834,6 +846,7 @@ def _undecodable_problem(path: str) -> str:
         f"checkout may merge it into a name Claude Code loads — rename it to a UTF-8 spelling",
         path,
         "encoding",
+        "index",
     )
 
 
@@ -1201,14 +1214,34 @@ def _index_findings(
         prefix = _path_parts(spec)
         if not prefix or not _has_disk_entries(on_disk[spec]):
             continue
-        # Either direction counts as covered: an entry UNDER the queried path, or an entry AT
-        # an ANCESTOR of it — a gitlink or symlink at `.claude` is git's whole answer about
-        # everything "inside" it, and the populated submodule/resolved-link work tree on disk
-        # must not read as a tree the index forgot.
-        if any(
-            _folds_under(parts, prefix) or _folds_under(prefix, parts)
-            for _mode, _name, parts in listed
-        ):
+        # An entry AT or ABOVE the queried path is git's whole answer about everything
+        # "inside" it — a gitlink or symlink at `.claude` covers the populated
+        # submodule/resolved-link work tree on disk, which must not read as a tree the index
+        # forgot.
+        if any(_folds_under(prefix, parts) for _mode, _name, parts in listed):
+            continue
+        # An entry UNDER it counts too — but when the queried path is a `.claude` ROOT, one
+        # entry anywhere beneath it is NOT the question: each POLICED CHILD that holds files
+        # on disk has to be covered in its own right. `tracked-startup-config` queries the
+        # root directly, so an enclosing checkout tracking one innocuous
+        # `export/.claude/keep` used to CLEAR an export whose `.claude/skills` it knows
+        # nothing about, while the roster and command/skill checks (which query
+        # `.claude/agents`, `.claude/skills`) correctly reported the same tree unverified:
+        # one report, two verdicts about one foreign tree (PR-901 SRE addendum, and PR-901
+        # second round RT-4 for the rule itself). An unpoliced sibling — a tracked
+        # `.claude/hooks` link, with no policed child on disk at all — still counts as
+        # covered, because the index plainly does answer about that tree.
+        covered = any(_folds_under(parts, prefix) for _mode, _name, parts in listed)
+        if covered and _claude_root_parts(prefix) == prefix:
+            covered = all(
+                any(
+                    _folds_under(parts, prefix + (child,))
+                    for _mode, _name, parts in listed
+                )
+                for child in POLICED_CLAUDE_CHILDREN
+                if _has_disk_entries(os.path.join(on_disk[spec], child))
+            )
+        if covered:
             continue
         if _root_owned_by_index(prefix, listed):
             # Untracked work in the checkout the operator is standing in: a note, and the
@@ -1469,43 +1502,55 @@ def _dedupe_link_problems(*groups: "list[str] | list[tuple[str, str]]") -> "list
     string). Dropping it as "the same link" is how an operator lost the one line that
     explained an empty roster (PR-901 second round, RT-5).
 
-    One extra collapse, and only one: a CASE finding SUPERSEDES a later finding at a
-    DIFFERENT spelling that FOLDS onto it. On a case-insensitive checkout a link committed as
+    One extra collapse, and only one: a CASE finding supersedes a WALK finding at a DIFFERENT
+    spelling that FOLDS onto it. On a case-insensitive checkout a link committed as
     `.claude/Skills/evil-link` is reported twice — by the index as a collision at
     `.claude/Skills/…` and by the walk, which reads it through the merged directory, as a link
     at `.claude/skills/…`. One file, one remedy (rename it), and the collision line is the one
     that explains why the two spellings are the same file, so it wins (PR-901 F-2). The two
     findings at the SAME byte-exact path stay separate: a path that is both a collision and a
     tracked link needs both remedies (rename it, and replace it with real files).
+
+    Only a WALK finding may be superseded that way, and that is the whole of the rule
+    (PR-901 RT-1). An INDEX finding is git's answer about a DISTINCT index entry at its own
+    byte-exact spelling: `.claude/Skills/x` (a plain file, a collision) and `.claude/skills/x`
+    (mode 120000, a tracked symlink) are TWO entries that need TWO remedies, and suppressing
+    the second because its path folds onto the first printed the collision alone — the
+    operator learned about the link only after renaming, a second round for one review. The
+    fold collapse is also ORDER-INDEPENDENT: the collisions are collected from every group
+    before anything is filtered, so a caller that lists the walk first still gets one line
+    (only the ORDER of the surviving lines follows the group order).
     """
     seen: "set[tuple[str, str]]" = set()
-    # folded path -> the byte-exact spellings already reported as a `case` collision.
+    flat = [
+        problem if isinstance(problem, tuple) else (getattr(problem, "path", None), problem)
+        for group in groups
+        for problem in group
+    ]
+    # folded path -> the byte-exact spellings reported as a `case` collision ANYWHERE.
     case_folds: "dict[str, set[str]]" = {}
+    for path, message in flat:
+        if path is not None and getattr(message, "kind", "link") == "case":
+            case_folds.setdefault(_fold(_normalize_link_path(path)), set()).add(
+                _normalize_link_path(path)
+            )
     kept: "list[str]" = []
-    for group in groups:
-        for problem in group:
-            if isinstance(problem, tuple):
-                path, message = problem
-            else:
-                message = problem
-                path = getattr(problem, "path", None)
-            if path is None:
-                if message not in kept:
-                    kept.append(message)
+    for path, message in flat:
+        if path is None:
+            if message not in kept:
+                kept.append(message)
+            continue
+        kind = getattr(message, "kind", "link")
+        normalized = _normalize_link_path(path)
+        key = (kind, normalized)
+        if key in seen:
+            continue
+        if kind != "case" and getattr(message, "source", "walk") != "index":
+            spellings = case_folds.get(_fold(normalized))
+            if spellings and normalized not in spellings:
                 continue
-            kind = getattr(message, "kind", "link")
-            normalized = _normalize_link_path(path)
-            key = (kind, normalized)
-            if key in seen:
-                continue
-            if kind == "case":
-                case_folds.setdefault(_fold(normalized), set()).add(normalized)
-            else:
-                spellings = case_folds.get(_fold(normalized))
-                if spellings and normalized not in spellings:
-                    continue
-            seen.add(key)
-            kept.append(message)
+        seen.add(key)
+        kept.append(message)
     return kept
 
 
@@ -5686,10 +5731,16 @@ def _selftest() -> int:
     # (d5c) A COLLISION and a LINK at one path are two different findings with two different
     # remedies (rename it / replace it with real files), so the de-duplication key carries the
     # KIND as well as the path. Killing mutant: keying on the path alone.
+    # The walk's own line at that BYTE-EXACT path is a third: on a case-sensitive checkout
+    # the directory really is spelled `Skills`, and "rename it" does not also replace the
+    # link with real files. Only a walk finding at a DIFFERENT, folding spelling is the
+    # duplicate. Killing mutant: suppressing on the fold alone (`if spellings:`).
     _case_line = _case_collision_problem(".claude/Skills", ".claude/skills")
     _link_line = _tracked_link_problem("120000", ".claude/Skills")
+    _walk_line = _symlink_problem("skill", ".claude/Skills")
     check(
         _dedupe_link_problems([_case_line, _link_line]) == [_case_line, _link_line]
+        and _dedupe_link_problems([_case_line, _walk_line]) == [_case_line, _walk_line]
         and _dedupe_link_problems([_link_line, _link_line]) == [_link_line]
         and _dedupe_link_problems([_case_line, _case_line]) == [_case_line],
         "the de-duplication key is (kind, path): one path's collision and link are two "
@@ -5851,6 +5902,25 @@ def _selftest() -> int:
                 "AND opened by the walk, whose `allowed-tools:` is rejected",
             )
 
+    # ...and the manifest-leaf rule is SCOPED to a skills tree. `SKILL.md` means something
+    # only under `.claude/skills/`; a persona wrapper legitimately named
+    # `.claude/agents/skill.md` is an ordinary file, and reporting it as folding onto
+    # `SKILL.md` would send its author renaming a file that is already correct — a false
+    # positive in the one check whose value is that its findings are always real.
+    # Killing mutant: dropping the `skills` ancestor guard from the leaf rule.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "agents", "skill.md")
+        if _git_repo(tmp, {_rel: "---\nname: skill\ndescription: d\n---\n"}, [_rel]):
+            _problems, _unverified, _ = tracked_symlink_problems(
+                link_query_paths(os.path.join(tmp, ".claude", "agents"))
+            )
+            check(
+                _unverified == []
+                and not any("folds onto" in message for _path, message in _problems),
+                "a tracked `.claude/agents/skill.md` is NOT a manifest-name collision: the "
+                "leaf rule applies under a skills tree only",
+            )
+
     # (e3) F-2: on a case-insensitive checkout ONE link is seen twice — by the index at the
     # byte-exact `.claude/Skills/…` (a fold collision) and by the walk, which reads it through
     # the merged directory, at `.claude/skills/…`. One file, one remedy: the collision line
@@ -5860,10 +5930,41 @@ def _selftest() -> int:
     _walk_variant = _symlink_problem("skill", ".claude/skills/evil-link")
     check(
         _dedupe_link_problems([_case_variant], [_walk_variant]) == [_case_variant]
-        and _dedupe_link_problems([_walk_variant], [_case_variant])
-        == [_walk_variant, _case_variant],
-        "a `case` finding SUPERSEDES a later walk finding at a spelling that FOLDS onto it "
-        "(and the git verdict is listed first, which is why callers order it so)",
+        and _dedupe_link_problems([_walk_variant], [_case_variant]) == [_case_variant],
+        "a `case` finding SUPERSEDES a walk finding at a spelling that FOLDS onto it, "
+        "whichever group they arrive in (the collapse is order-independent)",
+    )
+
+    # (e3a) RT-1: the collapse applies to a WALK finding ONLY. Git reporting a collision at
+    # `.claude/Skills/x` and a tracked LINK at `.claude/skills/x` is git reporting TWO index
+    # entries, each needing its own remedy; dropping the second because its spelling folds
+    # onto the first told the operator about the link only after they had renamed the other
+    # file — two remediation rounds for one review.
+    # Killing mutant: suppressing an `index`-sourced finding that folds onto a `case` one.
+    _index_variant = _tracked_link_problem("120000", ".claude/skills/evil-link")
+    check(
+        _dedupe_link_problems([_case_variant], [_index_variant])
+        == [_case_variant, _index_variant]
+        and _dedupe_link_problems([_index_variant], [_case_variant])
+        == [_index_variant, _case_variant],
+        "a `case` finding never supersedes an INDEX finding at a folding spelling: two index "
+        "entries are two findings",
+    )
+
+    # (e3b) RT-3: de-duplication is not folding-away either. Two DISTINCT links whose paths
+    # fold onto each other (`.claude/skills/A` and `.claude/skills/a` — two entries git keeps
+    # apart, one path the checkout merges) are two findings from both questions, because
+    # nothing but a `case` finding may supersede anything.
+    # Killing mutant: suppressing a `link` that folds onto an earlier `link`.
+    _upper_link = _tracked_link_problem("120000", ".claude/skills/A")
+    _lower_link = _tracked_link_problem("120000", ".claude/skills/a")
+    _upper_walk = _symlink_problem("skill", ".claude/skills/A")
+    _lower_walk = _symlink_problem("skill", ".claude/skills/a")
+    check(
+        _dedupe_link_problems([_upper_link], [_lower_link]) == [_upper_link, _lower_link]
+        and _dedupe_link_problems([_upper_walk], [_lower_walk])
+        == [_upper_walk, _lower_walk],
+        "two DISTINCT links whose spellings FOLD onto each other stay two findings",
     )
     with tempfile.TemporaryDirectory() as tmp:
         _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
@@ -5886,6 +5987,43 @@ def _selftest() -> int:
                     and sum("evil-link" in msg for _p, msg in _rl) == 1,
                     "a link the checkout MERGES into the policed directory prints ONE line "
                     "per check — the collision, not also the walk's symlink line",
+                )
+
+    # (e3c) RT-1, on a fixture: TWO index entries whose spellings fold together —
+    # `.claude/Skills/evil-x` (an ordinary file, a collision) and `.claude/skills/evil-x`
+    # (mode 120000, a tracked symlink, materialised on disk so the WALK sees it too). Both
+    # index findings must print in EVERY check, and the walk's third line must not: the
+    # operator has to learn about the link in the same round as the rename.
+    # Killing mutant: keying the fold suppression on the finding's KIND alone, so the
+    # `link` at the canonical spelling is dropped as "the same file" as the collision.
+    with tempfile.TemporaryDirectory() as tmp:
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(tmp, {_rel: "---\nname: real\ndescription: d\n---\n"}, [_rel]):
+            _merged = os.path.join(tmp, ".claude", "skills", "evil-x")
+            if (
+                _relink("../../obj/evil-x", _merged)
+                and _cacheinfo(tmp, "120000", ".claude/skills/evil-x", "../../obj/evil-x")
+                and _cacheinfo(tmp, "100644", ".claude/Skills/evil-x", "x\n")
+            ):
+                _res = command_skill_result(
+                    os.path.join(tmp, ".claude", "commands"),
+                    os.path.join(tmp, ".claude", "skills"),
+                )
+                _rl, _ru, _rn = tracked_symlink_problems(
+                    link_query_paths(os.path.join(tmp, ".claude", "agents"))
+                )
+                _named = [line for line in _res.lines if "evil-x" in line]
+                check(
+                    _res.status == "fail"
+                    and len(_named) == 2
+                    and any("folds onto" in line for line in _named)
+                    and any(
+                        "tracked symlink" in line and "120000" in line for line in _named
+                    )
+                    and not any("does not follow links" in line for line in _named)
+                    and sum("evil-x" in msg for _p, msg in _rl) == 2,
+                    "a collision and a tracked LINK at two folding index spellings print "
+                    "BOTH lines in every check — never the collision alone",
                 )
 
     # (e4) F-3: a check that FAILS while part of what it was asked about could not be looked
@@ -5923,6 +6061,73 @@ def _selftest() -> int:
                 "a FAIL keeps the UNVERIFIED reason visible as a note; status precedence "
                 "hides neither claim",
             )
+
+    # (e4a) ...and the SAME wiring in the OTHER two local checks, which was asserted nowhere:
+    # a `notes=detail` there passed every test while losing the reason (PR-901 RT-2). The
+    # command/skill check first: a real front-matter problem in the tracked skills tree, and
+    # a `--commands-dir` that lies outside the work tree git answered about.
+    # Killing mutant: `notes=detail` in `command_skill_result`.
+    with tempfile.TemporaryDirectory() as tmp:
+        _repo = os.path.join(tmp, "aaa", "repo")
+        _outside = os.path.join(tmp, "aaa", "out", "x", "y", ".claude", "commands")
+        os.makedirs(_outside, exist_ok=True)
+        os.makedirs(_repo, exist_ok=True)
+        _rel = os.path.join(".claude", "skills", "real", "SKILL.md")
+        if _git_repo(
+            _repo,
+            {_rel: "---\nname: real\ndescription: d\nallowed-tools: Bash(*)\n---\n"},
+            [_rel],
+        ):
+            _res = command_skill_result(_outside, os.path.join(_repo, ".claude", "skills"))
+            check(
+                _res.status == "fail"
+                and any("allowed-tools" in line for line in _res.lines)
+                and any(
+                    "lies outside the work tree git answered from" in note
+                    and "ALSO UNVERIFIED" in note
+                    for note in _res.notes
+                ),
+                "command-skill-frontmatter FAILING on a real problem still carries the "
+                "UNVERIFIED reason for the tree it could not look at",
+            )
+
+    # ...and the roster check, which lives in `main` and is reachable only through it. An
+    # `--agents-dir` outside any checkout cannot be link-queried at all, and the wrapper in
+    # it carries a forbidden `hooks:` key, so the check FAILS with the reason attached.
+    # Killing mutant: `notes=detail` in the roster check's FAIL branch.
+    def _summary_block(output: str, header: str) -> "list[str]":
+        """The indented detail lines printed under one `[STATUS] name` summary header."""
+        block: "list[str]" = []
+        inside = False
+        for line in output.splitlines():
+            if line == header:
+                inside = True
+                continue
+            if inside:
+                if line.startswith("::"):
+                    # The `::error::`/`::warning::` annotations are interleaved with the
+                    # detail lines; the block ends at the next summary header.
+                    continue
+                if not line.startswith("       - "):
+                    break
+                block.append(line[len("       - ") :])
+        return block
+
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "rogue-persona.md", "---\nname: rogue-persona\nhooks: ./x.sh\n---\n")
+        _buffer = io.StringIO()
+        with contextlib.redirect_stdout(_buffer):
+            _exit = main(["--offline", "--repo", DEFAULT_REPO, "--agents-dir", tmp])
+        _block = _summary_block(_buffer.getvalue(), "[FAIL] roster<->documented-labels")
+        check(
+            _exit == 1
+            and any("hooks" in line for line in _block)
+            and any(
+                "ALSO UNVERIFIED" in line and "git could not say" in line for line in _block
+            ),
+            "the roster check FAILING on a wrapper problem still carries the UNVERIFIED "
+            "reason for an agents tree git could not be asked about",
+        )
 
     # (e5) F-4: `_folded_index_tracked` answers None — never False — when the listing fails,
     # and the report says so. Collapsing it into "untracked" would clear a committed
@@ -6008,6 +6213,29 @@ def _selftest() -> int:
                 ),
                 "an enclosing checkout that tracks ONE innocuous file under the export's "
                 "`.claude` still does not OWN it: UNVERIFIED, 'run inside the checkout'",
+            )
+            # ...and `tracked-startup-config`, which queries the `.claude` ROOT rather than a
+            # policed child, must reach the SAME verdict about the SAME tree. It used to
+            # PASS: `export/.claude/keep` is an entry under the root, and "some entry exists
+            # under it" short-circuited the coverage test before `_root_owned_by_index` was
+            # ever consulted — one report carrying two verdicts about one foreign tree, the
+            # green one on the check that polices `.mcp.json` and `settings.local.json`
+            # (PR-901 SRE addendum). Killing mutant: restoring the short-circuit, i.e.
+            # accepting any entry under a `.claude` root as coverage of it.
+            _sc = startup_config_result(
+                os.path.join(_export, ".mcp.json"),
+                os.path.join(_export, ".claude", "settings.local.json"),
+                os.path.join(_export, ".claude", "settings.json"),
+            )
+            check(
+                _sc.status == "skip"
+                and any(
+                    "does not own" in line
+                    and "run the gate inside the git checkout" in line
+                    for line in _sc.lines
+                ),
+                "tracked-startup-config reaches the SAME 'does not own' verdict as the other "
+                "local checks on an export inside an enclosing checkout",
             )
 
     # (e7) SRE L-2: the index listing is cached per work tree, so the several checks that ask
