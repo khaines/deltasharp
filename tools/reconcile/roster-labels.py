@@ -7,7 +7,8 @@ feature-request milestone dropdown. This script turns that manual snapshot into 
 lightweight, re-runnable gate so the three sources of drift below fail CI instead of
 silently rotting:
 
-  1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
+  1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper (a markdown file
+     whose front matter carries a `name:`; other markdown there is ignored) must have a
      matching `persona:<slug>` label and vice-versa. The GitHub 50-character label cap forces
      exactly one documented truncation (the trailing `-engineer` is dropped from
      `persona:dotnet-vectorized-columnar-compute-engineer`); that truncation is allowed ONLY
@@ -64,6 +65,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.parse
 
 # --- Constants ---------------------------------------------------------------------------
@@ -169,26 +171,37 @@ def _read_frontmatter_name(path: str) -> "str | None":
 def read_roster(agents_dir: str) -> "tuple[set[str], list[str]]":
     """Return (persona slugs, integrity problems) from `.claude/agents/*.md`.
 
+    "Is a persona wrapper" is a property of the FILE, not of its name: only a
+    `.claude/agents/*.md` file whose front matter carries a `name:` is a roster entry. Plain
+    markdown that lives alongside the wrappers (a README, a template) has no front-matter
+    `name:` and is ignored rather than being mistaken for a persona slug — there is no
+    fall-back to the filename stem, so a stray README.md cannot red the gate.
+
     The slug is the front-matter `name:` (canonical); the filename stem must match it, and a
-    mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide.
+    mismatch is reported as an integrity problem so a mislabeled wrapper cannot hide. The
+    glob is deliberately non-recursive: nested directories are not part of the roster.
     """
     paths = sorted(glob.glob(os.path.join(agents_dir, "*.md")))
-    if not paths:
-        raise FileNotFoundError(f"no agent wrappers found under {agents_dir!r}")
     slugs: "set[str]" = set()
     problems: "list[str]" = []
     for path in paths:
-        stem = os.path.basename(path)[: -len(".md")]
         name = _read_frontmatter_name(path)
-        slug = name if name else stem
-        if name and name != stem:
+        if not name:
+            continue  # not a persona wrapper (no front-matter `name:`) — ignore
+        stem = os.path.basename(path)[: -len(".md")]
+        if name != stem:
             problems.append(
                 f"agent wrapper {path!r} front-matter name {name!r} does not match its "
                 f"filename stem {stem!r} — rename one so the persona slug is unambiguous"
             )
-        if slug in slugs:
-            problems.append(f"duplicate persona slug {slug!r} (from {path!r})")
-        slugs.add(slug)
+        if name in slugs:
+            problems.append(f"duplicate persona slug {name!r} (from {path!r})")
+        slugs.add(name)
+    if not slugs:
+        raise FileNotFoundError(
+            f"no persona wrappers found under {agents_dir!r} "
+            f"(expected {agents_dir!r}/*.md with a front-matter `name:`)"
+        )
     return slugs, problems
 
 
@@ -269,12 +282,14 @@ def reconcile_roster_labels(
                 continue
         problems.append(
             f"roster persona {slug!r} has no matching '{PERSONA_PREFIX}{slug}' GitHub label "
-            f"— create the label, or remove/rename the .claude/agents wrapper"
+            f"— create the label, or remove/rename the .claude/agents/*.md wrapper whose "
+            f"front-matter name is {slug!r}"
         )
     for label in sorted(label_only - covered_truncations):
         problems.append(
             f"GitHub label '{PERSONA_PREFIX}{label}' has no matching "
-            f".claude/agents/{label}.md — add the wrapper, or delete the stale label"
+            f".claude/agents/{label}.md wrapper (front-matter name: {label}) — add the "
+            f"wrapper, or delete the stale label"
         )
     return problems, allowed
 
@@ -781,6 +796,62 @@ def _selftest() -> int:
         "paired stale-label message suppressed (no double count)",
     )
     check(len(problems) == 1, "undocumented present truncation emits exactly one problem")
+
+    # --- R1-F3/F4: read_roster itself is exercised (it was previously untested, so a
+    # reverted glob could leave --selftest green while --offline exited 2). Fixtures are
+    # stdlib-only temp dirs; "is a persona wrapper" must be decided by the front-matter
+    # `name:`, NOT by the filename shape.
+    def _wrapper(directory: str, filename: str, body: str) -> None:
+        with open(os.path.join(directory, filename), "w", encoding="utf-8") as handle:
+            handle.write(body)
+
+    # (a) Two well-formed `<slug>.md` wrappers → both slugs, zero problems. This assertion is
+    # what fails if the glob is narrowed back to `*.agent.md` (nothing would be found and
+    # read_roster would raise FileNotFoundError).
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\nbody\n")
+        _wrapper(tmp, "release-manager.md", "---\nname: release-manager\ndescription: x\n---\n")
+        _roster_ok = True
+        try:
+            roster_slugs, roster_problems = read_roster(tmp)
+        except FileNotFoundError:
+            _roster_ok = False
+            roster_slugs, roster_problems = set(), ["FileNotFoundError"]
+        check(
+            _roster_ok
+            and roster_slugs == {"product-manager", "release-manager"}
+            and roster_problems == [],
+            "read_roster finds `<slug>.md` wrappers by front-matter name (0 problems)",
+        )
+
+    # (b) front-matter `name:` != filename stem → exactly one integrity problem.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: prodcut-manager\n---\n")
+        roster_slugs, roster_problems = read_roster(tmp)
+        check(
+            len(roster_problems) == 1 and "does not match its" in roster_problems[0],
+            "read_roster flags front-matter name != filename stem",
+        )
+
+    # (c) Non-persona markdown (no front-matter `name:`) is ignored, not counted as a slug.
+    with tempfile.TemporaryDirectory() as tmp:
+        _wrapper(tmp, "product-manager.md", "---\nname: product-manager\n---\n")
+        _wrapper(tmp, "README.md", "# Agents\n\nThis folder holds persona wrappers.\n")
+        _wrapper(tmp, "TEMPLATE.md", "---\ndescription: no name key\n---\n")
+        roster_slugs, roster_problems = read_roster(tmp)
+        check(
+            roster_slugs == {"product-manager"} and roster_problems == [],
+            "read_roster ignores non-persona markdown (README/TEMPLATE, no `name:`)",
+        )
+
+    # (d) A directory with no persona wrapper at all is a hard data error, not an empty pass.
+    _empty_raised = False
+    with tempfile.TemporaryDirectory() as tmp:
+        try:
+            read_roster(tmp)
+        except FileNotFoundError:
+            _empty_raised = True
+    check(_empty_raised, "read_roster raises FileNotFoundError when no persona wrapper exists")
 
     # --- Finding 7a: resolve_repo must NOT shell out to gh under --offline.
     mod = sys.modules[__name__]

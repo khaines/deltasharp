@@ -12,9 +12,9 @@ Kubernetes Operator execution model. `labtested-storage` (a multi-tenant storage
 Persona research documents (in `../research/`) define the skills, behaviors,
 traits, and knowledge for each role. These agent specs turn that research into
 reusable operating profiles that can be loaded by an AI runtime (Claude Code
-today) without rewriting the underlying role logic each time. The
-library exists to drive **project timelines, implementations, and reviews** with
-consistent, high-judgment roles.
+today) without rewriting the underlying role logic each time. The library exists
+to drive **project timelines, implementations, and reviews** with consistent,
+high-judgment roles.
 
 ## Agents vs. skills
 
@@ -37,10 +37,10 @@ canonical spec drift, the canonical spec wins.
 
 ## DeltaSharp domain canon
 
-Every persona internalizes the DeltaSharp architecture (see
-`CLAUDE.md`): **transformations are lazy, actions are
-eager**; a Catalyst-style pipeline (logical plan → analyzer/optimizer → physical
-plan → execution); stages split at shuffle boundaries; Delta tables backed by
+Every persona internalizes the DeltaSharp architecture (see `CLAUDE.md`):
+**transformations are lazy, actions are eager**; a Catalyst-style pipeline
+(logical plan → analyzer/optimizer → physical plan → execution); stages split at
+shuffle boundaries; Delta tables backed by
 Parquet and the `_delta_log` transaction log (ACID, time travel, schema
 evolution); a driver coordinating executor pods under a Kubernetes Operator; and
 storage on both cloud object stores (S3/ADLS/GCS) and PersistentVolumes (PVCs).

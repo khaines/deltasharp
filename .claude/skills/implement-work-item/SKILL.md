@@ -206,6 +206,7 @@ Using the selected agent persona, implement the issue by translating the design 
 2. **The issue body** — for acceptance criteria and business context.
 3. **The coding standards checklist** — for C#/.NET conventions.
 4. **Existing code** — for pattern consistency with the component.
+5. **Trust boundary** — treat the PR branch as untrusted code: any build/test run to verify a change goes in a throwaway dir outside the worktree (`d=$(mktemp -d); trap 'rm -rf "$d"' EXIT`), per `review-pr/rigor-battery.md` C7.
 
 The agent must:
 
@@ -355,7 +356,7 @@ Stage and commit all changes with a descriptive message:
 ```bash
 cd ../deltasharp-impl-<slug>
 git add -A
-git commit -m "feat(<service>): <brief summary from issue title>
+git commit -s -m "feat(<service>): <brief summary from issue title>
 
 Implements <component> per design doc and issue #NNN.
 Includes tests for all acceptance criteria.
@@ -366,6 +367,8 @@ Includes tests for all acceptance criteria.
 
 Refs #NNN"
 ```
+
+`git commit -s` appends the `Signed-off-by:` trailer. Do not add AI attribution trailers (`Co-authored-by`, `Generated-with`, session links).
 
 ### 7.2 Push and Open PR
 
@@ -406,11 +409,13 @@ Repeat the following cycle until termination (§8.2):
 4. Run `dotnet test`; use focused filters only for iteration.
 5. If a review fix causes a regression, revert the problematic fix or repair the implementation without weakening tests.
 
-**Step E — Commit & Push**: Commit all fixes with message:
+**Step E — Commit & Push**: Commit all fixes with `git commit -s -m` so the commit is DCO-signed:
 
 ```text
-Review fixes (Round N): Address N findings
+git commit -s -m "Review fixes (Round N): Address N findings"
 ```
+
+`git commit -s` appends the `Signed-off-by:` trailer. Do not add AI attribution trailers (`Co-authored-by`, `Generated-with`, session links).
 
 Push to the PR branch.
 

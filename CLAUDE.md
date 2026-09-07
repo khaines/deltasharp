@@ -55,6 +55,27 @@ Prefer keeping the solution buildable with `dotnet build` from the repo root
 (i.e. a single `*.sln` at the root that references all `src/` and `tests/`
 projects).
 
+## Agent permissions
+
+`.claude/settings.json` pre-approves read-only inspection commands — `git
+status`/`diff`/`log`/`show`/`rev-parse`/`rev-list`/`merge-base`/`ls-files`/`fetch`
+and branch/worktree listings, plus `gh pr view`/`diff`/`list`/`checks` and `gh
+issue view`/`list` — along with `dotnet restore`, `build`, `test`, and `format`.
+It denies destructive git/gh forms (branch deletion/rename, force push, `gh pr
+merge`, `gh release`, `gh secret`, `gh api` mutations). Anything that writes to
+the repo or to GitHub — commit, push, `git worktree add`/`remove`, PR or issue
+creation, reviews — deliberately prompts. Prompt-on-write is the design, not an
+omission.
+
+The `dotnet` grant is scoped to the maintainer's own branches. `dotnet
+restore`/`build`/`test`/`format` execute PR-supplied MSBuild targets, analyzers,
+source generators, and `nuget.config` package sources in-process, so when
+reviewing or verifying someone else's branch, run them from a throwaway copy
+outside the worktree per `.claude/skills/review-pr/rigor-battery.md` (C7). The
+allowlist does not relax that rule.
+
+Per-user overrides belong in `.claude/settings.local.json`, which is gitignored.
+
 ## Architecture — the big picture
 
 DeltaSharp follows Spark's layered execution model. Keep these layers separate:

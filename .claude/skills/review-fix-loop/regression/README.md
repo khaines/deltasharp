@@ -28,10 +28,7 @@ Optionally, when running locally, the orchestrator may append one JSON line per 
 **gitignored / out-of-tree** scratch path for trend analysis, e.g.:
 
 ```
-{"ts":"…","pr":323,"round":2,"complexity":"Complex","seats":["architect","balanced","quality","security"],
- "specialists":[],"findings":{"critical":0,"high":0,"medium":0,"low":0,"info":0},"redteam":"NO-MISS-CERTIFIED",
- "redteam_catches":1,"redteam_model":"fable","redteam_blind_first":true,"gate":"PASS",
- "miss_classes":["C2-parity","fixer-diff"]}
+{"ts":"2026-09-06T12:00:00Z","pr":323,"round":2,"complexity":"Complex","seats":["architect","balanced","quality","security"],"specialists":[],"findings":{"critical":0,"high":0,"medium":0,"low":0,"info":0},"redteam":"NO-MISS-CERTIFIED","redteam_catches":1,"redteam_model":"fable","redteam_blind_first":true,"redteam_forked":false,"redteam_blind_returned":"2026-09-06T11:58:12Z","redteam_verdicts_released":"2026-09-06T11:59:04Z","gate":"PASS","miss_classes":["C2-parity","fixer-diff"]}
 ```
 
 Never write this under a tracked path.

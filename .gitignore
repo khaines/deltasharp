@@ -68,3 +68,6 @@ secrets.json
 # Python tooling bytecode cache (tools/coverage/*.py)
 __pycache__/
 *.pyc
+
+# Claude Code per-user overrides — machine-local permission tweaks stay out of the repo
+.claude/settings.local.json

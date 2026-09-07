@@ -17,8 +17,7 @@ manufactures the independent, adversarial error-checking that constructive revie
 
 - **Different tier from every voting seat.** Run the red-team on **`fable`**. Every voting seat
   (Architect/Balanced/Quality/Security + specialists) runs on `opus`, so the gate is on a tier
-  **no voting seat uses** and the stronger of the two — the gate is where a blind spot is
-  unrecoverable, so the strongest model sits there. Record which model gated. A red-team on a
+  **no voting seat uses**. Record which model gated. A red-team on a
   voting-seat tier is **provisional** and does **not** satisfy the gate for protected-domain
   changes — say so and require a correct re-run or a documented human waiver.
 - **Blind-first.** The red-team is dispatched with the diff, changed files, and Review Package
@@ -126,7 +125,7 @@ do not reason about them.
 
 Blind pass (returned before any seat verdict is released):
 
-```
+```text
 ## Red-Team Blind Findings
 Gated by: <model>
 <findings in the canonical Finding Body Format, or "zero blind findings">
@@ -135,10 +134,10 @@ C7 repros run: <commands + observed output, or "n/a — no execution-eligible cl
 
 Falsification pass (after the seat verdicts arrive):
 
-```
+```text
 ## Red-Team Result
 VERDICT: MISS-FOUND | NO-MISS-CERTIFIED
-Gated by: <model> (tier distinct from every voting seat: yes|no; blind block returned before seat verdicts released: yes|no; forked: no → if any check fails, certification is PROVISIONAL and does NOT satisfy the gate for protected-domain changes)
+Gated by: <model> (tier distinct from every voting seat: yes|no; blind block returned before seat verdicts released: yes|no; forked: yes|no → if any check fails, certification is PROVISIONAL and does NOT satisfy the gate for protected-domain changes)
 
 ## New findings (issues the voting seats missed)
 Use the canonical Finding Body Format Contract (`rating-rubric.md`) — the same

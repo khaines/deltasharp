@@ -81,8 +81,7 @@ Decisions are recorded as **Architecture Decision Records** — the source of tr
   Delta protocol, plan serialization, memory, target framework, OSS).
 - [`docs/engineering/design/engine-architecture.md`](docs/engineering/design/engine-architecture.md)
   — the overview with diagrams.
-- [`CLAUDE.md`](CLAUDE.md) — the
-  conventions summary.
+- [`CLAUDE.md`](CLAUDE.md) — the conventions summary.
 
 ## Roadmap
 

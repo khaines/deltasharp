@@ -135,9 +135,10 @@ tracked there. When a persona is added, removed, or renamed:
 
 ### Reconciliation snapshot (verified)
 
-As of 2026-07-04 the roster and the `persona:` labels agree exactly: 25 roster
-slugs, 25 labels, with the single documented truncation. Reconcile at any time
-(no temporary files needed):
+As of 2026-09-06, with the roster source moved to `.claude/agents/`, the roster
+and the `persona:` labels still agree exactly: 25 roster slugs, 25 labels, with
+the single documented truncation. Reconcile at any time (no temporary files
+needed):
 
 ```bash
 comm -3 \
@@ -163,7 +164,10 @@ the [`reconcile`](../../.github/workflows/reconcile.yml) workflow. It fails when
 of three reconciliations breaks:
 
 1. **Roster ↔ persona labels.** Every `.claude/agents/*.md` wrapper must have a
-   matching `persona:<slug>` label and vice-versa. The one 50-character truncation
+   matching `persona:<slug>` label and vice-versa. `.claude/agents/` holds persona
+   wrappers only at the top level; the gate counts every `*.md` there that carries
+   a frontmatter `name:`, ignores markdown without one (e.g. a README), and does
+   not scan subdirectories. The one 50-character truncation
    (`persona:dotnet-vectorized-columnar-compute`) is accepted **only because this
    document records it**: the gate reads both the full slug and the standalone
    truncated label out of this file, so an *undocumented* truncation still fails. The

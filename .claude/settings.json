@@ -9,7 +9,12 @@
       "Bash(git diff:*)",
       "Bash(git log:*)",
       "Bash(git show:*)",
-      "Bash(git branch:*)",
+      "Bash(git branch --show-current)",
+      "Bash(git branch --list:*)",
+      "Bash(git branch -vv)",
+      "Bash(git branch -a:*)",
+      "Bash(git ls-files:*)",
+      "Bash(git fetch:*)",
       "Bash(git rev-parse:*)",
       "Bash(git rev-list:*)",
       "Bash(git merge-base:*)",
@@ -19,8 +24,23 @@
       "Bash(gh pr list:*)",
       "Bash(gh pr checks:*)",
       "Bash(gh issue view:*)",
-      "Bash(gh issue list:*)",
-      "Bash(gh api:*)"
+      "Bash(gh issue list:*)"
+    ],
+    "deny": [
+      "Bash(git branch -D:*)",
+      "Bash(git branch -d:*)",
+      "Bash(git branch -M:*)",
+      "Bash(git branch -m:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(gh api -X POST:*)",
+      "Bash(gh api -X PUT:*)",
+      "Bash(gh api -X PATCH:*)",
+      "Bash(gh api -X DELETE:*)",
+      "Bash(gh api --method:*)",
+      "Bash(gh pr merge:*)",
+      "Bash(gh release:*)",
+      "Bash(gh secret:*)"
     ]
   }
 }

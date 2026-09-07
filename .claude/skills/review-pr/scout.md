@@ -56,7 +56,7 @@ changed-file list.
 
 ## Output (required) — the Review Package
 
-```
+```text
 ## Review Package
 - Target: <PR #N | branch | paths>   Mode: <github | local>
 - Complexity: Simple | Complex   (triggers: <which>)

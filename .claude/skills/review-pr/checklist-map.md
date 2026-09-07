@@ -50,7 +50,7 @@ This file maps file patterns to engineering checklists so the `review-pr` skill 
 | `**/chaos/**`, `**/fault-injection/**`, `**/fuzz/**`, `**/simulation/**`, `**/oracles/**`, `**/invariants/**`, `**/*Property*Test*.cs` | 21, 04a, 04b | Chaos, fuzzing, deterministic simulation, correctness oracles |
 | **Documentation** | | |
 | `**/*.md` | 11, markdown-style-guide | Markdown documentation and skill files |
-| `docs/engineering/adr/**` | 01, 11 | Architecture decision records |
+| `docs/adr/**` | 01, 11 | Architecture decision records |
 | `docs/engineering/design/**` | 01, 11, 15, 16, 17, 18 | Design docs for engine/storage/operator concerns |
 | `docs/product/**`, `docs/requirements/**` | 11 | Product and requirement framing |
 

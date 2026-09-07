@@ -3,10 +3,10 @@ name: review-pr
 description: >-
   Orchestrates world-class pull request reviews using specialist agent personas and engineering checklists.
   Use this when asked to review a PR, review code changes, or assess PR quality.
-  A cheap Haiku scout triages and routes; an Opus council
-  reviews complex changes with up to 3 scout-selected domain specialists; a blind-first Fable
-  red-team on a tier no voting seat uses executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments
-  + review summary) for remote PRs.
+  A cheap Haiku scout triages and routes; an Opus council reviews complex changes with up to 3
+  scout-selected domain specialists; a blind-first Fable red-team, on a tier no voting seat uses,
+  executes repros (C7) and gates. Posts findings as GitHub PR code reviews (inline comments and a
+  review summary) for remote PRs.
 ---
 
 # PR Review Skill — Orchestration Instructions
@@ -168,8 +168,8 @@ always override the `model:` line in a persona's frontmatter. The full council s
 > **Fable 5.1** on the gate, **Haiku 4.5** on the scout. Update these as the tiers advance, keeping
 > the gate on a tier distinct from every voting seat.
 >
-> **The voting spine is Opus; the gate is Fable.** The Phase 8 red-team runs on a **different and
-> stronger tier than every voting seat**, starts **blind** (it forms its own findings and runs its own
+> **The voting spine is Opus; the gate is Fable.** The Phase 8 red-team runs on a **different tier
+> from every voting seat**, starts **blind** (it forms its own findings and runs its own
 > C7 repros before it sees any seat verdict), and holds a **shell**. Gate decorrelation is therefore
 > **tier + information + execution**, not vendor. See Phase 8.
 >
@@ -179,7 +179,7 @@ always override the `model:` line in a persona's frontmatter. The full council s
 > and Gemini seats produced materially identical adversarial content, and the verdicts that were
 > actually overturned came from **execution** (the 106-RED mutation experiment) and from a seat
 > **willing to disagree** — protocol properties, not model properties. The gate now spends its
-> independence where the protocol can enforce it: a stronger tier, a blind first pass, and mandatory
+> independence where the protocol can enforce it: a distinct tier, a blind first pass, and mandatory
 > C7 execution whose output is model-agnostic evidence.
 >
 > **Why the gate did not move to GPT.** The 2026-07 measurement stands (5/5 empty first responses,
@@ -202,19 +202,21 @@ independent reviewer.
 **Specialist seats (scout-selected, ≤3).** In addition to the 4 fixed lenses, dispatch each
 domain specialist from the scout's Review Package as an **additional voting seat**
 (`subagent_type` = the specialist persona; `model: opus` — the **voting-spine tier, never `fable`**,
-so the red-team's tier decorrelation stays *structurally* guaranteed; a specialist on `fable`
-would silently degrade the gate to provisional), scoped to its owned files + checklist IDs. The 4 lenses are the spine; specialists add depth for
-the domains the diff actually touches (Delta storage, query execution, operator, connectors, …).
+so the red-team's tier decorrelation stays *structurally* guaranteed; a specialist on `fable` would
+silently degrade the gate to provisional), scoped to its owned files + checklist IDs. The 4 lenses
+are the spine; specialists add depth for the domains the diff actually touches (Delta storage,
+query execution, operator, connectors, …).
 
 **Execution is mandatory for execution-eligible claims (C7).** Any seat verifying an enforcement /
 parity / compat / migration / test-efficacy claim must either **run** a repro (see
 [`rigor-battery.md`](rigor-battery.md)) and quote command + output, or **explicitly defer the claim
 to the red-team** (the canonical C7 executor) — "verified by reading" does not clear a C7-eligible
 claim. A seat expected to execute MUST be dispatched **shell-capable**: `general-purpose`, or an
-engineering persona whose `.claude/agents/` frontmatter lists `Bash` (the four non-engineering
-personas — product, program, developer-relations, privacy — do not, and must defer every C7
-claim). A seat that silently withholds judgment because it "couldn't run it" (instead of deferring,
-or being re-dispatched shell-capable) is a dispatch error, not a finding.
+engineering persona whose `.claude/agents/` frontmatter lists `Bash` (the three non-engineering
+personas — product, program, developer-relations — do not, and must defer every C7 claim;
+`privacy-compliance-grc-lead` carries `Bash` because it sits in the Security lens allowlist). A
+seat that silently withholds judgment because it "couldn't run it" (instead of deferring, or being
+re-dispatched shell-capable) is a dispatch error, not a finding.
 
 **Selection rule for `subagent_type`:**
 
@@ -227,6 +229,8 @@ Each model receives the same input package:
 - The full PR diff.
 - The relevant agent persona instructions.
 - The applicable checklists.
+- `rigor-battery.md` (C1–C7) — including the C7 trust-boundary rule: PR-supplied code is untrusted;
+  build/run it only in a throwaway dir outside the worktree.
 - The governing design document(s), if any.
 - DeltaSharp canon: Spark parity, lazy/eager semantics, Catalyst-style pipeline, Delta tables, Kubernetes driver/executor/operator, storage across object stores and PVCs.
 - Instructions to return findings in structured format.
@@ -240,7 +244,7 @@ After dispatching the 4 reviewers and **before** reporting any aggregate council
 1. **Read back each dispatch.** For each reviewer, look at the actual `subagent_type` and `model` arguments passed.
 2. **Validate against the protocol** verbatim. A round is invalid if any slot's model does not match its fixed value or if any `subagent_type` is not in its allowlist.
 3. **Correct off-protocol dispatches** by re-dispatching affected slots at the same HEAD SHA when possible; otherwise re-run the full round at current HEAD.
-4. **Capture verified composition** per round: slot name, `subagent_type`, `model`, justification, dispatch HEAD SHA, and dispatch timestamp.
+4. **Capture verified composition** per round: slot name, `subagent_type`, `model`, fork flag (must be `no`), justification, dispatch HEAD SHA, and dispatch timestamp. For the red-team seat, also capture the blind-block-returned and verdicts-released timestamps.
 5. **Composition verification gates aggregate-rating claims.** Do not claim unanimity, consensus, or aggregate rating until verified.
 6. **Externalized composition record.** At each round's close, post the verified composition record as a PR comment or persist it in an auditable project-relative path for local-only reviews. Prior records are append-only.
 
@@ -469,9 +473,11 @@ start with no conversation history.
    approval, diffs its blind findings against the seats' (anything it found that no seat found is a
    MISS candidate), and finalizes its verdict.
 
-Record the timestamp at which the blind block returned and the timestamp at which the seat
-verdicts were released; the second must be later than the first. It returns findings in the
-canonical `Critical|High|Medium|Low|Info` set and a verdict:
+Record both timestamps as **executed** shell output, never model-authored: run
+`date -u +%Y-%m-%dT%H:%M:%SZ` in the shell immediately when the blind block returns, and again
+immediately before the `SendMessage` that releases the seat verdicts, then quote both outputs
+verbatim in the composition record. The second must be later than the first. It returns findings in
+the canonical `Critical|High|Medium|Low|Info` set and a verdict:
 
 - `MISS-FOUND` — with new findings (each `file:line` + EVIDENCE). These are **actionable and
   blocking**; in a fix-loop they go back to the fix phase.

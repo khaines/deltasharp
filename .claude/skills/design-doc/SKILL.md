@@ -45,7 +45,7 @@ From the issue, extract:
    - `cross-cutting` — security, tenant isolation, privacy, performance, reliability, cost, documentation
    - If the component spans categories or does not fit, place the doc flat in `docs/engineering/design/`.
 3. **Referenced requirements**: Scan the issue body for `REQ-*` identifiers. If found, read the corresponding requirements doc from `docs/product/requirements/` to gather acceptance criteria, priority, and dependencies.
-4. **Related ADRs**: Scan the issue body and referenced requirements for ADR references. Read any linked ADRs from `docs/engineering/adr/`.
+4. **Related ADRs**: Scan the issue body and referenced requirements for ADR references. Read any linked ADRs from `docs/adr/`.
 5. **Existing design docs**: Check `docs/engineering/design/` for any existing design doc for this component. If one exists, this is an **update** operation — see the Update Mode Reconciliation note in Important Notes.
 
 ### 1.3 Determine File Placement
@@ -281,7 +281,7 @@ Write the assembled design document to the determined file path within the workt
 ```bash
 cd ../deltasharp-design-<slug>
 git add docs/engineering/design/
-git commit -m "Design: <Component Name> design document
+git commit -s -m "Design: <Component Name> design document
 
 Generates design document for <Component Name> from issue #NNN.
 Covers architecture, security, threat model, observability, and rollout.
@@ -289,6 +289,8 @@ Covers architecture, security, threat model, observability, and rollout.
 Refs #NNN"
 git push -u origin "$BRANCH_NAME"
 ```
+
+`git commit -s` appends the `Signed-off-by:` trailer. Do not add AI attribution trailers (`Co-authored-by`, `Generated-with`, session links).
 
 ### 7.4 Open Pull Request
 
