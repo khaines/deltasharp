@@ -31,7 +31,7 @@ Two further controls close that gap, and they are **not equally strong** — the
 
 | Anchor | Written by | Strength |
 |---|---|---|
-| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — not settable via Parquet.Net's `CustomMetadata`, and any Parquet.Net-authored file is rejected outright |
+| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — Parquet.Net's public write API cannot set it (`CustomMetadata` reaches only the key/value section), so a file Parquet.Net wrote and left untouched is rejected (by the engine-prefix check; the explicit "not Parquet.Net" assertion is subsumed and exists for the diagnosis). A footer patched byte-by-byte is **not** caught. |
 | `<engine>/matrix-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
 | `matrix.json` `version` | read from the installed library at generation time | Moderate |
 | `matrix.json` `engine` | a constant typed into the generator | Pins **drift only**, not origin |

@@ -330,9 +330,10 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > pinned generators + `SHA256SUMS` + a provenance README enforcing *never regenerated from DeltaSharp*),
 > and consumed by `PartitionEncodingGoldenDifferentialTests` (DS→ref byte-parity over the **33-value**
 > matrix + both ref→DS reads). Provenance is test-enforced in three independent ways: `SHA256SUMS`
-> set-equality in both directions (drifted *and* unlisted files fail); the **Parquet footer writer strings**
-> the writer library embeds (`parquet-mr`/`org.apache.spark.version`, `delta-rs version py-…`), which
-> DeltaSharp's Parquet.Net writer cannot produce; and **`matrix-log.json`** — the engine's own `_delta_log`
+> set-equality in both directions (drifted *and* unlisted files fail); the Parquet footer's **structured
+> `created_by`** (`parquet-mr version 1.13.…`, `delta-rs version py-…`), which Parquet.Net's public write API
+> cannot set — `CustomMetadata` reaches only the footer's key/value section, so a Parquet.Net-authored file is
+> rejected unless its footer is patched byte-by-byte; and **`matrix-log.json`** — the engine's own `_delta_log`
 > for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked, and which is
 > itself asserted to carry the engine's commit shape (`commitInfo.engineInfo` + `protocol` +
 > `metaData.partitionColumns`).
@@ -368,16 +369,24 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 >
 > | | writes `""` as | reads a committed `partitionValues:{"region":""}` as |
 > |---|---|---|
-> | Apache Spark 3.5.3 | `null` (folded into `add.partitionValues`; no distinct add-action) | **`""`** — honours the committed value |
+> | Apache Spark 3.5.3 | `null` (folded into `add.partitionValues`; no distinct add-action) | **`""`** — honours the committed value *(out-of-band measurement; not repo-backed — see below)* |
 > | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` — normalizes it away |
 > | **DeltaSharp** | `""` (verbatim, in the sentinel directory) | `""` |
 >
 > So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* —
-> it distinguishes `null` from `""`, which Spark's writer cannot — and, measured, **Spark reads a
-> DeltaSharp-written `""` partition back as `""`**, so the choice is interop-safe in the direction that matters.
-> delta-rs collapses it to `null` (documented residual, same class as its broader on-disk escaping). The
-> DeltaSharp side is pinned by `EmptyStringPartitionValue_DirectoryMatchesSpark_ButDeltaSharpPreservesTheValue`;
-> the foreign-reader half is an integration-tier measurement (needs the real engines) tracked in **#905**.
+> it distinguishes `null` from `""`, which Spark's writer cannot.
+>
+> **Provenance of each cell, precisely.** The two *write* columns and delta-rs's read behaviour come from the
+> committed `empty_string` blocks, which are harvested from real engine runs and asserted by
+> `EmptyStringPartitionValue_EngineBehaviour_IsHarvestedNotAssumed`. Note what those blocks do and do not
+> establish: Spark's `read_back_is_null` measures Spark reading *its own* table, whose log already holds `null`
+> because of the write-time fold — it says nothing about reading a committed `{"region":""}`. The
+> **Spark-reads-a-DeltaSharp-written-`""`** cell is therefore **not backed by any committed fixture and is not
+> asserted by any test**: it was measured out-of-band during review (pinned `pyspark==3.5.3` reading a
+> `DeltaWriteTarget`-written table returned `""`; method and output recorded in **#905**). Treat it as evidence
+> for the design decision, not as a repo-enforced invariant, until #905 lands it as an integration-tier test.
+> The DeltaSharp side *is* pinned, by
+> `EmptyStringPartitionValue_DirectoryMatchesSpark_ButDeltaSharpPreservesTheValue`.
 >
 > **Consequence to be aware of:** because `null` and `""` share one directory, the sentinel directory is
 > non-injective on the partition key. This is safe for OPTIMIZE and dynamic-partition-overwrite because both
