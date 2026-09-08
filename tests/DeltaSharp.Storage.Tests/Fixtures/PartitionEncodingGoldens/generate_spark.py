@@ -14,6 +14,7 @@ Usage:
     pip install pyspark==3.5.3 delta-spark==3.2.0
     JAVA_HOME=<jdk8-or-11> python generate_spark.py <out_dir>
 """
+import atexit
 import hashlib
 import json
 import os
@@ -46,7 +47,23 @@ READ_ROWS = [(1, "a1", "US"), (2, "b2", "a=b"), (3, "c3", "na me"), (4, "d4", "o
              (6, "f6", "p%p")]
 
 
+def _guard_out_dir(out_dir: str) -> None:
+    """Refuse to rmtree an arbitrary path: `out_dir` comes from argv, and this script deletes
+    `<out_dir>/read-table`. Require it to be an existing engine fixture dir (or empty/new)."""
+    if not os.path.exists(out_dir):
+        return
+    if not os.path.isdir(out_dir):
+        raise SystemExit(f"refusing to write: {out_dir!r} is not a directory")
+    entries = set(os.listdir(out_dir))
+    if entries and not ({"matrix.json", "SHA256SUMS", "read-table"} & entries):
+        raise SystemExit(
+            f"refusing to overwrite {out_dir!r}: not an engine golden dir "
+            "(expected matrix.json / SHA256SUMS / read-table)")
+
+
 def main(out_dir: str) -> None:
+    _guard_out_dir(out_dir)
+
     import pyspark
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
@@ -64,6 +81,8 @@ def main(out_dir: str) -> None:
     # (1) The full matrix table is written to a throwaway temp dir (NOT committed) purely to harvest
     #     the (on-disk dir, add.path) mapping into matrix.json.
     matrix_staging = tempfile.mkdtemp(prefix="ds806-matrix-")
+    # atexit so an engine failure mid-run cannot leave the staged table behind.
+    atexit.register(shutil.rmtree, matrix_staging, ignore_errors=True)
     matrix_src = os.path.join(matrix_staging, "matrix-table")
     rows = [(i, v) for i, v in enumerate(VALUES)]
     # Explicit nullable schema: the null row must not depend on schema inference.
@@ -79,12 +98,47 @@ def main(out_dir: str) -> None:
             add_by_value[o["add"]["partitionValues"]["region"]] = o["add"]["path"]
 
     from urllib.parse import unquote
+    # Commit the engine's OWN transaction log for the full matrix table. matrix.json is DERIVED (harvested by
+    # this script), so on its own a hand-edited row could bless a buggy encoder and pass every test
+    # (design risk R7). This file is written by the reference engine itself and is the ground truth the
+    # differential test cross-checks all rows against. Only the LOG is committed, never the matrix table's
+    # data files or directories -- so the non-ASCII / control-bearing values appear solely as text inside
+    # this JSON, never as filesystem paths (design R6, the macOS NFC/NFD hazard).
+    shutil.copyfile(log, os.path.join(out_dir, "matrix-log.json"))
+
     matrix = []
     for v in VALUES:
         add_path = add_by_value[v]
         decoded = unquote(add_path.split("/")[0])
         assert decoded in disk_dirs, f"dir {decoded!r} for value {v!r} not on disk: {disk_dirs}"
         matrix.append({"value": v, "on_disk_dir": decoded, "add_path_segment": add_path.split("/")[0]})
+    # (1b) The EMPTY-STRING axis, harvested from a real run. It cannot be a matrix row: Spark folds "" onto
+    #      the SAME __HIVE_DEFAULT_PARTITION__ partition as null and emits no distinct directory or add-action
+    #      for it, so there is no separate (dir, add.path) pair to record. What IS recordable — and what the
+    #      differential test pins — is exactly that folding behaviour plus what the engine reads back.
+    empty_staging = tempfile.mkdtemp(prefix="ds806-empty-")
+    atexit.register(shutil.rmtree, empty_staging, ignore_errors=True)
+    empty_src = os.path.join(empty_staging, "empty-table")
+    spark.createDataFrame([(0, None), (1, ""), (2, "keep")], matrix_schema).write.format("delta") \
+        .partitionBy("region").mode("overwrite").save(empty_src)
+    empty_dirs = sorted(n for n in os.listdir(empty_src) if n.startswith("region="))
+    empty_adds = []
+    for line in open(os.path.join(empty_src, "_delta_log", "00000000000000000000.json"), encoding="utf-8"):
+        o = json.loads(line)
+        if "add" in o:
+            empty_adds.append((o["add"]["partitionValues"]["region"], o["add"]["path"].split("/")[0]))
+    read_back = sorted((r["id"], r["region"]) for r in spark.read.format("delta").load(empty_src).collect())
+    empty_row = next((v for v in read_back if v[0] == 1), None)
+    empty_string = {
+        "on_disk_dirs": empty_dirs,
+        "add_partition_values": sorted({a[0] if a[0] is not None else None for a in empty_adds}, key=str),
+        "distinct_add_action": any(a[0] == "" for a in empty_adds),
+        "folds_onto_sentinel_with_null": not any(a[0] == "" for a in empty_adds),
+        "read_back_value": empty_row[1] if empty_row else None,
+        "read_back_is_null": (empty_row is not None and empty_row[1] is None),
+    }
+    shutil.rmtree(empty_staging, ignore_errors=True)
+
     shutil.rmtree(matrix_staging, ignore_errors=True)
 
     # (2) The committed small readable table.
@@ -100,6 +154,7 @@ def main(out_dir: str) -> None:
         "note": "Reference (dir, add.path) partition-encoding golden. Emitted by real Spark; never from DeltaSharp.",
         "column": "region",
         "matrix": matrix,
+        "empty_string": empty_string,
     }
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "matrix.json"), "w", encoding="utf-8") as f:

@@ -15,6 +15,7 @@ Usage:
     pip install deltalake==1.6.3 pyarrow
     python generate_delta_rs.py <out_dir>
 """
+import atexit
 import hashlib
 import json
 import os
@@ -42,13 +43,31 @@ READ_ROWS = {"id": [1, 2, 3, 4, 5, 6], "name": ["a1", "b2", "c3", "d4", "e5", "f
              "region": ["US", "a=b", "na me", "o'brien", "US", "p%p"]}
 
 
+def _guard_out_dir(out_dir: str) -> None:
+    """Refuse to rmtree an arbitrary path: `out_dir` comes from argv, and this script deletes
+    `<out_dir>/read-table`. Require it to be an existing engine fixture dir (or empty/new)."""
+    if not os.path.exists(out_dir):
+        return
+    if not os.path.isdir(out_dir):
+        raise SystemExit(f"refusing to write: {out_dir!r} is not a directory")
+    entries = set(os.listdir(out_dir))
+    if entries and not ({"matrix.json", "SHA256SUMS", "read-table"} & entries):
+        raise SystemExit(
+            f"refusing to overwrite {out_dir!r}: not an engine golden dir "
+            "(expected matrix.json / SHA256SUMS / read-table)")
+
+
 def main(out_dir: str) -> None:
+    _guard_out_dir(out_dir)
+
     import deltalake
     import pyarrow as pa
     from deltalake import write_deltalake
 
     # (1) Full matrix table → throwaway temp dir (not committed) to harvest matrix.json.
     matrix_staging = tempfile.mkdtemp(prefix="ds806-matrix-")
+    # atexit so an engine failure mid-run cannot leave the staged table behind.
+    atexit.register(shutil.rmtree, matrix_staging, ignore_errors=True)
     matrix_src = os.path.join(matrix_staging, "matrix-table")
     tab = pa.table({"id": list(range(len(VALUES))), "region": VALUES})
     write_deltalake(matrix_src, tab, partition_by=["region"])
@@ -61,12 +80,47 @@ def main(out_dir: str) -> None:
         if "add" in o:
             add_by_value[o["add"]["partitionValues"]["region"]] = o["add"]["path"]
 
+    # Commit the engine's OWN transaction log for the full matrix table. matrix.json is DERIVED (harvested by
+    # this script), so on its own a hand-edited row could bless a buggy encoder and pass every test
+    # (design risk R7). This file is written by the reference engine itself and is the ground truth the
+    # differential test cross-checks all rows against. Only the LOG is committed, never the matrix table's
+    # data files or directories -- so the non-ASCII / control-bearing values appear solely as text inside
+    # this JSON, never as filesystem paths (design R6, the macOS NFC/NFD hazard).
+    shutil.copyfile(log, os.path.join(out_dir, "matrix-log.json"))
+
     matrix = []
     for v in VALUES:
         add_path = add_by_value[v]
         decoded = unquote(add_path.split("/")[0])
         assert decoded in disk_dirs, f"dir {decoded!r} for {v!r} not on disk"
         matrix.append({"value": v, "on_disk_dir": decoded, "add_path_segment": add_path.split("/")[0]})
+    # (1b) The EMPTY-STRING axis, harvested from a real run. Unlike Spark, delta-rs gives "" its OWN
+    #      directory (region=) and its own add-action, so its behaviour differs from Spark here; both are
+    #      recorded so the differential test can pin the divergence instead of asserting it in prose.
+    empty_staging = tempfile.mkdtemp(prefix="ds806-empty-")
+    atexit.register(shutil.rmtree, empty_staging, ignore_errors=True)
+    empty_src = os.path.join(empty_staging, "empty-table")
+    write_deltalake(empty_src, pa.table({"id": [0, 1, 2], "region": [None, "", "keep"]}), partition_by=["region"])
+    empty_dirs = sorted(n for n in os.listdir(empty_src) if n.startswith("region="))
+    empty_adds = []
+    for line in open(os.path.join(empty_src, "_delta_log", "00000000000000000000.json"), encoding="utf-8"):
+        o = json.loads(line)
+        if "add" in o:
+            empty_adds.append((o["add"]["partitionValues"]["region"], o["add"]["path"].split("/")[0]))
+    from deltalake import DeltaTable
+    back = DeltaTable(empty_src).to_pyarrow_table().to_pydict()
+    pairs = dict(zip(back["id"], back["region"]))
+    empty_string = {
+        "on_disk_dirs": empty_dirs,
+        "add_partition_values": sorted({a[0] for a in empty_adds}, key=str),
+        "distinct_add_action": any(a[0] == "" for a in empty_adds),
+        "folds_onto_sentinel_with_null": not any(a[0] == "" for a in empty_adds),
+        "add_path_segment": next((a[1] for a in empty_adds if a[0] == ""), None),
+        "read_back_value": pairs.get(1),
+        "read_back_is_null": pairs.get(1) is None,
+    }
+    shutil.rmtree(empty_staging, ignore_errors=True)
+
     shutil.rmtree(matrix_staging, ignore_errors=True)
 
     # (2) Committed small readable table.
@@ -84,6 +138,7 @@ def main(out_dir: str) -> None:
                 "documented-residual tests.",
         "column": "region",
         "matrix": matrix,
+        "empty_string": empty_string,
     }
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "matrix.json"), "w", encoding="utf-8") as f:

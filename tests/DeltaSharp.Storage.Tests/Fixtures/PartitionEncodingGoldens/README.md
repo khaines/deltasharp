@@ -27,21 +27,39 @@ drifts *and* an unlisted file that appears both fail. A checked-in file whose ha
 
 The checksum manifest is minted by the same generator that writes the fixtures, so on its own it
 proves only that the bytes have not *drifted* — not that they came from a reference engine at all.
-`Goldens_CarryReferenceEngineProvenanceMarkers` closes that gap by asserting the **intrinsic markers
-the engines write themselves**: `matrix.json`'s `engine`/`version`, and the `_delta_log`'s
-`commitInfo.engineInfo` (`Apache-Spark/3.5.3 Delta-Lake/3.2.0`, `delta-rs:py-1.6.3`). A golden
-regenerated from DeltaSharp output would have to forge those deliberately.
+Two further controls close that gap, and they are **not equally strong** — the distinction matters:
+
+| Anchor | Written by | Strength |
+|---|---|---|
+| Parquet footer `created_by` / `org.apache.spark.version` / `delta-rs version` | the writer **library** | **Strongest** — DeltaSharp writes via Parquet.Net and cannot emit these |
+| `<engine>/matrix-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
+| `matrix.json` `version` | read from the installed library at generation time | Moderate |
+| `matrix.json` `engine` | a constant typed into the generator | Pins **drift only**, not origin |
+
+`Goldens_CarryReferenceEngineProvenanceMarkers` asserts the first three.
+`GoldenMatrix_EveryRow_MatchesTheEngineWrittenLog` cross-checks **every** matrix row against
+`matrix-log.json` — the engine's own transaction log for the full matrix table, committed verbatim.
+That is what makes `matrix.json` untrustworthy-on-its-own but *verifiable*: a row hand-edited to bless
+a buggy encoder must now also forge the engine's transaction log. Only the **log** is committed, never
+the matrix table's data files, so the non-ASCII and control-bearing values appear solely as text inside
+that JSON and never as filesystem paths (design R6).
 
 ## What the fixtures pin
 
 - **`<engine>/matrix.json`** — the full partition-value encoding matrix (ASCII-unreserved, every
   ASCII-reserved char, sub-delims, the URI-illegal set `< > | { } \` " \ [ ] ^ space`, non-ASCII
   Latin/CJK/emoji, a value already containing `%`, **`null` → the `__HIVE_DEFAULT_PARTITION__`
-  sentinel, and control-adjacent values** (`%09`/`%01` on disk)). Consumed by the **DS→ref byte-parity**
+  sentinel, and control-adjacent values** (`%09`/`%01` on disk)). The **empty string** is not a row —
+  Spark folds it onto the same sentinel partition as `null` and emits no distinct directory or
+  add-action — so its measured behaviour is harvested into the `empty_string` block instead.
+  Consumed by the **DS→ref byte-parity**
   differential test: DeltaSharp's `(EscapePathName, ToAddPath)` output must equal the **Spark** bytes
   for every row, and diverges from **delta-rs** on the documented broader-escaping on-disk residual —
   space, non-ASCII, **and** a number of ASCII sub-delims / URI-illegal chars (measured:
-  `& + , ; ! $ ( ) @ < > |`). DeltaSharp follows Spark (design D1).
+  ``& + , ; ! $ ( ) @ < > | } ` ``). DeltaSharp follows Spark (design D1). The residual set is *derived
+  and asserted* by the differential test, so this list cannot silently rot.
+- **`<engine>/matrix-log.json`** — the reference engine's own `_delta_log` for the full matrix table,
+  committed verbatim as the ground truth every `matrix.json` row is cross-checked against.
 - **`<engine>/read-table/`** — a small real Delta table (ASCII-safe partitions: unreserved, `=`,
   quote, space — deliberately no non-ASCII, to avoid the macOS NFC/NFD filesystem-normalization
   hazard, design R6) written by the reference engine. Consumed by the **ref→DS read** test:

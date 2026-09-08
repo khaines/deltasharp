@@ -170,5 +170,19 @@
       "on_disk_dir": "region=soh%01y",
       "add_path_segment": "region=soh%2501y"
     }
-  ]
+  ],
+  "empty_string": {
+    "on_disk_dirs": [
+      "region=__HIVE_DEFAULT_PARTITION__",
+      "region=keep"
+    ],
+    "add_partition_values": [
+      null,
+      "keep"
+    ],
+    "distinct_add_action": false,
+    "folds_onto_sentinel_with_null": true,
+    "read_back_value": null,
+    "read_back_is_null": true
+  }
 }
