@@ -1,3 +1,5 @@
+<!-- GENERATED from .claude/skills/review-pr/rating-rubric.md by tools/aiconfig/generate-copilot.py — do not edit; edit the source and re-run with --write. -->
+
 # PR Review Rating Rubric
 
 This document defines the scoring system, severity definitions, and consensus algorithm used by the `review-pr` skill to produce objective, repeatable PR ratings. AI review agents parse this rubric to assign findings, calculate scores, and format GitHub PR comments.
@@ -288,11 +290,10 @@ and the red-team verdict.
   council's own `NO-MISS-CERTIFIED` / attestations / quoted C7 output are **self-asserted signals**
   and therefore subject to the same C2 anti-forgeability rule the council applies to reviewed code
   (never trust a self-settable signal — the #323 class, applied reflexively);
-<!-- ai:block cert-decorrelation -->
-- the certifying red-team ran on a **tier no voting seat uses** (`fable` vs an all-`opus` spine),
-  **blind-first** (its Blind findings block returned before any seat verdict was released), and
-  **not forked**. A **provisional certification** (same tier, non-blind, or forked) **does NOT
-<!-- ai:endblock cert-decorrelation -->
+- the certifying red-team ran on a **vendor no voting seat uses** (`gemini-3.1-pro-preview`
+  vs an all-Claude spine), **blind-first** (its Blind findings block returned before any seat
+  verdict was released), and **not forked**. A **provisional certification** (same vendor,
+  non-blind, or forked) **does NOT
   satisfy PASS for protected-domain changes** — it blocks termination pending a correct re-run or a
   documented human waiver recorded in the composition audit.
 - **every finding not fixed in-PR is dispositioned** as exactly one of {fixed, dismissed-with-
@@ -310,14 +311,13 @@ CI (vacuous tests, validator↔consumer mismatches, migration notes the code con
 
 ## Decorrelated red-team gate
 
-<!-- ai:block gate-rules -->
-- The red-team runs **last** on **`fable`** — a tier **no voting seat uses** (every voting seat is
-  `opus`) — **blind-first** and **never forked**. Do **not** dispatch the red-team on `opus` while
-  the spine is Opus, and do **not** release seat verdicts to it before its blind block is back.
-  Vendor decorrelation is not available in-session under Claude Code (see `review-pr` → Complex
-  Change, 2026-09 record); the GPT family remains excluded on the 2026-07 measurement (empty first
-  response 5/5, C7 undischarged 4/5; see `red-team.md` → Dispatch). A red-team `MISS-FOUND`
-<!-- ai:endblock gate-rules -->
+- The red-team runs **last** on **`gemini-3.1-pro-preview`** — a **vendor** family **no voting
+  seat uses** (every voting seat is Claude) — **blind-first** and **never forked**. Do **not**
+  dispatch the red-team on a Claude model while the spine is Claude, and do **not** release
+  seat verdicts to it before its blind block is back. This council IS the vendor-decorrelated
+  gate: the Claude Code council decorrelates by tier only and defers the vendor axis to an
+  out-of-band re-run, which is this one. The GPT family remains excluded on the 2026-07
+  measurement (empty first response 5/5, C7 undischarged 4/5; see `red-team.md` → Dispatch). A red-team `MISS-FOUND`
   **always blocks** — its findings are actionable, in the canonical `Critical|High|Medium|Low|Info`
   set (the red-team does not emit `blocking/major/minor`).
 - `NO-MISS-CERTIFIED` is valid only with a fully-populated Falsification-Attempts block and a C7

@@ -1,0 +1,1 @@
+- **Decorrelate the red-team.** Run it on `gemini-3.1-pro-preview`, a vendor no voting seat uses, blind-first, never forked; same-vendor or non-blind certification is provisional for protected-domain changes. This council is the vendor-decorrelated re-run the Claude Code council defers to.

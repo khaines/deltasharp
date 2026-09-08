@@ -1,0 +1,78 @@
+{
+  "_comment": [
+    "Ordered, mechanical Claude -> Copilot rewrites applied to PASSTHROUGH text only.",
+    "Order matters: the longest paths rewrite first, and the .agent.md suffix regex runs",
+    "AFTER the directory rewrite that produces the paths it matches.",
+    "Text inside an ai:block override is NOT substituted - an override is authored",
+    "already-Copilot-shaped, and silently rewriting it would hide what it actually says.",
+    "`leakage` is the safety net: any of these PATTERNS matching passthrough-derived output",
+    "is a generator ERROR, because it means a Claude-only spelling reached the Copilot tree",
+    "through a substitution nobody remembered to add. They are regexes, and they deliberately",
+    "match a PATH (`.claude/<name>`) rather than a bare mention: prose that names `.claude/`",
+    "as a directory - a historical ledger row about the config-trust surface, say - is honest",
+    "cross-reference, while `.claude/commands` in a Copilot file points the reader at a tree",
+    "Copilot does not own."
+  ],
+  "substitutions": [
+    {
+      "kind": "literal",
+      "pattern": "A cheap Haiku scout triages and routes; an Opus council reviews complex changes with up to 3 scout-selected domain specialists; a blind-first Fable red-team, on a tier no voting seat uses, executes repros (C7) and gates.",
+      "replace": "A cheap scout triages and routes; a frontier council reviews complex changes with up to 3 scout-selected domain specialists; a blind-first, VENDOR-DECORRELATED red-team executes repros (C7) and gates."
+    },
+    {
+      "kind": "literal",
+      "pattern": "Fable red-team `NO-MISS-CERTIFIED`",
+      "replace": "vendor-decorrelated red-team `NO-MISS-CERTIFIED`"
+    },
+    {
+      "kind": "literal",
+      "pattern": ".claude/skills",
+      "replace": ".github/skills"
+    },
+    {
+      "kind": "literal",
+      "pattern": ".claude/agents",
+      "replace": ".github/agents"
+    },
+    {
+      "kind": "literal",
+      "pattern": "subagent_type",
+      "replace": "agent_type"
+    },
+    {
+      "kind": "literal",
+      "pattern": "the Agent tool",
+      "replace": "the task tool"
+    },
+    {
+      "kind": "literal",
+      "pattern": "Agent tool",
+      "replace": "task tool"
+    },
+    {
+      "kind": "literal",
+      "pattern": "agent_type: Explore",
+      "replace": "agent_type: explore"
+    },
+    {
+      "kind": "literal",
+      "pattern": "`Explore`",
+      "replace": "`explore`"
+    },
+    {
+      "kind": "literal",
+      "pattern": "CLAUDE.md",
+      "replace": ".github/copilot-instructions.md"
+    },
+    {
+      "kind": "regex",
+      "pattern": "\\.github/agents/([A-Za-z0-9._-]+)\\.md\\b",
+      "replace": ".github/agents/\\1.agent.md"
+    }
+  ],
+  "leakage": [
+    "\\.claude/[A-Za-z]",
+    "subagent_type",
+    "\\bCLAUDE\\.md\\b"
+  ]
+}

@@ -1,3 +1,5 @@
+<!-- GENERATED from .claude/skills/review-pr/red-team.md by tools/aiconfig/generate-copilot.py — do not edit; edit the source and re-run with --write. -->
+
 # Red-Team — RFL council adversarial gate
 
 > Dispatched by the `review-pr` skill (Phase 8) **last**, after every voting seat has
@@ -15,20 +17,29 @@ manufactures the independent, adversarial error-checking that constructive revie
 
 ## Dispatch — decorrelation + shell are mandatory
 
-<!-- ai:block gate-decorrelation -->
-- **Different tier from every voting seat.** Run the red-team on **`fable`**. Every voting seat
-  (Architect/Balanced/Quality/Security + specialists) runs on `opus`, so the gate is on a tier
-  **no voting seat uses**. Record which model gated. A red-team on a
-  voting-seat tier is **provisional** and does **not** satisfy the gate for protected-domain
-  changes — say so and require a correct re-run or a documented human waiver.
+- **Different VENDOR from every voting seat.** Run the red-team on
+  **`gemini-3.1-pro-preview`** (Gemini 3.1 Pro) — a frontier family **no voting seat uses**.
+  Every voting seat (Architect/Balanced/Quality/Security + specialists) runs on Claude, so the
+  gate does not share their family blind spots. Record which model gated. A red-team on a
+  voting seat's family is **provisional** and does **not** satisfy the gate for
+  protected-domain changes — say so and require a decorrelated re-run or a documented human
+  waiver.
+- **This is the decorrelated gate.** The Claude Code council cannot dispatch a non-Claude
+  model in-session, so its red-team decorrelates by *tier* (`fable` against an all-`opus`
+  spine) and records vendor decorrelation as an opt-in, out-of-band step that does not yet
+  exist. **Here it does exist.** Copilot can dispatch across vendors, so this council is the
+  **vendor-decorrelated re-run** for protected-domain changes (security, tenant isolation,
+  privacy): when the Claude council certifies a protected-domain change on tier
+  decorrelation alone, re-running *this* skill discharges the vendor half of the gate.
 - **Blind-first.** The red-team is dispatched with the diff, changed files, and Review Package
   **only**. It produces its **Blind findings** block and runs its C7 repros **before** the
   orchestrator releases any seat verdict, rating, or finding to it; the orchestrator then continues
   the same agent with the seats' verdicts for the falsification pass. A red-team that saw seat
-  verdicts before returning its blind block is **provisional** (same consequence as above). Vendor
-  decorrelation is no longer available in-session (Claude Code dispatches Claude models only; see
-  `review-pr` → Complex Change for the 2026-09 record); tier + blind-first + execution replace it.
-<!-- ai:endblock gate-decorrelation -->
+  verdicts before returning its blind block is **provisional** (same consequence as above).
+  Blind-first and execution are required *in addition to* vendor decorrelation here, not
+  instead of it — the 2026-07 record found that the verdicts actually overturned came from
+  **execution** and from a seat **willing to disagree**, so the vendor axis buys least when
+  the other two are weak.
 - **Never a fork.** Dispatch the red-team as a **new** subagent with no conversation history —
   never as a `fork` of the orchestrator, which would inherit the orchestrator's reading of the diff.
 - **Do not gate on the GPT family (measured, 2026-07).** Over 5 consecutive red-team runs spanning
@@ -40,7 +51,7 @@ manufactures the independent, adversarial error-checking that constructive revie
   future GPT release is retested and emits reliably, this may be revisited — but re-measure before
   re-adopting, and keep the telemetry.
 - **Shell-capable, always.** The red-team MUST hold a real shell to run C7 repros. Dispatch
-  it with `subagent_type: general-purpose` (full CLI tools) — **never** a persona agent without
+  it with `agent_type: general-purpose` (full CLI tools) — **never** a persona agent without
   `Bash`. (A reviewer that cannot execute cannot certify; a seat that withholds judgment for
   "couldn't run it" is a dispatch error, not a finding.)
 
@@ -50,7 +61,7 @@ block has been returned: **every prior seat's full verdict + findings**.
 
 ## First action
 
-Read `.claude/skills/review-pr/rigor-battery.md`. You apply the **entire battery (C1–C7)**,
+Read `.github/skills/review-pr/rigor-battery.md`. You apply the **entire battery (C1–C7)**,
 not just one domain. You are the council's mandatory **C7 executor**: you *run* repros, you
 do not reason about them.
 

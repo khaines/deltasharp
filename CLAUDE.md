@@ -26,10 +26,14 @@ assumed; see [ADR-0015](docs/adr/0015-open-source-positioning.md)).
 > [repository layout & project conventions](docs/engineering/design/repository-layout.md),
 > and keep these instructions in sync as engine code lands.
 >
+<!-- ai:block ai-workflows -->
 > **AI-assisted workflows.** Specialist personas live in `.claude/agents/` (canonical
 > role specs in `docs/persona/agents/`), and the orchestration skills — `design-doc`,
 > `implement-work-item`, `review-pr`, `review-fix-loop`, `stacked-pr-chain` — live in
-> `.claude/skills/`.
+> `.claude/skills/`. The GitHub Copilot mirror of both trees, plus
+> `.github/copilot-instructions.md`, is GENERATED from this one by
+> `tools/aiconfig/generate-copilot.py` — edit `.claude/**`, never `.github/**`.
+<!-- ai:endblock ai-workflows -->
 
 ## Build, test, and lint
 
@@ -55,6 +59,7 @@ Prefer keeping the solution buildable with `dotnet build` from the repo root
 (i.e. a single `*.sln` at the root that references all `src/` and `tests/`
 projects).
 
+<!-- ai:block agent-permissions -->
 ## Agent permissions
 
 `.claude/settings.json` pre-approves read-only inspection commands:
@@ -136,6 +141,22 @@ state. The same fold decides file *names*, in the walks as well as the index:
 CLI loads, so it is scanned like any other manifest and the index may hold only the
 canonical `SKILL.md` spelling.
 
+**The generated Copilot tree.** `.github/agents/*.agent.md`, `.github/skills/**` and
+`.github/copilot-instructions.md` are generated from `.claude/**` and this file by
+`tools/aiconfig/generate-copilot.py` — edit the canonical tree and re-run it with `--write`;
+never hand-edit the mirror. Those files are read and executed by Copilot on the same machines,
+so they sit inside the same C7 trust boundary, and a sixth check, `copilot-frontmatter`, holds
+them to the same policy: strict front matter (a wrapper may carry only
+`name`/`description`/`tools`, a manifest only `name`/`description`, with `model` rejected by
+name), the filename stem matching `name:`, an empty tree treated as drift, and the same
+tracked-symlink/gitlink/case-fold question over `.github`. That question is scoped to the three
+AI-config children plus the `.github` root ENTRY (so a link or submodule *at* `.github` cannot
+hide the tree behind it) and deliberately **not** to `.github/workflows`, `CODEOWNERS`,
+`ISSUE_TEMPLATE` or `dependabot.yml`, which are reviewed on their own path. Whether the mirror
+still matches its source is a separate workflow step,
+`tools/aiconfig/generate-copilot.py --check`: this gate owns configuration security, the
+generator owns sync.
+
 Three checks ask the `.claude` question — the roster walk in
 `roster<->documented-labels`, both front-matter walks in
 `command-skill-frontmatter`, and `tracked-startup-config` (which also owns
@@ -156,6 +177,7 @@ launches, before any tool call and with no prompt. **A tracked
 per-machine grants this file keeps recommending there are only safe while it stays
 untracked and gitignored (both paths are in `.gitignore`).
 
+<!-- ai:endblock agent-permissions -->
 ## Architecture — the big picture
 
 DeltaSharp follows Spark's layered execution model. Keep these layers separate:

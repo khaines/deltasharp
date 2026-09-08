@@ -192,6 +192,17 @@ DEFAULT_SETTINGS = os.path.join(".claude", "settings.json")
 # there, which only holds while the file is untracked).
 DEFAULT_MCP_CONFIG = ".mcp.json"
 SETTINGS_LOCAL_NAME = "settings.local.json"
+# The second config root. `.github/agents` and `.github/skills` are the GENERATED Copilot
+# mirror of `.claude/agents` and `.claude/skills` (`tools/aiconfig/generate-copilot.py`), and
+# `.github/copilot-instructions.md` the mirror of `CLAUDE.md`. They are read and executed by
+# Copilot on the same machines the Claude tree runs on, so they sit inside the same C7 trust
+# boundary and are policed the same way. Only these three children are in scope — see
+# :data:`POLICED_GITHUB_CHILDREN`.
+GITHUB_DIR_NAME = ".github"
+DEFAULT_COPILOT_AGENTS_DIR = os.path.join(GITHUB_DIR_NAME, "agents")
+DEFAULT_COPILOT_SKILLS_DIR = os.path.join(GITHUB_DIR_NAME, "skills")
+COPILOT_INSTRUCTIONS_NAME = "copilot-instructions.md"
+DEFAULT_COPILOT_INSTRUCTIONS = os.path.join(GITHUB_DIR_NAME, COPILOT_INSTRUCTIONS_NAME)
 DEFAULT_FEATURE_FORM = os.path.join(".github", "ISSUE_TEMPLATE", "feature_request.yml")
 DEFAULT_TAXONOMY = os.path.join("docs", "planning", "label-taxonomy.md")
 
@@ -375,6 +386,26 @@ FORBIDDEN_COMMAND_SKILL_KEY_REASONS = {
 # release adds — is rejected on sight, because an unknown key may grant tool use.
 ALLOWED_COMMAND_KEYS = ("description", "argument-hint", "model")
 ALLOWED_SKILL_KEYS = ("name", "description", "argument-hint", "model")
+
+# The GENERATED Copilot mirror (`.github/agents/*.agent.md`,
+# `.github/skills/**/SKILL.md`). Its schema is narrower than the Claude one it is projected
+# from: Copilot's wrapper carries a capability list, not a tool list, and has no antecedent
+# for `model`, `permissionMode` or `disallowedTools`. Anything outside these lists in a
+# tracked Copilot file means the file was hand-edited — the generator cannot emit it — so the
+# gate rejects it and the sync check names the real remedy.
+ALLOWED_COPILOT_AGENT_KEYS = ("name", "description", "tools")
+ALLOWED_COPILOT_SKILL_KEYS = ("name", "description")
+
+# `model` is called out BY NAME rather than falling through as merely unknown, because the
+# error a reader needs is "Copilot has no model selector here", not "unrecognized key". The
+# rest are the same tool-granting keys the Claude surface forbids, for the same reason: a
+# wrapper or manifest in this tree is loaded and run on the machine that checks it out.
+FORBIDDEN_COPILOT_KEYS = FORBIDDEN_COMMAND_SKILL_KEYS + ("model",)
+FORBIDDEN_COPILOT_KEY_REASONS = dict(
+    FORBIDDEN_COMMAND_SKILL_KEY_REASONS,
+    model="Copilot has no model selector in this file, and the generator drops `model:` "
+          "when projecting — its presence means the file was hand-edited",
+)
 
 
 # --- Output helpers ----------------------------------------------------------------------
@@ -1026,6 +1057,57 @@ SKILL_MANIFEST_NAME = "SKILL.md"
 # The suffix that makes a file in `.claude/agents` or `.claude/commands` configuration.
 MARKDOWN_SUFFIX = ".md"
 
+# The suffix that makes a file in `.github/agents` a Copilot persona wrapper. It is the
+# GENERATED mirror of `.claude/agents/<name>.md` (see `tools/aiconfig/generate-copilot.py`),
+# so the gate polices it exactly as it polices the canonical tree — a wrapper is loaded and
+# run by whichever runtime reads it, and Copilot reads this one.
+COPILOT_AGENT_SUFFIX = ".agent.md"
+
+# The second startup-config root. The `.github` directory is NOT policed wholesale the way
+# `.claude` is: it also holds `workflows/`, `CODEOWNERS`, `ISSUE_TEMPLATE/` and
+# `dependabot.yml`, none of which are AI configuration and all of which have their own
+# review path. Policing them here would red every dependabot PR on an unrelated rule. Only
+# the three AI-config children below — plus the `.github` root ENTRY itself, so a tracked
+# symlink or submodule AT `.github` cannot hide the whole tree — are in scope.
+POLICED_GITHUB_CHILDREN = (
+    "agents",
+    SKILLS_CHILD_NAME,
+    COPILOT_INSTRUCTIONS_NAME,
+)
+
+# Which children each config root contributes to the case-fold question, keyed on the FOLDED
+# root name so `sub/.Claude/agents` expands its children too (the raw `==` this replaced did
+# not — see :func:`_policed_prefixes`). A root absent from this table contributes only its own
+# spelling, never a child set borrowed from another root: `.github/settings.local.json` is not
+# a Claude permission file, and `.claude/workflows` is not a GitHub Actions directory.
+POLICED_CHILDREN_BY_ROOT = {
+    _fold(CLAUDE_DIR_NAME): POLICED_CLAUDE_CHILDREN,
+    _fold(GITHUB_DIR_NAME): POLICED_GITHUB_CHILDREN,
+}
+
+# Roots whose bare spelling polices the ROOT ENTRY ONLY, never everything beneath it.
+#
+# `.claude` is AI configuration all the way down, so its root prefix deliberately subsumes
+# every subtree — that is how a tracked link at `.claude/hooks`, a path no check names
+# explicitly, is still caught (LAST-CERT F2). `.github` is not: the same breadth would make a
+# tracked symlink at `.github/workflows/ci.yml` or `.github/ISSUE_TEMPLATE/bug.yml` a finding
+# of THIS gate, which reds unrelated PRs on a rule that was never about them and belongs to
+# the workflow review path instead. So the `.github` root entry itself is policed — a symlink
+# or submodule AT `.github` would otherwise hide the whole AI tree behind it — while depth
+# comes only from the three names in :data:`POLICED_GITHUB_CHILDREN`.
+SHALLOW_CONFIG_ROOTS = frozenset({_fold(GITHUB_DIR_NAME)})
+
+
+def _prefix_matches(parts: "tuple[str, ...]", prefix: "tuple[str, ...]") -> bool:
+    """Does `parts` fall under `prefix`, honoring :data:`SHALLOW_CONFIG_ROOTS`?
+
+    A shallow root matches only ITSELF; every other prefix matches itself and everything
+    below it, exactly as :func:`_folds_under` always has.
+    """
+    if len(prefix) == 1 and _fold(prefix[0]) in SHALLOW_CONFIG_ROOTS:
+        return tuple(_fold(part) for part in parts) == tuple(_fold(part) for part in prefix)
+    return _folds_under(parts, prefix)
+
 
 def _is_markdown_name(filename: str) -> bool:
     """Does `filename` name a markdown file on the checkout the CLI reads? (folded suffix)"""
@@ -1043,6 +1125,24 @@ def _is_skill_manifest_name(filename: str) -> bool:
     """
     return _fold(filename) == _fold(SKILL_MANIFEST_NAME)
 
+
+def _is_copilot_agent_name(filename: str) -> bool:
+    """Does `filename` name a Copilot persona wrapper on the checkout Copilot reads? (folded)
+
+    Folded for the same reason :func:`_is_skill_manifest_name` is: `x.AGENT.MD` and a `ſ`
+    spelling are the same file to APFS/NTFS and to the loader, so a wrapper committed under a
+    variant spelling is loaded while a byte-exact scan never sees it. The STEM is free (it is
+    the persona slug); only the suffix has a canonical spelling.
+    """
+    folded = _fold(filename)
+    suffix = _fold(COPILOT_AGENT_SUFFIX)
+    return folded.endswith(suffix) and len(folded) > len(suffix)
+
+
+def _canonical_copilot_agent_name(filename: str) -> str:
+    """`filename` with its `.agent.md` suffix in the canonical spelling (stem untouched)."""
+    return filename[: len(filename) - len(COPILOT_AGENT_SUFFIX)] + COPILOT_AGENT_SUFFIX
+
 # A sparse index collapses a whole directory into ONE entry (mode 040000, a trailing slash).
 # The files inside it are then absent from the listing, so "no findings under `.claude`" would
 # be an artefact of the index format rather than a fact about the tree.
@@ -1052,12 +1152,19 @@ _SPARSE_DIR_MODE = "040000"
 def _policed_prefixes(specs: "list[str]") -> "list[tuple[str, ...]]":
     """The canonical spellings an index entry is compared against, longest first.
 
-    Each queried path contributes its own spelling, and a `.claude` root additionally
-    contributes every name in :data:`POLICED_CLAUDE_CHILDREN` — that is what extends the
+    Each queried path contributes its own spelling, and a CONFIG ROOT additionally contributes
+    every name its entry in :data:`POLICED_CHILDREN_BY_ROOT` lists — that is what extends the
     case-fold question BELOW the root's direct children, where it used to stop (PR-901 second
     round, H-1: `.claude/COMMANDS/evil.md` and `.claude/Settings.local.json` passed the whole
     gate). Longest first so the most specific canonical spelling is the one quoted in the
     remedy (`.claude/skills`, not `.claude`).
+
+    The root is matched FOLDED, and each root contributes only its OWN children: `.github`
+    brings `agents`, `skills` and `copilot-instructions.md` and deliberately NOT `workflows`
+    or `settings.local.json`, so restoring the Copilot mirror does not quietly place every
+    GitHub Actions file under this gate. Folding the root name also fixes a latent gap in the
+    raw `==` this replaced: `--agents-dir sub/.Claude/agents` named a root the checkout
+    resolves but never expanded its children.
 
     The prefixes are ANCHOR-RELATIVE-turned-repo-relative spellings (`sub/.claude`), never a
     bare component: a clean root `.claude` must not mask a `sub/.Claude` under an
@@ -1070,8 +1177,9 @@ def _policed_prefixes(specs: "list[str]") -> "list[tuple[str, ...]]":
             continue
         if parts not in prefixes:
             prefixes.append(parts)
-        if parts[-1] == CLAUDE_DIR_NAME:
-            for child in POLICED_CLAUDE_CHILDREN:
+        children = POLICED_CHILDREN_BY_ROOT.get(_fold(parts[-1]))
+        if children:
+            for child in children:
                 candidate = parts + (child,)
                 if candidate not in prefixes:
                     prefixes.append(candidate)
@@ -1117,24 +1225,49 @@ def _count_uncovered_disk_files(
     return total
 
 
-def _claude_root_parts(parts: "tuple[str, ...]") -> "tuple[str, ...] | None":
-    """The `.claude` root `parts` lives in (folded match on the segment), or ``None``."""
+def _policed_root_parts(
+    parts: "tuple[str, ...]",
+) -> "tuple[tuple[str, ...], tuple[str, ...]] | None":
+    """The config root `parts` lives in and ITS policed children, or ``None``.
+
+    Scans right-to-left so the NEAREST root wins, and matches folded, so the root a
+    case-insensitive checkout resolves is the one answered about. Returns the children tuple
+    alongside the root because every caller needs both and must not borrow another root's set
+    — `.github` owns `agents`/`skills`/`copilot-instructions.md`, `.claude` owns its five.
+    """
     for index in range(len(parts) - 1, -1, -1):
-        if _fold(parts[index]) == _fold(CLAUDE_DIR_NAME):
-            return parts[: index + 1]
+        children = POLICED_CHILDREN_BY_ROOT.get(_fold(parts[index]))
+        if children is not None:
+            return parts[: index + 1], children
     return None
+
+
+def _claude_root_parts(parts: "tuple[str, ...]") -> "tuple[str, ...] | None":
+    """The config root `parts` lives in (folded match on the segment), or ``None``.
+
+    Name kept for the fixtures and assertions written against it; it now answers for any root
+    in :data:`POLICED_CHILDREN_BY_ROOT`, not only `.claude`.
+    """
+    matched = _policed_root_parts(parts)
+    return None if matched is None else matched[0]
 
 
 def _root_owned_by_index(
     parts: "tuple[str, ...]", listed: "list[tuple[str, str, tuple[str, ...]]]"
 ) -> bool:
-    """Does the index actually OWN the `.claude` root that `parts` lives in? (PR-901 SRE L-1)
+    """Does the index actually OWN the config root that `parts` lives in? (PR-901 SRE L-1)
 
     The question that decides whether "this subtree has files on disk and no index entry"
     means *untracked work in the checkout the operator is standing in* or *a foreign tree the
-    checkout knows nothing about*. It is answered only by an entry AT or UNDER one of the
-    POLICED children (`agents`, `commands`, `skills`, `settings.json`,
-    `settings.local.json`) — never by "some entry exists under the root".
+    checkout knows nothing about*. It is answered only by an entry AT or UNDER one of THAT
+    ROOT's policed children (`.claude`: `agents`, `commands`, `skills`, `settings.json`,
+    `settings.local.json`; `.github`: `agents`, `skills`, `copilot-instructions.md`) — never
+    by "some entry exists under the root".
+
+    Taking the children from the matched root matters for `.github`, where a checkout that
+    tracks only `workflows/` and `CODEOWNERS` does NOT thereby own the AI-config tree: a
+    `.github/agents` exported into it stays UNVERIFIED rather than being cleared by unrelated
+    entries that happen to share the root.
 
     That distinction is the whole safety of the rule. An export dropped inside an enclosing
     checkout that happens to track ONE innocuous `export/.claude/keep` would satisfy a
@@ -1142,12 +1275,13 @@ def _root_owned_by_index(
     prevent (PR-901 second round, RT-4). `keep` is not a policed child, so the root is not
     owned and the tree stays UNVERIFIED.
     """
-    root = _claude_root_parts(parts)
-    if root is None:
+    matched = _policed_root_parts(parts)
+    if matched is None:
         return False
+    root, children = matched
     return any(
         _folds_under(entry, root + (child,))
-        for child in POLICED_CLAUDE_CHILDREN
+        for child in children
         for _mode, _name, entry in listed
     )
 
@@ -1302,13 +1436,14 @@ def _index_findings(
         # `.claude/hooks` link, with no policed child on disk at all — still counts as
         # covered, because the index plainly does answer about that tree.
         covered = any(_folds_under(parts, prefix) for _mode, _name, parts in listed)
-        if covered and _claude_root_parts(prefix) == prefix:
+        matched_root = _policed_root_parts(prefix)
+        if covered and matched_root is not None and matched_root[0] == prefix:
             covered = all(
                 any(
                     _folds_under(parts, prefix + (child,))
                     for _mode, _name, parts in listed
                 )
-                for child in POLICED_CLAUDE_CHILDREN
+                for child in matched_root[1]
                 if _has_disk_entries(os.path.join(on_disk[spec], child))
             )
         if covered:
@@ -1332,8 +1467,13 @@ def _index_findings(
         )
     findings: "list[tuple[str, str, str]]" = []
     for mode, name, parts in listed:
-        matched = next((prefix for prefix in prefixes if _folds_under(parts, prefix)), None)
-        if matched is None and not any(_folds_under(parts, spec) for spec in scope):
+        matched = next((prefix for prefix in prefixes if _prefix_matches(parts, prefix)), None)
+        # The queried paths are a second way in, for an entry under a spec that contributed no
+        # prefix of its own. It honors the SHALLOW rule too: `.github` reaches this list as a
+        # queried root (`link_query_paths` adds it), and a plain `_folds_under` here would put
+        # `.github/workflows/ci.yml` back in scope through the side door after
+        # `_prefix_matches` had correctly kept it out.
+        if matched is None and not any(_prefix_matches(parts, spec) for spec in scope):
             continue
         if mode == _SPARSE_DIR_MODE or name.endswith("/"):
             return None, (
@@ -1362,6 +1502,17 @@ def _index_findings(
             # canonical spelling — otherwise the reviewer reading `SKILL.md` in the tree and
             # git recording something else are looking at different things (PR-901 F-1).
             expected = "/".join(parts[:-1] + (SKILL_MANIFEST_NAME,))
+        elif (
+            matched is not None
+            and _is_copilot_agent_name(parts[-1])
+            and parts[-1] != _canonical_copilot_agent_name(parts[-1])
+            and _fold(matched[-1]) == _fold("agents")
+        ):
+            # Same rule as the manifest leaf, for the wrapper SUFFIX. `x.AGENT.MD` is the file
+            # Copilot loads on a case-insensitive checkout, so the index may hold only the
+            # canonical `.agent.md` spelling — two of them cannot coexist there, and a
+            # reviewer reading `x.agent.md` in the tree must be reading what git recorded.
+            expected = "/".join(parts[:-1] + (_canonical_copilot_agent_name(parts[-1]),))
         if expected is not None:
             findings.append(("case", expected, name))
         elif mode in TRACKED_LINK_MODES:
@@ -1447,8 +1598,8 @@ def _tracked_links(paths: "list[str]") -> "list[tuple[str, str]] | None":
     return links
 
 
-def claude_root_pathspec(path: str) -> "str | None":
-    """The `.claude` directory a policed path lives in — the root path every check adds.
+def config_root_pathspec(path: str) -> "str | None":
+    """The config-root directory a policed path lives in — the root path every check adds.
 
     The `pathspec` in this function's name is HISTORICAL: the index is listed once with no
     pathspec at all (see :func:`_index_findings`) and the value returned here is the scoping
@@ -1466,6 +1617,16 @@ def claude_root_pathspec(path: str) -> "str | None":
 
     Duplicate findings across checks are harmless: :func:`_dedupe_link_problems` collapses
     them to one line per link WITHIN each check's report.
+
+    With a SECOND root in play the no-match branch became load-bearing. It used to synthesize
+    `dirname(path)/.claude` for ANY path with no `.claude` ancestor, which is right for the
+    `.mcp.json` sibling it was written for and catastrophically wrong for `.github/agents`:
+    that would have been scoped to `.github/.claude`, a directory that does not exist, so
+    every finding in the Copilot tree would have been selected away and the check would have
+    reported a clean tree it never looked at. So the synthesis is now narrowed to the known
+    `.claude`-sibling leaves, and anything else returns ``None`` — :func:`link_query_paths`
+    skips falsy candidates, leaving such a path queried under its OWN spelling and nothing
+    else. A wrong root is a false green; no root is merely a narrower true answer.
     """
     if not path:
         return None
@@ -1474,17 +1635,26 @@ def claude_root_pathspec(path: str) -> "str | None":
         normalized = normalized.replace(os.altsep, os.sep)
     parts = normalized.split(os.sep)
     for index in range(len(parts) - 1, -1, -1):
-        if parts[index] == CLAUDE_DIR_NAME:
-            # The caller's own spelling up to `.claude`, so the SKIP reason a responder reads
-            # names `.claude` rather than an absolute path they did not type.
+        if _fold(parts[index]) in POLICED_CHILDREN_BY_ROOT:
+            # The caller's own spelling up to the root, so the SKIP reason a responder reads
+            # names `.claude`/`.github` rather than an absolute path they did not type.
             return os.sep.join(parts[: index + 1]) or os.sep
-    # No `.claude` ancestor: the policed path is a SIBLING of the root (the default
-    # `.mcp.json`), so the root is the `.claude` beside it. Answering the path's PARENT here
-    # scoped the query to whatever directory that happened to be — `os.curdir`, i.e. the
-    # WHOLE REPOSITORY, for the root-relative `.mcp.json` this gate actually runs on, which
-    # is how a submodule at `vendor/lib` or a symlink at `docs/x/alias.md` came to fail
-    # `tracked-startup-config` with a `.claude` remedy (PR-901 F-B).
+    if _fold(os.path.basename(normalized)) != _fold(DEFAULT_MCP_CONFIG):
+        # Not a root, and not a known root SIBLING either. Answering the path's PARENT here
+        # scoped the query to whatever directory that happened to be — `os.curdir`, i.e. the
+        # WHOLE REPOSITORY, for the root-relative `.mcp.json` this gate actually runs on,
+        # which is how a submodule at `vendor/lib` or a symlink at `docs/x/alias.md` came to
+        # fail `tracked-startup-config` with a `.claude` remedy (PR-901 F-B). Answering a
+        # SYNTHESIZED root is worse still — see the false-green note above.
+        return None
+    # `.mcp.json` is a startup surface that sits BESIDE the root rather than under it, so the
+    # root it belongs to is the `.claude` next to it (PR-901 F-B).
     return os.path.normpath(os.path.join(os.path.dirname(normalized) or os.curdir, CLAUDE_DIR_NAME))
+
+
+def claude_root_pathspec(path: str) -> "str | None":
+    """Back-compatible name for :func:`config_root_pathspec` (fixtures reference it)."""
+    return config_root_pathspec(path)
 
 
 def link_query_paths(*paths: str) -> "list[str]":
@@ -2536,6 +2706,130 @@ def scan_command_skill_frontmatter(
     return problems, counts["command"], counts["skill"]
 
 
+# --- Check 6: .github/agents + .github/skills front matter (the GENERATED Copilot mirror) --
+
+def validate_copilot_frontmatter(
+    path: str, frontmatter: "dict[str, str]", kind: str
+) -> "list[str]":
+    """Return policy problems with one Copilot wrapper/manifest front matter (empty ⇒ clean).
+
+    ``kind`` is ``"copilot agent"`` (`.github/agents/*.agent.md`, held to
+    :data:`ALLOWED_COPILOT_AGENT_KEYS`) or ``"copilot skill"`` (`.github/skills/**/SKILL.md`,
+    held to :data:`ALLOWED_COPILOT_SKILL_KEYS`).
+
+    The remedy differs from every other surface here, and that is the point: this tree is
+    GENERATED. A violation is not "fix this file" but "this file was hand-edited" — the
+    generator cannot emit any of these keys — so the message points at the canonical source
+    rather than inviting an edit that the next `--write` would silently revert.
+    """
+    allowed = (
+        ALLOWED_COPILOT_SKILL_KEYS if kind == "copilot skill" else ALLOWED_COPILOT_AGENT_KEYS
+    )
+    problems: "list[str]" = []
+    for key in frontmatter:
+        if key in FORBIDDEN_COPILOT_KEYS:
+            reason = FORBIDDEN_COPILOT_KEY_REASONS.get(key)
+            because = f" ({reason})" if reason else ""
+            problems.append(
+                f"{kind} file {path!r} defines {key!r}{because}; this tree is GENERATED from "
+                f"`.claude/**` — fix the canonical file and re-run "
+                f"`python3 tools/aiconfig/generate-copilot.py --write`; tracked {kind} files "
+                f"may carry only {', '.join(repr(k) for k in allowed)}"
+            )
+            continue
+        if key not in allowed:
+            problems.append(
+                f"{kind} file {path!r} defines unknown front-matter key {key!r}; the "
+                f"generator emits only {', '.join(repr(k) for k in allowed)}, so this file "
+                f"was hand-edited — fix `.claude/**` and re-run "
+                f"`python3 tools/aiconfig/generate-copilot.py --write`"
+            )
+    for required in ("name", "description"):
+        if required not in frontmatter:
+            problems.append(
+                f"{kind} file {path!r} has no {required!r}; the generator always emits one, "
+                f"so this file was hand-edited or truncated"
+            )
+    return problems
+
+
+def scan_copilot_frontmatter(
+    agents_dir: str = DEFAULT_COPILOT_AGENTS_DIR, skills_dir: str = DEFAULT_COPILOT_SKILLS_DIR
+) -> "tuple[list[str], int, int]":
+    """Return (problems, wrappers scanned, skill manifests scanned) for the Copilot mirror.
+
+    The same walk, the same strict reader and the same fail-closed contract as
+    :func:`scan_command_skill_frontmatter`, over the second config root. Symlinked
+    directories are not followed but ARE reported, every entry is link-checked BEFORE the
+    name match (a dangling link is listed under whatever name it carries, and letting the
+    name decide whether the link is looked at is how one that resolves on another machine
+    stays invisible), and file names are matched FOLDED — Copilot loads `x.AGENT.MD` and
+    `ſkill.md` on a case-insensitive checkout, so a byte-exact scan would pass them green.
+
+    The wrapper's filename stem must equal its ``name:``. That check is spelled out here
+    rather than borrowed from :func:`read_roster` because the suffix differs: a Copilot
+    wrapper is `<name>.agent.md`, not `<name>.md`, so stripping `.md` would leave `.agent`
+    on every stem and fail all 25.
+    """
+    problems: "list[str]" = []
+    counts = {"copilot agent": 0, "copilot skill": 0}
+    for kind, root in (("copilot agent", agents_dir), ("copilot skill", skills_dir)):
+        link_problems: "list[str]" = []
+        if os.path.islink(root):
+            link_problems.append(_symlink_problem(kind, root))
+        if not os.path.isdir(root):
+            problems.extend(link_problems)
+            continue
+        paths: "list[str]" = []
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            dirnames.sort()
+            link_problems.extend(_walk_symlink_problems(kind, dirpath, dirnames))
+            for filename in filenames:
+                path = os.path.join(dirpath, filename)
+                if os.path.islink(path):
+                    link_problems.append(_symlink_problem(f"{kind} file", path))
+                if (
+                    _is_copilot_agent_name(filename)
+                    if kind == "copilot agent"
+                    else _is_skill_manifest_name(filename)
+                ):
+                    paths.append(path)
+        paths.sort()
+        problems.extend(sorted(link_problems))
+        for path in paths:
+            counts[kind] += 1
+            try:
+                frontmatter, duplicate_keys = _read_frontmatter(path)
+            except FrontmatterError as exc:
+                problems.append(f"{kind} file {path!r} {exc}")
+                continue
+            if frontmatter is None:
+                problems.append(
+                    f"{kind} file {path!r} has no front-matter fence; the generator always "
+                    f"emits one, so this file was hand-edited or truncated"
+                )
+                continue
+            for key in duplicate_keys:
+                problems.append(
+                    f"{kind} file {path!r} declares duplicate front-matter key {key!r}; YAML "
+                    f"keeps the LAST value while this gate reads the first, so the policy "
+                    f"would validate a value the loader never uses — keep exactly one "
+                    f"{key!r} line"
+                )
+            problems.extend(validate_copilot_frontmatter(path, frontmatter, kind))
+            if kind == "copilot agent":
+                stem = os.path.basename(path)[: -len(COPILOT_AGENT_SUFFIX)]
+                name = frontmatter.get("name")
+                if name and stem != name:
+                    problems.append(
+                        f"{kind} file {path!r} has filename stem {stem!r} but declares "
+                        f"`name: {name}`; Copilot addresses the persona by its `name`, so the "
+                        f"two must agree — re-run "
+                        f"`python3 tools/aiconfig/generate-copilot.py --write`"
+                    )
+    return problems, counts["copilot agent"], counts["copilot skill"]
+
+
 # --- Tracked startup configuration (.mcp.json / .claude/settings.local.json) --------------
 
 def _git_tracked(path: str) -> "bool | None":
@@ -2950,6 +3244,64 @@ def command_skill_result(commands_dir: str, skills_dir: str) -> Result:
     return Result("command-skill-frontmatter", "pass", detail)
 
 
+def copilot_frontmatter_result(agents_dir: str, skills_dir: str) -> Result:
+    """Wrap :func:`scan_copilot_frontmatter` as the "copilot-frontmatter" check.
+
+    The `.github` half of the same question `command-skill-frontmatter` asks about `.claude`,
+    with the same local/stdlib-only shape, the same git-as-well-as-filesystem link query, and
+    the same "zero manifests is drift, not a pass" rule.
+
+    It polices SHAPE, not freshness. Whether the generated tree still matches the canonical
+    one is `tools/aiconfig/generate-copilot.py --check`, a separate step in the reconcile
+    workflow — this gate owns config SECURITY and the generator owns SYNC, so neither has to
+    import the other. The passing detail names that command, because a developer running
+    `--offline` would otherwise reasonably assume this check covered staleness too.
+    """
+    problems, agents, skills = scan_copilot_frontmatter(agents_dir, skills_dir)
+    # The instructions file is DERIVED from the caller's agents directory, never taken from
+    # the module default: a fixture pointed at a temporary tree would otherwise drag the real
+    # checkout's `.github/copilot-instructions.md` into the same query, and a query spanning
+    # two work trees answers "could not verify" — a green fixture that proved nothing.
+    instructions = os.path.join(os.path.dirname(agents_dir), COPILOT_INSTRUCTIONS_NAME)
+    link_problems, link_unverified, link_notes = tracked_symlink_problems(
+        link_query_paths(agents_dir, skills_dir, instructions)
+    )
+    problems = _dedupe_link_problems(link_problems, problems)
+    # The repo TRACKS both trees, so an empty scan is a rename or a deletion, never a pass.
+    if agents == 0:
+        problems = problems + [
+            f"no {COPILOT_AGENT_SUFFIX} wrapper found under {agents_dir!r} — the repo tracks "
+            f"the generated Copilot mirror there, so an empty or missing tree means the scan "
+            f"covered nothing (directory moved, or the generator never run?); re-run "
+            f"`python3 tools/aiconfig/generate-copilot.py --write` or pass --copilot-agents-dir"
+        ]
+    if skills == 0:
+        problems = problems + [
+            f"no {SKILL_MANIFEST_NAME} manifest found under {skills_dir!r} — the repo tracks "
+            f"the generated Copilot skills there, so an empty scan means it covered nothing; "
+            f"re-run `python3 tools/aiconfig/generate-copilot.py --write` or pass "
+            f"--copilot-skills-dir"
+        ]
+    detail = [
+        f"{agents} Copilot wrapper(s) under {agents_dir} and {skills} skill manifest(s) under "
+        f"{skills_dir} scanned: strict front-matter parse, stem matches `name:`, no "
+        f"{'/'.join(FORBIDDEN_COPILOT_KEYS)}, no unknown key (wrappers may carry only "
+        f"{', '.join(ALLOWED_COPILOT_AGENT_KEYS)}; skills only "
+        f"{', '.join(ALLOWED_COPILOT_SKILL_KEYS)}). This tree is GENERATED — freshness is "
+        f"checked by `python3 tools/aiconfig/generate-copilot.py --check`, not here."
+    ] + link_notes
+    if problems:
+        return Result(
+            "copilot-frontmatter",
+            "fail",
+            problems,
+            notes=_fail_notes(detail, link_unverified),
+        )
+    if link_unverified:
+        return Result("copilot-frontmatter", "skip", link_unverified, notes=detail)
+    return Result("copilot-frontmatter", "pass", detail)
+
+
 def startup_config_result(
     mcp_path: str, settings_local_path: str, settings_path: "str | None" = None
 ) -> Result:
@@ -3094,6 +3446,13 @@ def run_checks(args: argparse.Namespace) -> "list[Result]":
     # settings policy nor the wrapper policy above can see it.
     results.append(command_skill_result(args.commands_dir, args.skills_dir))
 
+    # --- Check 6: the GENERATED Copilot mirror's front matter (local) ---------------------
+    # Same policy as check 5, over the second config root. Local, so it runs under --offline;
+    # freshness is the generator's own workflow step, not this check (see the Result docstring).
+    results.append(
+        copilot_frontmatter_result(args.copilot_agents_dir, args.copilot_skills_dir)
+    )
+
     # --- Check 1b: roster <-> LIVE persona labels (remote; catches GitHub UI-side drift) ---
     early, labels = _remote_or_skip(
         "roster<->live-labels", args.offline, lambda: fetch_persona_labels(repo), args.require_remote
@@ -3186,11 +3545,11 @@ def _print_summary(results: "list[Result]") -> None:
 #     GITHUB_ACTIONS/CI default on) — those two escapes become failures in their own right:
 #     any skip, and any reduced coverage, FAILS the floor and names what was skipped. So an
 #     automated run either executes the full count or goes red; it cannot go green with less.
-SELFTEST_ASSERTIONS_IN_CHECKOUT = 327
+SELFTEST_ASSERTIONS_IN_CHECKOUT = 356
 # The assertions that can only run there (they exercise the REAL .claude tree through main()).
 # Anywhere else — a `git archive` export, a tarball, a vendored copy, a subdirectory — they
 # are skipped rather than failed, so the floor below is what proves they ran where they can.
-SELFTEST_CHECKOUT_ONLY_ASSERTIONS = 3
+SELFTEST_CHECKOUT_ONLY_ASSERTIONS = 4
 
 
 def _selftest(strict: bool = False) -> int:
@@ -5384,6 +5743,107 @@ def _selftest(strict: bool = False) -> int:
                 f"an empty roster under a symlinked `.claude` ({_shape}) names the parent link",
             )
 
+    # --- COPILOT-A/B: the SECOND config root (`.github`). The Copilot tree
+    # (`.github/agents`, `.github/skills`, `.github/copilot-instructions.md`) is generated
+    # from `.claude/**` and executed by Copilot on the same machines, so it is policed the
+    # same way. Two properties decide whether that policing is real, and both have a false
+    # green as their failure mode.
+    #
+    # (A) SCOPE. `.github` also holds `workflows/`, `CODEOWNERS`, `ISSUE_TEMPLATE/` and
+    # `dependabot.yml`. Policing the root the way `.claude` is policed — everything beneath
+    # it — would make a tracked symlink at `.github/workflows/ci.yml` a finding of THIS gate
+    # and red unrelated PRs on a rule that was never about them. The root ENTRY is policed
+    # (a link or submodule AT `.github` would otherwise hide the whole AI tree behind it);
+    # depth comes only from the three named children.
+    # Killing mutant: dropping `SHALLOW_CONFIG_ROOTS` from `_prefix_matches`, or adding
+    # `workflows` to `POLICED_GITHUB_CHILDREN`.
+    _github_prefixes = _policed_prefixes([GITHUB_DIR_NAME])
+    check(
+        set(_github_prefixes) == {
+            (GITHUB_DIR_NAME,),
+            (GITHUB_DIR_NAME, "agents"),
+            (GITHUB_DIR_NAME, SKILLS_CHILD_NAME),
+            (GITHUB_DIR_NAME, "copilot-instructions.md"),
+        },
+        "the `.github` root contributes exactly its three AI-config children plus itself",
+    )
+    check(
+        _prefix_matches((GITHUB_DIR_NAME,), (GITHUB_DIR_NAME,))
+        and _prefix_matches(("." + "GitHub",), (GITHUB_DIR_NAME,)),
+        "the `.github` ROOT ENTRY is policed, in any spelling the checkout folds onto it",
+    )
+    check(
+        not any(
+            _prefix_matches(_parts, _prefix)
+            for _prefix in _github_prefixes
+            for _parts in (
+                (GITHUB_DIR_NAME, "workflows", "ci.yml"),
+                (GITHUB_DIR_NAME, "CODEOWNERS"),
+                (GITHUB_DIR_NAME, "ISSUE_TEMPLATE", "bug.yml"),
+                (GITHUB_DIR_NAME, "dependabot.yml"),
+            )
+        ),
+        "`.github/workflows`, CODEOWNERS, ISSUE_TEMPLATE and dependabot.yml stay OUT of scope",
+    )
+    check(
+        any(
+            _prefix_matches((GITHUB_DIR_NAME, "agents", "x.agent.md"), _prefix)
+            for _prefix in _github_prefixes
+        )
+        and any(
+            _prefix_matches(
+                (GITHUB_DIR_NAME, SKILLS_CHILD_NAME, "s", SKILL_MANIFEST_NAME), _prefix
+            )
+            for _prefix in _github_prefixes
+        ),
+        "the three `.github` AI-config children ARE policed to full depth",
+    )
+    check(
+        any(
+            _prefix_matches((CLAUDE_DIR_NAME, "hooks"), _prefix)
+            for _prefix in _policed_prefixes([CLAUDE_DIR_NAME])
+        ),
+        "`.claude` keeps its root-and-everything-below breadth (LAST-CERT F2 unchanged)",
+    )
+
+    # (B) THE SYNTHESIZED-ROOT FALSE GREEN. `config_root_pathspec` used to answer
+    # `dirname(path)/.claude` for ANY path with no `.claude` ancestor. That is right for the
+    # `.mcp.json` sibling it was written for (PR-901 F-B) and catastrophic for a second root:
+    # `.github/agents` would have been scoped to `.github/.claude`, a directory that does not
+    # exist, so every finding in the Copilot tree would have been selected away and the check
+    # would have reported a clean tree it never looked at. An unrecognized path now answers
+    # None, which `link_query_paths` skips — the path is then queried under its own spelling
+    # and nothing else. A wrong root is a false green; no root is a narrower truth.
+    # Killing mutant: restoring the unconditional `dirname/.claude` synthesis.
+    check(
+        config_root_pathspec(DEFAULT_COPILOT_AGENTS_DIR) == GITHUB_DIR_NAME
+        and config_root_pathspec(DEFAULT_COPILOT_SKILLS_DIR) == GITHUB_DIR_NAME
+        and config_root_pathspec(DEFAULT_COPILOT_INSTRUCTIONS) == GITHUB_DIR_NAME,
+        "every policed `.github` path scopes to the `.github` root",
+    )
+    check(
+        config_root_pathspec(DEFAULT_COPILOT_AGENTS_DIR)
+        != os.path.join(GITHUB_DIR_NAME, CLAUDE_DIR_NAME),
+        "`.github/agents` does NOT scope to a synthesized `.github/.claude` (false green)",
+    )
+    check(
+        config_root_pathspec(DEFAULT_MCP_CONFIG) == CLAUDE_DIR_NAME,
+        "the `.mcp.json` sibling still scopes to the `.claude` beside it (PR-901 F-B)",
+    )
+    check(
+        config_root_pathspec(os.path.join("docs", "x.md")) is None
+        and config_root_pathspec(os.path.join("vendor", "lib")) is None,
+        "a path in NEITHER root scopes to None, never to an invented root",
+    )
+    check(
+        claude_root_pathspec(DEFAULT_AGENTS_DIR) == CLAUDE_DIR_NAME,
+        "the `claude_root_pathspec` alias still answers for the `.claude` root",
+    )
+    check(
+        link_query_paths(os.path.join("docs", "x.md")) == [os.path.join("docs", "x.md")],
+        "a None root drops out of link_query_paths, leaving the path's own spelling",
+    )
+
     # --- PR-901 F-A/F-B/F-C/F-D/F-E: WHERE git is asked, and about WHAT. ---------------
     # Every fixture above builds a link INSIDE a `.claude` that is itself an ordinary
     # directory, so the old code's habit of running git from `dirname(first pathspec)` — i.e.
@@ -6643,9 +7103,9 @@ def _selftest(strict: bool = False) -> int:
         _out = _buffer.getvalue()
         check_in_checkout(
             _exit == 0
-            and _out.count("[PASS] ") == 4
+            and _out.count("[PASS] ") == 5
             and "file(s) on disk are not in the index" not in _out,
-            "this checkout's four LOCAL checks all PASS with ZERO coverage notes: the "
+            "this checkout's five LOCAL checks all PASS with ZERO coverage notes: the "
             "`git add` note never fires on a tree the index fully covers",
         )
     # ...and the same, on a fixture, so the assertion is not a property of the directory the
@@ -6955,6 +7415,151 @@ def _selftest(strict: bool = False) -> int:
                 ) == 1,
                 "an UNTRACKED `.claude` symlink still FAILS tracked-startup-config, once",
             )
+    # --- COPILOT-C/D/E: the GENERATED Copilot mirror as a POLICED surface. Shape only —
+    # freshness is `tools/aiconfig/generate-copilot.py --check`, a separate workflow step.
+    #
+    # (D) POLICY. Same fail-closed discipline as the command/skill surface, over a narrower
+    # schema: a Copilot wrapper carries a capability list, not a tool list, and has no
+    # antecedent for `model`. A violation here means the file was HAND-EDITED — the generator
+    # cannot emit any of these keys — so every message must point at the canonical source
+    # rather than inviting an edit the next `--write` would revert.
+    # Killing mutant: widening ALLOWED_COPILOT_AGENT_KEYS, or dropping the stem/name check.
+    def _copilot_problems(front: str, filename: str = "demo.agent.md",
+                          skill_front: "str | None" = None) -> "tuple[list[str], int, int]":
+        with tempfile.TemporaryDirectory() as tmp:
+            _agents = os.path.join(tmp, "agents")
+            _skills = os.path.join(tmp, "skills", "demo")
+            os.makedirs(_agents, exist_ok=True)
+            os.makedirs(_skills, exist_ok=True)
+            with open(os.path.join(_agents, filename), "w", encoding="utf-8") as handle:
+                handle.write(front)
+            with open(os.path.join(_skills, SKILL_MANIFEST_NAME), "w", encoding="utf-8") as handle:
+                handle.write(skill_front or "---\nname: demo\ndescription: d\n---\n")
+            return scan_copilot_frontmatter(_agents, os.path.join(tmp, "skills"))
+
+    _clean = "---\nname: demo\ndescription: d\ntools: [\"read\"]\n---\nbody\n"
+    _problems, _agents_n, _skills_n = _copilot_problems(_clean)
+    check(
+        _problems == [] and _agents_n == 1 and _skills_n == 1,
+        "a well-formed generated wrapper + manifest scan clean, and both are COUNTED",
+    )
+    check(
+        any("allowed-tools" in item and "GENERATED" in item for item in
+            _copilot_problems("---\nname: demo\ndescription: d\nallowed-tools: [Bash]\n---\n")[0]),
+        "`allowed-tools:` in a Copilot wrapper is rejected, and the remedy names the generator",
+    )
+    check(
+        any("'model'" in item for item in
+            _copilot_problems("---\nname: demo\ndescription: d\nmodel: opus\n---\n")[0]),
+        "`model:` is rejected BY NAME (the generator drops it, so its presence is a hand-edit)",
+    )
+    check(
+        any("unknown front-matter key" in item and "surprise" in item for item in
+            _copilot_problems("---\nname: demo\ndescription: d\nsurprise: x\n---\n")[0]),
+        "an unknown Copilot front-matter key is rejected on sight",
+    )
+    check(
+        any("duplicate front-matter key" in item for item in
+            _copilot_problems("---\nname: demo\ndescription: a\ndescription: b\n---\n")[0]),
+        "a duplicate key is a problem (YAML keeps the last, this reader the first)",
+    )
+    check(
+        _copilot_problems("---\nname: demo\ndescription: d\n")[0] != [],
+        "front matter the strict reader cannot parse FAILS CLOSED, never scans as clean",
+    )
+    check(
+        any("no front-matter fence" in item for item in _copilot_problems("body only\n")[0]),
+        "a generated wrapper with NO fence is a problem (the generator always emits one)",
+    )
+    check(
+        any("filename stem" in item and "elsewhere" in item for item in
+            _copilot_problems("---\nname: elsewhere\ndescription: d\n---\n")[0]),
+        "a wrapper whose stem does not match `name:` is an integrity problem",
+    )
+    check(
+        any(SKILL_MANIFEST_NAME in item and "covered nothing" in item
+            for item in copilot_frontmatter_result(
+                os.path.join(os.curdir, "no-agents"), os.path.join(os.curdir, "no-skills")
+            ).lines),
+        "an EMPTY Copilot tree FAILS the check; it never passes with '0 scanned'",
+    )
+    check(
+        tuple(ALLOWED_COPILOT_AGENT_KEYS) == ("name", "description", "tools")
+        and tuple(ALLOWED_COPILOT_SKILL_KEYS) == ("name", "description"),
+        "the Copilot allowlists still hold exactly the keys the generator emits",
+    )
+    check(
+        "model" in FORBIDDEN_COPILOT_KEYS
+        and set(FORBIDDEN_COMMAND_SKILL_KEYS) <= set(FORBIDDEN_COPILOT_KEYS)
+        and set(FORBIDDEN_COPILOT_KEY_REASONS) == set(FORBIDDEN_COPILOT_KEYS),
+        "FORBIDDEN_COPILOT_KEYS covers every tool-granting key plus `model`, each with a reason",
+    )
+
+    # (C) THE INDEX. The walk above cannot see a link whose target is absent in this checkout,
+    # a submodule CI checks out empty, or a spelling the filesystem folds. Those are exactly
+    # the shapes that ship unreviewed configuration to a developer machine, so git is asked
+    # too — and the answer must be SCOPED to `.github`, which is what COPILOT-B protects.
+    # Killing mutant: dropping `link_query_paths` from `copilot_frontmatter_result`.
+    for _mode, _path, _label in (
+        ("120000", ".github/agents/evil.agent.md", "a tracked SYMLINK wrapper"),
+        ("160000", ".github/skills/vendor", "a tracked GITLINK (submodule) under the skills tree"),
+        ("100644", ".GitHub/agents/x.agent.md", "a case-FOLDED `.GitHub/agents` entry"),
+        ("100644", ".github/skills/demo/\u017fkill.md", "a folded `\u017fkill.md` manifest"),
+        ("100644", ".github/agents/foo.AGENT.MD", "a folded `.AGENT.MD` wrapper suffix"),
+    ):
+        with tempfile.TemporaryDirectory() as _tmp:
+            _files = {
+                ".github/agents/demo.agent.md": "---\nname: demo\ndescription: d\n---\n",
+                ".github/skills/demo/SKILL.md": "---\nname: demo\ndescription: d\n---\n",
+            }
+            if not _git_repo(_tmp, _files, [".github"]):
+                skip("git unavailable: Copilot index fixtures not run")
+                break
+            if not _cacheinfo(_tmp, _mode, _path, "x"):
+                skip("git update-index --cacheinfo unavailable")
+                break
+            _res = copilot_frontmatter_result(
+                os.path.join(_tmp, ".github", "agents"),
+                os.path.join(_tmp, ".github", "skills"),
+            )
+            check(
+                _res.status == "fail" and any(
+                    _path.rsplit("/", 1)[-1] in line for line in _res.lines
+                ),
+                f"{_label} FAILS copilot-frontmatter, naming the entry",
+            )
+
+    # The SCOPE guard, executed rather than reasoned about: a tracked symlink at
+    # `.github/workflows/ci.yml` is a real concern and a DIFFERENT gate's business. If this
+    # ever starts failing, every dependabot PR reds on a rule that was never about it.
+    with tempfile.TemporaryDirectory() as _tmp:
+        _files = {
+            ".github/agents/demo.agent.md": "---\nname: demo\ndescription: d\n---\n",
+            ".github/skills/demo/SKILL.md": "---\nname: demo\ndescription: d\n---\n",
+        }
+        if not _git_repo(_tmp, _files, [".github"]):
+            skip("git unavailable: Copilot scope-guard fixture not run")
+        elif not _cacheinfo(_tmp, "120000", ".github/workflows/ci.yml", "../../elsewhere"):
+            skip("git update-index --cacheinfo unavailable")
+        else:
+            _res = copilot_frontmatter_result(
+                os.path.join(_tmp, ".github", "agents"),
+                os.path.join(_tmp, ".github", "skills"),
+            )
+            check(
+                _res.status == "pass" and not any("ci.yml" in line for line in _res.lines),
+                "a tracked symlink at `.github/workflows/ci.yml` is OUT of scope and silent",
+            )
+
+    # (E) THE REAL TREE. The fixtures above prove the rules; this proves they are pointed at
+    # the checkout the repository actually ships.
+    check_in_checkout(
+        copilot_frontmatter_result(
+            DEFAULT_COPILOT_AGENTS_DIR, DEFAULT_COPILOT_SKILLS_DIR
+        ).status == "pass",
+        "this checkout's generated Copilot tree passes copilot-frontmatter",
+    )
+
     # --- LAST-CERT F3: FAIL-CLOSED. "git could not answer" must reach the operator as SKIP,
     # never as a pass — the half of the contract that was asserted for the TRACKING question
     # but never for the LINK question. These are unit-level (independent of the directory the
@@ -7351,6 +7956,18 @@ def main(argv: "list[str] | None" = None) -> int:
         default=DEFAULT_SKILLS_DIR,
         help="directory of skills whose SKILL.md front matter is policed "
         f"(default: {DEFAULT_SKILLS_DIR}; absent is fine)",
+    )
+    parser.add_argument(
+        "--copilot-agents-dir",
+        default=DEFAULT_COPILOT_AGENTS_DIR,
+        help="directory of GENERATED Copilot persona wrappers whose front matter is policed "
+        f"(default: {DEFAULT_COPILOT_AGENTS_DIR})",
+    )
+    parser.add_argument(
+        "--copilot-skills-dir",
+        default=DEFAULT_COPILOT_SKILLS_DIR,
+        help="directory of GENERATED Copilot skills whose SKILL.md front matter is policed "
+        f"(default: {DEFAULT_COPILOT_SKILLS_DIR})",
     )
     parser.add_argument("--feature-form", default=DEFAULT_FEATURE_FORM)
     parser.add_argument("--taxonomy", default=DEFAULT_TAXONOMY)
