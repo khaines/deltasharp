@@ -63,6 +63,7 @@ def _guard_out_dir(out_dir: str) -> None:
 
 def main(out_dir: str) -> None:
     _guard_out_dir(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
 
     import pyspark
     from delta import configure_spark_with_delta_pip
@@ -156,7 +157,6 @@ def main(out_dir: str) -> None:
         "matrix": matrix,
         "empty_string": empty_string,
     }
-    os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, "matrix.json"), "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, indent=2)
     _write_checksums(out_dir)

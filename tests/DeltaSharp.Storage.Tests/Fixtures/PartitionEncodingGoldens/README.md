@@ -31,18 +31,25 @@ Two further controls close that gap, and they are **not equally strong** — the
 
 | Anchor | Written by | Strength |
 |---|---|---|
-| Parquet footer `created_by` / `org.apache.spark.version` / `delta-rs version` | the writer **library** | **Strongest** — DeltaSharp writes via Parquet.Net and cannot emit these |
+| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — not settable via Parquet.Net's `CustomMetadata`, and any Parquet.Net-authored file is rejected outright |
 | `<engine>/matrix-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
 | `matrix.json` `version` | read from the installed library at generation time | Moderate |
 | `matrix.json` `engine` | a constant typed into the generator | Pins **drift only**, not origin |
 
-`Goldens_CarryReferenceEngineProvenanceMarkers` asserts the first three.
+`Goldens_CarryReferenceEngineProvenanceMarkers` asserts the first three (including that **both** committed
+logs carry the engine's `commitInfo.engineInfo`, a `protocol` action, and `metaData.partitionColumns`).
 `GoldenMatrix_EveryRow_MatchesTheEngineWrittenLog` cross-checks **every** matrix row against
-`matrix-log.json` — the engine's own transaction log for the full matrix table, committed verbatim.
-That is what makes `matrix.json` untrustworthy-on-its-own but *verifiable*: a row hand-edited to bless
-a buggy encoder must now also forge the engine's transaction log. Only the **log** is committed, never
-the matrix table's data files, so the non-ASCII and control-bearing values appear solely as text inside
-that JSON and never as filesystem paths (design R6).
+`matrix-log.json` — the engine's own transaction log for the full matrix table, committed verbatim. Only the
+**log** is committed, never the matrix table's data files, so the non-ASCII and control-bearing values appear
+solely as text inside that JSON and never as filesystem paths (design R6).
+
+> **What these controls do NOT do.** They do **not** make the goldens unforgeable, and nothing here closes
+> design risk R7. Every committed artifact can be edited by whoever edits the encoder: a forge that patches
+> `matrix.json`, `matrix-log.json` and re-mints `SHA256SUMS` passes the suite (measured, during review). What
+> they buy is that blessing a buggy encoder is no longer a one-file edit, and that **accidents** — a
+> regeneration against the wrong engine version, a hand-tweaked row, a substituted or DeltaSharp-authored data
+> file — are caught. The only real oracle is **re-measurement against the live engines**; a scheduled
+> regeneration+diff CI job is tracked in **#908**.
 
 ## What the fixtures pin
 

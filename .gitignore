@@ -75,8 +75,8 @@ __pycache__/
 # Claude Code MCP config — each mcpServers[*].command is spawned at CLI launch, unprompted
 /.mcp.json
 
-# #806 Inc-C golden generators stage their throwaway full-matrix Delta table here.
-# The scripts write it under a system temp dir and clean it up, but an interrupted
-# run must never leave a partial matrix table inside the tracked fixture tree.
+# #806 Inc-C golden generators: belt-and-braces only. They stage their throwaway full-matrix
+# Delta table under a system temp dir (tempfile.mkdtemp) with atexit cleanup, so this path is
+# not written today; it stays as a guard against a future generator regressing to an in-tree
+# staging directory. A pattern without an interior slash already matches at every depth.
 .matrix-src/
-**/.matrix-src/

@@ -333,10 +333,20 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > set-equality in both directions (drifted *and* unlisted files fail); the **Parquet footer writer strings**
 > the writer library embeds (`parquet-mr`/`org.apache.spark.version`, `delta-rs version py-…`), which
 > DeltaSharp's Parquet.Net writer cannot produce; and **`matrix-log.json`** — the engine's own `_delta_log`
-> for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked. That last
-> control is what closes **R7** for `matrix.json`, which is otherwise a derived artifact: a row hand-edited to
-> bless a buggy encoder must now also forge the engine's transaction log. (Note the honest strength ordering:
-> `matrix.json`'s `engine` field is a generator constant and pins drift only, not origin.)
+> for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked, and which is
+> itself asserted to carry the engine's commit shape (`commitInfo.engineInfo` + `protocol` +
+> `metaData.partitionColumns`).
+>
+> **What this does and does not buy (measured, not assumed).** These controls do **not** close **R7**, and must
+> not be described as doing so. Every committed artifact — text or binary — can be edited by whoever edits the
+> encoder: a forge that patches `matrix.json`, `matrix-log.json` and re-mints `SHA256SUMS` still passes. What
+> they buy is that blessing a buggy encoder is no longer a one-file edit, and that **accidents** — a
+> regeneration against the wrong engine version, a hand-tweaked row, a stale or substituted fixture, a
+> DeltaSharp-authored Parquet — are caught. R7 is therefore *mitigated by these controls plus review*; genuine
+> closure requires **re-measurement against the live engines**, tracked as a scheduled regeneration+diff CI job
+> in **#908**. (Honest strength ordering: the Parquet footer's structured `created_by` is stamped by the writer
+> library and is not settable via Parquet.Net's `CustomMetadata`; `matrix.json`'s `engine` field is a generator
+> constant and pins drift only, not origin.)
 >
 > **Matrix axis coverage.** The value axes are measured against both reference engines. Two scope notes:
 >
@@ -351,12 +361,27 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 >
 > **The empty string, and where DeltaSharp deliberately diverges (#899).** At the **directory** layer DeltaSharp
 > matches Spark: `null` and `""` both fold onto the sentinel, which is why `HivePartitionSegment` tests
-> `string.IsNullOrEmpty` (Spark's `ExternalCatalogUtils.getPartitionValueString`). At the **recovered-value**
-> layer DeltaSharp diverges from **both** engines, deliberately: Spark and delta-rs re-derive the value from the
-> directory and therefore return `null` for an empty-string partition value, whereas DeltaSharp treats
-> `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* — it distinguishes
-> `null` from `""`, which neither engine can — but it is **not** byte-parity, and it is pinned by
-> `EmptyStringPartitionValue_DirectoryMatchesSpark_ButDeltaSharpPreservesTheValue`.
+> `string.IsNullOrEmpty` (Spark's `ExternalCatalogUtils.getPartitionValueString`).
+>
+> The **value** layer needs care, because the engines are asymmetric and the mechanism is a *write*-time fold,
+> not a read-time re-derivation (measured — an earlier draft of this section stated the mechanism incorrectly):
+>
+> | | writes `""` as | reads a committed `partitionValues:{"region":""}` as |
+> |---|---|---|
+> | Apache Spark 3.5.3 | `null` (folded into `add.partitionValues`; no distinct add-action) | **`""`** — honours the committed value |
+> | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` — normalizes it away |
+> | **DeltaSharp** | `""` (verbatim, in the sentinel directory) | `""` |
+>
+> So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* —
+> it distinguishes `null` from `""`, which Spark's writer cannot — and, measured, **Spark reads a
+> DeltaSharp-written `""` partition back as `""`**, so the choice is interop-safe in the direction that matters.
+> delta-rs collapses it to `null` (documented residual, same class as its broader on-disk escaping). The
+> DeltaSharp side is pinned by `EmptyStringPartitionValue_DirectoryMatchesSpark_ButDeltaSharpPreservesTheValue`;
+> the foreign-reader half is an integration-tier measurement (needs the real engines) tracked in **#905**.
+>
+> **Consequence to be aware of:** because `null` and `""` share one directory, the sentinel directory is
+> non-injective on the partition key. This is safe for OPTIMIZE and dynamic-partition-overwrite because both
+> key on `PartitionKeyBuilder` over `add.partitionValues`, never on the directory name.
 >
 > **Measured details beyond the original assumptions:**
 > 1. **delta-rs escapes a broader on-disk set than Spark** — not only space and non-ASCII but also a number of
@@ -368,7 +393,8 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 >    it onto the sentinel. It agrees with Spark on `null`. Read-compatibility is unaffected: partition truth is
 >    `add.partitionValues`, never the path.
 
-A **golden differential** test: for a matrix of partition names/values spanning
+A **golden differential** test: for a matrix of partition **values** (the column is fixed to `region`,
+so each row isolates the value encoding; the partition-NAME axis is a documented residual, #907) spanning
 {ASCII-unreserved, ASCII-reserved (`" # % ' * / : = ? \ { [ ] ^ space`), control-adjacent (**measured: escaped,
 not rejected** — Spark and delta-rs both write `%09`/`%01` on disk and double-encode in `add.path`), non-ASCII
 (`région`, `名前`, emoji), `null`→sentinel (empty string folds onto the same sentinel — see STATUS above)}, compare DeltaSharp's `(physical dir, add.path)`

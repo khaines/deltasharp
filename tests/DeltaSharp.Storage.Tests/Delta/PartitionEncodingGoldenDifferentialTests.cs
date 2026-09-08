@@ -5,6 +5,7 @@ using DeltaSharp.Storage.Delta;
 using DeltaSharp.Storage.Reading;
 using DeltaSharp.Storage.Writing;
 using DeltaSharp.Types;
+using Parquet;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -41,11 +42,18 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private const string DeltaRsVersion = "1.6.3";
     private const string DeltaRsEngineInfo = "delta-rs:py-1.6.3";
 
-    // The STRONGEST provenance anchors: strings the writer LIBRARY embeds in the Parquet footer, which a
-    // DeltaSharp-authored substitute (Parquet.Net) cannot produce. Semicolon-separated; every marker must be
-    // present in every data file of that engine's read-table.
-    private const string SparkWriterMarkers = "parquet-mr version 1.13.;org.apache.spark.version";
-    private const string DeltaRsWriterMarkers = "delta-rs version py-1.6.3";
+    // The Parquet footer's STRUCTURED `created_by` field, set by the writer library itself.
+    //
+    // This must be read as a structured field, NOT scanned for as a substring: Parquet.Net exposes
+    // `ParquetWriter.CustomMetadata` (DeltaSharp itself uses it, ParquetFileWriter.cs:197), so arbitrary
+    // key/value strings — including "parquet-mr version 1.13.1" — can be planted in a DeltaSharp-written
+    // footer. `created_by` is not settable that way, and Parquet.Net stamps its own value, which is why the
+    // negative assertion below (no golden may be Parquet.Net-authored) is the part that actually bites.
+    private const string SparkCreatedByPrefix = "parquet-mr version 1.13.";
+    private const string DeltaRsCreatedByPrefix = "delta-rs version py-1.6.3";
+
+    // Parquet.Net stamps this into `created_by`; no reference-engine golden may carry it.
+    private const string DeltaSharpWriterCreatedBy = "Parquet.Net";
 
     // Fixture directory names (the on-disk engine folders under Fixtures/PartitionEncodingGoldens/).
     private const string SparkDir = "spark";
@@ -55,6 +63,20 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private const string NullValueKey = "<null>";
 
     private sealed record GoldenRow(string? Value, string OnDiskDir, string AddPathSegment);
+
+    /// <summary>Renders a fixture value safely: partition values may contain control characters, which must
+    /// never reach a log or CI output stream verbatim.</summary>
+    private static string Escape(string value)
+    {
+        var sb = new StringBuilder(value.Length + 2);
+        sb.Append('"');
+        foreach (char c in value)
+        {
+            _ = char.IsControl(c) ? sb.Append("\\u").Append(((int)c).ToString("X4")) : sb.Append(c);
+        }
+
+        return sb.Append('"').ToString();
+    }
 
     private static IReadOnlyList<GoldenRow> LoadMatrix(string engineDirName)
     {
@@ -137,6 +159,21 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // from the sentinel/empty directory rather than trusting the committed partitionValues.
         Assert.True(spark.GetProperty("read_back_is_null").GetBoolean());
         Assert.True(deltaRs.GetProperty("read_back_is_null").GetBoolean());
+
+        // The engines AGREE on null (they diverge only on ""): both fold it onto the sentinel directory.
+        // (Asserted here because an earlier refactor of this class silently dropped it while §3.2 still
+        // claimed it.)
+        Assert.Equal(
+            LoadMatrix(SparkDir).Single(r => r.Value is null).OnDiskDir,
+            LoadMatrix(DeltaRsDir).Single(r => r.Value is null).OnDiskDir);
+
+        // Harvested but previously unasserted — measured data that nothing read is dead data.
+        Assert.Equal(
+            new[] { null, "keep" },
+            spark.GetProperty("add_partition_values").EnumerateArray().Select(e => e.GetString()).ToArray());
+        Assert.Equal(
+            new[] { string.Empty, null, "keep" },
+            deltaRs.GetProperty("add_partition_values").EnumerateArray().Select(e => e.GetString()).ToArray());
     }
 
     [Fact]
@@ -186,8 +223,37 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     .Where(n => n!.StartsWith("region=", StringComparison.Ordinal))
                     .OrderBy(n => n, StringComparer.Ordinal).ToArray());
 
-            // ... but the committed partitionValues keep them distinct, so DeltaSharp recovers "" as "" and
-            // null as null — where both reference engines would return null for each.
+            // ... and the load-bearing artifact is the COMMITTED add.partitionValues: assert it directly, so a
+            // future writer that folded "" -> null in the log (with the reader compensating elsewhere) cannot
+            // keep this test green.
+            var committed = new List<string?>();
+            foreach (string line in File.ReadAllLines(
+                Path.Combine(root, "_delta_log", "00000000000000000000.json")))
+            {
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                using JsonDocument action = JsonDocument.Parse(line);
+                if (!action.RootElement.TryGetProperty("add", out JsonElement add))
+                {
+                    continue;
+                }
+
+                Assert.StartsWith(
+                    "region=__HIVE_DEFAULT_PARTITION__/",
+                    add.GetProperty("path").GetString(),
+                    StringComparison.Ordinal);
+                JsonElement pv = add.GetProperty("partitionValues").GetProperty("region");
+                committed.Add(pv.ValueKind == JsonValueKind.Null ? null : pv.GetString());
+            }
+
+            Assert.Equal(new string?[] { null, string.Empty }, committed.OrderBy(v => v, StringComparer.Ordinal).ToArray());
+
+            // ... so DeltaSharp recovers "" as "" and null as null. Measured foreign-reader behaviour on this
+            // exact shape (integration-tier, #905): real Spark 3.5.3 returns "" (it honours the committed
+            // value), real delta-rs 1.6.3 normalizes it to null.
             using DeltaReadSource source = DeltaReadSource.ForLocalPath(root);
             DeltaSnapshotInfo info = await source.LoadSnapshotAsync(null, null);
             int regionIdx = info.Schema.IndexOf("region");
@@ -274,16 +340,23 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
 
             GoldenRow dr = deltaRsByValue[row.Value];
-            if (!string.Equals(dr.OnDiskDir, row.OnDiskDir, StringComparison.Ordinal))
+            foreach (char c in row.Value.Where(c => !char.IsLetterOrDigit(c)))
             {
-                foreach (char c in row.Value.Where(c => !char.IsLetterOrDigit(c)))
+                // A character is a delta-rs-only residual iff SPARK keeps it literal and delta-rs escapes it.
+                // Deriving per VALUE instead would wrongly sweep in characters Spark escapes too: `brace{}`
+                // gives Spark `region=brace%7B}` and delta-rs `region=brace%7B%7D`, so only `}` is a residual
+                // while `{` is escaped by both.
+                bool sparkKeepsLiteral = row.OnDiskDir.Contains(c, StringComparison.Ordinal);
+                bool deltaRsKeepsLiteral = dr.OnDiskDir.Contains(c, StringComparison.Ordinal);
+                if (sparkKeepsLiteral && !deltaRsKeepsLiteral)
                 {
                     residualAscii.Add(c);
                 }
             }
         }
 
-        Assert.Equal("!$&()+,;<>@`{|}", new string(residualAscii.ToArray()));
+        // Must stay byte-identical to the list in the class summary, the fixture README and design §3.2.
+        Assert.Equal("!$&()+,;<>@`|}", new string(residualAscii.ToArray()));
     }
 
     // ---- The delta-rs golden's add.path column is self-consistent (backs the read-compat premise) ----
@@ -305,19 +378,21 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // ---- Provenance: intrinsic engine markers + the checked-in SHA256SUMS (design §3.2 / R7) -----
 
     [Theory]
-    [InlineData(SparkDir, SparkEngineName, SparkVersion, SparkEngineInfo, SparkWriterMarkers)]
-    [InlineData(DeltaRsDir, DeltaRsEngineName, DeltaRsVersion, DeltaRsEngineInfo, DeltaRsWriterMarkers)]
-    public void Goldens_CarryReferenceEngineProvenanceMarkers(
+    [InlineData(SparkDir, SparkEngineName, SparkVersion, SparkEngineInfo, SparkCreatedByPrefix)]
+    [InlineData(DeltaRsDir, DeltaRsEngineName, DeltaRsVersion, DeltaRsEngineInfo, DeltaRsCreatedByPrefix)]
+    public async Task Goldens_CarryReferenceEngineProvenanceMarkers(
         string engineDirName, string expectedEngine, string expectedVersion, string expectedEngineInfo,
-        string expectedWriterMarkers)
+        string expectedCreatedByPrefix)
     {
         // The checksum manifest below proves the bytes have not DRIFTED, but it is minted by the same script
         // that writes the fixtures, so on its own it cannot prove the bytes came from a reference engine at
         // all (C2: never trust a self-settable signal).
         //
         // These markers are NOT equally strong, and it matters which is which:
-        //   * the Parquet footer writer strings (below) are embedded by the writer LIBRARY — DeltaSharp writes
-        //     via Parquet.Net and cannot emit "parquet-mr"/"delta-rs version", so these are the real anchor;
+        //   * the Parquet footer's structured `created_by` (below) is stamped by the writer LIBRARY and is not
+        //     settable through Parquet.Net's CustomMetadata, so an accidentally-substituted or
+        //     DeltaSharp-authored data file is caught. It is NOT proof against a determined forger who
+        //     crafts a footer byte-by-byte — no in-repo artifact can be;
         //   * `_delta_log` commitInfo.engineInfo is written by the engine itself — strong;
         //   * matrix.json `version` is read from the installed library at generation time — moderate;
         //   * matrix.json `engine` is a constant typed into the generator — it pins DRIFT only, not origin.
@@ -328,42 +403,70 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             Assert.Equal(expectedVersion, matrix.RootElement.GetProperty("version").GetString());
         }
 
-        string logPath = Path.Combine(engineDir, "read-table", "_delta_log", "00000000000000000000.json");
-        string? engineInfo = null;
-        foreach (string line in File.ReadAllLines(logPath))
+        // BOTH committed logs must carry the engine's commit shape — the read-table log and matrix-log.json.
+        // matrix-log.json is what grounds all 33 matrix rows, so leaving it unasserted would let a forger
+        // replace it with bare hand-authored `add` lines.
+        foreach (string logPath in new[]
         {
-            if (line.Length == 0)
+            Path.Combine(engineDir, "read-table", "_delta_log", "00000000000000000000.json"),
+            Path.Combine(engineDir, "matrix-log.json"),
+        })
+        {
+            string? engineInfo = null;
+            bool sawProtocol = false;
+            string[] partitionColumns = Array.Empty<string>();
+
+            foreach (string line in File.ReadAllLines(logPath))
             {
-                continue;
+                if (line.Length == 0)
+                {
+                    continue;
+                }
+
+                using JsonDocument action = JsonDocument.Parse(line);
+                if (action.RootElement.TryGetProperty("commitInfo", out JsonElement commitInfo)
+                    && commitInfo.TryGetProperty("engineInfo", out JsonElement info))
+                {
+                    engineInfo = info.GetString();
+                }
+
+                sawProtocol |= action.RootElement.TryGetProperty("protocol", out _);
+
+                if (action.RootElement.TryGetProperty("metaData", out JsonElement metaData)
+                    && metaData.TryGetProperty("partitionColumns", out JsonElement cols))
+                {
+                    partitionColumns = cols.EnumerateArray().Select(c => c.GetString()!).ToArray();
+                }
             }
 
-            using JsonDocument action = JsonDocument.Parse(line);
-            if (action.RootElement.TryGetProperty("commitInfo", out JsonElement commitInfo)
-                && commitInfo.TryGetProperty("engineInfo", out JsonElement info))
-            {
-                engineInfo = info.GetString();
-            }
+            string which = Path.GetFileName(logPath);
+            Assert.Equal(expectedEngineInfo, engineInfo);
+            Assert.True(sawProtocol, $"{engineDirName}/{which}: no protocol action — not an engine-written log");
+            Assert.Equal(new[] { "region" }, partitionColumns);
         }
 
-        Assert.Equal(expectedEngineInfo, engineInfo);
-
-        // Every committed data file must carry its engine's writer strings. This is what makes a
-        // cross-engine substitution (or a DeltaSharp-authored Parquet) fail rather than pass silently.
-        string[] markers = expectedWriterMarkers.Split(';', StringSplitOptions.RemoveEmptyEntries);
+        // Every committed data file's STRUCTURED created_by must be its engine's, and must not be
+        // Parquet.Net's — that negative is what catches a cross-engine substitution or a DeltaSharp-authored
+        // Parquet, both of which a substring scan of the whole file would miss (CustomMetadata can plant any
+        // string in the footer's key/value section).
         string[] dataFiles = Directory.GetFiles(
             Path.Combine(engineDir, "read-table"), "*.parquet", SearchOption.AllDirectories);
         Assert.NotEmpty(dataFiles);
         foreach (string dataFile in dataFiles)
         {
-            // The footer strings are ASCII inside a binary container; a Latin-1 decode preserves byte offsets.
-            string bytes = Encoding.Latin1.GetString(File.ReadAllBytes(dataFile));
-            foreach (string marker in markers)
-            {
-                Assert.True(
-                    bytes.Contains(marker, StringComparison.Ordinal),
-                    $"{engineDirName}: {Path.GetFileName(dataFile)} is missing the writer marker '{marker}' — "
-                    + "it was not written by the pinned reference engine.");
-            }
+            await using FileStream fs = File.OpenRead(dataFile);
+            await using ParquetReader reader = await ParquetReader.CreateAsync(fs);
+            string createdBy = reader.Metadata?.CreatedBy ?? string.Empty;
+
+            Assert.True(
+                createdBy.StartsWith(expectedCreatedByPrefix, StringComparison.Ordinal),
+                $"{engineDirName}: {Path.GetFileName(dataFile)} has created_by '{createdBy}', expected it to "
+                + $"start with '{expectedCreatedByPrefix}' — it was not written by the pinned reference engine.");
+
+            Assert.False(
+                createdBy.Contains(DeltaSharpWriterCreatedBy, StringComparison.OrdinalIgnoreCase),
+                $"{engineDirName}: {Path.GetFileName(dataFile)} was written by DeltaSharp's own Parquet writer "
+                + $"(created_by '{createdBy}') — a golden must never be produced by the system under test.");
         }
     }
 
@@ -379,8 +482,18 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // risk R7, and a mutant that survived the previous review round.
         //
         // matrix-log.json is the reference engine's OWN _delta_log for the full matrix table, committed
-        // verbatim. Cross-checking every row against it means a fabricated row must also forge the engine's
-        // transaction log (which carries the engine's own commitInfo/protocol/metaData shape) to pass.
+        // verbatim, and Goldens_CarryReferenceEngineProvenanceMarkers asserts it carries the engine's commit
+        // shape (engineInfo + protocol + metaData.partitionColumns).
+        //
+        // HONEST SCOPE — this does NOT make the goldens unforgeable, and must not be described as closing
+        // design risk R7. Every committed artifact can be edited by whoever edits the encoder: a determined
+        // forge that patches matrix.json AND matrix-log.json AND re-mints SHA256SUMS still passes (measured).
+        // What this control does buy is that a fabricated row is no longer a ONE-file edit, and that an
+        // ACCIDENT — a regeneration against the wrong engine, a hand-tweaked row, a stale fixture — is caught.
+        // Note also that the on_disk_dir check below is deliberately NOT claimed as engine evidence: see the
+        // comment there. Genuine closure requires re-measurement against the live engines, not an in-repo
+        // artifact; that is tracked as a scheduled-regeneration CI job (#908).
+        //
         // Only the log is committed, never the matrix table's files — so the non-ASCII and control-bearing
         // values live solely as text inside this JSON, never as filesystem paths (design R6).
         string engineDir = Path.Combine(GoldensDir, engineDirName);
@@ -418,16 +531,31 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
         foreach (GoldenRow row in matrix)
         {
-            string engineSegment = row.Value is null
-                ? nullAddPath ?? throw new InvalidOperationException("matrix-log.json has no null-partition add")
-                : engineAddPaths[row.Value];
+            string engineSegment;
+            if (row.Value is null)
+            {
+                engineSegment = nullAddPath
+                    ?? throw new InvalidOperationException("matrix-log.json has no null-partition add");
+            }
+            else if (!engineAddPaths.TryGetValue(row.Value, out engineSegment!))
+            {
+                // Escape before reporting: matrix values legitimately contain control characters (0x01, 0x09),
+                // and a bare indexer's KeyNotFoundException would put those raw bytes on the CI output stream.
+                Assert.Fail(
+                    $"{engineDirName}: matrix.json row {Escape(row.Value)} has no matching add in matrix-log.json");
+                return;
+            }
 
             // The committed add.path segment is engine bytes — this is what kills a fabricated row.
             Assert.Equal(engineSegment, row.AddPathSegment);
 
-            // The on-disk directory is the URI decode of that segment. Uri.UnescapeDataString is used here
-            // deliberately: it is independent of the encoder under test (EscapePathName / ToAddPath), so a
-            // mutated encoder cannot make a fabricated on_disk_dir agree with the engine's log.
+            // The on-disk directory is the URI decode of that segment. NOTE the honest limit: this checks
+            // that matrix.json's two columns are decode-consistent with the ENGINE's add.path, which pins
+            // on_disk_dir for any row whose add_path_segment is genuine. It is NOT an independent check of
+            // the encoder, because DeltaWriteEncoding maintains UnescapeDataString(ToAddPath(p)) == p by
+            // construction — so a forger who edits BOTH columns and the log keeps this consistent. Committed
+            // engine evidence for the on-disk layer exists only for the read-table rows, which
+            // GoldenMatrix_RowsCoveredByReadTable_MatchRealOnDiskDirectories checks against real directories.
             Assert.Equal(Uri.UnescapeDataString(engineSegment), row.OnDiskDir);
         }
     }
@@ -520,10 +648,17 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             // could reach outside the fixture tree even though the manifest is repo-controlled today.
             Assert.False(
                 Path.IsPathRooted(relative)
+                    || relative.Contains('\\', StringComparison.Ordinal)
                     || relative.Split('/').Any(seg => seg == ".." || seg == "."),
                 $"SHA256SUMS entry must be a plain relative path inside the fixture tree: {relative}");
 
             string filePath = Path.Combine(engineDir, relative.Replace('/', Path.DirectorySeparatorChar));
+
+            // Containment is the check that cannot be out-thought by separator trivia (on Windows '\\' is a
+            // separator too, so a segment scan alone is not enough).
+            string rootFull = Path.GetFullPath(engineDir) + Path.DirectorySeparatorChar;
+            Assert.StartsWith(rootFull, Path.GetFullPath(filePath), StringComparison.Ordinal);
+
             Assert.True(File.Exists(filePath), $"SHA256SUMS references a missing file: {relative}");
             string actualHash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(filePath)));
             Assert.Equal(expectedHash, actualHash);
