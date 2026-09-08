@@ -135,9 +135,18 @@ def main(out_dir: str) -> None:
         "add_partition_values": sorted({a[0] if a[0] is not None else None for a in empty_adds}, key=str),
         "distinct_add_action": any(a[0] == "" for a in empty_adds),
         "folds_onto_sentinel_with_null": not any(a[0] == "" for a in empty_adds),
+        # Row presence harvested explicitly (see the delta-rs generator's note): a missing row must not be
+        # indistinguishable from a row that read back as null.
+        "read_back_ids": sorted(v[0] for v in read_back),
         "read_back_value": empty_row[1] if empty_row else None,
         "read_back_is_null": (empty_row is not None and empty_row[1] is None),
     }
+    # Commit this table's log too. Without it the empty_string block would have SINGLE-FILE provenance —
+    # the one-file-edit failure mode matrix-log.json exists to remove — even though these cells are the sole
+    # evidence for the #899 sentinel decision. Only the LOG is committed, never the table's data files.
+    shutil.copyfile(
+        os.path.join(empty_src, "_delta_log", "00000000000000000000.json"),
+        os.path.join(out_dir, "empty-string-log.json"))
     shutil.rmtree(empty_staging, ignore_errors=True)
 
     shutil.rmtree(matrix_staging, ignore_errors=True)

@@ -31,7 +31,7 @@ Two further controls close that gap, and they are **not equally strong** — the
 
 | Anchor | Written by | Strength |
 |---|---|---|
-| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — Parquet.Net's public write API cannot set it (`CustomMetadata` reaches only the key/value section), so a file Parquet.Net wrote and left untouched is rejected (by the engine-prefix check; the explicit "not Parquet.Net" assertion is subsumed and exists for the diagnosis). A footer patched byte-by-byte is **not** caught. |
+| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — Parquet.Net's public write API cannot set it (`CustomMetadata` reaches only the key/value section), so a file Parquet.Net wrote and left untouched is rejected (by the engine-prefix check; the explicit "not Parquet.Net" assertion is usually not the deciding check and exists for the diagnosis, though it is not strictly redundant). A footer patched byte-by-byte is **not** caught. |
 | `<engine>/matrix-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
 | `matrix.json` `version` | read from the installed library at generation time | Moderate |
 | `matrix.json` `engine` | a constant typed into the generator | Pins **drift only**, not origin |
@@ -68,7 +68,7 @@ solely as text inside that JSON and never as filesystem paths (design R6).
 - **`<engine>/matrix-log.json`** — the reference engine's own `_delta_log` for the full matrix table,
   committed verbatim as the ground truth every `matrix.json` row is cross-checked against.
 - **`<engine>/read-table/`** — a small real Delta table (ASCII-safe partitions: unreserved, `=`,
-  quote, space — deliberately no non-ASCII, to avoid the macOS NFC/NFD filesystem-normalization
+  quote, space, `%` — deliberately no non-ASCII, to avoid the macOS NFC/NFD filesystem-normalization
   hazard, design R6) written by the reference engine. Consumed by the **ref→DS read** test:
   DeltaSharp reads the foreign `_delta_log` + files and returns the exact rows and partition values
   (partition truth from `add.partitionValues`), closing the #708 read-half gap for both a

@@ -182,6 +182,11 @@
     ],
     "distinct_add_action": false,
     "folds_onto_sentinel_with_null": true,
+    "read_back_ids": [
+      0,
+      1,
+      2
+    ],
     "read_back_value": null,
     "read_back_is_null": true
   }

@@ -364,13 +364,15 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > matches Spark: `null` and `""` both fold onto the sentinel, which is why `HivePartitionSegment` tests
 > `string.IsNullOrEmpty` (Spark's `ExternalCatalogUtils.getPartitionValueString`).
 >
-> The **value** layer needs care, because the engines are asymmetric and the mechanism is a *write*-time fold,
-> not a read-time re-derivation (measured — an earlier draft of this section stated the mechanism incorrectly):
+> The **value** layer needs care, because the engines are asymmetric. The mechanism is a *write*-time fold —
+> that much is repo-backed by the committed `empty_string` blocks, and an earlier draft of this section stated
+> it incorrectly. That Spark then *honours* a committed `""` rather than re-deriving it from the directory is
+> the separate **out-of-band** measurement called out below (#905), not something any fixture pins:
 >
 > | | writes `""` as | reads a committed `partitionValues:{"region":""}` as |
 > |---|---|---|
 > | Apache Spark 3.5.3 | `null` (folded into `add.partitionValues`; no distinct add-action) | **`""`** — honours the committed value *(out-of-band measurement; not repo-backed — see below)* |
-> | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` — normalizes it away |
+> | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` *(value pinned by the fixture; the mechanism is not measured)* |
 > | **DeltaSharp** | `""` (verbatim, in the sentinel directory) | `""` |
 >
 > So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* —

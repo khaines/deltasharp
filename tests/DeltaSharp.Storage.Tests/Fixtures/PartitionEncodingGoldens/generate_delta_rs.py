@@ -117,9 +117,19 @@ def main(out_dir: str) -> None:
         "distinct_add_action": any(a[0] == "" for a in empty_adds),
         "folds_onto_sentinel_with_null": not any(a[0] == "" for a in empty_adds),
         "add_path_segment": next((a[1] for a in empty_adds if a[0] == ""), None),
+        # Row presence is harvested explicitly: without it, "row 1 read back as null" and "row 1 was not
+        # returned at all" produce byte-identical blocks, so the fixture would pin a value that may never
+        # have been measured.
+        "read_back_ids": sorted(back["id"]),
         "read_back_value": pairs.get(1),
-        "read_back_is_null": pairs.get(1) is None,
+        "read_back_is_null": 1 in pairs and pairs.get(1) is None,
     }
+    # Commit this table's log too. Without it the empty_string block would have SINGLE-FILE provenance —
+    # the one-file-edit failure mode matrix-log.json exists to remove — even though these cells are the sole
+    # evidence for the #899 sentinel decision. Only the LOG is committed, never the table's data files.
+    shutil.copyfile(
+        os.path.join(empty_src, "_delta_log", "00000000000000000000.json"),
+        os.path.join(out_dir, "empty-string-log.json"))
     shutil.rmtree(empty_staging, ignore_errors=True)
 
     shutil.rmtree(matrix_staging, ignore_errors=True)
