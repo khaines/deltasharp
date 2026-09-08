@@ -19,6 +19,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 
 # The partition-value matrix: ASCII-unreserved, every ASCII-reserved char, sub-delims, the
 # URI-illegal set (< > | { } ` " \ [ ] ^ space), non-ASCII (Latin, CJK, emoji), and a value that
@@ -28,18 +29,28 @@ VALUES = [
     "US", "a=b", "na me", "région", "名前", "e🎯moji", "o'brien", "a/b", "c:d", "q?x", "h#h",
     "p%p", "amp&r", "plus+", "comma,", "semi;", "excl!", "dollar$", "paren()", "star*", "tilde~",
     "lt<gt>", "pipe|", "brace{}", "brack[]", "caret^", "quote\"", "back\\", "at@", "hash`bt",
+    # --- §3.2 axes measured in the R2 fix round (previously absent -> the STATUS block overclaimed) ---
+    # null -> the __HIVE_DEFAULT_PARTITION__ sentinel. NOTE: the EMPTY string is deliberately NOT a
+    # separate row: Spark folds "" onto the same sentinel partition as null (measured -- it emits no
+    # distinct directory or add-action for it, and reads the value back as null), so "" has no
+    # reference encoding of its own to pin. That measurement is asserted DS-side instead.
+    None,
+    # control-adjacent: escaped on disk (%09/%01) and double-encoded in add.path.
+    "tab\tx", "soh\x01y",
 ]
 
 # The small ASCII-SAFE readable table consumed by the ref->DS read test. Deliberately NO non-ASCII
 # (avoids the macOS NFC/NFD filesystem-normalization hazard, design R6); covers unreserved, the '='
 # reserved char, a quote, a space, and a 2-row partition (US).
-READ_ROWS = [(1, "a1", "US"), (2, "b2", "a=b"), (3, "c3", "na me"), (4, "d4", "o'brien"), (5, "e5", "US")]
+READ_ROWS = [(1, "a1", "US"), (2, "b2", "a=b"), (3, "c3", "na me"), (4, "d4", "o'brien"), (5, "e5", "US"),
+             (6, "f6", "p%p")]
 
 
 def main(out_dir: str) -> None:
     import pyspark
     from delta import configure_spark_with_delta_pip
     from pyspark.sql import SparkSession
+    from pyspark.sql.types import IntegerType, StringType, StructField, StructType
 
     builder = (
         SparkSession.builder.appName("ds-806-golden").master("local[1]")
@@ -52,10 +63,13 @@ def main(out_dir: str) -> None:
 
     # (1) The full matrix table is written to a throwaway temp dir (NOT committed) purely to harvest
     #     the (on-disk dir, add.path) mapping into matrix.json.
-    matrix_src = os.path.join(out_dir, ".matrix-src")
-    shutil.rmtree(matrix_src, ignore_errors=True)
+    matrix_staging = tempfile.mkdtemp(prefix="ds806-matrix-")
+    matrix_src = os.path.join(matrix_staging, "matrix-table")
     rows = [(i, v) for i, v in enumerate(VALUES)]
-    spark.createDataFrame(rows, ["id", "region"]).write.format("delta").partitionBy("region").mode("overwrite").save(matrix_src)
+    # Explicit nullable schema: the null row must not depend on schema inference.
+    matrix_schema = StructType([StructField("id", IntegerType(), False),
+                               StructField("region", StringType(), True)])
+    spark.createDataFrame(rows, matrix_schema).write.format("delta").partitionBy("region").mode("overwrite").save(matrix_src)
     disk_dirs = [n for n in os.listdir(matrix_src) if n.startswith("region=")]
     log = os.path.join(matrix_src, "_delta_log", "00000000000000000000.json")
     add_by_value = {}
@@ -71,7 +85,7 @@ def main(out_dir: str) -> None:
         decoded = unquote(add_path.split("/")[0])
         assert decoded in disk_dirs, f"dir {decoded!r} for value {v!r} not on disk: {disk_dirs}"
         matrix.append({"value": v, "on_disk_dir": decoded, "add_path_segment": add_path.split("/")[0]})
-    shutil.rmtree(matrix_src, ignore_errors=True)
+    shutil.rmtree(matrix_staging, ignore_errors=True)
 
     # (2) The committed small readable table.
     read_table = os.path.join(out_dir, "read-table")

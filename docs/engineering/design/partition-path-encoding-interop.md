@@ -328,15 +328,33 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > **STATUS (Inc-C): captured & green.** The reference fixtures are checked in under
 > `tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/` (real **Spark 3.5 / delta-rs 1.6**,
 > pinned generators + `SHA256SUMS` + a provenance README enforcing *never regenerated from DeltaSharp*),
-> and consumed by `PartitionEncodingGoldenDifferentialTests` (DS→ref byte-parity over the full 30-value
-> matrix + both ref→DS reads). Measured detail beyond the original assumption: **delta-rs escapes a broader
-> on-disk set than Spark** — not only space and non-ASCII but also some sub-delims (e.g. `&` → `region=amp%26r`)
-> — whereas Spark/DeltaSharp keep them literal. DeltaSharp follows Spark (D1); the residual test asserts
-> DeltaSharp == Spark everywhere and characterises (does not require byte-equality with) delta-rs.
+> and consumed by `PartitionEncodingGoldenDifferentialTests` (DS→ref byte-parity over the **33-value**
+> matrix + both ref→DS reads). Provenance is test-enforced in two independent ways: `SHA256SUMS` set-equality
+> in both directions (drifted *and* unlisted files fail), plus the engines' own intrinsic markers
+> (`matrix.json` `engine`/`version` and the `_delta_log` `commitInfo.engineInfo`), which a golden regenerated
+> from DeltaSharp output would have to forge deliberately.
+>
+> **Matrix axis coverage.** All five axes below are now measured against the reference engines, with one
+> documented exception: the **empty string has no distinct reference encoding to pin**. Measured against real
+> Spark 3.5.3, `""` is folded onto the *same* `__HIVE_DEFAULT_PARTITION__` partition as `null` — Spark emits
+> no separate directory or add-action for it and reads the value back as `null`, so the empty string is not
+> round-trippable through Hive-style partitioning. Its DS-side parity is therefore asserted directly
+> (`NullAndEmptyPartitionValue_BothMapToSentinel_SparkParity`) rather than via a golden row. This measurement
+> confirms `HivePartitionSegment`'s `string.IsNullOrEmpty` fold is genuine Spark parity (**#899**).
+>
+> **Measured details beyond the original assumptions:**
+> 1. **delta-rs escapes a broader on-disk set than Spark** — not only space and non-ASCII but also a number of
+>    ASCII sub-delims / URI-illegal chars (measured: `& + , ; ! $ ( ) @ < > |`, e.g. `&` → `region=amp%26r`) —
+>    whereas Spark/DeltaSharp keep them literal. DeltaSharp follows Spark (D1); the residual test asserts
+>    DeltaSharp == Spark everywhere and characterises (does not require byte-equality with) delta-rs.
+> 2. **delta-rs also diverges on the empty string**, writing an empty directory (`region=`) instead of folding
+>    it onto the sentinel. It agrees with Spark on `null`. Read-compatibility is unaffected: partition truth is
+>    `add.partitionValues`, never the path.
 
 A **golden differential** test: for a matrix of partition names/values spanning
-{ASCII-unreserved, ASCII-reserved (`" # % ' * / : = ? \ { [ ] ^ space`), control-adjacent (rejected — asserted
-rejected), non-ASCII (`région`, `名前`, emoji), `null`→sentinel}, compare DeltaSharp's `(physical dir, add.path)`
+{ASCII-unreserved, ASCII-reserved (`" # % ' * / : = ? \ { [ ] ^ space`), control-adjacent (**measured: escaped,
+not rejected** — Spark and delta-rs both write `%09`/`%01` on disk and double-encode in `add.path`), non-ASCII
+(`région`, `名前`, emoji), `null`→sentinel (empty string folds onto the same sentinel — see STATUS above)}, compare DeltaSharp's `(physical dir, add.path)`
 against **reference fixtures emitted by real Spark and delta-rs** (checked-in goldens produced out-of-band, the
 same OR-a/OR-b pattern as #520/#646). Two directions:
 

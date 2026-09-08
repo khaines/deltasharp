@@ -20,17 +20,26 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 from urllib.parse import unquote
 
 VALUES = [
     "US", "a=b", "na me", "région", "名前", "e🎯moji", "o'brien", "a/b", "c:d", "q?x", "h#h",
     "p%p", "amp&r", "plus+", "comma,", "semi;", "excl!", "dollar$", "paren()", "star*", "tilde~",
     "lt<gt>", "pipe|", "brace{}", "brack[]", "caret^", "quote\"", "back\\", "at@", "hash`bt",
+    # --- §3.2 axes measured in the R2 fix round (previously absent -> the STATUS block overclaimed) ---
+    # null -> the __HIVE_DEFAULT_PARTITION__ sentinel. NOTE: the EMPTY string is deliberately NOT a
+    # separate row: Spark folds "" onto the same sentinel partition as null (measured -- it emits no
+    # distinct directory or add-action for it, and reads the value back as null), so "" has no
+    # reference encoding of its own to pin. That measurement is asserted DS-side instead.
+    None,
+    # control-adjacent: escaped on disk (%09/%01) and double-encoded in add.path.
+    "tab\tx", "soh\x01y",
 ]
 
 # ASCII-safe readable table for the ref->DS read test (no non-ASCII → no macOS NFC/NFD hazard, R6).
-READ_ROWS = {"id": [1, 2, 3, 4, 5], "name": ["a1", "b2", "c3", "d4", "e5"],
-             "region": ["US", "a=b", "na me", "o'brien", "US"]}
+READ_ROWS = {"id": [1, 2, 3, 4, 5, 6], "name": ["a1", "b2", "c3", "d4", "e5", "f6"],
+             "region": ["US", "a=b", "na me", "o'brien", "US", "p%p"]}
 
 
 def main(out_dir: str) -> None:
@@ -39,8 +48,8 @@ def main(out_dir: str) -> None:
     from deltalake import write_deltalake
 
     # (1) Full matrix table → throwaway temp dir (not committed) to harvest matrix.json.
-    matrix_src = os.path.join(out_dir, ".matrix-src")
-    shutil.rmtree(matrix_src, ignore_errors=True)
+    matrix_staging = tempfile.mkdtemp(prefix="ds806-matrix-")
+    matrix_src = os.path.join(matrix_staging, "matrix-table")
     tab = pa.table({"id": list(range(len(VALUES))), "region": VALUES})
     write_deltalake(matrix_src, tab, partition_by=["region"])
 
@@ -58,7 +67,7 @@ def main(out_dir: str) -> None:
         decoded = unquote(add_path.split("/")[0])
         assert decoded in disk_dirs, f"dir {decoded!r} for {v!r} not on disk"
         matrix.append({"value": v, "on_disk_dir": decoded, "add_path_segment": add_path.split("/")[0]})
-    shutil.rmtree(matrix_src, ignore_errors=True)
+    shutil.rmtree(matrix_staging, ignore_errors=True)
 
     # (2) Committed small readable table.
     read_table = os.path.join(out_dir, "read-table")

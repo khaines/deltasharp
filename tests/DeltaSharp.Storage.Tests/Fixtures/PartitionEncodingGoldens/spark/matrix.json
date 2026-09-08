@@ -154,6 +154,21 @@
       "value": "hash`bt",
       "on_disk_dir": "region=hash`bt",
       "add_path_segment": "region=hash%60bt"
+    },
+    {
+      "value": null,
+      "on_disk_dir": "region=__HIVE_DEFAULT_PARTITION__",
+      "add_path_segment": "region=__HIVE_DEFAULT_PARTITION__"
+    },
+    {
+      "value": "tab\tx",
+      "on_disk_dir": "region=tab%09x",
+      "add_path_segment": "region=tab%2509x"
+    },
+    {
+      "value": "soh\u0001y",
+      "on_disk_dir": "region=soh%01y",
+      "add_path_segment": "region=soh%2501y"
     }
   ]
 }

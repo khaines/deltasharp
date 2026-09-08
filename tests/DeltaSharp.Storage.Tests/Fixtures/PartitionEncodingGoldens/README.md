@@ -20,25 +20,38 @@ the design's §3.2 differential-parity gate
 | delta-rs (`deltalake`) | Rust | `deltalake==1.6.3`, `pyarrow==25.0.1` | `generate_delta_rs.py` | **percent-escaped** (diverges) |
 
 Each `<engine>/matrix.json` records `engine` + `version` and the `(value → on_disk_dir,
-add_path_segment)` mapping. `<engine>/SHA256SUMS` pins every fixture file's SHA-256. A checked-in
-file whose hash drifts from `SHA256SUMS` (or was produced by anything other than the pinned engine)
-is a provenance violation.
+add_path_segment)` mapping. `<engine>/SHA256SUMS` pins every fixture file's SHA-256, and
+`Goldens_MatchCheckedInChecksums` asserts **set equality** in both directions — a listed file that
+drifts *and* an unlisted file that appears both fail. A checked-in file whose hash drifts from
+`SHA256SUMS` is a provenance violation.
+
+The checksum manifest is minted by the same generator that writes the fixtures, so on its own it
+proves only that the bytes have not *drifted* — not that they came from a reference engine at all.
+`Goldens_CarryReferenceEngineProvenanceMarkers` closes that gap by asserting the **intrinsic markers
+the engines write themselves**: `matrix.json`'s `engine`/`version`, and the `_delta_log`'s
+`commitInfo.engineInfo` (`Apache-Spark/3.5.3 Delta-Lake/3.2.0`, `delta-rs:py-1.6.3`). A golden
+regenerated from DeltaSharp output would have to forge those deliberately.
 
 ## What the fixtures pin
 
 - **`<engine>/matrix.json`** — the full partition-value encoding matrix (ASCII-unreserved, every
   ASCII-reserved char, sub-delims, the URI-illegal set `< > | { } \` " \ [ ] ^ space`, non-ASCII
-  Latin/CJK/emoji, and a value already containing `%`). Consumed by the **DS→ref byte-parity**
+  Latin/CJK/emoji, a value already containing `%`, **`null` → the `__HIVE_DEFAULT_PARTITION__`
+  sentinel, and control-adjacent values** (`%09`/`%01` on disk)). Consumed by the **DS→ref byte-parity**
   differential test: DeltaSharp's `(EscapePathName, ToAddPath)` output must equal the **Spark** bytes
-  for every row, and must diverge from **delta-rs** exactly and only on space + non-ASCII (the
-  documented on-disk residual — DeltaSharp follows Spark, design D1).
+  for every row, and diverges from **delta-rs** on the documented broader-escaping on-disk residual —
+  space, non-ASCII, **and** a number of ASCII sub-delims / URI-illegal chars (measured:
+  `& + , ; ! $ ( ) @ < > |`). DeltaSharp follows Spark (design D1).
 - **`<engine>/read-table/`** — a small real Delta table (ASCII-safe partitions: unreserved, `=`,
   quote, space — deliberately no non-ASCII, to avoid the macOS NFC/NFD filesystem-normalization
   hazard, design R6) written by the reference engine. Consumed by the **ref→DS read** test:
   DeltaSharp reads the foreign `_delta_log` + files and returns the exact rows and partition values
   (partition truth from `add.partitionValues`), closing the #708 read-half gap for both a
   Spark-shaped (`region=na me`, literal space) and a delta-rs-shaped (`region=na%20me`, escaped
-  space) on-disk layout via the resolver's decoded-first + literal-fallback.
+  space) on-disk layout via the resolver's **decoded-first** branch. (The literal-`%` *fallback* is a
+  legacy-DeltaSharp layout no reference engine emits — both engines write a URI-encoded `add.path`
+  whose decode hits — so these fixtures structurally cannot reach it; it is covered by
+  `PartitionPathResolverTests` / `PartitionPathReadResolutionTests`.)
 
 ## Key measured finding (design O1, closed)
 
@@ -56,11 +69,14 @@ non-ASCII — DeltaSharp matches Spark.
 # Spark (needs a JDK 8 or 11)
 python3.11 -m venv /tmp/spark-gen && . /tmp/spark-gen/bin/activate
 pip install pyspark==3.5.3 delta-spark==3.2.0
-JAVA_HOME=<jdk> python generate_spark.py spark
+# PYSPARK_PYTHON must point at THIS venv: PySpark aborts with PYTHON_VERSION_MISMATCH if the
+# worker picks up a different system python (e.g. a 3.14 default) than the 3.11 driver.
+JAVA_HOME=<jdk8-or-11> PYSPARK_PYTHON=/tmp/spark-gen/bin/python \
+  PYSPARK_DRIVER_PYTHON=/tmp/spark-gen/bin/python python generate_spark.py spark
 
 # delta-rs
-python3 -m venv /tmp/dr-gen && . /tmp/dr-gen/bin/activate
-pip install deltalake==1.6.3 pyarrow
+python3.11 -m venv /tmp/dr-gen && . /tmp/dr-gen/bin/activate
+pip install deltalake==1.6.3 pyarrow==25.0.1
 python generate_delta_rs.py delta-rs
 ```
 
@@ -70,3 +86,11 @@ Spark's `.crc` sidecars themselves. Regenerating produces an **equivalent** fixt
 file names/bytes differ by a fresh UUID each run, so `SHA256SUMS` changes; commit the regenerated
 bytes together. A checked-in golden whose hash no longer matches `SHA256SUMS` fails
 `Goldens_MatchCheckedInChecksums` at test time.
+
+The generators stage their throwaway full-matrix table under a system temp dir (never inside this
+tracked tree) and delete it when done.
+
+> **When iterating on fixtures:** the csproj copies these with `CopyToOutputDirectory="PreserveNewest"`,
+> and `git checkout -- <fixture>` restores an *older* mtime — so a reverted edit can leave the mutated
+> copy in `bin/` and keep producing stale results. Run `rm -rf tests/DeltaSharp.Storage.Tests/bin
+> tests/DeltaSharp.Storage.Tests/obj` (or `dotnet build --no-incremental`) after changing a golden.
