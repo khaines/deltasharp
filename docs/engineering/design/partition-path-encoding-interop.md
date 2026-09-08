@@ -376,8 +376,8 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* —
 > it distinguishes `null` from `""`, which Spark's writer cannot.
 >
-> **Provenance of each cell, precisely.** The two *write* columns and delta-rs's read behaviour come from the
-> committed `empty_string` blocks, which are harvested from real engine runs and asserted by
+> **Provenance of each cell, precisely.** The two *reference engines'* write cells and delta-rs's read cell
+> come from the committed `empty_string` blocks, which are harvested from real engine runs and asserted by
 > `EmptyStringPartitionValue_EngineBehaviour_IsHarvestedNotAssumed`. Note what those blocks do and do not
 > establish: Spark's `read_back_is_null` measures Spark reading *its own* table, whose log already holds `null`
 > because of the write-time fold — it says nothing about reading a committed `{"region":""}`. The

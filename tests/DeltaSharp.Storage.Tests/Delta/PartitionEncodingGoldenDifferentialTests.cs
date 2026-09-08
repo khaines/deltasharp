@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using DeltaSharp.Engine.Columnar;
@@ -47,8 +48,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // This must be read as a structured field, NOT scanned for as a substring: Parquet.Net exposes
     // `ParquetWriter.CustomMetadata` (DeltaSharp itself uses it, ParquetFileWriter.cs:197), so arbitrary
     // key/value strings — including "parquet-mr version 1.13.1" — can be planted in a DeltaSharp-written
-    // footer. `created_by` is not settable that way, and Parquet.Net stamps its own value, which is why the
-    // negative assertion below (no golden may be Parquet.Net-authored) is the part that actually bites.
+    // footer. `created_by` is not settable that way, and Parquet.Net stamps its own value — so the
+    // engine-PREFIX assertion below is what rejects a foreign or DeltaSharp-authored file. (The separate
+    // "not Parquet.Net" check is for diagnosis; see its comment for the narrow case where it also bites.)
     private const string SparkCreatedByPrefix = "parquet-mr version 1.13.";
     private const string DeltaRsCreatedByPrefix = "delta-rs version py-1.6.3";
 
@@ -154,15 +156,30 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // partitionValues of "". It agrees with Spark on null. DeltaSharp follows Spark (design D1).
         JsonElement deltaRs = EmptyStringBlock(DeltaRsDir);
         Assert.True(deltaRs.GetProperty("distinct_add_action").GetBoolean());
+        Assert.False(deltaRs.GetProperty("folds_onto_sentinel_with_null").GetBoolean());
         Assert.Equal("region=", deltaRs.GetProperty("add_path_segment").GetString());
+
+        // The directory listing is the direct fixture evidence for "delta-rs gives \"\" its own region= dir";
+        // without this the claim rests on add_path_segment alone.
+        Assert.Equal(
+            new[] { "region=", "region=__HIVE_DEFAULT_PARTITION__", "region=keep" },
+            deltaRs.GetProperty("on_disk_dirs").EnumerateArray().Select(e => e.GetString()).ToArray());
 
         // Both engines report NULL for the empty string here — but note the mechanism, which an earlier draft
         // of this file stated incorrectly: for Spark this is a WRITE-time fold (it never commits "" at all, so
-        // this measures Spark->Spark after the fold), and for delta-rs it commits "" and normalizes it away on
-        // read. Spark does NOT re-derive from the directory: given a committed partitionValues of "", it
-        // returns "" (measured; see the write/read matrix in design §3.2).
+        // this measures Spark->Spark after the fold), and for delta-rs it commits "" and returns null on read
+        // (measured; the fixture pins the value, not the mechanism).
+        //
+        // What this therefore does NOT establish is what Spark does with a COMMITTED partitionValues of "" —
+        // no committed fixture covers that shape, and no test asserts it. See design §3.2, which states the
+        // provenance of every cell; #905 owns landing it as an integration-tier test.
         Assert.True(spark.GetProperty("read_back_is_null").GetBoolean());
         Assert.True(deltaRs.GetProperty("read_back_is_null").GetBoolean());
+
+        // Cross-check the harvested value against its own boolean: otherwise a fixture could carry
+        // read_back_value="zzz" alongside read_back_is_null=true and no test would notice the contradiction.
+        Assert.Equal(JsonValueKind.Null, spark.GetProperty("read_back_value").ValueKind);
+        Assert.Equal(JsonValueKind.Null, deltaRs.GetProperty("read_back_value").ValueKind);
 
         // The engines AGREE on null (they diverge only on ""): both fold it onto the sentinel directory.
         // (Asserted here because an earlier refactor of this class silently dropped it while §3.2 still
@@ -193,9 +210,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // LAYER 2 (recovered value) — DeltaSharp diverges from both engines' WRITERS, deliberately.
         // Spark folds "" -> null at write time (it never commits ""); delta-rs commits "" but normalizes it to
         // null on read. DeltaSharp treats add.partitionValues as authoritative and writes the value verbatim,
-        // so "" round-trips as "". Measured foreign-reader behaviour on this exact shape: real Spark 3.5.3
-        // returns "" (it honours the committed value), real delta-rs 1.6.3 returns null — so the choice is
-        // interop-safe with Spark. See design §3.2 for the full write/read matrix.
+        // so "" round-trips as "". On the foreign-reader side, real Spark 3.5.3 was observed to return ""
+        // for this shape and real delta-rs 1.6.3 to return null — but that was measured OUT OF BAND during
+        // review: it is NOT backed by any committed fixture and is NOT asserted by this or any other test.
+        // #905 owns turning it into an integration-tier test. See design §3.2 for the per-cell provenance.
         // That is LOSSLESS (it distinguishes null from "", which the engines cannot) but it is NOT byte-parity,
         // and it is asserted here so the divergence is pinned rather than discovered later. Design §3.2.
         Assert.True(EmptyStringBlock(SparkDir).GetProperty("read_back_is_null").GetBoolean());
@@ -371,12 +389,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 // Deriving per VALUE instead would wrongly sweep in characters Spark escapes too: `brace{}`
                 // gives Spark `region=brace%7B}` and delta-rs `region=brace%7B%7D`, so only `}` is a residual
                 // while `{` is escaped by both.
-                // Compare the VALUE part only. Testing the whole `region=…` segment would misclassify the
-                // structural '=' separator and the '%' of every %XX escape as "kept literal" by both engines.
+                // Compare the VALUE part only — the whole `region=…` segment would misclassify the
+                // structural '=' separator. And decide "escaped" by the presence of the %XX triple rather
+                // than by the literal absence of `c`: for c == '%' the escape output ("%25") itself contains
+                // '%', so a literal-presence test would call '%' kept-literal by both engines.
                 string sparkValuePart = row.OnDiskDir[(row.OnDiskDir.IndexOf('=', StringComparison.Ordinal) + 1)..];
                 string deltaRsValuePart = dr.OnDiskDir[(dr.OnDiskDir.IndexOf('=', StringComparison.Ordinal) + 1)..];
-                bool sparkKeepsLiteral = sparkValuePart.Contains(c, StringComparison.Ordinal);
-                bool deltaRsKeepsLiteral = deltaRsValuePart.Contains(c, StringComparison.Ordinal);
+                string escaped = "%" + ((int)c).ToString("X2", CultureInfo.InvariantCulture);
+                bool sparkKeepsLiteral = !sparkValuePart.Contains(escaped, StringComparison.Ordinal);
+                bool deltaRsKeepsLiteral = !deltaRsValuePart.Contains(escaped, StringComparison.Ordinal);
                 if (sparkKeepsLiteral && !deltaRsKeepsLiteral)
                 {
                     residualAscii.Add(c);
@@ -477,9 +498,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         }
 
         // Every committed data file's STRUCTURED created_by must be its engine's, and must not be
-        // Parquet.Net's — that negative is what catches a cross-engine substitution or a DeltaSharp-authored
-        // Parquet, both of which a substring scan of the whole file would miss (CustomMetadata can plant any
-        // string in the footer's key/value section).
+        // Parquet.Net's. The PREFIX assertion is what catches a cross-engine substitution or a
+        // DeltaSharp-authored Parquet — both of which a substring scan of the whole file would miss, since
+        // CustomMetadata can plant any string in the footer's key/value section.
         string[] dataFiles = Directory.GetFiles(
             Path.Combine(engineDir, "read-table"), "*.parquet", SearchOption.AllDirectories);
         Assert.NotEmpty(dataFiles);
@@ -489,21 +510,25 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             await using ParquetReader reader = await ParquetReader.CreateAsync(fs);
             string createdBy = reader.Metadata?.CreatedBy ?? string.Empty;
 
-            // Check the DeltaSharp-authored case FIRST. It is logically subsumed by the prefix assertion
-            // below (a Parquet.Net created_by cannot start with an engine prefix), so it exists purely to
-            // give the right DIAGNOSIS: "a golden was produced by the system under test" is a different
-            // problem from "this file came from the wrong engine", and an operator should be told which.
+            // Check the DeltaSharp-authored case FIRST, for the DIAGNOSIS: "a golden was produced by the
+            // system under test" is a different problem from "this file came from the wrong engine", and an
+            // operator should be told which. For genuine Parquet.Net output the prefix assertion below would
+            // also reject it, so this is usually not the deciding check — but it is not strictly redundant:
+            // a crafted created_by such as "parquet-mr version 1.13.x Parquet.Net" passes the prefix and is
+            // caught only here.
             Assert.False(
                 createdBy.Contains(DeltaSharpWriterCreatedBy, StringComparison.OrdinalIgnoreCase),
-                $"{engineDirName}: {Path.GetFileName(dataFile)} was written by DeltaSharp's own Parquet writer "
-                + $"(created_by '{createdBy}') — a golden must never be produced by the system under test.");
+                $"{engineDirName}: {Escape(Path.GetFileName(dataFile))} was written by DeltaSharp's own Parquet "
+                + $"writer (created_by {Escape(createdBy)}) — a golden must never be produced by the system "
+                + "under test.");
 
             // This is the assertion that actually bites: it rejects any file whose writer library is not the
             // pinned engine, including a cross-engine substitution.
             Assert.True(
                 createdBy.StartsWith(expectedCreatedByPrefix, StringComparison.Ordinal),
-                $"{engineDirName}: {Path.GetFileName(dataFile)} has created_by '{createdBy}', expected it to "
-                + $"start with '{expectedCreatedByPrefix}' — it was not written by the pinned reference engine.");
+                $"{engineDirName}: {Escape(Path.GetFileName(dataFile))} has created_by {Escape(createdBy)}, "
+                + $"expected it to start with '{expectedCreatedByPrefix}' — it was not written by the pinned "
+                + "reference engine.");
         }
     }
 
@@ -673,7 +698,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
             // Format: "<hex-sha256>  <relative/path>" (two spaces, sha256sum/shasum -c convention).
             int sep = line.IndexOf("  ", StringComparison.Ordinal);
-            Assert.True(sep > 0, $"malformed SHA256SUMS line: {line}");
+            Assert.True(sep > 0, $"malformed SHA256SUMS line: {Escape(line)}");
             string expectedHash = line[..sep].Trim();
             string relative = line[(sep + 2)..].Trim();
             if (relative.StartsWith("./", StringComparison.Ordinal))
@@ -687,7 +712,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 Path.IsPathRooted(relative)
                     || relative.Contains('\\', StringComparison.Ordinal)
                     || relative.Split('/').Any(seg => seg == ".." || seg == "."),
-                $"SHA256SUMS entry must be a plain relative path inside the fixture tree: {relative}");
+                $"SHA256SUMS entry must be a plain relative path inside the fixture tree: {Escape(relative)}");
 
             string filePath = Path.Combine(engineDir, relative.Replace('/', Path.DirectorySeparatorChar));
 
@@ -696,7 +721,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             string rootFull = Path.GetFullPath(engineDir) + Path.DirectorySeparatorChar;
             Assert.StartsWith(rootFull, Path.GetFullPath(filePath), StringComparison.Ordinal);
 
-            Assert.True(File.Exists(filePath), $"SHA256SUMS references a missing file: {relative}");
+            Assert.True(File.Exists(filePath), $"SHA256SUMS references a missing file: {Escape(relative)}");
             string actualHash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(filePath)));
             Assert.Equal(expectedHash, actualHash);
             Assert.True(manifest.Add(relative), $"duplicate SHA256SUMS entry: {relative}");
