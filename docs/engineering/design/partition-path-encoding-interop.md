@@ -117,13 +117,20 @@ on-disk directory name; it is what Spark and delta-rs write and expect.
 add.path = uriEncodePath( seg1 + "/" + seg2 + "/" + … + "part-<token>.parquet" )
 ```
 
-`uriEncodePath` percent-encodes each path *segment's* octets per the Delta protocol URI rule (the protocol
-cites **RFC 2396**; the encoder alphabet is **subordinate to the O1 goldens** below — DeltaSharp conforms to
-the exact bytes real Spark/delta-rs emit via `Path.toUri`, not to an independent RFC-3986 derivation) while
-preserving the `/` separators. Crucially this is applied **on top of** layer 1, so a layer-1 `%XX` has its `%`
-re-encoded to `%25` (e.g. value `a/b` → layer-1 segment `col=a%2Fb` → `add.path` `col%3Da%252Fb/…`), the
-literal separator `=` becomes `%3D`, a passthrough space becomes `%20`, and a passthrough non-ASCII octet
-becomes its UTF-8 `%`-triplets. This is exactly the Delta protocol rule (`country=US/f` ⇒ `country%3DUS/f`).
+`uriEncodePath` percent-encodes the path per the Delta protocol URI rule (the protocol cites **RFC 2396**;
+the encoder alphabet is **subordinate to the O1 goldens** below — DeltaSharp conforms to the exact bytes real
+Spark/delta-rs emit via `Path.toUri`, not to an independent RFC-3986 derivation) while preserving the `/`
+separators. **Measured against Apache Spark 3.5 + delta-rs 1.6 (O1 now closed):** this is Java's `URI.toString`
+path-quoting applied on top of layer 1 — it percent-encodes only **URI-illegal ASCII** (space→`%20`, and a
+layer-1 `%XX` has its `%`→`%25`, e.g. value `a/b` → layer-1 `col=a%2Fb` → `add.path` `col=a%252Fb/…`; also
+`< > { } | ` `` ` ``→their `%XX`) and **keeps literal** the structural `=` separator, the `/` separators, the
+pchar/sub-delims (`: @ & + $ , ; ! ~ * ' ( ) -`) **and all non-ASCII** (Spark stores `URI.toString`, not
+`toASCIIString`, so `région` stays `région`). So `country=US/f` ⇒ `country=US/f` (the `=` is **not** encoded).
+> **delta-rs on-disk divergence (residual).** delta-rs additionally percent-escapes space and non-ASCII in the
+> **on-disk** directory (`region=na%20me`, `region=r%C3%A9gion`) and hence in its `add.path`; Apache Spark and
+> DeltaSharp keep them literal on disk. DeltaSharp follows **Spark** (design D1), so a delta-rs-written table is
+> **read-compatible** (the resolver decodes its `add.path` to the correct key) but **not byte-identical** on
+> disk. Documented as an accepted interop residual; see §3.2 (the DS→ref golden asserts parity vs **Spark**).
 
 **Read — recover the physical object key:**
 
@@ -168,8 +175,10 @@ carries no `%`. There is **no** `exists()` probe: the resolver **opens `k_dec` a
 back to opening `k_lit`**. So an **L2 (go-forward) file opens in one round-trip**; a legacy L0/L1 file whose
 `add.path` contains a `%` pays **+1 open only on the first (decoded) miss**; a non-partitioned or
 ASCII-unreserved-non-partitioned file (`k_dec==k_lit`) is one open, unchanged. (Earlier drafts claimed the
-go-forward format hits the zero-extra-probe path — it does **not**, because layer-2 always encodes the `=`
-separator to `%3D`, so every L2 partition segment has `k_dec≠k_lit`; §4 and O2 are re-scoped accordingly.)
+go-forward format hits the zero-extra-probe path only rarely — corrected by the O1 measurement: layer-2 keeps
+the `=` separator and all unreserved/sub-delim/non-ASCII **literal**, so an L2 partition file has `k_dec≠k_lit`
+**only when the value contains a URI-illegal char** (space, `%`, `< > { } | ` `` ` ``); a plain-ASCII partition
+value like `region=US` round-trips with `k_dec==k_lit` in one open. §4 and O2 are re-scoped accordingly.)
 
 **Untrusted both-exist tie-break (adversarial — §6 T-Poison).** On a **foreign, attacker-authored** table a
 file may be planted at *both* `k_dec` and `k_lit`. Decoded-first is the protocol-correct interpretation, so the
@@ -189,7 +198,7 @@ partition columns from it), so a directory-encoding change cannot change query r
 |---|---|---|---|---|
 | **L0 raw-name** | DeltaSharp pre-#797 (#708 origin) | `my col=a%2Fb` (name raw, value `EscapeDataString`) | literal `my col=a%2Fb/…` | literal |
 | **L1 escape-both** | DeltaSharp #797 (current) | `my%20col=a%2Fb` (both `EscapeDataString`) | literal `my%20col=a%2Fb/…` | literal |
-| **L2 two-layer** | this design / Spark / delta-rs | `my col=a%2Fb` (`escapePathName`; space passes through) | URI-encoded `my%20col%3Da%252Fb/…` | `uriDecodePath` |
+| **L2 two-layer** | this design / Spark | `my col=a%2Fb` (`escapePathName`; space passes through) | URI-encoded `my%20col=a%252Fb/…` (`=` literal, Spark parity) | `uriDecodePath` |
 
 Key observations that make the bounded resolver (§2.3) correct and fail-closed:
 
@@ -201,9 +210,9 @@ Key observations that make the bounded resolver (§2.3) correct and fail-closed:
   Resolution is therefore unambiguous for conforming tables. (A **foreign/adversarial** table that plants a
   file at *both* keys is handled by the decoded-first tie-break + integrity cross-check — §2.3, §6 T-Poison —
   and is a read-only, in-root, single-tenant residual.)
-- For a non-partitioned table and the ASCII-unreserved-name/value legacy case `k_dec == k_lit` — one open, no
-  behavior change. (Note: a **go-forward L2 partitioned** file always has `k_dec≠k_lit` because layer-2 encodes
-  the `=` separator — §2.3/§4.)
+- For a non-partitioned table and the ASCII-unreserved-name/value case `k_dec == k_lit` — one open, no
+  behavior change. (Note: a **go-forward L2 partitioned** file has `k_dec≠k_lit` only when the partition value
+  contains a URI-illegal char (space, `%`, …); a plain-ASCII value round-trips at `k_dec==k_lit` — §2.3/§4.)
 - **Commit-time conflict detection & tombstones are canonicalization-safe:** `RemoveFile`/conflict comparison
   use the **verbatim** stored `add.path` string (never recomposed across versions — e.g. `DeltaOptimize`'s
   `ToRemove` copies `input.Path` as-is), so string comparison stays encoding-consistent even in a mixed
@@ -310,8 +319,9 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
   #708 AC "written and read back correctly by DeltaSharp".
 - **H2** — On-disk layout assertion: the physical directory equals `escapePathName(name)=escapePathName(value)`
   byte-for-byte (space and non-ASCII pass through; `/ = : "` escaped as `%2F %3D %3A %22`).
-- **H3** — `add.path` assertion: equals `uriDecodePath⁻¹` of the physical relative path (`=`→`%3D`,
-  space→`%20`, layer-1 `%2F`→`%252F`, non-ASCII→UTF-8 `%`-triplets).
+- **H3** — `add.path` assertion: equals the Java-URI/RFC-2396 quoting of the physical relative path measured
+  from Spark (space→`%20`, layer-1 `%2F`→`%252F`; the structural `=`, the `/` separators, and non-ASCII stay
+  **literal** — e.g. `region=café/f` ⇒ `region=café/f`, `region=a%2Fb/f` ⇒ `region=a%252Fb/f`).
 
 ### 3.2 Differential parity vs Spark & delta-rs (the #806 core oracle — "measured, not assumed")
 
@@ -332,9 +342,13 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
 > **checksum/attestation**, and be governed by an explicit **"never regenerated from DeltaSharp output"** rule in
 > the fixture README. This provenance guarantee is a launch-checklist item for Inc-C, not a deferred pointer.
 
-> **Open item O1 (§9):** the exact `%`-double-encoding of a layer-1 `%XX` inside `add.path` (`%2F`→`%252F`)
-> must be **verified against** the reference goldens, not assumed — Hadoop `Path`/`SparkPath` URI handling is
-> the authority. The differential fixture is the oracle; the implementation conforms to it.
+> **Open item O1 (§9) — MEASURED & CLOSED (Inc-B).** The exact `add.path` encoding was captured from real
+> Apache Spark 3.5 (Delta 3.2) and delta-rs 1.6. Finding: the reference add.path is **Java `URI.toString`
+> path-quoting** of the on-disk relative path — it percent-encodes only URI-illegal ASCII (space→`%20`, a
+> layer-1 `%`→`%25`, and `< > { } | ` `` ` ``) and keeps the structural `=`, the `/` separators, the
+> pchar/sub-delims and **all non-ASCII literal**. DeltaSharp's `ToAddPath` was corrected to match Spark
+> byte-for-byte (the earlier assumed `=`→`%3D` / non-ASCII→UTF-8-triplet rule was wrong). The full provenance
+> matrix + differential goldens land in Inc-C (§3.2).
 
 ### 3.3 Migration / mixed-layout (bounded resolver)
 
@@ -591,9 +605,12 @@ graph LR
 - **O6 — stale code comment (follow-up, not this design).** `DeltaWriteEncoding.cs`'s XML comment cites the
   literal-open sites as `DeltaReadSource.cs:310,362`; the actual sites are `:328,:380`. Tracked as a code
   follow-up in **#894** (does not affect this doc).
-- **O1 — exact `%`-double-encoding in `add.path` must be measured, not assumed.** The layer-1 `%XX`→`%25XX`
-  and separator `=`→`%3D` behavior is specified per RFC/protocol but the **reference goldens (Spark, delta-rs)
-  are the authority** — Inc-C conforms DeltaSharp to them. *Open until the goldens are captured.*
+- **O1 — exact `add.path` encoding — MEASURED & CLOSED (Inc-B).** Captured from real Spark 3.5 + delta-rs 1.6:
+  the reference add.path is Java `URI.toString` path-quoting — layer-1 `%`→`%25` and URI-illegal ASCII
+  (space→`%20`, `< > { } | ` `` ` ``) are encoded, while the `=` separator, `/` separators, pchar/sub-delims,
+  and **all non-ASCII** stay literal. `ToAddPath` corrected to match Spark byte-for-byte (the assumed
+  `=`→`%3D` / non-ASCII→triplet rule was wrong). delta-rs diverges on-disk (escapes space/non-ASCII) →
+  read-compatible-but-not-byte-identical residual; DeltaSharp matches Spark (D1). Provenance goldens: Inc-C.
 - **O3 — do we ever need to *parse* a directory name?** Currently no (partition truth = `partitionValues`).
   Confirm no read path infers partition values from the path (survey found none) so the encoding is a pure
   locator. *Believed closed; reviewer confirm.*

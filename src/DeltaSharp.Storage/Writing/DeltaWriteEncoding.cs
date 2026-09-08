@@ -104,50 +104,212 @@ internal static class DeltaWriteEncoding
     }
 
     /// <summary>
-    /// Composes a single Hive-style partition directory segment, <c>column=value</c>, percent-encoding
-    /// <b>both</b> the column name and the value with <see cref="Uri.EscapeDataString(string)"/> (#708). A
-    /// null value uses the <see cref="HiveDefaultPartition"/> sentinel.
-    /// </summary>
+    /// Composes a single Hive-style partition directory <b>physical</b> segment, <c>column=value</c> (#806
+    /// layer 1), using Apache Spark's <c>ExternalCatalogUtils.escapePathName</c> alphabet
+    /// (<see cref="EscapePathName"/>) for both the column name and the value. A null <b>or empty</b> value uses
+    /// the <see cref="HiveDefaultPartition"/> sentinel (Spark parity — both collide on disk, disambiguated by
+    /// the authoritative <c>add.partitionValues</c>).</summary>
     /// <remarks>
-    /// <para>
-    /// <b>#708 — the encoding is settled here, deliberately, in one place — as a directory-injection
-    /// hardening, NOT a Spark-parity claim.</b> DeltaSharp previously percent-encoded only the value and
-    /// emitted the column name raw, so a legal Delta column name containing a <c>/</c>, <c>=</c>, quote,
-    /// space, or control character landed verbatim in <c>add.path</c> and could fabricate spurious path
-    /// segments or escape the confined table root. Encoding the NAME as well as the value with
-    /// <see cref="Uri.EscapeDataString(string)"/> closes that.
-    /// </para>
-    /// <para>
-    /// <b>This is a known, deliberate DEVIATION from the Delta URI-encoded-path rule, not parity with it.</b>
-    /// DeltaSharp treats <c>add.path</c> as a <b>literal relative object key</b>, not a URI to be decoded —
-    /// the read path never decodes it (<c>DeltaReadSource.cs:310,362</c>). And
-    /// <see cref="Uri.EscapeDataString(string)"/> uses a DIFFERENT alphabet than Apache Spark's
-    /// <c>ExternalCatalogUtils.escapePathName</c> (a 128-entry ASCII bitset that cannot escape non-ASCII), so
-    /// the on-disk segment DeltaSharp writes is not byte-identical to Spark's for the same value. This
-    /// deviation is pre-existing for partition VALUES and is extended here to NAMES. The consequence:
-    /// DeltaSharp tables whose partition names/values contain characters outside the RFC-3986 unreserved set
-    /// are <b>not currently round-trippable with Spark/delta-rs</b>. The correct two-layer fix (physical
-    /// segment via Spark's <c>escapePathName</c> alphabet + URI-encode into <c>add.path</c>, decode on read)
-    /// is tracked by <b>#806</b>.
-    /// </para>
-    /// <para>
-    /// This is safe on read regardless, because <b>partition truth is authoritative from
-    /// <c>add.partitionValues</c></b>, never recovered by parsing the directory path (see
-    /// <c>DeltaWriteTarget.DataFilePath</c>). Tables written previously carry a raw key; nothing re-parses the
-    /// key for correctness, and <c>OrphanCleanup</c> already matches on the union of the raw path and its
-    /// <see cref="Uri.UnescapeDataString(string)"/> decoding, so previously-written raw-key layouts still
-    /// resolve. Encoding the key also retires the write-path half of the Hive-redaction residuals (#714) for
-    /// NEW writes: DeltaSharp-authored keys can no longer carry a quote or whitespace (a legacy raw-key
-    /// <c>add.path</c> written before #708 can still carry one).
-    /// </para>
-    /// <para>Both the write path (<c>DeltaWriteTarget.DataFilePath</c>) and OPTIMIZE
-    /// (<c>DeltaOptimize.BuildOutputPath</c>) call this, so the two cannot drift.</para>
+    /// <para><b>#806 two-layer encoding — layer 1 (physical on disk).</b> This is the directory name written to
+    /// storage; it is byte-for-byte what Spark/delta-rs write for the same <c>(name, value)</c>, so the on-disk
+    /// layout is interoperable. The complementary layer 2 (<see cref="ToAddPath"/>) URI-encodes the assembled
+    /// relative path into <c>add.path</c> per the Delta protocol; the read path recovers the physical key by a
+    /// single <c>Uri.UnescapeDataString</c> (<c>PartitionPathResolver</c>, Inc-A). This replaces the pre-#806
+    /// <c>Uri.EscapeDataString</c> scheme, whose alphabet diverged from Spark's (it escaped space and all
+    /// non-ASCII) and which stored <c>add.path</c> literally.</para>
+    /// <para><b>Injection safety is preserved.</b> <see cref="EscapePathName"/> escapes <c>/ \ = :</c> and
+    /// control characters, so a hostile name or value cannot fabricate or escape a directory segment (the #708
+    /// hardening). The write-door column-name validation (<c>ColumnMapping.FindUnsafePathSegmentReason</c>)
+    /// remains as defense in depth.</para>
+    /// <para><b>Encoded-length budget (#806 §2.6).</b> The composed physical segment must fit a filesystem path
+    /// component (<see cref="MaxEncodedPathComponentBytes"/>). <see cref="EscapePathName"/>'s non-ASCII
+    /// passthrough removes the old <c>Uri.EscapeDataString</c> blow-up; the residual is escape-heavy ASCII (each
+    /// escaped char → 3 bytes). An over-budget segment fails <b>closed</b> here (pre-commit, orphan-Parquet-only)
+    /// rather than a late filesystem <c>ENAMETOOLONG</c>.</para>
+    /// <para><b>Partition truth is authoritative from <c>add.partitionValues</c></b>, never recovered by parsing
+    /// the directory path, so the physical encoding never affects read correctness. Both the write path
+    /// (<c>DeltaWriteTarget.DataFilePath</c>) and OPTIMIZE (<c>DeltaOptimize.BuildOutputPath</c>) call this, so
+    /// the two cannot drift.</para>
     /// </remarks>
+    /// <exception cref="DeltaStorageException">The composed segment exceeds
+    /// <see cref="MaxEncodedPathComponentBytes"/> UTF-8 bytes (<see cref="StorageErrorKind.UnsupportedFeature"/>).</exception>
     public static string HivePartitionSegment(string column, string? value)
     {
         ArgumentNullException.ThrowIfNull(column);
-        string encodedValue = value is null ? HiveDefaultPartition : Uri.EscapeDataString(value);
-        return Uri.EscapeDataString(column) + "=" + encodedValue;
+        // Spark parity (ExternalCatalogUtils.getPartitionValueString): BOTH null and empty-string map to the
+        // sentinel directory (they collide on disk, disambiguated by the authoritative add.partitionValues).
+        string encodedValue = string.IsNullOrEmpty(value) ? HiveDefaultPartition : EscapePathName(value);
+        string segment = EscapePathName(column) + "=" + encodedValue;
+
+        int encodedBytes = Encoding.UTF8.GetByteCount(segment);
+        if (encodedBytes > MaxEncodedPathComponentBytes)
+        {
+            // Message hygiene (#653/#806): name only the bounded byte counts, never the (potentially PII) value.
+            throw DeltaStorageException.UnsupportedFeature(
+                $"A Hive partition-directory component is {encodedBytes} bytes after encoding, exceeding the "
+                + $"{MaxEncodedPathComponentBytes}-byte filesystem path-component limit; the partition value "
+                + "cannot be written as a Hive partition path. The write fails closed before commit.");
+        }
+
+        return segment;
+    }
+
+    /// <summary>The conservative on-disk path-<b>component</b> byte budget (ext4/PVC <c>NAME_MAX</c>), enforced
+    /// by <see cref="HivePartitionSegment"/> on the composed physical <c>name=value</c> directory segment
+    /// (#806 §2.6).</summary>
+    public const int MaxEncodedPathComponentBytes = 255;
+
+    // The Apache Spark ExternalCatalogUtils.escapePathName charToEscape bitset (non-Windows alphabet, #806 D1):
+    // ASCII controls 0x01–0x1F, DEL 0x7F, and " # % ' * / : = ? \ { [ ] ^. Every other code point — including
+    // all non-ASCII and (non-Windows) the space — passes through unescaped.
+    private static readonly bool[] PathNameEscape = BuildPathNameEscapeSet();
+
+    private static readonly char[] UpperHex = "0123456789ABCDEF".ToCharArray();
+
+    // The RFC 2396 / Java-URI path-quoting allowed ASCII set — the exact set of characters Apache Spark and
+    // delta-rs keep *literal* in the Delta `add.path` (verified byte-for-byte against Spark 3.5 + delta-rs 1.6
+    // goldens; #806 design O1). It is the URI "unreserved mark" chars plus the path pchar/sub-delims
+    // `-_.!~*'()` and `:@&=+$,;` and the `/` separator. Every other ASCII byte — space, `%`, and the
+    // URI-illegal `" # < > ? [ ] { } | \ ^ ` (backtick)` and controls — is percent-encoded; non-ASCII code
+    // points pass through literally (Java `URI.toString`, not `toASCIIString`, which is what Delta stores).
+    private static readonly bool[] AddPathAsciiLiteral = BuildAddPathLiteralSet();
+
+    private static bool[] BuildAddPathLiteralSet()
+    {
+        var set = new bool[128];
+        for (char c = '0'; c <= '9'; c++)
+        {
+            set[c] = true;
+        }
+
+        for (char c = 'A'; c <= 'Z'; c++)
+        {
+            set[c] = true;
+        }
+
+        for (char c = 'a'; c <= 'z'; c++)
+        {
+            set[c] = true;
+        }
+
+        foreach (char c in "-_.!~*'():@&=+$,;/")
+        {
+            set[c] = true;
+        }
+
+        return set;
+    }
+
+    private static bool[] BuildPathNameEscapeSet()
+    {
+        var set = new bool[128];
+        for (int c = 0x01; c <= 0x1F; c++)
+        {
+            set[c] = true;
+        }
+
+        set[0x7F] = true;
+        foreach (char c in "\"#%'*/:=?\\{[]^")
+        {
+            set[c] = true;
+        }
+
+        return set;
+    }
+
+    /// <summary>The physical on-disk directory-name encoding — byte-for-byte Apache Spark
+    /// <c>ExternalCatalogUtils.escapePathName</c> (#806 layer 1). Escapes only the Hive <c>charToEscape</c>
+    /// bitset as uppercase <c>%XX</c>; every other code point (all non-ASCII, and the space) passes through
+    /// unescaped, so DeltaSharp's on-disk layout matches Apache Spark byte-for-byte. (delta-rs additionally
+    /// percent-escapes space and non-ASCII on disk, so it diverges here — see <see cref="ToAddPath"/> and the
+    /// #806 Inc-C interop residual; DeltaSharp follows Spark.)</summary>
+    public static string EscapePathName(string value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+
+        int firstEscape = -1;
+        for (int i = 0; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (c < 0x80 && PathNameEscape[c])
+            {
+                firstEscape = i;
+                break;
+            }
+        }
+
+        if (firstEscape < 0)
+        {
+            return value; // fast path: nothing to escape (the common ASCII-unreserved / non-ASCII case)
+        }
+
+        var sb = new StringBuilder(value.Length + 8);
+        sb.Append(value, 0, firstEscape);
+        for (int i = firstEscape; i < value.Length; i++)
+        {
+            char c = value[i];
+            if (c < 0x80 && PathNameEscape[c])
+            {
+                sb.Append('%').Append(UpperHex[(c >> 4) & 0xF]).Append(UpperHex[c & 0xF]);
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+
+        return sb.ToString();
+    }
+
+    /// <summary>The Delta-protocol <c>add.path</c> encoding (#806 layer 2): URI-quotes the assembled physical
+    /// relative path (<see cref="EscapePathName"/> segments joined by <c>/</c>, plus the
+    /// <c>part-*.parquet</c> file name) with the **Java-URI / RFC 2396 path** rule that Apache Spark and
+    /// delta-rs use — verified byte-for-byte against Spark 3.5 + delta-rs 1.6 goldens (#806 design O1). Only
+    /// URI-illegal ASCII is percent-encoded: a space becomes <c>%20</c>, a layer-1 <c>%2F</c> becomes
+    /// <c>%252F</c> (the <c>%</c> → <c>%25</c>), and <c>&lt; &gt; { } | ` "</c> and controls become their
+    /// <c>%XX</c>. The structural <c>=</c> separator, the <c>/</c> path separators, the pchar/sub-delims
+    /// (<c>: @ &amp; + $ , ; ! ~ * ' ( ) -</c>) and **all non-ASCII** pass through literally (matching Spark's
+    /// <c>URI.toString</c>). The read path recovers the physical object key by a single
+    /// <c>Uri.UnescapeDataString</c> (<c>PartitionPathResolver</c>, Inc-A) — <c>UnescapeDataString(ToAddPath(p)) == p</c>
+    /// for every physical path <c>p</c>. Note delta-rs additionally percent-escapes space and non-ASCII in the
+    /// on-disk directory (and hence its <c>add.path</c>); DeltaSharp follows Spark's on-disk layout, so a
+    /// delta-rs table is read-compatible but not byte-identical (#806 Inc-C residual).</summary>
+    public static string ToAddPath(string physicalRelativePath)
+    {
+        ArgumentNullException.ThrowIfNull(physicalRelativePath);
+
+        int firstEncode = -1;
+        for (int i = 0; i < physicalRelativePath.Length; i++)
+        {
+            char c = physicalRelativePath[i];
+            if (c < 0x80 && !AddPathAsciiLiteral[c])
+            {
+                firstEncode = i;
+                break;
+            }
+        }
+
+        if (firstEncode < 0)
+        {
+            return physicalRelativePath; // fast path: every character is add.path-literal
+        }
+
+        var sb = new StringBuilder(physicalRelativePath.Length + 8);
+        sb.Append(physicalRelativePath, 0, firstEncode);
+        for (int i = firstEncode; i < physicalRelativePath.Length; i++)
+        {
+            char c = physicalRelativePath[i];
+            if (c < 0x80 && !AddPathAsciiLiteral[c])
+            {
+                sb.Append('%').Append(UpperHex[(c >> 4) & 0xF]).Append(UpperHex[c & 0xF]);
+            }
+            else
+            {
+                sb.Append(c);
+            }
+        }
+
+        return sb.ToString();
     }
 
     /// <summary>Formats the value at <paramref name="row"/> of a partition column <paramref name="source"/>

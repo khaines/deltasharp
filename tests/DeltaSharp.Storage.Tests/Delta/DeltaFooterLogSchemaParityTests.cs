@@ -921,7 +921,8 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
     /// <summary>Reads the <c>org.apache.spark.sql.parquet.row.metadata</c> footer metadata off one committed data file.</summary>
     private async Task<string> ReadFooterSchema(string relativePath)
     {
-        await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
+        // #806: add.path is URI-encoded; the on-disk key is its decode (escapePathName layer 1).
+        await using FileStream stream = File.OpenRead(Path.Combine(_root, Uri.UnescapeDataString(relativePath)));
         await using ParquetReader reader =
             await ParquetReader.CreateAsync(stream, null, false, CancellationToken.None);
         return reader.CustomMetadata[FooterWireKeys.Schema];

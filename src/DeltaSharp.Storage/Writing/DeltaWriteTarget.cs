@@ -846,7 +846,9 @@ public sealed class DeltaWriteTarget : IDisposable
             await _backend.PutIfAbsentAsync(relativePath, bytes, cancellationToken).ConfigureAwait(false);
 
             files.Add(new StagedDataFile(
-                relativePath,
+                // #806 layer 2: the physical key (relativePath, escapePathName segments) is what we PutIfAbsent
+                // and read back by; add.path records the URI-encoded form per the Delta protocol.
+                DeltaWriteEncoding.ToAddPath(relativePath),
                 group.PartitionValues,
                 Size: bytes.LongLength,
                 ModificationTime: modificationTime,

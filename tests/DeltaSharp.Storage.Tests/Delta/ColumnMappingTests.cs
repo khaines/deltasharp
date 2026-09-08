@@ -3573,7 +3573,7 @@ public sealed class ColumnMappingTests : IDisposable
 
     private async Task<string[]> ReadParquetColumnNamesAsync(string relativePath)
     {
-        await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
+        await using FileStream stream = File.OpenRead(Path.Combine(_root, Uri.UnescapeDataString(relativePath)));
         await using ParquetReader reader = await ParquetReader.CreateAsync(stream);
         return reader.Schema.DataFields.Select(f => f.Name).ToArray();
     }
@@ -3584,7 +3584,7 @@ public sealed class ColumnMappingTests : IDisposable
     // A leaf element without a field_id is omitted.
     private async Task<Dictionary<string, int>> ReadParquetFieldIdsAsync(string relativePath)
     {
-        await using FileStream stream = File.OpenRead(Path.Combine(_root, relativePath));
+        await using FileStream stream = File.OpenRead(Path.Combine(_root, Uri.UnescapeDataString(relativePath)));
         await using ParquetReader reader = await ParquetReader.CreateAsync(stream);
         var byName = new Dictionary<string, int>(StringComparer.Ordinal);
         foreach (global::Parquet.Meta.SchemaElement element in reader.Metadata!.Schema)
