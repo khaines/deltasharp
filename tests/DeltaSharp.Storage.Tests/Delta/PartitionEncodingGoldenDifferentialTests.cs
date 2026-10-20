@@ -1199,7 +1199,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("", "_ = Xunit.Sdk.ArgumentFormatter.Format(row.Value);")]
     [InlineData("", "System.Diagnostics.Debug.WriteLine(row.Value);")]
     [InlineData("", "TextWriter w = new StreamWriter(Stream.Null); w.Write(row.Value);")]
-    [InlineData("static class W { public static void Put<T>(T w, string s) where T : TextWriter { w.Write(s); } }", "W.Put(new StreamWriter(Stream.Null), row.Value!);")]
+    [InlineData("static class W { public static void Put<T>(T w, string s) where T : TextWriter { w.Write(s); } }", "W.Put<TextWriter>(null!, row.Value!);")]
     [InlineData("static class O { public static void Put<T>(T o, string s) where T : Xunit.Abstractions.ITestOutputHelper => o.WriteLine(s); }", "O.Put<Xunit.Abstractions.ITestOutputHelper>(null!, row.Value!);")]
     [InlineData("sealed class Rows : TheoryData<int> { public Rows(string s) { } }", "_ = new Rows(row.Value!);")]
     [InlineData("", "ICollection<KeyValuePair<string, int>> c = new Dictionary<string, int>(); c.Add(new KeyValuePair<string, int>(row.Value!, 1));")]
@@ -1311,6 +1311,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         + "    [Theory]\n    [MemberData(nameof(Rows))]\n    public void T(int value) => Assert.True(value > 0);\n",
         "    public static TheoryData<int> Rows() => new() { 1 };\n"
         + "    [Theory]\n    [MemberData(nameof(Rows), MemberType = typeof(Other))]\n    public void T(int value) => Assert.True(value > 0);\n",
+        "    public static TheoryData<int> Rows() => new() { 1 };\n"
+        + "    [Theory]\n    [MemberData(nameof(Rows))]\n    public void T(string value) => Assert.True(value.Length > 0);\n",
+        "    [Theory]\n    [MemberData(nameof(Other.Rows))]\n    public void T(int value) => Assert.True(value > 0);\n",
+        "    public static TheoryData<int> Rows() => new() { 1 };\n"
+        + "    [Theory]\n    [MemberData(nameof(Rows), @MemberType = typeof(Other))]\n    public void T(int value) => Assert.True(value > 0);\n",
     };
 
     public static TheoryData<int> TheoryDataEvasionIndices()
@@ -1356,6 +1361,29 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(
             result.Findings.Any(f => f.Contains("declaration named Escape", StringComparison.Ordinal)),
             $"a second Escape declaration was not reported: [{string.Join("; ", result.Findings.Select(Escape))}]");
+    }
+
+    // MemberData resolves through base types: an inherited member — overload or property — that yields text must
+    // be refused too.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    public void FixtureTextGuard_FlagsTextBearingTheoryDataInheritedOverload(int shape)
+    {
+        string inherited = shape == 0
+            ? "public class B { public static TheoryData<string> Rows(int n) => new() { \"a\" }; }\n"
+            : "public class B { public static IEnumerable<object[]> Rows => new[] { new object[] { \"a\" } }; }\n";
+        string Source =
+            "using Xunit;\n" + inherited
+            + "public sealed class C : B\n{\n    private static string Escape(string? s) => s ?? \"<null>\";\n"
+            + (shape == 0 ? "    public static new TheoryData<int> Rows() => new() { 1 };\n" : string.Empty)
+            + "    [Theory]\n    [MemberData(nameof(Rows)" + (shape == 0 ? ", 1" : string.Empty) + ")]\n"
+            + "    public void T(int value) => Assert.True(value > 0);\n}\n";
+        GuardResult result = FindFixtureTextFindings(Source, "GuardSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+        Assert.True(
+            result.Findings.Any(f => f.Contains("MemberData", StringComparison.Ordinal)),
+            $"an inherited text-yielding overload was not refused: [{string.Join("; ", result.Findings.Select(Escape))}]");
     }
 
     // The per-member coverage oracle fires on its own: an assertion-shaped call the guard does not recognise as a
@@ -1422,18 +1450,18 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// parameter, not position; a helper used as a method group, or a vetted parameter reassigned by direct
     /// assignment, is a finding;</item>
     /// <item>every argument and object-initializer value of an exception construction (explicit, target-typed or
-    /// aliased), every argument of a constructor
-    /// initializer on an exception type, and of any method declared on, or returning, an exception type (the
-    /// <c>ThrowIf*</c> helpers, factories);</item>
+    /// aliased), every argument of a constructor initializer on an exception type, and of any method declared on,
+    /// or returning, an exception type (the <c>ThrowIf*</c> helpers, factories) — except a lambda or method-group
+    /// argument (<c>Record.Exception(() =&gt; …)</c>), which is code rather than text and is checked where it runs;
+    /// a method group of such a member is a finding;</item>
     /// <item>the key of a dictionary READ or <c>Add</c> (including a collection initializer and
     /// <c>ICollection&lt;KeyValuePair&gt;.Add</c>) — both echo it on failure; dictionary constructors from a
     /// collection, <c>CreateRange</c>/<c>AddRange</c> on dictionary types and the <c>To…Dictionary</c>
     /// conversions are findings outright, since a duplicate key is echoed;</item>
     /// <item>any member of Console, Debug, Trace, ITestOutputHelper or a TextWriter, Environment.FailFast, any
     /// <c>Xunit.Sdk</c> member and any <c>dynamic</c> operation is a finding outright (the output writers are an
-    /// enumerated list, not every API that can reach a stream — see the residual; a call on a receiver typed
-    /// exactly as an in-memory StringWriter is exempt, as are lambda arguments to exception-returning calls such
-    /// as Record.Exception, which are code rather than text);</item>
+    /// enumerated list, not every API that can reach a stream — see the residual; creating an in-memory
+    /// StringWriter, or calling on a receiver typed exactly as one, is exempt);</item>
     /// <item>theory data becomes the display name: <c>[MemberData]</c> must yield only text-free values and may
     /// not name a <c>MemberType</c>; any other data attribute than InlineData/MemberData, and any TheoryData
     /// subclass declared here, is a finding;</item>
@@ -1443,7 +1471,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// field set after construction, which no argument sink sees.</item>
     /// </list>
     /// A sink value is safe only if it is a compile-time constant; a number, boolean or enum (no text can ride
-    /// on it); a call to THE <see cref="Escape"/> method (by symbol — and no other declaration may be named
+    /// on it under an unmutated culture); a call to THE <see cref="Escape"/> method (by symbol — and no other declaration may be named
     /// Escape); <c>string.Join(safe, xs.Select(Escape))</c> with LINQ's Select; a helper's own vetted
     /// <c>what</c> parameter; or an interpolation, concatenation, conditional or parenthesis built only from
     /// those. Anything else — a string local, a parameter, a property, a call — is a finding.
@@ -1451,8 +1479,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// encoding and regex APIs, System.Text.Json, Parquet.Net — and reflection. Those cannot be enumerated
     /// completely; this file does not feed fixture text to them in a failure path. Also outside the rule, as
     /// own-code shapes judged contrived here: reassigning `what` by ref, out or deconstruction; duplicate keys
-    /// through KeyedCollection.Add or OrderedDictionary.Insert; and per-site (rather than per-member) coverage.
-    /// All of it is tracked in #917.</para>
+    /// through KeyedCollection.Add, OrderedDictionary.Insert/SetAt or a dictionary's GetAlternateLookup indexer;
+    /// culture-dependent number text (a mutated NumberFormat.NegativeSign makes a number print text); reaching a
+    /// stream through Unsafe.As or a file handle; and per-site (rather than per-member) coverage. All of it is
+    /// tracked in #917.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
@@ -1776,7 +1806,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
         void CheckMemberData(AttributeSyntax attribute)
         {
-            if (attribute.ArgumentList?.Arguments.Any(a => a.NameEquals?.Name.Identifier.Text == "MemberType") == true)
+            if (attribute.ArgumentList?.Arguments.Any(a => a.NameEquals?.Name.Identifier.ValueText == "MemberType") == true)
             {
                 Finding(attribute, "MemberData with a MemberType is resolved outside this check");
                 return;
@@ -1791,12 +1821,18 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             string? member = attribute.ArgumentList?.Arguments.Count > 0
                 ? model.GetConstantValue(attribute.ArgumentList.Arguments[0].Expression).Value as string
                 : null;
-            // EVERY member of that name must qualify: arguments to MemberData can select any overload.
-            List<ITypeSymbol?> data = theorySymbol.ContainingType.GetMembers(member ?? string.Empty)
-                .Select(m => m switch { IMethodSymbol method => method.ReturnType, IPropertySymbol property => property.Type, IFieldSymbol field => field.Type, _ => null })
-                .ToList();
-            // The theory's own parameter types bound what its display name can show, whatever the data source,
-            // overload or enumerable wrapper; the declared data type must agree.
+            // EVERY member of that name must qualify — arguments to MemberData can select any overload, and xUnit
+            // looks through base types for it.
+            var data = new List<ITypeSymbol?>();
+            for (INamedTypeSymbol? owner = theorySymbol.ContainingType; owner is not null; owner = owner.BaseType)
+            {
+                data.AddRange(owner.GetMembers(member ?? string.Empty)
+                    .Select(m => m switch { IMethodSymbol method => method.ReturnType, IPropertySymbol property => property.Type, IFieldSymbol field => field.Type, _ => null }));
+            }
+
+            // The declared data type is what bounds the display name: xUnit renders the RAW row values, before any
+            // conversion to the parameter types, so an int parameter does not stop string data from printing. The
+            // parameter check is defense in depth on top of it.
             if (!theorySymbol.Parameters.All(p => IsTextFree(p.Type))
                 || data.Count == 0
                 || !data.All(t => t is INamedTypeSymbol { TypeArguments: { Length: > 0 } arguments } named
