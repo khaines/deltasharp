@@ -1102,7 +1102,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + string.Join("\n  ", result.CompileErrors.Select(Escape)));
         Assert.True(
             result.Findings.Count == 0,
-            $"{EmbeddedSourceName}: fixture text can reach the CI log unescaped:\n  "
+            $"{EmbeddedSourceName}: fixture text can reach the CI log unescaped. Render it with Escape(…), compare "
+            + "through the AssertFixture*/AssertValue* helpers, read dictionaries with TryGetValue; the rules are on "
+            + "FindFixtureTextFindings:\n  "
             + string.Join("\n  ", result.Findings.Select(Escape)));
 
         // Nor may it pass by seeing nothing. MEASURED-AT cf9c401+: 88 sinks and 61 Escape calls; the floors catch a
@@ -1181,13 +1183,34 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("", "_ = new Dictionary<(string, int), int>()[(row.OnDiskDir, 1)];")]
     [InlineData("", "throw Xunit.Sdk.EqualException.ForMismatchedValues(\"a\", row.Value);")]
     [InlineData("sealed class Boom : System.Exception { public string? Detail { get; set; } public override string Message => Detail ?? string.Empty; }", "throw new Boom { Detail = row.Value };")]
+    [InlineData("sealed class Boom : System.Exception { public string? D { get; set; } }", "Assert.True(ok, \"c\"); var b = new Boom(); b.D = row.Value; throw b;")]
+    [InlineData("", "var d = new Dictionary<string, int>(); d[row.Value!] += 1;")]
+    [InlineData("", "Assert.True(ok, Escape(row.Value)); throw new InvalidOperationException { Source = row.Value };")]
+    [InlineData("", "Assert.True(ok, Escape(row.Value)); dynamic d = row.Value!; throw new InvalidOperationException(d);")]
+    [InlineData("", "var d = new Dictionary<string, string?>(); d[row.Value!] ??= \"x\";")]
+    [InlineData("sealed class H { public Dictionary<string, int> D { get; } = new(); }", "_ = new H { D = { { row.Value!, 1 } } };")]
+    [InlineData("", "_ = new Dictionary<string, Dictionary<string, int>> { [\"a\"] = { { row.Value!, 1 } } };")]
+    [InlineData("sealed class Leak { public static string Stash = \"\"; public static implicit operator string(Leak? l) => Stash; }", "Leak.Stash = row.Value!; Assert.True(ok, (Leak?)null);")]
+    [InlineData("", "_ = System.Collections.Immutable.ImmutableDictionary.CreateRange(names.Select(n => new KeyValuePair<string, int>(n, 1)));")]
+    [InlineData("", "Assert.True(ok, string.Join(row.Value, names.Select(Escape)));")]
+    [InlineData("", "Action<string?> w = Console.WriteLine; w(row.Value);")]
+    [InlineData("static class H { public static void AssertValueX(string what, string v) { what = v; Xunit.Assert.True(true, what); } }", "H.AssertValueX(\"k\", row.Value!);")]
+    [InlineData("static class Factory { public static Exception Make(string m) => new InvalidOperationException(\"c\"); }", "throw Factory.Make(row.Value!);")]
+    [InlineData("", "_ = Xunit.Sdk.ArgumentFormatter.Format(row.Value);")]
+    [InlineData("", "System.Diagnostics.Debug.WriteLine(row.Value);")]
+    [InlineData("", "TextWriter w = new StreamWriter(Stream.Null); w.Write(row.Value);")]
+    [InlineData("sealed class Rows : TheoryData<int> { public Rows(string s) { } }", "_ = new Rows(row.Value!);")]
+    [InlineData("", "ICollection<KeyValuePair<string, int>> c = new Dictionary<string, int>(); c.Add(new KeyValuePair<string, int>(row.Value!, 1));")]
     public void FixtureTextGuard_FlagsEveryKnownEvasion(string usings, string body)
     {
         GuardResult result = FindFixtureTextFindings(GuardSnippet(usings, body), "GuardSnippet");
         Assert.True(
             result.CompileErrors.Count == 0,
             $"the case {Escape(body)} does not compile, so it proves nothing: {string.Join("; ", result.CompileErrors.Select(Escape))}");
-        Assert.True(result.Findings.Count > 0, $"the guard accepted {Escape(usings)} {Escape(body)}");
+        // A REAL rule must fire: the coverage oracle alone ("checked no sink") would let a deleted rule stay green.
+        Assert.True(
+            result.Findings.Any(f => !f.Contains("the guard checked no sink", StringComparison.Ordinal)),
+            $"the guard accepted {Escape(usings)} {Escape(body)}: [{string.Join("; ", result.Findings.Select(Escape))}]");
     }
 
     // ... and accepts the shapes this file actually relies on, so the rule is not simply "reject everything".
@@ -1207,6 +1230,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("var d = new Dictionary<string, int>(StringComparer.Ordinal); d.Add(\"literal\", 1); _ = d[\"literal\"];")]
     [InlineData("_ = new Dictionary<int, int>()[count];")]
     [InlineData("throw new ArgumentOutOfRangeException(\"p\", count, \"constant\");")]
+    [InlineData("if (!ok) throw new InvalidOperationException();")]
+    [InlineData("_ = Record.Exception(() => { });")]
+    [InlineData("using var w = new StringWriter(); w.Write(count);")]
     public void FixtureTextGuard_AcceptsTheSafeShapes(string body)
     {
         GuardResult result = FindFixtureTextFindings(GuardSnippet(string.Empty, body), "GuardSnippet");
@@ -1261,6 +1287,14 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         + "        public override IEnumerable<object[]> GetData(System.Reflection.MethodInfo m) => new[] { new object[] { \"a\" } };\n    }\n"
         + "    [Theory]\n    [Rows]\n    public void T(string value) => Assert.True(value.Length > 0);\n",
         "    [Theory]\n    [ClassData(typeof(Other))]\n    public void T(string value) => Assert.True(value.Length > 0);\n",
+        "    public sealed class Rows<TData> : IEnumerable<object[]>\n    {\n"
+        + "        public IEnumerator<object[]> GetEnumerator() { yield return new object[] { \"a\" }; }\n"
+        + "        System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();\n    }\n"
+        + "    public static Rows<int> Data() => new();\n"
+        + "    [Theory]\n    [MemberData(nameof(Data))]\n    public void T(string value) => Assert.True(value.Length > 0);\n",
+        "    public static TheoryData<int> Rows() => new() { 1 };\n"
+        + "    public static TheoryData<string> Rows(int n) => new() { \"a\" };\n"
+        + "    [Theory]\n    [MemberData(nameof(Rows), 1)]\n    public void T(string value) => Assert.True(value.Length > 0);\n",
     };
 
     public static TheoryData<int> TheoryDataEvasionIndices()
@@ -1306,6 +1340,22 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(
             result.Findings.Any(f => f.Contains("declaration named Escape", StringComparison.Ordinal)),
             $"a second Escape declaration was not reported: [{string.Join("; ", result.Findings.Select(Escape))}]");
+    }
+
+    // The per-member coverage oracle fires on its own: an assertion-shaped call the guard does not recognise as a
+    // sink (here a look-alike Assert type) leaves its member with sites but no checked sink.
+    [Fact]
+    public void FixtureTextGuard_CoverageOracleReportsAMemberWithNoCheckedSink()
+    {
+        GuardResult result = FindFixtureTextFindings(
+            "public static class MyAssert { public static void True(bool c, string m) { } }\n"
+            + "public sealed class C\n{\n    private static string Escape(string? s) => s ?? \"<null>\";\n"
+            + "    private static void M(string v) => MyAssert.True(true, v);\n}\n",
+            "GuardSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+        Assert.True(
+            result.Findings.Any(f => f.Contains("the guard checked no sink in M", StringComparison.Ordinal)),
+            $"the coverage oracle did not report M: [{string.Join("; ", result.Findings.Select(Escape))}]");
     }
 
     // The compile-error gate is what keeps every rule above from passing vacuously on a file that binds nothing.
@@ -1355,18 +1405,23 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// <item>the <c>what</c> argument of every <c>AssertFixture*</c>/<c>AssertValue*</c> helper, matched by
     /// parameter, not position; a helper used as a method group, or a vetted parameter reassigned, is a
     /// finding;</item>
-    /// <item>every argument of an exception construction (explicit, target-typed or aliased), of a constructor
+    /// <item>every argument and object-initializer value of an exception construction (explicit, target-typed or
+    /// aliased), every argument of a constructor
     /// initializer on an exception type, and of any method declared on, or returning, an exception type (the
     /// <c>ThrowIf*</c> helpers, factories);</item>
     /// <item>the key of a dictionary READ or <c>Add</c> (including a collection initializer) — both echo it on
-    /// failure; dictionary constructors from a collection and the <c>To…Dictionary</c>/<c>ToLookup</c>
+    /// failure; dictionary constructors from a collection and the <c>To…Dictionary</c>
     /// conversions are findings outright, since a duplicate key is echoed;</item>
     /// <item>any member of Console, Debug, Trace, ITestOutputHelper or a TextWriter, Environment.FailFast, any
-    /// <c>Xunit.Sdk</c> member and any <c>dynamic</c> operation is a finding outright;</item>
+    /// <c>Xunit.Sdk</c> member and any <c>dynamic</c> operation is a finding outright (the output writers are an
+    /// enumerated list, not every API that can reach a stream — see the residual);</item>
     /// <item>theory data becomes the display name: <c>[MemberData]</c> must yield only text-free values and may
-    /// not name a <c>MemberType</c>; any other data attribute than InlineData/MemberData is a finding;</item>
+    /// not name a <c>MemberType</c>; any other data attribute than InlineData/MemberData, and any TheoryData
+    /// subclass declared here, is a finding;</item>
     /// <item>a conditional-compilation directive is a finding: code it disables here could be enabled by the
-    /// real build's symbols and would ship unchecked.</item>
+    /// real build's symbols and would ship unchecked;</item>
+    /// <item>an exception type declared in this file is a finding: its Message could read a property or static
+    /// field set after construction, which no argument sink sees.</item>
     /// </list>
     /// A sink value is safe only if it is a compile-time constant; a number, boolean or enum (no text can ride
     /// on it); a call to THE <see cref="Escape"/> method (by symbol — and no other declaration may be named
@@ -1464,7 +1519,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
             return operation switch
             {
-                IConversionOperation { IsImplicit: true } conversion => IsSafe(conversion.Operand),
+                IConversionOperation { IsImplicit: true, OperatorMethod: null } conversion => IsSafe(conversion.Operand),
                 IParenthesizedOperation parenthesized => IsSafe(parenthesized.Operand),
                 IInterpolatedStringOperation interpolated => interpolated.Parts.All(part => part switch
                 {
@@ -1561,10 +1616,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     break;
             }
 
-            // A collection initializer's Add calls are implicit and do not surface on their own syntax node.
+            // A collection initializer's Add calls are implicit and do not surface on their own syntax node —
+            // including those nested in a member or index initializer (`new H { D = { { k, 1 } } }`).
             if (operation is IObjectCreationOperation { Initializer: { } collection })
             {
-                foreach (IInvocationOperation add in collection.Initializers.OfType<IInvocationOperation>())
+                foreach (IInvocationOperation add in collection.Descendants().OfType<IInvocationOperation>().Where(i => i.IsImplicit))
                 {
                     CheckInvocation(add);
                 }
@@ -1572,7 +1628,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
             if (operation is IPropertyReferenceOperation { Property.IsIndexer: true } indexer
                 && IsDictionary(indexer.Property.ContainingType)
-                && !(indexer.Parent is IAssignmentOperation assignment && assignment.Target == indexer))
+                && !(indexer.Parent is ISimpleAssignmentOperation assignment && assignment.Target == indexer)) // `+=` and `??=` read first
             {
                 Sink(indexer.Arguments[0].Value, "dictionary key (KeyNotFoundException echoes it)");
             }
@@ -1619,20 +1675,30 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     }
                 }
             }
-            else if (IsChecked(target.ContainingType) || (containing == "System.Environment" && target.Name == "FailFast"))
+            else if (IsChecked(call.Instance?.Type ?? target.ContainingType) || (containing == "System.Environment" && target.Name == "FailFast"))
             {
                 Finding(call.Syntax, "write to an output stream, or use of Xunit.Sdk");
             }
-            else if (DictionaryConversions.Contains(target.Name))
+            else if (DictionaryConversions.Contains(target.Name)
+                || (target.Name is "CreateRange" or "AddRange" && containing.Contains("Dictionary", StringComparison.Ordinal)))
             {
                 Finding(call.Syntax, "a duplicate key would be echoed by the exception");
             }
             else if (IsException(target.ContainingType) || IsException(target.ReturnType))
             {
-                // Throw helpers, factories, and `: base(...)` initializers of exception types.
-                SinkAll(call.Arguments, "exception argument");
+                // Throw helpers, factories, and `: base(...)` initializers of exception types. A lambda argument
+                // (`Record.Exception(() => …)`) is code, not text: what it does is checked where it does it.
+                foreach (IArgumentOperation argument in call.Arguments)
+                {
+                    if (Unwrap(argument.Value) is not (IAnonymousFunctionOperation or IDelegateCreationOperation))
+                    {
+                        Sink(argument.Value, "exception argument");
+                    }
+                }
             }
-            else if (target.Name == "Add" && IsDictionary(target.ContainingType) && call.Arguments.Length > 0)
+            else if (target.Name == "Add" && call.Arguments.Length > 0
+                && (IsDictionary(target.ContainingType)
+                    || target.ContainingType is { Name: "ICollection", TypeArguments: [INamedTypeSymbol { Name: "KeyValuePair" }] }))
             {
                 Sink(call.Arguments[0].Value, "dictionary key (a duplicate is echoed)");
             }
@@ -1645,6 +1711,21 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                         Sink(argument.Value, "assertion description");
                     }
                 }
+            }
+        }
+
+        // An exception type declared here could carry text into its Message through a property or static field set
+        // after construction, which no argument sink sees. The file needs none, so declaring one is a finding.
+        foreach (BaseTypeDeclarationSyntax declared in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+        {
+            INamedTypeSymbol? declaredType = model.GetDeclaredSymbol(declared);
+            if (IsException(declaredType))
+            {
+                Finding(declared, "an exception type declared in this file (its Message can be set out of sight)");
+            }
+            else if (declaredType?.BaseType?.OriginalDefinition.ToDisplayString().StartsWith("Xunit.TheoryData", StringComparison.Ordinal) == true)
+            {
+                Finding(declared, "a TheoryData subclass declared in this file (AddRow can feed text to display names)");
             }
         }
 
@@ -1683,7 +1764,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             ITypeSymbol? data = theorySymbol.ContainingType.GetMembers(member ?? string.Empty)
                 .Select(m => m switch { IMethodSymbol method => method.ReturnType, IPropertySymbol property => property.Type, _ => null })
                 .FirstOrDefault(t => t is not null);
-            if (data is not INamedTypeSymbol { TypeArguments: { Length: > 0 } arguments } || !arguments.All(IsTextFree))
+            // The theory's own parameter types bound what its display name can show, whatever the data source,
+            // overload or enumerable wrapper; the declared data type must agree.
+            if (!theorySymbol.Parameters.All(p => IsTextFree(p.Type))
+                || data is not INamedTypeSymbol { TypeArguments: { Length: > 0 } arguments } named
+                || !named.OriginalDefinition.ToDisplayString().StartsWith("Xunit.TheoryData<", StringComparison.Ordinal)
+                || !arguments.All(IsTextFree))
             {
                 Finding(attribute, "MemberData must yield only numbers, booleans or enums (the display name)");
             }
@@ -1707,7 +1793,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 InvocationExpressionSyntax { Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "Fail" } } => true,
                 InvocationExpressionSyntax { Expression: IdentifierNameSyntax { Identifier.Text: var name } } =>
                     name.StartsWith("AssertFixture", StringComparison.Ordinal) || name.StartsWith("AssertValue", StringComparison.Ordinal),
-                BaseObjectCreationExpressionSyntax creation => model.GetTypeInfo(creation).Type is { } type && IsException(type),
+                // `throw new X()` with nothing to print is not a site.
+                BaseObjectCreationExpressionSyntax creation => model.GetTypeInfo(creation).Type is { } type && IsException(type)
+                    && (creation.ArgumentList?.Arguments.Count > 0 || creation.Initializer is not null),
                 _ => false,
             });
             if (sites > 0 && sinksByMember.GetValueOrDefault(member) == 0)
@@ -1727,10 +1815,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         return new GuardResult(findings, compileErrors, sinks, escapeCalls);
     }
 
-    // Conversions that throw on a duplicate key with the key in the message.
+    // Conversions that throw on a duplicate key with the key in the message. (ToLookup groups duplicates instead.)
     private static readonly HashSet<string> DictionaryConversions = new(StringComparer.Ordinal)
     {
-        "ToDictionary", "ToLookup", "ToFrozenDictionary", "ToImmutableDictionary", "ToImmutableSortedDictionary", "ToSortedDictionary",
+        "ToDictionary", "ToFrozenDictionary", "ToImmutableDictionary", "ToImmutableSortedDictionary", "ToSortedDictionary",
     };
 
     private static IOperation Unwrap(IOperation operation) => operation switch
@@ -1770,7 +1858,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // exception factories and assertion internals print their operands).
     private static bool IsChecked(ITypeSymbol? type) => type is not null
         && (OutputWriterTypes.Contains(type.ToDisplayString())
-            || DerivesFrom(type, "System.IO.TextWriter")
+            || (DerivesFrom(type, "System.IO.TextWriter") && type.ToDisplayString() != "System.IO.StringWriter")
             || type.ContainingNamespace?.ToDisplayString().StartsWith("Xunit.Sdk", StringComparison.Ordinal) == true);
 
     private static bool IsDictionary(ITypeSymbol? type) => type is INamedTypeSymbol named

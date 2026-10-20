@@ -183,7 +183,10 @@ back to opening `k_lit`**. So an **L2 (go-forward) file opens in one round-trip*
 ASCII-unreserved-non-partitioned file (`k_dec==k_lit`) is one open, unchanged. (Earlier drafts claimed the
 go-forward format hits the zero-extra-probe path only rarely — corrected by the O1 measurement: layer-2 keeps
 the `=` separator and all unreserved/sub-delim/non-ASCII **literal**, so an L2 partition file has
-`k_dec≠k_lit` exactly when its `add.path` contains a `%` — i.e. the partition name or value carries an `escapePathName`-escaped character (`= : / % # { [ ] ^ " \` …, already `%XX` on disk and `%25XX` in `add.path`) or a character that only layer 2 encodes (space, `< > } |`, backtick — literal on disk); a plain value like `region=US` round-trips with `k_dec==k_lit` in one open. §4 and O2 are re-scoped
+`k_dec≠k_lit` exactly when its `add.path` contains a `%` — i.e. the partition name or value carries an
+`escapePathName`-escaped character (`= : / % # { [ ] ^ " \` …, already `%XX` on disk and `%25XX` in `add.path`) or
+a character that only layer 2 encodes (space, `< > } |`, backtick — literal on disk); a plain value like
+`region=US` round-trips with `k_dec==k_lit` in one open. §4 and O2 are re-scoped
 accordingly.)
 
 **Untrusted both-exist tie-break (adversarial — §6 T-Poison).** On a **foreign, attacker-authored** table a
@@ -217,7 +220,10 @@ Key observations that make the bounded resolver (§2.3) correct and fail-closed:
   file at *both* keys is handled by the decoded-first tie-break + integrity cross-check — §2.3, §6 T-Poison —
   and is a read-only, in-root, single-tenant residual.)
 - For a non-partitioned table and the ASCII-unreserved-name/value case `k_dec == k_lit` — one open, no
-  behavior change. (Note: a **go-forward L2 partitioned** file has `k_dec≠k_lit` exactly when its `add.path` contains a `%` — i.e. the partition name or value carries an `escapePathName`-escaped character (`= : / % # { [ ] ^ " \` …, already `%XX` on disk and `%25XX` in `add.path`) or a character that only layer 2 encodes (space, `< > } |`, backtick — literal on disk); a plain value round-trips at
+  behavior change. (Note: a **go-forward L2 partitioned** file has `k_dec≠k_lit` exactly when its `add.path`
+  contains a `%` — i.e. the partition name or value carries an `escapePathName`-escaped character
+  (`= : / % # { [ ] ^ " \` …, already `%XX` on disk and `%25XX` in `add.path`) or a character that only
+  layer 2 encodes (space, `< > } |`, backtick — literal on disk); a plain value round-trips at
   `k_dec==k_lit` — §2.3/§4.)
 - **Commit-time conflict detection & tombstones are canonicalization-safe:** `RemoveFile`/conflict comparison
   use the **verbatim** stored `add.path` string (never recomposed across versions — e.g. `DeltaOptimize`'s
@@ -557,7 +563,10 @@ wall-clock, no map-ordering dependence (partition columns iterate in schema orde
   - **Non-partitioned tables & ASCII-unreserved-name/value legacy files** (`k_dec==k_lit`): **one** open,
     identical to today.
   - **Go-forward L2 partitioned files:** **one** open. Layer 2 keeps the `=` separator literal (O1, measured),
-    so an L2 file has `k_dec≠k_lit` exactly when its `add.path` contains a `%` — i.e. the partition name or value carries an `escapePathName`-escaped character (`= : / % # { [ ] ^ " \` …, already `%XX` on disk and `%25XX` in `add.path`) or a character that only layer 2 encodes (space, `< > } |`, backtick — literal on disk) — and then opens `k_dec`, the correct key, directly; otherwise `k_dec==k_lit`. No extra round-trip in the steady
+    so an L2 file has `k_dec≠k_lit` exactly when its `add.path` contains a `%` — i.e. the partition name or value
+    carries an `escapePathName`-escaped character (`= : / % # { [ ] ^ " \` …, already `%XX` on disk and `%25XX` in
+    `add.path`) or a character that only layer 2 encodes (space, `< > } |`, backtick — literal on disk) — and then
+    opens `k_dec`, the correct key, directly; otherwise `k_dec==k_lit`. No extra round-trip in the steady
     state. (An earlier draft assumed layer 2 encodes `=` as `%3D`, making every L2 segment differ; O1 falsified
     that.)
   - **Legacy L0/L1 partitioned files whose `add.path` carries a `%`:** `k_dec` misses, then `k_lit` opens —
