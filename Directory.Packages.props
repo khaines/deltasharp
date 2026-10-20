@@ -91,8 +91,9 @@
          an analyzer), to parse source with a real C# parser instead of a bug-prone hand-rolled one:
          DeltaSharp.Core.Tests for the #455 telemetry-leak guard (TelemetryExceptionScrubbingGuardTests),
          and DeltaSharp.Storage.Tests for the #806 Inc-C fixture-text guard
-         (PartitionEncodingGoldenDifferentialTests), which replaced a regex that missed $@"…", raw-string
-         and brace-adjacent interpolation holes. Never a production/runtime dependency. -->
+         (PartitionEncodingGoldenDifferentialTests), which binds its own source with a semantic model after
+         spelling-based guards were walked around in review. Never a production/runtime dependency. It brings
+         the transitive Microsoft.CodeAnalysis.Analyzers package into both test builds (same version in each). -->
     <PackageVersion Include="Microsoft.CodeAnalysis.CSharp" Version="5.9.0" />
   </ItemGroup>
 

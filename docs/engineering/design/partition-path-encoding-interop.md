@@ -24,9 +24,10 @@ DeltaSharp composes a Hive-style partition directory segment as
    *unreserved* alphabet: it escapes space (`%20`), all non-ASCII (`%C3%A9`), and a different reserved
    set. So DeltaSharp and Spark produce **different directory names** for any partition NAME or VALUE
    outside the ASCII-unreserved set.
-2. **`add.path`** is, per the Delta protocol, a **URI-encoded** relative path (RFC 2396): `country=US/…`
-   is stored as `country%3DUS/…` and must be URI-**decoded** to recover the object key. DeltaSharp treats
-   `add.path` as a literal object key on both write and read.
+2. **`add.path`** is, per the Delta protocol, a **URI-encoded** relative path (RFC 2396) that must be
+   URI-**decoded** to recover the object key — measured (O1) as Java `URI.toString` path-quoting: value
+   `a b` is on disk as `country=a b/…` and stored as `country=a%20b/…`, with the `=` kept literal.
+   DeltaSharp treats `add.path` as a literal object key on both write and read.
 
 **Consequence:** a DeltaSharp table whose partition names/values contain characters outside the
 RFC-3986 unreserved set is **not round-trippable with Spark/delta-rs** — the directory Spark expects and
@@ -556,8 +557,9 @@ wall-clock, no map-ordering dependence (partition columns iterate in schema orde
   - **Non-partitioned tables & ASCII-unreserved-name/value legacy files** (`k_dec==k_lit`): **one** open,
     identical to today.
   - **Go-forward L2 partitioned files:** **one** open. Layer 2 keeps the `=` separator literal (O1, measured),
-    so an L2 file has `k_dec≠k_lit` only when its value carries a URI-illegal character (space, `%`, …) and
-    opens `k_dec` — the correct key — directly; otherwise `k_dec==k_lit`. No extra round-trip in the steady
+    so an L2 file has `k_dec≠k_lit` only when its on-disk segment contains a `%` — i.e. the name or value carries
+    an `escapePathName`-escaped character (`= : / % #` …) or a URI-illegal one (space, `< > { } |`, backtick) —
+    and then opens `k_dec`, the correct key, directly; otherwise `k_dec==k_lit`. No extra round-trip in the steady
     state. (An earlier draft assumed layer 2 encodes `=` as `%3D`, making every L2 segment differ; O1 falsified
     that.)
   - **Legacy L0/L1 partitioned files whose `add.path` carries a `%`:** `k_dec` misses, then `k_lit` opens —
@@ -606,10 +608,11 @@ wall-clock, no map-ordering dependence (partition columns iterate in schema orde
   **in-root cross-area** reads (a decoded key could point at `_delta_log/…` / a DV `.bin` / `_change_data/…`
   under the same single-tenant root — §6 T-InRoot; low residual: single tenant, parsed as Parquet, fails closed).
 - **Supply chain.** No new **runtime** dependency — `escapePathName`/URI codec are in-repo (a small, audited
-  port of the Hive/Spark bitset). Inc-C adds two **dev-only** surfaces, neither run in CI: the fixture
-  generators (`pip` installs of the pinned engines, unhashed, plus a Maven/Ivy fetch of the Delta jars for
-  Spark — documented in the fixture README), and a test-only reference to `Microsoft.CodeAnalysis.CSharp` (the
-  same version `DeltaSharp.Core.Tests` already uses) for the fixture-text guard.
+  port of the Hive/Spark bitset). Inc-C adds two non-shipping surfaces: the fixture generators (**dev-only,
+  never run in CI** — `pip` installs of the pinned engines, unhashed, plus a Maven/Ivy fetch of the Delta jars
+  for Spark; documented in the fixture README), and a **test-only** reference to `Microsoft.CodeAnalysis.CSharp`
+  5.9.0 for the fixture-text guard, which CI restores (locked) and executes on every run but which never ships —
+  the same version, and the same transitive analyzer package, `DeltaSharp.Core.Tests` already uses.
 
 ---
 

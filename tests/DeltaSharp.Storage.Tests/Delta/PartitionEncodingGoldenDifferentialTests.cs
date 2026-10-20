@@ -9,6 +9,7 @@ using DeltaSharp.Types;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Operations;
 using Parquet;
 using Xunit;
 
@@ -31,10 +32,13 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// delta-rs-shaped (escaped space) on-disk layout. This closes the partition-VALUE read path only: every
 /// fixture fixes the column to <c>region</c>, so the partition-NAME read half of #708 stays open (#907).</item>
 /// </list>
-/// <para><b>Fixture text never reaches the CI log raw.</b> Every failure message renders fixture-derived
-/// text through <see cref="Escape"/>, and the assertions that print their operands (<c>Assert.Equal</c>,
-/// <c>Assert.Contains</c>, …) are not used here at all — the <c>AssertFixture*</c> helpers replace them.
-/// <see cref="FixtureTextGuard_HoldsOverThisFile"/> enforces both rules over this file's own syntax tree.</para>
+/// <para><b>Fixture text reaches the CI log only through <see cref="Escape"/>.</b> Every failure message,
+/// assertion description and exception message this file builds renders fixture-derived text through Escape;
+/// the assertions that print their operands (<c>Assert.Equal</c>, <c>Assert.Contains</c>, …) are not used here
+/// at all — the <c>AssertFixture*</c> helpers replace them; and theory data is row indices, so no fixture text
+/// becomes a test's display name. <see cref="FixtureTextGuard_HoldsOverThisFile"/> enforces all of it on a
+/// compiled, symbol-bound view of this file. Its stated residual: text a library composes from fixture input
+/// while failing (System.Text.Json, Parquet.Net).</para>
 /// </summary>
 public sealed class PartitionEncodingGoldenDifferentialTests
 {
@@ -181,12 +185,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private static string?[] Strings(JsonElement array) =>
         array.EnumerateArray().Select(e => e.ValueKind == JsonValueKind.Null ? null : e.GetString()).ToArray();
 
-    public static TheoryData<string?, string, string> SparkMatrix()
+    // The theory is keyed by row INDEX, never by the fixture text itself: xUnit renders theory arguments into
+    // the test's display name and escapes only C0 controls there, so a fixture value carrying a bidi override,
+    // a C1 control or a line separator would otherwise reach the CI log raw before any assertion runs.
+    public static TheoryData<int> SparkMatrixRows()
     {
-        var data = new TheoryData<string?, string, string>();
-        foreach (GoldenRow r in LoadMatrix(SparkDir))
+        var data = new TheoryData<int>();
+        for (int row = 0; row < LoadMatrix(SparkDir).Count; row++)
         {
-            data.Add(r.Value, r.OnDiskDir, r.AddPathSegment);
+            data.Add(row);
         }
 
         return data;
@@ -195,21 +202,31 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // ---- DS-&gt;ref: byte-parity against the Apache Spark reference (the #806 core oracle) ---------
 
     [Theory]
-    [MemberData(nameof(SparkMatrix))]
-    public void DeltaSharpEncoding_MatchesSpark_ByteForByte(string? value, string onDiskDir, string addPathSegment)
+    [MemberData(nameof(SparkMatrixRows))]
+    public void DeltaSharpEncoding_MatchesSpark_ByteForByte(int row)
     {
+        GoldenRow golden = LoadMatrix(SparkDir)[row];
+
         // Layer 1 — the on-disk directory name (escapePathName), byte-for-byte Spark.
-        AssertFixtureTextEquals(onDiskDir, DeltaWriteEncoding.HivePartitionSegment("region", value), "layer-1 directory");
+        AssertFixtureTextEquals(
+            golden.OnDiskDir,
+            DeltaWriteEncoding.HivePartitionSegment("region", golden.Value),
+            $"row {row} {Escape(golden.Value)}: layer-1 directory");
 
         // Layer 2 — the committed add.path first segment (Java-URI/RFC-2396 quoting), byte-for-byte Spark.
-        string physical = onDiskDir + "/part-x.parquet";
-        AssertFixtureTextEquals(addPathSegment + "/part-x.parquet", DeltaWriteEncoding.ToAddPath(physical), "layer-2 add.path");
+        string physical = golden.OnDiskDir + "/part-x.parquet";
+        AssertFixtureTextEquals(
+            golden.AddPathSegment + "/part-x.parquet",
+            DeltaWriteEncoding.ToAddPath(physical),
+            $"row {row} {Escape(golden.Value)}: layer-2 add.path");
 
         // The production read-side decoder is the exact inverse — DeltaSharp reads its own (and Spark's)
         // add.path. Bind to PartitionPathResolver.DecodePhysicalKey (not Uri.UnescapeDataString) so a future
         // resolver change cannot break the write/read round trip while this suite stays green.
         AssertFixtureTextEquals(
-            physical, PartitionPathResolver.DecodePhysicalKey(DeltaWriteEncoding.ToAddPath(physical)), "decode(add.path)");
+            physical,
+            PartitionPathResolver.DecodePhysicalKey(DeltaWriteEncoding.ToAddPath(physical)),
+            $"row {row} {Escape(golden.Value)}: decode(add.path)");
     }
 
     // ---- The empty-string axis: measured engine behaviour + DeltaSharp's value-layer divergence (#899) ----
@@ -966,28 +983,28 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         Assert.True(
             string.Equals(expected, actual, StringComparison.Ordinal),
-            $"{Escape(what)}: expected {Escape(expected)}, fixture has {Escape(actual)}");
+            $"{what}: expected {Escape(expected)}, fixture has {Escape(actual)}");
     }
 
     private static void AssertFixtureTextNotEquals(string? unexpected, string? actual, string what)
     {
         Assert.False(
             string.Equals(unexpected, actual, StringComparison.Ordinal),
-            $"{Escape(what)}: expected a value other than {Escape(unexpected)}");
+            $"{what}: expected a value other than {Escape(unexpected)}");
     }
 
     private static void AssertFixtureTextStartsWith(string prefix, string? actual, string what)
     {
         Assert.True(
             actual is not null && actual.StartsWith(prefix, StringComparison.Ordinal),
-            $"{Escape(what)}: expected a value starting with {Escape(prefix)}, got {Escape(actual)}");
+            $"{what}: expected a value starting with {Escape(prefix)}, got {Escape(actual)}");
     }
 
     private static void AssertFixtureSetContains(string? item, IReadOnlySet<string> set, string what)
     {
         Assert.True(
             item is not null && set.Contains(item),
-            $"{Escape(what)}: {Escape(item)} is not among [{string.Join(", ", set.Order(StringComparer.Ordinal).Select(Escape))}]");
+            $"{what}: {Escape(item)} is not among [{string.Join(", ", set.Order(StringComparer.Ordinal).Select(Escape))}]");
     }
 
     private static void AssertFixtureSequenceEquals(IEnumerable<string?> expected, IEnumerable<string?> actual, string what)
@@ -996,7 +1013,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         string?[] a = actual.ToArray();
         Assert.True(
             e.SequenceEqual(a, StringComparer.Ordinal),
-            $"{Escape(what)}: expected [{string.Join(", ", e.Select(Escape))}], got [{string.Join(", ", a.Select(Escape))}]");
+            $"{what}: expected [{string.Join(", ", e.Select(Escape))}], got [{string.Join(", ", a.Select(Escape))}]");
     }
 
     // Values that cannot carry text (numbers, booleans, enums) — rendered invariantly, then escaped anyway so
@@ -1006,7 +1023,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         Assert.True(
             EqualityComparer<T>.Default.Equals(expected, actual),
-            $"{Escape(what)}: expected {Escape(Convert.ToString(expected, CultureInfo.InvariantCulture))}, "
+            $"{what}: expected {Escape(Convert.ToString(expected, CultureInfo.InvariantCulture))}, "
             + $"got {Escape(Convert.ToString(actual, CultureInfo.InvariantCulture))}");
     }
 
@@ -1017,7 +1034,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         T[] a = actual.ToArray();
         Assert.True(
             e.SequenceEqual(a),
-            $"{Escape(what)}: expected {Escape(string.Join(", ", e))}, got {Escape(string.Join(", ", a))}");
+            $"{what}: expected {Escape(string.Join(", ", e))}, got {Escape(string.Join(", ", a))}");
     }
 
     // One row of a read table as a single comparable string; each text field is escaped, so a null and a
@@ -1025,16 +1042,23 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private static string RenderRow(long id, params string?[] fields) =>
         string.Join("|", fields.Select(Escape).Prepend(id.ToString(CultureInfo.InvariantCulture)));
 
-    // ---- Guard: fixture text never reaches the CI log unescaped ------------------------------------
+    // ---- Guard: fixture text never reaches a failure message, or a test name, unescaped -------------
 
     private const string EmbeddedSourceName = "Delta/PartitionEncodingGoldenDifferentialTests.cs";
 
-    // The xUnit assertions this file may call: none of them prints an operand on failure (True/False/Fail
-    // print only the message, NotEmpty and NotNull print nothing value-bearing). Every other Assert member
-    // — Equal, Contains, StartsWith, Single, … — prints its operands and is a finding.
+    // The Xunit.Assert members this file may call: none prints an operand on failure (True/False/Fail print
+    // only the message; NotEmpty and NotNull print nothing value-bearing). Every other member — Equal,
+    // Contains, StartsWith, Single, … — prints its operands and is a finding, however it is spelled or reached
+    // (qualified, aliased, `using static`, or as a method group).
     private static readonly HashSet<string> NonPrintingAssertions = new(StringComparer.Ordinal)
     {
         "True", "False", "Fail", "NotEmpty", "NotNull",
+    };
+
+    // Types whose members write straight to an output stream the CI log may capture.
+    private static readonly HashSet<string> OutputWriterTypes = new(StringComparer.Ordinal)
+    {
+        "System.Console", "System.Diagnostics.Debug", "System.Diagnostics.Trace", "Xunit.Abstractions.ITestOutputHelper",
     };
 
     [Fact]
@@ -1042,69 +1066,97 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         // This defect class recurred across several review rounds: a failure message carrying fixture text
         // (partition values carry 0x01/0x09; SHA256SUMS lines and matrix.json's `note` are attacker-authored)
-        // put raw control/ANSI bytes on the CI output stream — from inside the anti-forgery control, i.e. a
-        // hostile fixture could paint the log this suite exists to make trustworthy. Its first two guards
-        // were a line filter plus a regex over `$"` lines with a NAME allowlist, and review measured them
-        // missing `$@"…"`, raw strings, brace-adjacent holes, `Escape(a) + raw`, string concatenation and a
-        // local re-bound to an allowlisted name. So this one parses the file with the real C# parser and
-        // holds every message to a STRUCTURAL rule instead (see FindFixtureTextFindings).
+        // put raw control, ANSI or bidi bytes on the CI output stream — from inside the anti-forgery control,
+        // i.e. a hostile fixture could paint the log this suite exists to make trustworthy. Two earlier guards
+        // matched SPELLINGS (a regex over `$"` lines, then a syntax walk keyed on the identifiers `Assert` and
+        // `Escape`), and review measured both being walked around: `$@"…"`, raw strings, `Xunit.Assert.Equal`,
+        // `using static`, named arguments, a local function shadowing Escape, target-typed `new(…)`, a
+        // dictionary indexer whose KeyNotFoundException echoes the key, and theory arguments rendered into test
+        // names. So this guard COMPILES the file and decides on symbols and types (FindFixtureTextFindings).
         //
         // THE SOURCE IS READ FROM THE ASSEMBLY, NOT FROM DISK. A [CallerFilePath] path is green on a developer
         // machine and red on every pipeline run — deterministic builds rewrite source paths to `/_/tests/...`,
         // so the file is not beside the build. Embedding makes both environments identical and keeps a missing
         // resource a hard failure. The same remedy, for the same reason, is documented on
         // PathDisclosureHygieneTests.
+        //
+        // SCOPE, stated rather than implied: the guard sees what this file's own code sends to an assertion,
+        // an exception, an output writer, a dictionary lookup or a theory's display name. It does not see text
+        // that a library composes from fixture input while failing (System.Text.Json, Parquet.Net), nor
+        // reflection or `dynamic`; none of those is used to report fixture text here.
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
-        Assert.True(stream is not null, $"embedded source {Escape(EmbeddedSourceName)} is missing");
+        Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
 
         using var reader = new StreamReader(stream!);
-        GuardResult result = FindFixtureTextFindings(reader.ReadToEnd());
+        GuardResult result = FindFixtureTextFindings(reader.ReadToEnd(), "DeltaSharp.Storage.Tests");
 
+        // A file that does not compile here binds nothing, and every rule below would pass vacuously.
+        Assert.True(
+            result.CompileErrors.Count == 0,
+            $"{EmbeddedSourceName} does not compile inside the guard, so its symbols cannot be checked:\n  "
+            + string.Join("\n  ", result.CompileErrors.Select(Escape)));
         Assert.True(
             result.Findings.Count == 0,
-            "fixture text can reach a failure message unescaped, or a value-printing assertion is used:\n  "
+            $"{EmbeddedSourceName}: fixture text can reach the CI log unescaped:\n  "
             + string.Join("\n  ", result.Findings.Select(Escape)));
 
-        // The guard must not pass by seeing nothing: a parse that stopped finding the shapes it was built for
-        // would read as verified. These floors sit well below this file's real usage.
-        int messagesChecked = result.MessagesChecked;
-        int holesChecked = result.HolesChecked;
-        int escapeMethods = result.EscapeMethods;
-        Assert.True(messagesChecked >= 30, $"guard checked only {messagesChecked} failure messages");
-        Assert.True(holesChecked >= 30, $"guard checked only {holesChecked} interpolation holes");
-        Assert.True(escapeMethods == 1, $"expected exactly one Escape method, found {escapeMethods}");
+        // Nor may it pass by seeing nothing, or by quietly losing coverage. MEASURED-AT 5f934ae+: 85 sinks and 61
+        // Escape calls; the floors sit just under that, so a guard that stops seeing a block of the file fails.
+        Assert.True(result.SinksChecked >= 75, $"guard checked only {result.SinksChecked} sinks");
+        Assert.True(result.EscapeCalls >= 55, $"guard saw only {result.EscapeCalls} calls to Escape");
     }
 
-    // Every evasion review found against the earlier guards, plus the obvious ones, each wrapped in a method
-    // the guard must flag. Kept beside the guard so a weakened rule fails here, not in review.
+    // Every evasion review found against the earlier guards, each in a method the guard must flag. Kept beside
+    // the guard so a weakened rule fails here, not in review. `usings` lets a case add file-level directives.
     [Theory]
-    [InlineData("Assert.True(ok, $\"{row.Value}\");")]
-    [InlineData("Assert.True(ok, $@\"{row.Value}\");")]
-    [InlineData("Assert.True(ok, @$\"{row.Value}\");")]
-    [InlineData("Assert.True(ok, $\"{{{row.Value}}}\");")]
-    [InlineData("Assert.True(ok, $\"{row.Value}}}\");")]
-    [InlineData("Assert.True(ok, $\"\"\"{row.Value}\"\"\");")]
-    [InlineData("Assert.True(ok, $$\"\"\"{{row.Value}}\"\"\");")]
-    [InlineData("Assert.True(ok, $\"{Escape(\"\") + row.Value}\");")]
-    [InlineData("Assert.True(ok, $\"{row.Value + string.Join(\",\", names.Select(Escape))}\");")]
-    [InlineData("Assert.True(ok, $\"{string.Join(\",\", names)}\");")]
-    [InlineData("string which = row.OnDiskDir; Assert.True(ok, $\"{which}\");")]
-    [InlineData("Assert.True(ok, \"x\" + row.Value);")]
-    [InlineData("string message = \"x\"; Assert.True(ok, message);")]
-    [InlineData("Assert.True(ok, string.Format(\"{0}\", row.Value));")]
-    [InlineData("Assert.Fail(row.Value);")]
-    [InlineData("throw new InvalidOperationException(row.Value);")]
-    [InlineData("_ = $\"{row.Value}\";")]
-    [InlineData("Assert.Equal(\"a\", row.Value);")]
-    [InlineData("Assert.Contains(row.Value, names);")]
-    [InlineData("Assert.StartsWith(\"a\", row.Value);")]
-    [InlineData("AssertFixtureTextEquals(\"a\", row.Value, row.OnDiskDir);")]
-    [InlineData("AssertFixtureTextEquals(\"a\", row.Value, $\"{row.OnDiskDir} row\");")]
-    public void FixtureTextGuard_FlagsEveryKnownEvasion(string body)
+    [InlineData("", "Assert.True(ok, $\"{row.Value}\");")]
+    [InlineData("", "Assert.True(ok, $@\"{row.Value}\");")]
+    [InlineData("", "Assert.True(ok, @$\"{row.Value}\");")]
+    [InlineData("", "Assert.True(ok, $\"{{{row.Value}}}\");")]
+    [InlineData("", "Assert.True(ok, $\"{row.Value}}}\");")]
+    [InlineData("", "Assert.True(ok, $\"\"\"{row.Value}\"\"\");")]
+    [InlineData("", "Assert.True(ok, $$\"\"\"{{row.Value}}\"\"\");")]
+    [InlineData("", "Assert.True(ok, $\"{Escape(\"\") + row.Value}\");")]
+    [InlineData("", "Assert.True(ok, $\"{row.Value + string.Join(\",\", names.Select(Escape))}\");")]
+    [InlineData("", "Assert.True(ok, $\"{string.Join(\",\", names)}\");")]
+    [InlineData("", "string which = row.OnDiskDir; Assert.True(ok, $\"{which}\");")]
+    [InlineData("", "Assert.True(ok, \"x\" + row.Value);")]
+    [InlineData("", "string message = $\"{row.Value}\"; Assert.True(ok, message);")]
+    [InlineData("", "Assert.True(ok, string.Format(\"{0}\", row.Value));")]
+    [InlineData("", "Assert.Fail(row.Value);")]
+    [InlineData("", "Assert.True(userMessage: row.Value, condition: ok);")]
+    [InlineData("", "Assert.True(ok, new { Count = row.Value }.Count);")]
+    [InlineData("", "Assert.Equal(\"a\", row.Value);")]
+    [InlineData("", "Assert.Contains(row.Value, names);")]
+    [InlineData("", "Xunit.Assert.Equal(\"a\", row.Value);")]
+    [InlineData("", "global::Xunit.Assert.Equal(\"a\", row.Value);")]
+    [InlineData("using static Xunit.Assert;", "Equal(\"a\", row.Value);")]
+    [InlineData("using XA = Xunit.Assert;", "XA.Equal(\"a\", row.Value);")]
+    [InlineData("", "Action<string> fail = Assert.Fail; fail(row.Value);")]
+    [InlineData("", "throw new InvalidOperationException(row.Value);")]
+    [InlineData("", "Exception e = new(row.Value); throw e;")]
+    [InlineData("using Boom = System.InvalidOperationException;", "throw new Boom(row.Value);")]
+    [InlineData("", "try { } catch (Exception problem) { Assert.Fail($\"{problem}\"); }")]
+    [InlineData("", "Assert.True(ok, (from v in names select v).First());")]
+    [InlineData("", "{ string Label = row.OnDiskDir; Assert.True(ok, $\"{Label}\"); }")]
+    [InlineData("", "Assert.True(ok, $\"{(ok ? Label : row.Value)}\");")]
+    [InlineData("", "Assert.True(ok, $\"{(ok ? row.Value : Label)}\");")]
+    [InlineData("", "_ = new Dictionary<string, int>()[row.Value];")]
+    [InlineData("", "_ = names.ToDictionary(n => n);")]
+    [InlineData("", "Console.WriteLine(row.Value);")]
+    [InlineData("", "string Escape(string s) => s; Assert.True(ok, Escape(row.Value));")]
+    [InlineData("", "Func<string, string> Escape = s => s; Assert.True(ok, Escape(row.Value));")]
+    [InlineData("", "AssertFixtureTextEquals(\"a\", row.Value, row.OnDiskDir);")]
+    [InlineData("", "AssertFixtureTextEquals(what: row.OnDiskDir, expected: \"a\", actual: row.Value);")]
+    [InlineData("", "AssertFixtureTextEquals(\"a\", row.Value, $\"{row.OnDiskDir} row\");")]
+    public void FixtureTextGuard_FlagsEveryKnownEvasion(string usings, string body)
     {
-        GuardResult result = FindFixtureTextFindings(GuardSnippet(body));
-        Assert.True(result.Findings.Count > 0, $"the guard accepted {Escape(body)}");
+        GuardResult result = FindFixtureTextFindings(GuardSnippet(usings, body), "GuardSnippet");
+        Assert.True(
+            result.CompileErrors.Count == 0,
+            $"the case {Escape(body)} does not compile, so it proves nothing: {string.Join("; ", result.CompileErrors.Select(Escape))}");
+        Assert.True(result.Findings.Count > 0, $"the guard accepted {Escape(usings)} {Escape(body)}");
     }
 
     // ... and accepts the shapes this file actually relies on, so the rule is not simply "reject everything".
@@ -1113,210 +1165,363 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("Assert.True(ok, $\"[{string.Join(\", \", names.Select(Escape))}]\");")]
     [InlineData("Assert.True(ok, \"literal \" + Escape(row.Value));")]
     [InlineData("Assert.Fail($\"{count + 1} of {names.Length}\");")]
+    [InlineData("long total = 3; Assert.True(ok, $\"{total}\");")]
     [InlineData("AssertFixtureTextEquals(\"a\", row.Value, $\"{Label} row\");")]
     [InlineData("Assert.True(ok, $\"{(ok ? Escape(row.Value) : Label)}\");")]
+    [InlineData("Assert.True(ok, $\"{nameof(GoldenRow)}\");")]
     [InlineData("throw new InvalidOperationException(\"constant text\");")]
+    [InlineData("_ = new Dictionary<string, int>()[\"literal\"];")]
+    [InlineData("var d = new Dictionary<string, int>(); d[row.Value] = 1;")]
     [InlineData("Assert.NotEmpty(names);")]
     public void FixtureTextGuard_AcceptsTheSafeShapes(string body)
     {
-        GuardResult result = FindFixtureTextFindings(GuardSnippet(body));
+        GuardResult result = FindFixtureTextFindings(GuardSnippet(string.Empty, body), "GuardSnippet");
+        Assert.True(
+            result.CompileErrors.Count == 0,
+            $"the case {Escape(body)} does not compile: {string.Join("; ", result.CompileErrors.Select(Escape))}");
         Assert.True(
             result.Findings.Count == 0,
             $"the guard rejected {Escape(body)}: {string.Join("; ", result.Findings.Select(Escape))}");
     }
 
-    private static string GuardSnippet(string body) =>
-        "class C { const string Label = \"k\"; static string Escape(string? s) => s ?? \"\"; "
-        + "void M(GoldenRow row, string[] names, int count, bool ok) { " + body + " } }";
-
-    private sealed record GuardResult(List<string> Findings, int MessagesChecked, int HolesChecked, int EscapeMethods);
-
-    /// <summary>
-    /// The structural rule, over a C# syntax tree. A failure message — the message argument of
-    /// <c>Assert.True/False/Fail</c>, any argument to an exception constructor, and the <c>what</c> argument of
-    /// an <c>AssertFixture*</c>/<c>AssertValue*</c> helper — and every interpolation hole anywhere in the file
-    /// must be built only from: literals; <c>const</c> names; <c>nameof</c>; numeric shapes (an <c>int</c>/
-    /// <c>long</c>-declared name, a <c>.Count</c>/<c>.Length</c>); <c>Escape(x)</c> as the WHOLE expression;
-    /// <c>string.Join(literal, xs.Select(Escape))</c>; and interpolations, concatenations, conditionals and
-    /// parentheses of those. Anything else — a string local, a parameter, a call, a member read — is a finding,
-    /// so a new fixture-derived value fails closed instead of depending on someone adding it to a list. Separately,
-    /// every <c>Assert.*</c> member outside <see cref="NonPrintingAssertions"/> is a finding.
-    /// </summary>
-    private static GuardResult FindFixtureTextFindings(string source)
+    // Escape is the sanitiser everything above relies on, so its OUTPUT is pinned, case by case. A [Fact] over
+    // a table rather than a [Theory]: as theory data these inputs would land in the test's display name, which
+    // is the very channel this file keeps fixture-shaped text out of.
+    [Fact]
+    public void Escape_RendersEveryUnsafeCodePointAsAnEscape()
     {
-        SyntaxNode root = CSharpSyntaxTree.ParseText(source, new CSharpParseOptions(LanguageVersion.Latest)).GetRoot();
-        var declarations = DeclaredTypes(root);
-        var findings = new List<string>();
-        int messages = 0;
-        int holes = 0;
-
-        void Check(ExpressionSyntax expression, string role)
+        (string? Input, string Expected)[] cases =
         {
-            if (!IsSafe(expression, declarations))
-            {
-                int lineNumber = expression.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-                findings.Add($"{EmbeddedSourceName}:{lineNumber}: {Escape(role)}: {Escape(expression.ToString())}");
-            }
-        }
-
-        foreach (InvocationExpressionSyntax call in root.DescendantNodes().OfType<InvocationExpressionSyntax>())
-        {
-            SeparatedSyntaxList<ArgumentSyntax> args = call.ArgumentList.Arguments;
-            if (call.Expression is MemberAccessExpressionSyntax { Expression: IdentifierNameSyntax { Identifier.Text: "Assert" } } member)
-            {
-                string name = member.Name.Identifier.Text;
-                if (!NonPrintingAssertions.Contains(name))
-                {
-                    int lineNumber = call.GetLocation().GetLineSpan().StartLinePosition.Line + 1;
-                    findings.Add($"{EmbeddedSourceName}:{lineNumber}: value-printing assertion Assert.{Escape(name)}");
-                    continue;
-                }
-
-                int messageIndex = name == "Fail" ? 0 : name is "True" or "False" ? 1 : -1;
-                if (messageIndex >= 0 && args.Count > messageIndex)
-                {
-                    messages++;
-                    Check(args[messageIndex].Expression, "assertion message");
-                }
-            }
-            else if (call.Expression is IdentifierNameSyntax helper
-                && (helper.Identifier.Text.StartsWith("AssertFixture", StringComparison.Ordinal)
-                    || helper.Identifier.Text.StartsWith("AssertValue", StringComparison.Ordinal))
-                && args.Count > 0)
-            {
-                messages++;
-                Check(args[^1].Expression, "assertion description");
-            }
-        }
-
-        foreach (BaseObjectCreationExpressionSyntax creation in root.DescendantNodes().OfType<BaseObjectCreationExpressionSyntax>())
-        {
-            if (creation is ObjectCreationExpressionSyntax { Type: var type }
-                && type.ToString().EndsWith("Exception", StringComparison.Ordinal)
-                && creation.ArgumentList is { } list)
-            {
-                foreach (ArgumentSyntax arg in list.Arguments)
-                {
-                    messages++;
-                    Check(arg.Expression, "exception message");
-                }
-            }
-        }
-
-        foreach (InterpolationSyntax hole in root.DescendantNodes().OfType<InterpolationSyntax>())
-        {
-            // A hole inside Escape(...)'s argument is escaped by the enclosing call.
-            if (hole.Ancestors().OfType<InvocationExpressionSyntax>().Any(IsEscapeCall))
-            {
-                continue;
-            }
-
-            holes++;
-            Check(hole.Expression, "interpolation hole");
-        }
-
-        int escapeMethods = root.DescendantNodes().OfType<MethodDeclarationSyntax>()
-            .Count(m => m.Identifier.Text == nameof(Escape));
-        return new GuardResult(findings, messages, holes, escapeMethods);
-    }
-
-    private static bool IsEscapeCall(InvocationExpressionSyntax call) =>
-        call.Expression is IdentifierNameSyntax { Identifier.Text: nameof(Escape) } && call.ArgumentList.Arguments.Count == 1;
-
-    private static bool IsSafe(ExpressionSyntax expression, Dictionary<string, List<DeclaredName>> declarations)
-    {
-        switch (expression)
-        {
-            case LiteralExpressionSyntax:
-                return true;
-            case InterpolatedStringExpressionSyntax interpolated:
-                return interpolated.Contents.OfType<InterpolationSyntax>().All(h => IsSafe(h.Expression, declarations));
-            case ParenthesizedExpressionSyntax parenthesized:
-                return IsSafe(parenthesized.Expression, declarations);
-            case BinaryExpressionSyntax binary when binary.IsKind(SyntaxKind.AddExpression)
-                || binary.IsKind(SyntaxKind.SubtractExpression) || binary.IsKind(SyntaxKind.MultiplyExpression):
-                return IsSafe(binary.Left, declarations) && IsSafe(binary.Right, declarations);
-            case ConditionalExpressionSyntax conditional:
-                return IsSafe(conditional.WhenTrue, declarations) && IsSafe(conditional.WhenFalse, declarations);
-            case MemberAccessExpressionSyntax { Name.Identifier.Text: "Count" or "Length" }:
-                return true;
-            case IdentifierNameSyntax identifier:
-                return declarations.TryGetValue(identifier.Identifier.Text, out List<DeclaredName>? decls)
-                    && (decls.All(d => d.IsConst) || decls.All(d => d.Type is "int" or "long"));
-            case InvocationExpressionSyntax call when IsEscapeCall(call):
-                return true;
-            case InvocationExpressionSyntax { Expression: IdentifierNameSyntax { Identifier.Text: "nameof" } }:
-                return true;
-            case InvocationExpressionSyntax call:
-                return IsJoinOfEscaped(call, declarations);
-            default:
-                return false;
-        }
-    }
-
-    // string.Join(<safe separator>, <anything>.Select(Escape)) — every element is escaped.
-    private static bool IsJoinOfEscaped(InvocationExpressionSyntax call, Dictionary<string, List<DeclaredName>> declarations) =>
-        call.Expression is MemberAccessExpressionSyntax
-        {
-            Expression: PredefinedTypeSyntax { Keyword.Text: "string" }, Name.Identifier.Text: "Join",
-        }
-        && call.ArgumentList.Arguments.Count == 2
-        && IsSafe(call.ArgumentList.Arguments[0].Expression, declarations)
-        && call.ArgumentList.Arguments[1].Expression is InvocationExpressionSyntax
-        {
-            Expression: MemberAccessExpressionSyntax { Name.Identifier.Text: "Select" },
-            ArgumentList.Arguments: [{ Expression: IdentifierNameSyntax { Identifier.Text: nameof(Escape) } }],
+            (null, "<null>"),
+            ("<null>", "\"<null>\""),
+            ("plain", "\"plain\""),
+            ("a\u001B[31mb", "\"a\\u001B[31mb\""),
+            ("\u0001\t", "\"\\u0001\\u0009\""),
+            ("\u007F", "\"\\u007F\""),
+            ("\u009B", "\"\\u009B\""),
+            ("x\u202Ey", "\"x\\u202Ey\""),
+            ("\u200B", "\"\\u200B\""),
+            ("\u2028\u2029", "\"\\u2028\\u2029\""),
+            ("\uD800", "\"\\uD800\""),
+            ("\uDB40\uDC01", "\"\\U000E0001\""),
+            ("back\\slash \"quote\"", "\"back\\\\slash \\\"quote\\\"\""),
+            ("e\U0001F3AFmoji région 名前", "\"e\U0001F3AFmoji région 名前\""),
         };
 
-    private sealed record DeclaredName(string? Type, bool IsConst);
-
-    // Every declaration of every name in the tree, with its declared type text (null when the parser cannot
-    // say, e.g. a deconstruction designation) and whether it is a const. A name is treated as safe only if
-    // EVERY declaration of it is const, or EVERY one is int/long, so re-using a safe name for a string fails.
-    private static Dictionary<string, List<DeclaredName>> DeclaredTypes(SyntaxNode root)
-    {
-        var map = new Dictionary<string, List<DeclaredName>>(StringComparer.Ordinal);
-        void Add(string name, string? type, bool isConst)
+        for (int i = 0; i < cases.Length; i++)
         {
-            if (!map.TryGetValue(name, out List<DeclaredName>? list))
+            AssertFixtureTextEquals(cases[i].Expected, Escape(cases[i].Input), $"Escape case {i}");
+        }
+    }
+
+    // A failing theory row in display-name position: the guard must refuse text-typed MemberData.
+    [Fact]
+    public void FixtureTextGuard_FlagsTextTypedTheoryData()
+    {
+        const string Source =
+            "using Xunit;\n"
+            + "public sealed class C\n{\n"
+            + "    public static TheoryData<string> Rows() => new() { \"a\" };\n"
+            + "    [Theory]\n    [MemberData(nameof(Rows))]\n    public void T(string value) => Assert.True(value.Length > 0);\n}\n";
+        GuardResult result = FindFixtureTextFindings(Source, "GuardSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+        Assert.True(result.Findings.Count > 0, "the guard accepted a theory whose display name carries text");
+    }
+
+    private static string GuardSnippet(string usings, string body) =>
+        "using Xunit;\n" + usings + "\n"
+        + "public sealed record GoldenRow(string? Value, string OnDiskDir, string AddPathSegment);\n"
+        + "public sealed class C\n{\n"
+        + "    private const string Label = \"k\";\n"
+        + "    private static string Escape(string? s) => s ?? \"<null>\";\n"
+        + "    private static void AssertFixtureTextEquals(string? expected, string? actual, string what) =>\n"
+        + "        Assert.True(expected == actual, $\"{what}: {Escape(expected)} {Escape(actual)}\");\n"
+        + "    public void M(GoldenRow row, string[] names, int count, bool ok)\n    {\n        " + body + "\n    }\n}\n";
+
+    private sealed record GuardResult(List<string> Findings, List<string> CompileErrors, int SinksChecked, int EscapeCalls);
+
+    private const string ImplicitUsings =
+        "global using System;\nglobal using System.Collections.Generic;\nglobal using System.IO;\nglobal using System.Linq;\n"
+        + "global using System.Net.Http;\nglobal using System.Threading;\nglobal using System.Threading.Tasks;\n";
+
+    // Every assembly the test host can load, except this test assembly itself (the file under check is
+    // compiled from source, and its own compiled copy would collide with it).
+    private static readonly Lazy<List<MetadataReference>> GuardReferences = new(() =>
+    {
+        string self = typeof(PartitionEncodingGoldenDifferentialTests).Assembly.Location;
+        string tpa = AppContext.GetData("TRUSTED_PLATFORM_ASSEMBLIES") as string ?? string.Empty;
+        return tpa.Split(Path.PathSeparator)
+            .Where(path => path.Length > 0 && File.Exists(path) && !string.Equals(path, self, StringComparison.Ordinal))
+            .Distinct(StringComparer.Ordinal)
+            .Select(path => (MetadataReference)MetadataReference.CreateFromFile(path))
+            .ToList();
+    });
+
+    /// <summary>
+    /// The rule, decided on SYMBOLS and TYPES over a compilation of the source, so that spelling cannot route
+    /// around it. Sinks — every place text can leave this file for the CI log — and what each must receive:
+    /// <list type="bullet">
+    /// <item>every string argument of an <c>Xunit.Assert</c> member (any spelling); any other member than
+    /// True/False/Fail/NotEmpty/NotNull is itself a finding, and so is an <c>Xunit.Assert</c> method group;</item>
+    /// <item>the <c>what</c> argument of every <c>AssertFixture*</c>/<c>AssertValue*</c> helper, matched by
+    /// parameter, not position;</item>
+    /// <item>every string argument of any exception construction (explicit, target-typed or aliased);</item>
+    /// <item>the key of a string-keyed dictionary READ (its KeyNotFoundException echoes the key); and
+    /// <c>ToDictionary</c>/<c>ToLookup</c> are findings outright (a duplicate key is echoed);</item>
+    /// <item>any member of Console, Debug, Trace or ITestOutputHelper is a finding outright;</item>
+    /// <item>the data of every <c>[MemberData]</c> theory must be text-free (it becomes the display name);
+    /// <c>[ClassData]</c> is a finding.</item>
+    /// </list>
+    /// A sink value is safe only if it is a compile-time constant; a number, boolean or enum (no text can ride
+    /// on it); a call to THE <see cref="Escape"/> method (by symbol — and no other declaration may be named
+    /// Escape); <c>string.Join(safe, xs.Select(Escape))</c>; a helper's own vetted <c>what</c> parameter; or an
+    /// interpolation, concatenation, conditional or parenthesis built only from those. Anything else — a string
+    /// local, a parameter, a property, a call — is a finding.
+    /// </summary>
+    private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
+    {
+        var parseOptions = new CSharpParseOptions(LanguageVersion.Latest);
+        SyntaxTree tree = CSharpSyntaxTree.ParseText(source, parseOptions);
+        CSharpCompilation compilation = CSharpCompilation.Create(
+            assemblyName,
+            new[] { tree, CSharpSyntaxTree.ParseText(ImplicitUsings, parseOptions) },
+            GuardReferences.Value,
+            new CSharpCompilationOptions(
+                OutputKind.DynamicallyLinkedLibrary, nullableContextOptions: NullableContextOptions.Enable, allowUnsafe: true));
+        List<string> compileErrors = compilation.GetDiagnostics()
+            .Where(d => d.Severity == DiagnosticSeverity.Error)
+            .Select(d => d.ToString())
+            .ToList();
+
+        SemanticModel model = compilation.GetSemanticModel(tree);
+        SyntaxNode root = tree.GetRoot();
+        var findings = new List<string>();
+        int sinks = 0;
+        int escapeCalls = 0;
+
+        void Finding(SyntaxNode node, string what) =>
+            findings.Add($"line {node.GetLocation().GetLineSpan().StartLinePosition.Line + 1}: {what}: {node}");
+
+        // THE escaping function: the one declaration named Escape, which must be a method. A second declaration
+        // of the name — a local function, a delegate, a parameter — could stand in for it at a call site.
+        List<SyntaxNode> escapeDeclarations = root.DescendantNodes().Where(n => n switch
+        {
+            MethodDeclarationSyntax m => m.Identifier.Text == nameof(Escape),
+            LocalFunctionStatementSyntax f => f.Identifier.Text == nameof(Escape),
+            VariableDeclaratorSyntax v => v.Identifier.Text == nameof(Escape),
+            ParameterSyntax p => p.Identifier.Text == nameof(Escape),
+            PropertyDeclarationSyntax p => p.Identifier.Text == nameof(Escape),
+            SingleVariableDesignationSyntax d => d.Identifier.Text == nameof(Escape),
+            _ => false,
+        }).ToList();
+        IMethodSymbol? escape = escapeDeclarations is [MethodDeclarationSyntax only] ? model.GetDeclaredSymbol(only) : null;
+        if (escape is null)
+        {
+            findings.Add($"expected exactly one declaration named {nameof(Escape)}, a method; found {escapeDeclarations.Count}");
+        }
+
+        // The `what` parameter of each helper. Every call site's argument for it is checked as a sink, so
+        // inside the helper the parameter itself is safe to print.
+        var vettedParameters = new HashSet<ISymbol>(SymbolEqualityComparer.Default);
+        foreach (MethodDeclarationSyntax method in root.DescendantNodes().OfType<MethodDeclarationSyntax>())
+        {
+            if (method.Identifier.Text.StartsWith("AssertFixture", StringComparison.Ordinal)
+                || method.Identifier.Text.StartsWith("AssertValue", StringComparison.Ordinal))
             {
-                map[name] = list = new List<DeclaredName>();
+                foreach (ParameterSyntax parameter in method.ParameterList.Parameters)
+                {
+                    if (parameter.Identifier.Text == "what" && model.GetDeclaredSymbol(parameter) is { } symbol)
+                    {
+                        vettedParameters.Add(symbol);
+                    }
+                }
+            }
+        }
+
+        bool IsEscape(IMethodSymbol method) =>
+            escape is not null && SymbolEqualityComparer.Default.Equals(method.OriginalDefinition, escape);
+
+        bool IsSafe(IOperation operation)
+        {
+            if (operation.ConstantValue.HasValue || IsTextFree(operation.Type))
+            {
+                return true;
             }
 
-            list.Add(new DeclaredName(type, isConst));
+            return operation switch
+            {
+                IConversionOperation { IsImplicit: true } conversion => IsSafe(conversion.Operand),
+                IParenthesizedOperation parenthesized => IsSafe(parenthesized.Operand),
+                IInterpolatedStringOperation interpolated => interpolated.Parts.All(part => part switch
+                {
+                    IInterpolatedStringTextOperation => true,
+                    IInterpolationOperation hole => IsSafe(hole.Expression)
+                        && (hole.Alignment is null || hole.Alignment.ConstantValue.HasValue)
+                        && (hole.FormatString is null || hole.FormatString.ConstantValue.HasValue),
+                    _ => false,
+                }),
+                IBinaryOperation { OperatorKind: BinaryOperatorKind.Add } binary => IsSafe(binary.LeftOperand) && IsSafe(binary.RightOperand),
+                IConditionalOperation { WhenFalse: { } whenFalse } conditional => IsSafe(conditional.WhenTrue) && IsSafe(whenFalse),
+                IInvocationOperation call when IsEscape(call.TargetMethod) => true,
+                IInvocationOperation call => IsJoinOfEscaped(call),
+                IParameterReferenceOperation parameter => vettedParameters.Contains(parameter.Parameter.OriginalDefinition),
+                _ => false,
+            };
+        }
+
+        // string.Join(<safe separator>, <anything>.Select(Escape)) — every element passes through Escape.
+        bool IsJoinOfEscaped(IInvocationOperation call) =>
+            call.TargetMethod is { Name: "Join", ContainingType.SpecialType: SpecialType.System_String }
+            && call.Arguments.Length == 2
+            && IsSafe(call.Arguments[0].Value)
+            && Unwrap(call.Arguments[1].Value) is IInvocationOperation { TargetMethod.Name: "Select" } select
+            && select.Arguments.Length == 2
+            && Unwrap(select.Arguments[1].Value) is IDelegateCreationOperation { Target: IMethodReferenceOperation reference }
+            && IsEscape(reference.Method);
+
+        void Sink(IOperation value, string what)
+        {
+            sinks++;
+            if (!IsSafe(value))
+            {
+                Finding(value.Syntax, what);
+            }
         }
 
         foreach (SyntaxNode node in root.DescendantNodes())
         {
-            switch (node)
+            switch (model.GetOperation(node))
             {
-                case VariableDeclaratorSyntax { Parent: VariableDeclarationSyntax declaration } declarator:
-                    bool isConst = declaration.Parent switch
+                case IInvocationOperation call when call.Syntax == node:
+                    IMethodSymbol target = call.TargetMethod;
+                    string containing = target.ContainingType?.ToDisplayString() ?? string.Empty;
+                    if (IsEscape(target))
                     {
-                        FieldDeclarationSyntax field => field.Modifiers.Any(SyntaxKind.ConstKeyword),
-                        LocalDeclarationStatementSyntax local => local.Modifiers.Any(SyntaxKind.ConstKeyword),
-                        _ => false,
-                    };
-                    Add(declarator.Identifier.Text, declaration.Type.ToString(), isConst);
-                    break;
-                case ParameterSyntax parameter:
-                    Add(parameter.Identifier.Text, parameter.Type?.ToString(), isConst: false);
-                    break;
-                case ForEachStatementSyntax forEach:
-                    Add(forEach.Identifier.Text, forEach.Type.ToString(), isConst: false);
-                    break;
-                case SingleVariableDesignationSyntax designation:
-                    string? designated = designation.Parent switch
+                        escapeCalls++;
+                    }
+
+                    if (containing == "Xunit.Assert")
                     {
-                        DeclarationExpressionSyntax declarationExpression => declarationExpression.Type.ToString(),
-                        DeclarationPatternSyntax pattern => pattern.Type.ToString(),
-                        _ => null,
-                    };
-                    Add(designation.Identifier.Text, designated, isConst: false);
+                        if (!NonPrintingAssertions.Contains(target.Name))
+                        {
+                            Finding(node, "value-printing assertion Assert." + target.Name);
+                            break;
+                        }
+
+                        foreach (IArgumentOperation argument in call.Arguments)
+                        {
+                            if (argument.Parameter?.Type.SpecialType == SpecialType.System_String)
+                            {
+                                Sink(argument.Value, "assertion message");
+                            }
+                        }
+                    }
+                    else if (OutputWriterTypes.Contains(containing))
+                    {
+                        Finding(node, "write to an output stream");
+                    }
+                    else if (containing == "System.Linq.Enumerable" && target.Name is "ToDictionary" or "ToLookup")
+                    {
+                        Finding(node, "a duplicate key would be echoed by the exception");
+                    }
+                    else
+                    {
+                        foreach (IArgumentOperation argument in call.Arguments)
+                        {
+                            if (argument.Parameter is { } parameter && vettedParameters.Contains(parameter.OriginalDefinition))
+                            {
+                                Sink(argument.Value, "assertion description");
+                            }
+                        }
+                    }
+
+                    break;
+                case IObjectCreationOperation creation when creation.Syntax == node && IsException(creation.Type):
+                    foreach (IArgumentOperation argument in creation.Arguments)
+                    {
+                        if (argument.Value.Type?.SpecialType == SpecialType.System_String || argument.Value.Type is null)
+                        {
+                            Sink(argument.Value, "exception message");
+                        }
+                    }
+
+                    break;
+                case IMethodReferenceOperation reference when reference.Syntax == node
+                    && reference.Method.ContainingType?.ToDisplayString() == "Xunit.Assert":
+                    Finding(node, "Xunit.Assert member used as a delegate");
+                    break;
+                case IDelegateCreationOperation { Target: IMethodReferenceOperation reference } creation when creation.Syntax == node
+                    && reference.Method.ContainingType?.ToDisplayString() == "Xunit.Assert":
+                    Finding(node, "Xunit.Assert member used as a delegate");
+                    break;
+                case IPropertyReferenceOperation { Property.IsIndexer: true } indexer when indexer.Syntax == node
+                    && IsStringKeyedDictionary(indexer.Property.ContainingType)
+                    && !(indexer.Parent is ISimpleAssignmentOperation assignment && assignment.Target == indexer):
+                    Sink(indexer.Arguments[0].Value, "dictionary key (KeyNotFoundException echoes it)");
                     break;
             }
         }
 
-        return map;
+        // Theory data becomes the test's display name, which xUnit escapes only for C0 controls.
+        foreach (AttributeSyntax attribute in root.DescendantNodes().OfType<AttributeSyntax>())
+        {
+            string? attributeType = model.GetTypeInfo(attribute).Type?.ToDisplayString();
+            if (attributeType == "Xunit.ClassDataAttribute")
+            {
+                Finding(attribute, "ClassData theory data reaches the display name unchecked");
+            }
+            else if (attributeType == "Xunit.MemberDataAttribute"
+                && attribute.Parent?.Parent is MethodDeclarationSyntax theory
+                && model.GetDeclaredSymbol(theory) is { } theorySymbol)
+            {
+                string? member = attribute.ArgumentList?.Arguments.Count > 0
+                    ? model.GetConstantValue(attribute.ArgumentList.Arguments[0].Expression).Value as string
+                    : null;
+                ITypeSymbol? data = theorySymbol.ContainingType.GetMembers(member ?? string.Empty)
+                    .Select(m => m switch { IMethodSymbol method => method.ReturnType, IPropertySymbol property => property.Type, _ => null })
+                    .FirstOrDefault(t => t is not null);
+                if (data is not INamedTypeSymbol { TypeArguments: { Length: > 0 } arguments } || !arguments.All(IsTextFree))
+                {
+                    Finding(attribute, "MemberData must yield only numbers, booleans or enums (the display name)");
+                }
+            }
+        }
+
+        return new GuardResult(findings, compileErrors, sinks, escapeCalls);
     }
+
+    private static IOperation Unwrap(IOperation operation) => operation switch
+    {
+        IConversionOperation { IsImplicit: true } conversion => Unwrap(conversion.Operand),
+        IParenthesizedOperation parenthesized => Unwrap(parenthesized.Operand),
+        IArgumentOperation argument => Unwrap(argument.Value),
+        _ => operation,
+    };
+
+    // A value of one of these types cannot carry text (char can: it is one code point, ESC included).
+    private static bool IsTextFree(ITypeSymbol? type) => type is not null
+        && (type.TypeKind == TypeKind.Enum
+            || type.SpecialType is SpecialType.System_Boolean
+                or SpecialType.System_SByte or SpecialType.System_Byte
+                or SpecialType.System_Int16 or SpecialType.System_UInt16
+                or SpecialType.System_Int32 or SpecialType.System_UInt32
+                or SpecialType.System_Int64 or SpecialType.System_UInt64
+                or SpecialType.System_Single or SpecialType.System_Double or SpecialType.System_Decimal);
+
+    private static bool IsException(ITypeSymbol? type)
+    {
+        for (ITypeSymbol? current = type; current is not null; current = current.BaseType)
+        {
+            if (current.ToDisplayString() == "System.Exception")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsStringKeyedDictionary(INamedTypeSymbol type) =>
+        new[] { type }.Concat(type.AllInterfaces).Any(t =>
+            t is { Name: "IDictionary" or "IReadOnlyDictionary", TypeArguments: [{ SpecialType: SpecialType.System_String }, _] });
 }

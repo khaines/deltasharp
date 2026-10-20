@@ -16,8 +16,8 @@
 
   <ItemGroup>
     <PackageReference Include="Parquet.Net" />
-    <!-- Test-only: the #806 Inc-C fixture-text guard parses its own embedded source with the real C#
-         parser (see Directory.Packages.props). -->
+    <!-- Test-only: the #806 Inc-C fixture-text guard compiles its own embedded source with Roslyn and binds
+         it with a semantic model (see Directory.Packages.props). -->
     <PackageReference Include="Microsoft.CodeAnalysis.CSharp" />
   </ItemGroup>
 
@@ -78,8 +78,8 @@
   <ItemGroup>
     <EmbeddedResource Include="Delta/PathDisclosureHygieneTests.cs" LogicalName="%(Identity)" />
     <!--
-      Same reason, same remedy: the #806 Inc-C interpolation guard reads its OWN source to assert where
-      text appears, which nothing in IL preserves. Taking the path from [CallerFilePath] is green locally
+      Same reason, same remedy: the #806 Inc-C fixture-text guard compiles its OWN source to check where
+      text can reach the CI log, which nothing in IL preserves. Taking the path from [CallerFilePath] is green locally
       and red in CI (deterministic builds map source paths to /_/...), which is exactly how it shipped once
       and failed build-test-format. Embedding makes both environments identical and keeps a missing
       resource a hard failure.
