@@ -30,7 +30,7 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// Spark-shaped (literal space) and a delta-rs-shaped (escaped space) on-disk layout.</item>
 /// </list>
 /// </summary>
-public sealed class PartitionEncodingGoldenDifferentialTests
+public sealed partial class PartitionEncodingGoldenDifferentialTests
 {
     private static readonly string GoldensDir = Path.Combine(
         AppContext.BaseDirectory, "Fixtures", "PartitionEncodingGoldens");
@@ -195,9 +195,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.Equal(JsonValueKind.Null, spark.GetProperty("read_back_value").ValueKind);
         Assert.Equal(JsonValueKind.Null, deltaRs.GetProperty("read_back_value").ValueKind);
 
-        // Ground the block in the engine's OWN log for the empty-string table, so these cells have the same
-        // two-file provenance every matrix row has. Without this they were single-file — the one-file-edit
-        // failure mode matrix-log.json exists to remove — while being the sole evidence for the #899 decision.
+        // Ground the block in the engine's OWN log for the empty-string table. Scope, precisely: this binds
+        // distinct_add_action and add_partition_values to a second engine-emitted artifact, and
+        // Goldens_CarryReferenceEngineProvenanceMarkers holds that log to the same engineInfo/protocol/
+        // partitionColumns bar as the other two. The read_back_* cells are READ results and cannot be
+        // log-grounded by construction — no log records what a reader returned.
         foreach ((string dir, JsonElement block) in new[] { (SparkDir, spark), (DeltaRsDir, deltaRs) })
         {
             var logValues = new List<string?>();
@@ -515,28 +517,31 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         string engineDir = Path.Combine(GoldensDir, engineDirName);
         using (JsonDocument matrix = JsonDocument.Parse(File.ReadAllBytes(Path.Combine(engineDir, "matrix.json"))))
         {
-            Assert.Equal(expectedEngine, matrix.RootElement.GetProperty("engine").GetString());
-            Assert.Equal(expectedVersion, matrix.RootElement.GetProperty("version").GetString());
+            AssertFixtureTextEquals(expectedEngine, matrix.RootElement.GetProperty("engine").GetString(), $"{engineDirName}/matrix.json engine");
+            AssertFixtureTextEquals(expectedVersion, matrix.RootElement.GetProperty("version").GetString(), $"{engineDirName}/matrix.json version");
 
             // Every test in this class hard-codes the partition column; bind it here so a regenerated fixture
             // with a different column fails at the declaration rather than obscurely downstream.
-            Assert.Equal("region", matrix.RootElement.GetProperty("column").GetString());
+            AssertFixtureTextEquals("region", matrix.RootElement.GetProperty("column").GetString(), $"{engineDirName}/matrix.json column");
 
             // The remaining harvested header fields, so none is dead data. `note` matters most: it is the
             // fixture's own provenance statement, and unpinned it could be rewritten to claim the golden was
             // "generated from DeltaSharp output" with the suite still green. Pinned exactly, since the
             // generator owns the text.
-            Assert.Equal(expectedLibraryVersion, matrix.RootElement.GetProperty(libraryVersionKey).GetString());
-            Assert.Equal(expectedNote, matrix.RootElement.GetProperty("note").GetString());
+            AssertFixtureTextEquals(expectedLibraryVersion, matrix.RootElement.GetProperty(libraryVersionKey).GetString(), $"{engineDirName}/matrix.json {libraryVersionKey}");
+            AssertFixtureTextEquals(expectedNote, matrix.RootElement.GetProperty("note").GetString(), $"{engineDirName}/matrix.json note");
         }
 
-        // BOTH committed logs must carry the engine's commit shape — the read-table log and matrix-log.json.
-        // matrix-log.json is what grounds all 33 matrix rows, so leaving it unasserted would let a forger
-        // replace it with bare hand-authored `add` lines.
+        // ALL THREE committed logs must carry the engine's commit shape: the read-table log, matrix-log.json
+        // (which grounds all 33 matrix rows) and empty-string-log.json (which grounds the empty_string
+        // block). Leaving any of them unasserted lets a forger replace it with bare hand-authored `add`
+        // lines — measured: that is exactly what happened to empty-string-log.json when it was committed
+        // without being added here.
         foreach (string logPath in new[]
         {
             Path.Combine(engineDir, "read-table", "_delta_log", "00000000000000000000.json"),
             Path.Combine(engineDir, "matrix-log.json"),
+            Path.Combine(engineDir, "empty-string-log.json"),
         })
         {
             string? engineInfo = null;
@@ -567,7 +572,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
 
             string which = Path.GetFileName(logPath);
-            Assert.Equal(expectedEngineInfo, engineInfo);
+            AssertFixtureTextEquals(expectedEngineInfo, engineInfo, $"{engineDirName}/{which} commitInfo.engineInfo");
             Assert.True(sawProtocol, $"{engineDirName}/{which}: no protocol action — not an engine-written log");
             Assert.Equal(new[] { "region" }, partitionColumns);
         }
@@ -684,7 +689,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
 
             // The committed add.path segment is engine bytes — this is what kills a fabricated row.
-            Assert.Equal(engineSegment, row.AddPathSegment);
+            AssertFixtureTextEquals(engineSegment, row.AddPathSegment, $"{engineDirName} matrix row add_path_segment vs engine log");
 
             // The on-disk directory is the URI decode of that segment. NOTE the honest limit: this checks
             // that matrix.json's two columns are decode-consistent with the ENGINE's add.path, which pins
@@ -693,7 +698,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             // construction — so a forger who edits BOTH columns and the log keeps this consistent. Committed
             // engine evidence for the on-disk layer exists only for the read-table rows, which
             // GoldenMatrix_RowsCoveredByReadTable_MatchRealOnDiskDirectories checks against real directories.
-            Assert.Equal(Uri.UnescapeDataString(engineSegment), row.OnDiskDir);
+            AssertFixtureTextEquals(Uri.UnescapeDataString(engineSegment), row.OnDiskDir, $"{engineDirName} matrix row on_disk_dir");
         }
     }
 
@@ -743,7 +748,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 continue;
             }
 
-            Assert.Equal(realAddSegment, row.AddPathSegment);
+            AssertFixtureTextEquals(realAddSegment, row.AddPathSegment, $"{engineDirName} matrix row add_path_segment");
             Assert.Contains(row.OnDiskDir, onDiskDirs);
             crossChecked++;
         }
@@ -838,51 +843,92 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
     // ---- Guard: fixture-derived text must never reach a failure message unescaped ---------------
 
+    private const string EmbeddedSourceName = "Delta/PartitionEncodingGoldenDifferentialTests.cs";
+
+    // Expressions that may appear in an interpolation hole WITHOUT Escape(): values this test class
+    // controls, never text read from a fixture. Anything else fails, so a newly-introduced fixture-derived
+    // local fails closed instead of slipping past a hand-maintained denylist of names.
+    private static readonly string[] SafeInterpolands =
+    {
+        "engineDirName", "which", "what", "crossChecked", "expectedCreatedByPrefix", "libraryVersionKey",
+        "i + 1", "offenders.Count", "spaceOrNonAsciiDiverged.Count", "verified", "logValues.Count",
+        "EmbeddedSourceName",
+    };
+
     [Fact]
     public void EveryFixtureDerivedInterpolation_InThisFile_RoutesThroughEscape()
     {
-        // This defect class recurred in three consecutive review rounds: a message interpolating a value
-        // that came from a fixture (partition values carry 0x01/0x09; manifest lines are attacker-chosen
-        // text) put raw control/ANSI bytes on the CI output stream — from inside an anti-forgery control,
-        // i.e. it let a hostile fixture paint the log this suite exists to make trustworthy. Rather than fix
-        // the sites one round at a time, scan this file and make the invariant enforceable.
-        string source = SourceFilePath();
-        Assert.True(File.Exists(source), $"cannot audit interpolations: source not found at {source}");
+        // This defect class recurred across four review rounds: a failure message interpolating fixture
+        // text (partition values carry 0x01/0x09; SHA256SUMS lines and matrix.json's `note` are attacker-
+        // authored) put raw control/ANSI bytes on the CI output stream — from inside the anti-forgery
+        // control, i.e. a hostile fixture could paint the log this suite exists to make trustworthy.
+        //
+        // THE SOURCE IS READ FROM THE ASSEMBLY, NOT FROM DISK. Taking it from [CallerFilePath] is green on
+        // a developer machine and red on every pipeline run — deterministic builds rewrite source paths to
+        // `/_/tests/...`, so the file is not beside the build — and that is how this guard first shipped.
+        // Embedding makes both environments identical and keeps a missing resource a hard failure. The
+        // same remedy, for the same reason, is documented on PathDisclosureHygieneTests.
+        //
+        // The rule is an ALLOWLIST, not a denylist: every interpolation hole must be Escape(...) or a
+        // member of SafeInterpolands. A denylist of identifier names cannot see a local that does not
+        // exist yet, which is how the partition-value holes evaded the first version of this guard.
+        using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
+            .GetManifestResourceStream(EmbeddedSourceName);
+        Assert.True(stream is not null, $"embedded source '{EmbeddedSourceName}' is missing");
 
-        // Identifiers that hold fixture-derived text at some point in this file.
-        string[] tainted =
-        {
-            "relative", "createdBy", "expectedHash", "actualHash", "line", "dataFile", "engineSegment",
-        };
+        using var reader = new StreamReader(stream!);
+        string[] lines = reader.ReadToEnd().Split('\n');
 
         var offenders = new List<string>();
-        string[] lines = File.ReadAllLines(source);
         for (int i = 0; i < lines.Length; i++)
         {
-            string text = lines[i];
-            if (text.TrimStart().StartsWith("//", StringComparison.Ordinal))
+            string text = lines[i].TrimEnd('\r');
+            if (text.TrimStart().StartsWith("//", StringComparison.Ordinal) || !text.Contains("$\"", StringComparison.Ordinal))
             {
-                continue; // prose, not an emitted message (this guard's own examples live in comments)
+                continue; // comments carry examples; non-interpolated lines emit nothing
             }
 
-            foreach (string name in tainted)
+            foreach (Match hole in InterpolationHole().Matches(text))
             {
-                // An interpolation hole naming a tainted identifier directly, e.g. {relative} or
-                // {Path.GetFileName(dataFile)} — as opposed to {Escape(relative)}.
-                foreach (Match m in Regex.Matches(text, @"\{(?<expr>[^{}]*\b" + Regex.Escape(name) + @"\b[^{}]*)\}"))
+                string expr = hole.Groups["expr"].Value.Trim();
+                // Escape(x), or a projection that escapes every element.
+                if (expr.Length == 0
+                    || expr.StartsWith("Escape(", StringComparison.Ordinal)
+                    || expr.Contains(".Select(Escape)", StringComparison.Ordinal))
                 {
-                    string expr = m.Groups["expr"].Value;
-                    if (!expr.Contains("Escape(", StringComparison.Ordinal))
-                    {
-                        offenders.Add($"{Path.GetFileName(source)}:{i + 1}: {{{expr}}}");
-                    }
+                    continue;
                 }
+
+                if (SafeInterpolands.Contains(expr, StringComparer.Ordinal))
+                {
+                    continue;
+                }
+
+                offenders.Add($"{EmbeddedSourceName}:{i + 1}: {{{expr}}}");
             }
         }
 
         Assert.True(
             offenders.Count == 0,
-            "fixture-derived text is interpolated without Escape():\n  " + string.Join("\n  ", offenders));
+            "interpolated text must be Escape()d or listed in SafeInterpolands:\n  "
+            + string.Join("\n  ", offenders));
+    }
+
+    // A single interpolation hole. `{{` is a literal brace in an interpolated string, so it is consumed
+    // first and never treated as the start of a hole.
+    [GeneratedRegex(@"(?<!\{)\{(?<expr>[^{}]+)\}(?!\})")]
+    private static partial Regex InterpolationHole();
+
+    /// <summary>Equality over FIXTURE-DERIVED text. Never <c>Assert.Equal</c> on such a value: xUnit's
+    /// "Strings differ" diff prints both operands verbatim, so a hostile fixture (a crafted <c>note</c>, a
+    /// forged <c>on_disk_dir</c>) can put raw ANSI/control bytes on the CI output stream — from inside the
+    /// control that exists to make that stream trustworthy. Both sides render through <see cref="Escape"/>.
+    /// </summary>
+    private static void AssertFixtureTextEquals(string? expected, string? actual, string what)
+    {
+        Assert.True(
+            string.Equals(expected, actual, StringComparison.Ordinal),
+            $"{what}: expected {Escape(expected ?? "<null>")}, fixture has {Escape(actual ?? "<null>")}");
     }
 
     private static string SourceFilePath([CallerFilePath] string path = "") => path;

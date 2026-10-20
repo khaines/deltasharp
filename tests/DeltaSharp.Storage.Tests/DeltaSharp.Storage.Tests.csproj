@@ -72,6 +72,14 @@
   -->
   <ItemGroup>
     <EmbeddedResource Include="Delta/PathDisclosureHygieneTests.cs" LogicalName="%(Identity)" />
+    <!--
+      Same reason, same remedy: the #806 Inc-C interpolation guard reads its OWN source to assert where
+      text appears, which nothing in IL preserves. Taking the path from [CallerFilePath] is green locally
+      and red in CI (deterministic builds map source paths to /_/...), which is exactly how it shipped once
+      and failed build-test-format. Embedding makes both environments identical and keeps a missing
+      resource a hard failure.
+    -->
+    <EmbeddedResource Include="Delta/PartitionEncodingGoldenDifferentialTests.cs" LogicalName="%(Identity)" />
     <EmbeddedResource Include="../../src/DeltaSharp.Storage/Backends/LocalFileSystemBackend.cs" LogicalName="LocalFileSystemBackend.cs" />
   </ItemGroup>
 

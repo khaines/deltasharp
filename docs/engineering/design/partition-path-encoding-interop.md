@@ -334,9 +334,10 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > `created_by`** (`parquet-mr version 1.13.…`, `delta-rs version py-…`), which Parquet.Net's public write API
 > cannot set — `CustomMetadata` reaches only the footer's key/value section, so a Parquet.Net-authored file is
 > rejected unless its footer is patched byte-by-byte; and **`matrix-log.json`** — the engine's own `_delta_log`
-> for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked, and which is
-> itself asserted to carry the engine's commit shape (`commitInfo.engineInfo` + `protocol` +
-> `metaData.partitionColumns`).
+> for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked. A fourth
+> committed log, **`empty-string-log.json`**, grounds the `empty_string` block the same way. All three
+> committed logs are asserted to carry the engine's commit shape (`commitInfo.engineInfo` + `protocol` +
+> `metaData.partitionColumns`), so none can be replaced by hand-authored `add` lines.
 >
 > **What this does and does not buy (measured, not assumed).** These controls do **not** close **R7**, and must
 > not be described as doing so. Every committed artifact — text or binary — can be edited by whoever edits the
@@ -372,7 +373,7 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > | | writes `""` as | reads a committed `partitionValues:{"region":""}` as |
 > |---|---|---|
 > | Apache Spark 3.5.3 | `null` (folded into `add.partitionValues`; no distinct add-action) | **`""`** — honours the committed value *(out-of-band measurement; not repo-backed — see below)* |
-> | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` *(value pinned by the fixture; the mechanism is not measured)* |
+> | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` *(repo-backed: `empty-string-log.json` shows it committing `partitionValues:{"region":""}`, the block shows it reading back `null`)* |
 > | **DeltaSharp** | `""` (verbatim, in the sentinel directory) | `""` |
 >
 > So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* —

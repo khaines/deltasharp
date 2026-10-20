@@ -32,7 +32,7 @@ Two further controls close that gap, and they are **not equally strong** — the
 | Anchor | Written by | Strength |
 |---|---|---|
 | Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — Parquet.Net's public write API cannot set it (`CustomMetadata` reaches only the key/value section), so a file Parquet.Net wrote and left untouched is rejected (by the engine-prefix check; the explicit "not Parquet.Net" assertion is usually not the deciding check and exists for the diagnosis, though it is not strictly redundant). A footer patched byte-by-byte is **not** caught. |
-| `<engine>/matrix-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
+| `<engine>/matrix-log.json`, `<engine>/empty-string-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
 | `matrix.json` `version` | read from the installed library at generation time | Moderate |
 | `matrix.json` `engine` | a constant typed into the generator | Pins **drift only**, not origin |
 
@@ -67,6 +67,11 @@ solely as text inside that JSON and never as filesystem paths (design R6).
   and asserted* by the differential test, so this list cannot silently rot.
 - **`<engine>/matrix-log.json`** — the reference engine's own `_delta_log` for the full matrix table,
   committed verbatim as the ground truth every `matrix.json` row is cross-checked against.
+- **`<engine>/empty-string-log.json`** — the engine's own `_delta_log` for the empty-string probe table,
+  grounding the `empty_string` block's `distinct_add_action` and `add_partition_values` in engine bytes.
+  (The `read_back_*` cells are read RESULTS and cannot be log-grounded — no log records what a reader
+  returned.) All three committed logs are asserted to carry `commitInfo.engineInfo`, a `protocol` action
+  and `metaData.partitionColumns`.
 - **`<engine>/read-table/`** — a small real Delta table (ASCII-safe partitions: unreserved, `=`,
   quote, space, `%` — deliberately no non-ASCII, to avoid the macOS NFC/NFD filesystem-normalization
   hazard, design R6) written by the reference engine. Consumed by the **ref→DS read** test:
@@ -105,8 +110,9 @@ pip install deltalake==1.6.3 pyarrow==25.0.1
 python generate_delta_rs.py delta-rs
 ```
 
-Both scripts write `matrix.json` (harvested from a throwaway full-matrix table), the committed
-`read-table/` (the small ASCII-safe readable table), and `SHA256SUMS` for their engine. They strip
+Both scripts write `matrix.json` (harvested from a throwaway full-matrix table), `matrix-log.json` and
+`empty-string-log.json` (those tables' own engine-written `_delta_log`s), the committed `read-table/`
+(the small ASCII-safe readable table), and `SHA256SUMS` for their engine. They strip
 Spark's `.crc` sidecars themselves. Regenerating produces an **equivalent** fixture — the Parquet
 file names/bytes differ by a fresh UUID each run, so `SHA256SUMS` changes; commit the regenerated
 bytes together. A checked-in golden whose hash no longer matches `SHA256SUMS` fails
