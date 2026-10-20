@@ -3733,7 +3733,7 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         // LocalFileSystemBackend.cs -- the recognizer's own source, and the whole point of "over BOTH files"
         // -- while `counted` stayed at 8 and the suite stayed green.
         string[] silent = countedBySource
-            .Where(entry => entry.Value == 0)
+            .Where(entry => entry.Value == 0 && !CountFreeSources.Contains(entry.Key, StringComparer.Ordinal))
             .Select(entry => entry.Key)
             .Order(StringComparer.Ordinal)
             .ToArray();
@@ -3745,6 +3745,21 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
                 + $"({string.Join(", ", silent)}), so this guard is reading them as verified while "
                 + $"measuring nothing in them. Either the source stopped carrying the shape, or the "
                 + $"recognizer stopped seeing it."));
+
+        // The exemption above is a claim about the exempted sources, so it is executed rather than assumed:
+        // a count-free source must be swept and must carry NO recognised count. One that gains a count -- even
+        // a dated one -- fails here, and leaves the list rather than hiding inside it.
+        string[] notCountFree = CountFreeSources
+            .Where(name => !countedBySource.TryGetValue(name, out int n) || n != 0)
+            .Order(StringComparer.Ordinal)
+            .ToArray();
+        Assert.True(
+            notCountFree.Length == 0,
+            string.Create(
+                CultureInfo.InvariantCulture,
+                $"{notCountFree.Length} source(s) declared count-free are unswept or now carry a recognised "
+                + $"test-outcome count ({string.Join(", ", notCountFree)}). Remove them from "
+                + $"{nameof(CountFreeSources)} so the per-source bound holds them like every other source."));
 
         // AND THE AXIS ITSELF IS BOUNDED THE OTHER WAY, against a population it does not get to choose: every
         // `.cs` source EMBEDDED in the test assembly must be swept. Dropping a source is then a set mismatch
@@ -3781,7 +3796,15 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     // this change set have already rotted.
     private const string RecognizerSourceName = "LocalFileSystemBackend.cs";
 
-    private static readonly string[] SweptSources = [EmbeddedSourceName, RecognizerSourceName];
+    // Embedded for its own interpolation guard (#806 Inc-C), so the population bound requires it be swept.
+    private const string GoldenDifferentialSourceName = "Delta/PartitionEncodingGoldenDifferentialTests.cs";
+
+    private static readonly string[] SweptSources =
+        [EmbeddedSourceName, RecognizerSourceName, GoldenDifferentialSourceName];
+
+    // Swept sources that carry no test-outcome count today, so they are exempt from the per-source
+    // "contributes at least one count" bound. Still swept for undated counts, and asserted to stay at zero.
+    private static readonly string[] CountFreeSources = [GoldenDifferentialSourceName];
 
     // The token a comment must carry to be allowed to state a test-outcome count, and how far above the
     // count the sweep will look for it.
