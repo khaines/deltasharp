@@ -3,17 +3,19 @@
 
 PROVENANCE (design §3.2 / risk R7): emitted by REAL delta-rs (the Rust `deltalake` engine), never
 regenerated from DeltaSharp output. Records where delta-rs DIVERGES from Apache Spark (it percent-
-escapes space and non-ASCII in the on-disk directory, and hence in add.path). DeltaSharp follows
-Spark on disk (design D1), so a delta-rs table is read-compatible but NOT byte-identical — this
-fixture pins that divergence and backs the ref->DS read-compat test.
+escapes space, non-ASCII and a number of ASCII sub-delims in the on-disk directory, and hence in
+add.path). DeltaSharp follows Spark on disk where the two diverge (design D4), so a delta-rs table is
+read-compatible but NOT byte-identical — this fixture pins that divergence and backs the ref->DS
+read-compat test.
 
-Pinned engine (recorded in matrix.json.engine / .version):
+Pinned engine (recorded in matrix.json.engine / .version / .pyarrow):
     deltalake==1.6.3   pyarrow==25.0.1
 
-Usage:
-    python3 -m venv /tmp/dr-gen && . /tmp/dr-gen/bin/activate
-    pip install deltalake==1.6.3 pyarrow
-    python generate_delta_rs.py <out_dir>
+Dev-only, and it uses the network: pip fetches the pins (no hashes). Usage, from the repository root
+(with no argument the output goes to the `delta-rs/` directory beside this script):
+    venv=$(mktemp -d) && python3.11 -m venv "$venv" && . "$venv/bin/activate"
+    pip install deltalake==1.6.3 pyarrow==25.0.1
+    python tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/generate_delta_rs.py
 """
 import atexit
 import hashlib
@@ -165,10 +167,20 @@ def _strip_crc(root: str) -> None:
 
 
 def _write_checksums(out_dir: str) -> None:
+    """Mint SHA256SUMS over exactly the tree the test can see. The test reads the fixtures as COPIED
+    beside its binary, and the .NET SDK neither copies dot-directories nor preserves symlinks (it copies a
+    link's target as a regular file), so refuse both rather than list something the test cannot check.
+    Finder's .DS_Store is skipped: it is never copied, and .gitignore keeps it out of commits."""
     lines = []
-    for root, _dirs, files in os.walk(out_dir):
+    for root, dirs, files in os.walk(out_dir):
+        for name in dirs + files:
+            rel = os.path.relpath(os.path.join(root, name), out_dir)
+            if os.path.islink(os.path.join(root, name)):
+                raise SystemExit(f"refusing to checksum a symlink: {rel!r}")
+            if name.startswith(".") and name != ".DS_Store":
+                raise SystemExit(f"refusing to checksum a dot-entry the test cannot see: {rel!r}")
         for name in sorted(files):
-            if name == "SHA256SUMS":
+            if name in ("SHA256SUMS", ".DS_Store"):
                 continue
             p = os.path.join(root, name)
             h = hashlib.sha256(open(p, "rb").read()).hexdigest()

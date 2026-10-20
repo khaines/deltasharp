@@ -4,7 +4,7 @@
 > **Issues:** [#806](https://github.com/khaines/deltasharp/issues/806) — Delta partition NAME/VALUE encoding: Spark/delta-rs interop round-trip (two-layer physical-segment + URI-encoded add.path); [#708](https://github.com/khaines/deltasharp/issues/708) — partition column names written raw while values are percent-encoded (origin)
 > **Author:** design-doc skill (orchestrated)
 > **Reviewers:** cloud-native-distributed-systems-architect, delta-storage-format-engineer, reliability-test-chaos-engineer, cloud-native-security-sme, cloud-native-site-reliability-engineer, performance-benchmarking-engineer
-> **Last Updated:** 2026-08-30
+> **Last Updated:** 2026-10-20
 > **Related:** PR #797 (the #708 scope-correction that percent-encoded both NAME and value with `Uri.EscapeDataString` — directory-injection hardening retained, but not Spark-parity), #696 (message-hygiene recognizer that must stay fixed regardless), OrphanCleanup encoding-robust protection (#489 lineage)
 
 ---
@@ -38,7 +38,7 @@ migration** for the DeltaSharp tables already written in the two legacy layouts 
 #797 `Uri.EscapeDataString`-both):
 
 - **Layer 1 — physical directory segment (on disk):** `escapePathName(name) = "=" = escapePathName(value)`,
-  matching Spark/delta-rs byte-for-byte.
+  matching Spark byte-for-byte (delta-rs escapes a broader on-disk set; DeltaSharp follows Spark — D4).
 - **Layer 2 — `add.path` (in the log):** URI-encode the full relative path per the Delta protocol.
 - **Read:** URI-**decode** `add.path` to recover the physical object key, with a bounded, fail-closed
   resolution that still reads the legacy literal-key layouts.
@@ -89,24 +89,28 @@ pair for layer 2 and threads the read-side decode through the object-key resolut
 ### 2.2 The two-layer scheme (the crux)
 
 Let `name` and `value` be the *logical* partition column name (its physical name in `name`/`id` column
-mapping) and the string partition value (`null` → the `__HIVE_DEFAULT_PARTITION__` sentinel).
+mapping) and the string partition value (`null` **or `""`** → the `__HIVE_DEFAULT_PARTITION__` sentinel —
+Spark's `getPartitionValueString` rule, measured in §3.2; `add.partitionValues` still records which one it
+was, D5).
 
 **Layer 1 — physical segment (identical to Spark `ExternalCatalogUtils.escapePathName`):**
 
 ```
-seg(name, value) = escapePathName(name) + "=" + escapePathName(value)      // value=null → escapePathName(name)+"="+"__HIVE_DEFAULT_PARTITION__"
+seg(name, value) = escapePathName(name) + "=" + escapePathName(value)      // value is null or "" → escapePathName(name)+"="+"__HIVE_DEFAULT_PARTITION__"
 ```
 
 `escapePathName(s)` escapes exactly the Hive/Spark `charToEscape` bitset — `0x01–0x1F`, `" # % ' * / : = ? \`,
 `0x7F`, `{ [ ] ^` (and, only when running on Windows, `space < > |`) — as uppercase `%XX`, and **passes every
 other code point through unescaped, including all non-ASCII and (on non-Windows) the space**. This is the
-on-disk directory name; it is what Spark and delta-rs write and expect.
+on-disk directory name Spark writes and expects. delta-rs writes a more heavily escaped name for the same value
+(measured, §3.2) and still reads Spark's; DeltaSharp follows Spark (D4).
 
 > **Portability note.** Spark's set is Windows-conditional (`Shell.WINDOWS`). For a **portable, engine-stable**
 > on-disk layout DeltaSharp must pick one alphabet regardless of host OS — otherwise a table written on Linux
 > and compacted on Windows would diverge. Decision **D1 (§9):** adopt the **non-Windows** Spark alphabet on all
-> hosts (space and `< > |` pass through), because (a) it is what Spark-on-Linux and delta-rs emit — the dominant
-> lake producers — and (b) the confined backend never interprets `< > |` as shell metacharacters. The Windows
+> hosts (space and `< > |` pass through), because (a) it is what Spark-on-Linux — the dominant lake producer —
+> emits (delta-rs does **not** match it: measured in §3.2, it escapes space, non-ASCII and `< > |` among others;
+> see D4), and (b) the confined backend never interprets `< > |` as shell metacharacters. The Windows
 > local backend must therefore accept these in a component name (they are legal on the object-store key space and
 > on POSIX; the Windows *local* filesystem is the only place `< > |` are illegal, handled as a backend concern —
 > see §2.6 length/again §8 risk).
@@ -126,9 +130,10 @@ layer-1 `%XX` has its `%`→`%25`, e.g. value `a/b` → layer-1 `col=a%2Fb` → 
 `< > { } | ` `` ` ``→their `%XX`) and **keeps literal** the structural `=` separator, the `/` separators, the
 pchar/sub-delims (`: @ & + $ , ; ! ~ * ' ( ) -`) **and all non-ASCII** (Spark stores `URI.toString`, not
 `toASCIIString`, so `région` stays `région`). So `country=US/f` ⇒ `country=US/f` (the `=` is **not** encoded).
-> **delta-rs on-disk divergence (residual).** delta-rs additionally percent-escapes space and non-ASCII in the
-> **on-disk** directory (`region=na%20me`, `region=r%C3%A9gion`) and hence in its `add.path`; Apache Spark and
-> DeltaSharp keep them literal on disk. DeltaSharp follows **Spark** (design D1), so a delta-rs-written table is
+> **delta-rs on-disk divergence (residual).** delta-rs additionally percent-escapes space, non-ASCII and a number
+> of ASCII sub-delims / URI-illegal chars in the **on-disk** directory (`region=na%20me`, `region=r%C3%A9gion`,
+> `region=amp%26r`; the full measured set is in §3.2) and hence in its `add.path`; Apache Spark and DeltaSharp
+> keep them literal on disk. DeltaSharp follows **Spark** (design D4), so a delta-rs-written table is
 > **read-compatible** (the resolver decodes its `add.path` to the correct key) but **not byte-identical** on
 > disk. Documented as an accepted interop residual; see §3.2 (the DS→ref golden asserts parity vs **Spark**).
 
@@ -329,15 +334,16 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > `tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/` (real **Spark 3.5 / delta-rs 1.6**,
 > pinned generators + `SHA256SUMS` + a provenance README enforcing *never regenerated from DeltaSharp*),
 > and consumed by `PartitionEncodingGoldenDifferentialTests` (DS→ref byte-parity over the **33-value**
-> matrix + both ref→DS reads). Provenance is test-enforced in three independent ways: `SHA256SUMS`
+> matrix + both ref→DS reads). Provenance is test-enforced by three in-repo controls: `SHA256SUMS`
 > set-equality in both directions (drifted *and* unlisted files fail); the Parquet footer's **structured
 > `created_by`** (`parquet-mr version 1.13.…`, `delta-rs version py-…`), which Parquet.Net's public write API
 > cannot set — `CustomMetadata` reaches only the footer's key/value section, so a Parquet.Net-authored file is
 > rejected unless its footer is patched byte-by-byte; and **`matrix-log.json`** — the engine's own `_delta_log`
-> for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked. A fourth
+> for the full matrix table, committed verbatim, against which *every* matrix row is cross-checked. A further
 > committed log, **`empty-string-log.json`**, grounds the `empty_string` block the same way. All three
-> committed logs are asserted to carry the engine's commit shape (`commitInfo.engineInfo` + `protocol` +
-> `metaData.partitionColumns`), so none can be replaced by hand-authored `add` lines.
+> committed logs (those two and the read-table's) are asserted to carry the engine's commit shape
+> (`commitInfo.engineInfo` + `protocol` + `metaData.partitionColumns`), so none can be replaced by *bare*
+> hand-authored `add` lines (a forge that keeps the commit shape still passes — see below).
 >
 > **What this does and does not buy (measured, not assumed).** These controls do **not** close **R7**, and must
 > not be described as doing so. Every committed artifact — text or binary — can be edited by whoever edits the
@@ -350,7 +356,11 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > library and is not settable via Parquet.Net's `CustomMetadata`; `matrix.json`'s `engine` field is a generator
 > constant and pins drift only, not origin.)
 >
-> **Matrix axis coverage.** The value axes are measured against both reference engines. Two scope notes:
+> **Matrix axis coverage.** The value axes are measured against both reference engines. Three scope notes:
+>
+> * **`0x7F` (DEL) is not a matrix row.** The control-adjacent axis covers `0x09` and `0x01`; DEL is the one
+>   member of the escape set outside the `0x01–0x1F` loop. It is added at the first real-engine regeneration
+>   (**#908**) rather than by regenerating every fixture for one row.
 >
 > * **The partition-NAME axis is not measured here.** Every matrix row fixes the column to `region` so each row
 >   isolates the VALUE encoding; the name axis is a documented Inc-C residual tracked in **#907** (§3.1 H1
@@ -376,8 +386,10 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > | delta-rs 1.6.3 | `""` (its own `region=` directory) | `null` *(repo-backed: `empty-string-log.json` shows it committing `partitionValues:{"region":""}`, the block shows it reading back `null`)* |
 > | **DeltaSharp** | `""` (verbatim, in the sentinel directory) | `""` |
 >
-> So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""`. That is *lossless* —
-> it distinguishes `null` from `""`, which Spark's writer cannot.
+> So DeltaSharp treats `add.partitionValues` as authoritative and round-trips `""` as `""` (decision **D5**). That
+> is *lossless* — it distinguishes `null` from `""`, which Spark's writer cannot — but it is a deliberate
+> **departure from the Delta protocol**: PROTOCOL.md ("Partition Value Serialization") says *an empty string for
+> any type translates to a null partition value*, which is exactly what delta-rs's `null` read-back implements.
 >
 > **Provenance of each cell, precisely.** The two *reference engines'* write cells and delta-rs's read cell
 > come from the committed `empty_string` blocks, which are harvested from real engine runs and asserted by
@@ -391,15 +403,24 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 > The DeltaSharp side *is* pinned, by
 > `EmptyStringPartitionValue_DirectoryMatchesSpark_ButDeltaSharpPreservesTheValue`.
 >
-> **Consequence to be aware of:** because `null` and `""` share one directory, the sentinel directory is
-> non-injective on the partition key. This is safe for OPTIMIZE and dynamic-partition-overwrite because both
-> key on `PartitionKeyBuilder` over `add.partitionValues`, never on the directory name.
+> **Consequences to be aware of:**
+>
+> * Because `null` and `""` share one directory, the sentinel directory is non-injective on the partition key.
+>   This is safe for OPTIMIZE and dynamic-partition-overwrite because both key on `PartitionKeyBuilder` over
+>   `add.partitionValues`, never on the directory name.
+> * **The `null`/`""` distinction does not survive a Spark rewrite.** Spark's writer folds `""` to `null`
+>   (repo-backed: Spark's `empty_string.add_partition_values` is `[null, "keep"]`), so any Spark rewrite of a
+>   DeltaSharp table — OPTIMIZE, UPDATE, DELETE, MERGE copy-on-write — silently turns DeltaSharp's `""`
+>   partition rows into `null`. delta-rs reads them as `null` without rewriting.
+> * **Typed partition columns.** A committed `""` on a *non-string* partition column — protocol-legal foreign
+>   input — currently throws on read instead of reading as `null`. That is a pre-existing gap outside this
+>   increment, tracked with the Spark-rewrite integration test in **#916**.
 >
 > **Measured details beyond the original assumptions:**
 > 1. **delta-rs escapes a broader on-disk set than Spark** — not only space and non-ASCII but also a number of
 >    ASCII sub-delims / URI-illegal chars (measured: ``& + , ; ! $ ( ) @ < > | } ` ``, e.g. `&` → `region=amp%26r`;
 >    the set is *derived and asserted* by the residual test so it cannot rot) —
->    whereas Spark/DeltaSharp keep them literal. DeltaSharp follows Spark (D1); the residual test asserts
+>    whereas Spark/DeltaSharp keep them literal. DeltaSharp follows Spark (D4); the residual test asserts
 >    DeltaSharp == Spark everywhere and characterises (does not require byte-equality with) delta-rs.
 > 2. **delta-rs also diverges on the empty string**, writing an empty directory (`region=`) instead of folding
 >    it onto the sentinel. It agrees with Spark on `null`. Read-compatibility is unaffected: partition truth is
@@ -414,10 +435,12 @@ against **reference fixtures emitted by real Spark and delta-rs** (checked-in go
 same OR-a/OR-b pattern as #520/#646). Two directions:
 
 - **DS→ref:** DeltaSharp's directory and `add.path` equal the reference **Spark** bytes (delta-rs's broader
-  on-disk escaping is a documented residual, not a parity target — DeltaSharp follows Spark, D1).
+  on-disk escaping is a documented residual, not a parity target — DeltaSharp follows Spark, D4).
 - **ref→DS:** a Spark/delta-rs-written `_delta_log` + files fixture is **read** by DeltaSharp and returns the
-  correct rows/partition values (closes the read half — the more urgent gap per #708). Covered for both a
-  Spark-shaped (literal-space `region=na me`) and a delta-rs-shaped (escaped-space `region=na%20me`) layout.
+  correct rows/partition values. Covered for both a Spark-shaped (literal-space `region=na me`) and a
+  delta-rs-shaped (escaped-space `region=na%20me`) layout. This closes the partition-**value** read path only:
+  #708's read-half question is about partition **names** (`my%20col=…`), and every fixture fixes the column to
+  `region`, so the name read half stays open in **#907**.
 
 > **Fixture provenance is an Inc-C acceptance gate (Quality-review F3 — promoted out of O4).** A golden is only
 > a "measurement" if it is **provably not producible by DeltaSharp** (else the differential is a tautology). The
@@ -460,6 +483,9 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
 
 - **E1** — value `null` → `__HIVE_DEFAULT_PARTITION__` sentinel on disk (unescaped), partition value reads back
   as `null`.
+- **E1b** — value `""` → the **same** sentinel directory as `null` (Spark parity at the directory layer, §2.2);
+  `add.partitionValues` records `""`, and DeltaSharp reads it back as `""`, not `null` (D5 — a deliberate
+  departure from the protocol's empty-string-is-null rule; consequences in §3.2).
 - **E2** — value that *is* the literal string `__HIVE_DEFAULT_PARTITION__` vs a real null (must stay distinct —
   Spark parity gap guard).
 - **E3** — encoded-length breach (§2.6): an **escape-expanding ASCII** name/value (e.g. a value of N `%`/`/`
@@ -509,7 +535,8 @@ wall-clock, no map-ordering dependence (partition columns iterate in schema orde
 | #806 — migration/compat for mixed legacy + new layouts | §3.3 (M1–M8), §3.5 |
 | #806 — read compat across DELETE / OPTIMIZE-input / CDF-data on L2/mixed | §3.3 M5–M7 (Storage-review HIGH) |
 | #806 — encoded-segment length budget (encoded-expansion gap; fails closed) | §2.6, §3.4 E3 (escape-expanding ASCII) |
-| #708 — behaviour of Spark/delta-rs on hostile-but-legal names **measured** | §3.2 (goldens + provenance are the measurement) |
+| #708 — behaviour of Spark/delta-rs on hostile-but-legal partition **values** measured | §3.2 (goldens + provenance are the measurement) |
+| #708 — behaviour of Spark/delta-rs on hostile-but-legal partition **names** measured | **Not yet measured** — the §3.2 goldens fix the column to `region`; tracked in #907 |
 | #708 — decision among {deviating / conventional / ambiguous} with rationale | §9 D2 (we ARE deviating → adopt escapePathName + URI add.path) |
 | #708 — round-trip: name with space + quote written & read back | §3.1 H1 |
 | #708 — write-format change preserves read compat; OPTIMIZE/CDF/DV re-verified | §3.3 M5–M7, §3.5, §2.5 |
@@ -528,9 +555,11 @@ wall-clock, no map-ordering dependence (partition columns iterate in schema orde
   probe-first** (§2.3): it opens `k_dec` and, only on a not-found, opens `k_lit`. Accounting per file:
   - **Non-partitioned tables & ASCII-unreserved-name/value legacy files** (`k_dec==k_lit`): **one** open,
     identical to today.
-  - **Go-forward L2 partitioned files** (`k_dec≠k_lit` — because layer-2 always encodes the `=` separator to
-    `%3D`, so *every* L2 partition segment differs): **one** open of `k_dec` (the correct key). No extra
-    round-trip in the steady state.
+  - **Go-forward L2 partitioned files:** **one** open. Layer 2 keeps the `=` separator literal (O1, measured),
+    so an L2 file has `k_dec≠k_lit` only when its value carries a URI-illegal character (space, `%`, …) and
+    opens `k_dec` — the correct key — directly; otherwise `k_dec==k_lit`. No extra round-trip in the steady
+    state. (An earlier draft assumed layer 2 encodes `=` as `%3D`, making every L2 segment differ; O1 falsified
+    that.)
   - **Legacy L0/L1 partitioned files whose `add.path` carries a `%`:** `k_dec` misses, then `k_lit` opens —
     **+1 open only on the legacy miss**.
   - Earlier drafts wrongly put the go-forward format on the "zero-extra-probe" path. Corrected: the extra cost
@@ -576,8 +605,11 @@ wall-clock, no map-ordering dependence (partition columns iterate in schema orde
   introduced. The decode is per-file and stateless. Note the confined backend stops **root escape** but not
   **in-root cross-area** reads (a decoded key could point at `_delta_log/…` / a DV `.bin` / `_change_data/…`
   under the same single-tenant root — §6 T-InRoot; low residual: single tenant, parsed as Parquet, fails closed).
-- **Supply chain.** No new dependency — `escapePathName`/URI codec are in-repo (a small, audited port of the
-  Hive/Spark bitset).
+- **Supply chain.** No new **runtime** dependency — `escapePathName`/URI codec are in-repo (a small, audited
+  port of the Hive/Spark bitset). Inc-C adds two **dev-only** surfaces, neither run in CI: the fixture
+  generators (`pip` installs of the pinned engines, unhashed, plus a Maven/Ivy fetch of the Delta jars for
+  Spark — documented in the fixture README), and a test-only reference to `Microsoft.CodeAnalysis.CSharp` (the
+  same version `DeltaSharp.Core.Tests` already uses) for the fixture-text guard.
 
 ---
 
@@ -660,8 +692,8 @@ graph LR
   - *R7 — golden fixture provenance / self-fulfilling fixture.* Mitigation: fixtures emitted by real Spark/delta-rs,
     version-pinned, checksum'd, never regenerated from DeltaSharp — an Inc-C acceptance gate (§3.2), not a deferred
     pointer.
-- **Launch checklist:** differential parity green (Spark + delta-rs, both directions) **with attested non-DeltaSharp
-  fixture provenance**; mixed-layout migration green incl. **DELETE / OPTIMIZE-input / CDF-data reads on L2/mixed**
+- **Launch checklist:** DS→Spark byte-parity green, the delta-rs on-disk residual characterised (D4), and ref→DS
+  reads green for both engines' layouts — **with attested non-DeltaSharp fixture provenance**; mixed-layout migration green incl. **DELETE / OPTIMIZE-input / CDF-data reads on L2/mixed**
   (§3.3 M5–M7); adversarial both-exist (M8) green; OrphanCleanup/VACUUM/DV/CDF path-matching re-verified; VACUUM
   lists a real Spark non-ASCII dir (§3.5); encoded-length fail-closed on **escape-expanding ASCII** (E3);
   confinement-on-decoded-key + read-side `add.path` length cap verified; host-determinism + Windows-local cells
@@ -672,9 +704,11 @@ graph LR
 ## 9 · Open questions & decisions
 
 - **D1 — on-disk alphabet is host-stable (non-Windows Spark set).** *Decided:* use the non-Windows
-  `escapePathName` alphabet on every host (space/`<>|` pass through) for an engine-stable, Spark-on-Linux/delta-rs-
-  matching layout. Windows *local* filesystem illegality of `< > |` is a backend concern (accept on object
-  stores/POSIX; bounded backend error on Windows-local if it ever matters). *Confirm with reviewers.*
+  `escapePathName` alphabet on every host (space/`<>|` pass through) for an engine-stable layout matching
+  Spark-on-Linux. (It does **not** match delta-rs, which escapes a broader set — measured in §3.2; see D4.)
+  Windows *local* filesystem illegality of `< > |` — including a PVC backed by a Windows filesystem — is a backend
+  concern (accept on object stores/POSIX; bounded backend error on Windows-local if it ever matters, §3.6).
+  *Confirm with reviewers.*
 - **D2 — we ARE deviating; adopt the two-layer fix.** *Decided (answers #708's three-way choice):* current
   behavior is a genuine protocol/interop deviation (both layers), not merely a robustness gap → adopt
   `escapePathName` physical + URI-encoded `add.path` + read decode. Recorded on #708/#806.
@@ -684,6 +718,18 @@ graph LR
   L2 format, extra cost only on the legacy decoded-miss (§4), and it mirrors OrphanCleanup's existing encoding
   tolerance. *Alternative (O2):* a `_delta_log` config hint to skip the legacy fallback — deferred behind a
   legacy-table benchmark. *Confirm the adopted resolver + the untrusted both-exist tie-break (§2.3 T-Poison).*
+- **D4 — where the reference engines diverge on disk, follow Spark.** *Decided (Inc-B, recorded in Inc-C):* the
+  §3.2 goldens measured delta-rs escaping a broader on-disk set than Spark (space, non-ASCII, and
+  ``& + , ; ! $ ( ) @ < > | } ` ``). DeltaSharp writes Spark's bytes and treats delta-rs's extra escaping as a
+  read-compatible residual: a delta-rs table reads correctly through the decoded-first resolver (§2.3), but
+  DeltaSharp does not reproduce its directory names. Spark is the larger producer and the engine whose
+  `add.path` rule (O1) this design already matches byte-for-byte.
+- **D5 — `""` partition values: Spark's directory, DeltaSharp's own value.** *Decided (Inc-B, measured in
+  Inc-C):* at the directory layer `""` folds onto the `__HIVE_DEFAULT_PARTITION__` sentinel with `null`, as
+  Spark does (§2.2, E1b). At the value layer DeltaSharp writes `""` verbatim into `add.partitionValues` and reads
+  it back as `""` — lossless, but a deliberate departure from PROTOCOL.md's empty-string-is-null rule, and not
+  preserved by a Spark rewrite of the table (§3.2). Typed-column `""` reads and the Spark-rewrite integration
+  test are tracked in **#916**, which also re-confirms this decision once measured.
 - **O5 — foreign `add.path` read-side length cap.** A concrete pre-decode byte cap for the DoS residual (§5/§6
   T-DoS) must be chosen (independent of the write-door `MaxPathSegmentNameBytes`). *Open: pick the value in Inc-A.*
 - **O6 — stale code comment (follow-up, not this design).** `DeltaWriteEncoding.cs`'s XML comment cites the
@@ -693,8 +739,8 @@ graph LR
   the reference add.path is Java `URI.toString` path-quoting — layer-1 `%`→`%25` and URI-illegal ASCII
   (space→`%20`, `< > { } | ` `` ` ``) are encoded, while the `=` separator, `/` separators, pchar/sub-delims,
   and **all non-ASCII** stay literal. `ToAddPath` corrected to match Spark byte-for-byte (the assumed
-  `=`→`%3D` / non-ASCII→triplet rule was wrong). delta-rs diverges on-disk (escapes space/non-ASCII) →
-  read-compatible-but-not-byte-identical residual; DeltaSharp matches Spark (D1). Provenance goldens: Inc-C.
+  `=`→`%3D` / non-ASCII→triplet rule was wrong). delta-rs diverges on-disk (escapes a broader set, §3.2) →
+  read-compatible-but-not-byte-identical residual; DeltaSharp matches Spark (D4). Provenance goldens: Inc-C.
 - **O3 — do we ever need to *parse* a directory name?** Currently no (partition truth = `partitionValues`).
   Confirm no read path infers partition values from the path (survey found none) so the encoding is a pure
   locator. *Believed closed; reviewer confirm.*

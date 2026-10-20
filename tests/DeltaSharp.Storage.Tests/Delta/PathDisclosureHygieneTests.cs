@@ -186,7 +186,7 @@ namespace DeltaSharp.Storage.Tests.Delta;
 // same commit that declared it: a paragraph in this file claiming a red count "at THIS head" that no
 // longer matched the tree, and nothing failed when it stopped matching, which is the rule's own argument
 // turned on the rule. NoCommentStatesATestOutcomeCount_WithoutSayingWhenItWasMeasured now enforces it
-// over BOTH files, so a red count must either lose its number or carry the MEASURED-AT marker naming when
+// over every swept source, so a red count must either lose its number or carry the MEASURED-AT marker naming when
 // it was taken. The generalisation, and this file has now paid for it three times: WHEN YOU DERIVE A
 // RULE, SWEEP FOR ITS VIOLATIONS IN THE SAME COMMIT, and prefer a mechanism that makes the violation
 // impossible over a rule that asks the next author to remember. A rule applied to the site that produced
@@ -3654,7 +3654,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     /// the tree stays green while the sentence becomes false. This file carried one such sentence for
     /// several rounds and a reviewer measured it wrong; the round after the rule was stated, the same
     /// reviewer found the rule already violated at another site -- and at a third, in the recognizer's
-    /// own source. Stating a rule is not applying it, so this applies it, over BOTH files.</para>
+    /// own source. Stating a rule is not applying it, so this applies it, over every swept source -- this
+    /// file and the recognizer's source above all.</para>
     /// <para>The escape is not deletion but DATING: a count that says when it was measured is a fact
     /// about a commit, which cannot rot. A count with no WHEN is a claim about the tree the reader is
     /// looking at, and this file is not able to check it.</para>
@@ -3664,12 +3665,14 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     /// counts it does recognise, it says so rather than reading as verified.</para>
     /// <para>THE SOURCE AXIS IS PINNED TWICE, AND THAT IS THE ROUND-11 REPAIR. `SweptSources` was a fresh
     /// literal list with no pin: `axis-trim-sweep.py` trimmed it to its first element -- dropping
-    /// `LocalFileSystemBackend.cs`, the recognizer's own source and the reason this guard says "over BOTH
-    /// files" -- and the suite stayed GREEN, because an aggregate `counted` bound is satisfied by whichever
-    /// source is left. So the axis is now bounded on both sides: it must COVER every `.cs` source embedded
-    /// in the test assembly (the chokepoint -- dropping a source is a set mismatch, not a smaller number),
-    /// and EVERY swept source must contribute at least one recognised count (per-source, so a source that
-    /// stops carrying the shape can no longer hide behind its sibling's eight).</para>
+    /// `LocalFileSystemBackend.cs`, the recognizer's own source and the reason this guard sweeps more than
+    /// its own file -- and the suite stayed GREEN, because an aggregate `counted` bound is satisfied by
+    /// whichever source is left. So the axis is now bounded on both sides: it must COVER every `.cs` source
+    /// embedded in the test assembly (the chokepoint -- dropping a source is a set mismatch, not a smaller
+    /// number), and every swept source must contribute at least one recognised count (per-source, so a
+    /// source that stops carrying the shape can no longer hide behind its sibling's eight). The one
+    /// exception is a source listed in `CountFreeSources`, which must instead carry NONE -- asserted, so the
+    /// exemption cannot hide a source that does carry the shape.</para>
     /// </remarks>
     [Fact]
     public void NoCommentStatesATestOutcomeCount_WithoutSayingWhenItWasMeasured()
@@ -3730,8 +3733,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
 
         // PER SOURCE, because the aggregate above is satisfied by whichever source is left. That is exactly
         // how the source axis went unpinned: trimming SweptSources to its first element dropped
-        // LocalFileSystemBackend.cs -- the recognizer's own source, and the whole point of "over BOTH files"
-        // -- while `counted` stayed at 8 and the suite stayed green.
+        // LocalFileSystemBackend.cs -- the recognizer's own source, and the whole point of sweeping beyond
+        // this file -- while `counted` stayed at 8 and the suite stayed green.
         string[] silent = countedBySource
             .Where(entry => entry.Value == 0 && !CountFreeSources.Contains(entry.Key, StringComparer.Ordinal))
             .Select(entry => entry.Key)

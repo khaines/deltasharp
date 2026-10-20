@@ -27,16 +27,23 @@ drifts *and* an unlisted file that appears both fail. A checked-in file whose ha
 
 The checksum manifest is minted by the same generator that writes the fixtures, so on its own it
 proves only that the bytes have not *drifted* — not that they came from a reference engine at all.
-Two further controls close that gap, and they are **not equally strong** — the distinction matters:
+Further controls narrow that gap (none closes it — see below), and they are **not equally strong**:
 
 | Anchor | Written by | Strength |
 |---|---|---|
-| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available — Parquet.Net's public write API cannot set it (`CustomMetadata` reaches only the key/value section), so a file Parquet.Net wrote and left untouched is rejected (by the engine-prefix check; the explicit "not Parquet.Net" assertion is usually not the deciding check and exists for the diagnosis, though it is not strictly redundant). A footer patched byte-by-byte is **not** caught. |
+| Parquet footer's **structured** `created_by` | the writer **library** | Strongest available (see below) |
 | `<engine>/matrix-log.json`, `<engine>/empty-string-log.json`, `read-table/_delta_log/*.json` (incl. `commitInfo.engineInfo`) | the **engine** | Strong |
-| `matrix.json` `version` | read from the installed library at generation time | Moderate |
-| `matrix.json` `engine` | a constant typed into the generator | Pins **drift only**, not origin |
+| `matrix.json` `version`; delta-rs `pyarrow` | read from the installed library at generation time | Moderate |
+| `matrix.json` `engine`; Spark `delta` | a constant in the generator when these fixtures were made | Pins **drift only**, not origin |
 
-`Goldens_CarryReferenceEngineProvenanceMarkers` asserts the first three (including that **both** committed
+The footer's `created_by` cannot be set through Parquet.Net's public write API — `CustomMetadata` reaches
+only the key/value section — so a file Parquet.Net wrote and left untouched is rejected by the
+engine-prefix check. (The explicit "not Parquet.Net" assertion is usually not the deciding check and
+exists for the diagnosis, though it is not strictly redundant.) A footer patched byte-by-byte is **not**
+caught. Spark's Delta version is anchored by the engine-written `engineInfo` (`Delta-Lake/3.2.0`), not by
+the `delta` field; the generator now reads that field from the installed `delta-spark` on regeneration.
+
+`Goldens_CarryReferenceEngineProvenanceMarkers` asserts all four (including that **all three** committed
 logs carry the engine's `commitInfo.engineInfo`, a `protocol` action, and `metaData.partitionColumns`).
 `GoldenMatrix_EveryRow_MatchesTheEngineWrittenLog` cross-checks **every** matrix row against
 `matrix-log.json` — the engine's own transaction log for the full matrix table, committed verbatim. Only the
@@ -51,11 +58,17 @@ solely as text inside that JSON and never as filesystem paths (design R6).
 > file — are caught. The only real oracle is **re-measurement against the live engines**; a scheduled
 > regeneration+diff CI job is tracked in **#908**.
 
+> **Scope of the checksum manifest.** The test runs over the fixture tree as **copied beside the test
+> binary**. The .NET SDK's default item excludes do not copy dot-directories, and MSBuild copies a symlink's
+> *target* as a regular file — so an unlisted file under a dot-directory, or a tracked symlink, is invisible
+> to the test. The generators refuse both when they mint `SHA256SUMS` (and skip Finder's `.DS_Store`, which is
+> never copied or committed), and the test rejects any symlink it does see.
+
 ## What the fixtures pin
 
 - **`<engine>/matrix.json`** — the full partition-value encoding matrix (ASCII-unreserved, every
-  ASCII-reserved char, sub-delims, the URI-illegal set `< > | { } \` " \ [ ] ^ space`, non-ASCII
-  Latin/CJK/emoji, a value already containing `%`, **`null` → the `__HIVE_DEFAULT_PARTITION__`
+  ASCII-reserved char, sub-delims, the URI-illegal set ``< > | { } ` " \ [ ] ^`` plus space,
+  non-ASCII Latin/CJK/emoji, a value already containing `%`, **`null` → the `__HIVE_DEFAULT_PARTITION__`
   sentinel, and control-adjacent values** (`%09`/`%01` on disk)). The **empty string** is not a row —
   Spark folds it onto the same sentinel partition as `null` and emits no distinct directory or
   add-action — so its measured behaviour is harvested into the `empty_string` block instead.
@@ -63,8 +76,8 @@ solely as text inside that JSON and never as filesystem paths (design R6).
   differential test: DeltaSharp's `(EscapePathName, ToAddPath)` output must equal the **Spark** bytes
   for every row, and diverges from **delta-rs** on the documented broader-escaping on-disk residual —
   space, non-ASCII, **and** a number of ASCII sub-delims / URI-illegal chars (measured:
-  ``& + , ; ! $ ( ) @ < > | } ` ``). DeltaSharp follows Spark (design D1). The residual set is *derived
-  and asserted* by the differential test, so this list cannot silently rot.
+  ``& + , ; ! $ ( ) @ < > | } ` ``). DeltaSharp follows Spark where the two diverge (design D4). The
+  residual set is *derived and asserted* by the differential test, so this list cannot silently rot.
 - **`<engine>/matrix-log.json`** — the reference engine's own `_delta_log` for the full matrix table,
   committed verbatim as the ground truth every `matrix.json` row is cross-checked against.
 - **`<engine>/empty-string-log.json`** — the engine's own `_delta_log` for the empty-string probe table,
@@ -76,38 +89,44 @@ solely as text inside that JSON and never as filesystem paths (design R6).
   quote, space, `%` — deliberately no non-ASCII, to avoid the macOS NFC/NFD filesystem-normalization
   hazard, design R6) written by the reference engine. Consumed by the **ref→DS read** test:
   DeltaSharp reads the foreign `_delta_log` + files and returns the exact rows and partition values
-  (partition truth from `add.partitionValues`), closing the #708 read-half gap for both a
-  Spark-shaped (`region=na me`, literal space) and a delta-rs-shaped (`region=na%20me`, escaped
-  space) on-disk layout via the resolver's **decoded-first** branch. (The literal-`%` *fallback* is a
-  legacy-DeltaSharp layout no reference engine emits — both engines write a URI-encoded `add.path`
-  whose decode hits — so these fixtures structurally cannot reach it; it is covered by
+  (partition truth from `add.partitionValues`) for both a Spark-shaped (`region=na me`, literal space)
+  and a delta-rs-shaped (`region=na%20me`, escaped space) on-disk layout via the resolver's
+  **decoded-first** branch. That closes the partition-**value** read path; the partition-**name** read half
+  of #708 stays open, because every fixture fixes the column to `region` (#907). (The literal-`%`
+  *fallback* is a legacy-DeltaSharp layout no reference engine emits — both engines write a URI-encoded
+  `add.path` whose decode hits — so these fixtures structurally cannot reach it; it is covered by
   `PartitionPathResolverTests` / `PartitionPathReadResolutionTests`.)
 
 ## Key measured finding (design O1, closed)
 
 The reference `add.path` is **Java `URI.toString` / RFC-2396 path-quoting** of the on-disk relative
-path: it percent-encodes only URI-illegal ASCII (space→`%20`, a layer-1 `%`→`%25`, `< > { } | \``)
+path: it percent-encodes only URI-illegal ASCII (space→`%20`, a layer-1 `%`→`%25`, ``< > { } | ` ``)
 and keeps the structural `=` separator, the `/` separators, the pchar/sub-delims, and **all
 non-ASCII** literal. (The design's earlier *assumed* `=`→`%3D` / non-ASCII→UTF-8-triplet rule was
 falsified by this measurement and corrected in Inc-B.) Spark and delta-rs agree on `add.path`
-double-encoding of already-escaped chars but **diverge on the on-disk directory** for space and
-non-ASCII — DeltaSharp matches Spark.
+double-encoding of already-escaped chars but **diverge on the on-disk directory** for space, non-ASCII
+and the ASCII residual listed above — DeltaSharp matches Spark.
 
 ## Regenerating (maintainers)
 
+The generators are **dev-only** and fetch from the network: `pip` installs the pinned packages (these
+pins carry no hashes), and Spark's `configure_spark_with_delta_pip` downloads the Delta jars from Maven
+through Ivy at run time. Nothing here runs in CI. Run them from the repository root; with no argument
+each script writes to its own engine directory beside it.
+
 ```bash
 # Spark (needs a JDK 8 or 11)
-python3.11 -m venv /tmp/spark-gen && . /tmp/spark-gen/bin/activate
+venv=$(mktemp -d) && python3.11 -m venv "$venv" && . "$venv/bin/activate"
 pip install pyspark==3.5.3 delta-spark==3.2.0
 # PYSPARK_PYTHON must point at THIS venv: PySpark aborts with PYTHON_VERSION_MISMATCH if the
 # worker picks up a different system python (e.g. a 3.14 default) than the 3.11 driver.
-JAVA_HOME=<jdk8-or-11> PYSPARK_PYTHON=/tmp/spark-gen/bin/python \
-  PYSPARK_DRIVER_PYTHON=/tmp/spark-gen/bin/python python generate_spark.py spark
+JAVA_HOME=<jdk8-or-11> PYSPARK_PYTHON="$venv/bin/python" PYSPARK_DRIVER_PYTHON="$venv/bin/python" \
+  python tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/generate_spark.py
 
 # delta-rs
-python3.11 -m venv /tmp/dr-gen && . /tmp/dr-gen/bin/activate
+venv=$(mktemp -d) && python3.11 -m venv "$venv" && . "$venv/bin/activate"
 pip install deltalake==1.6.3 pyarrow==25.0.1
-python generate_delta_rs.py delta-rs
+python tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/generate_delta_rs.py
 ```
 
 Both scripts write `matrix.json` (harvested from a throwaway full-matrix table), `matrix-log.json` and

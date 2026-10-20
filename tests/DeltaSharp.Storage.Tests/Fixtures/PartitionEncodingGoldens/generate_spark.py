@@ -4,18 +4,22 @@
 PROVENANCE (design §3.2 / risk R7): this fixture is emitted by REAL Apache Spark + Delta Lake
 (a JVM engine DeltaSharp cannot produce), never regenerated from DeltaSharp output. It is the
 reference oracle DeltaSharp's `(on-disk dir, add.path)` encoding is measured against. Do NOT
-hand-edit `matrix.json` or `table/`; re-run this script against the pinned engine to update.
+hand-edit `matrix.json` or `read-table/`; re-run this script against the pinned engine to update.
 
-Pinned engine (recorded in matrix.json.engine / .version):
-    pyspark==3.5.3   delta-spark==3.2.0   (Java 8/11)
+Pinned engine (recorded in matrix.json.engine / .version / .delta):
+    pyspark==3.5.3   delta-spark==3.2.0   (Java 8/11, Python 3.11 or 3.12 -- PySpark 3.5 does not run on 3.14)
 
-Usage:
-    python3.11 -m venv /tmp/spark-gen && . /tmp/spark-gen/bin/activate
+Dev-only, and it uses the network: pip fetches the pins (no hashes) and configure_spark_with_delta_pip
+downloads the Delta jars from Maven through Ivy at run time. Usage, from the repository root (with no
+argument the output goes to the `spark/` directory beside this script):
+    venv=$(mktemp -d) && python3.11 -m venv "$venv" && . "$venv/bin/activate"
     pip install pyspark==3.5.3 delta-spark==3.2.0
-    JAVA_HOME=<jdk8-or-11> python generate_spark.py <out_dir>
+    JAVA_HOME=<jdk8-or-11> PYSPARK_PYTHON="$venv/bin/python" PYSPARK_DRIVER_PYTHON="$venv/bin/python" \
+        python tests/DeltaSharp.Storage.Tests/Fixtures/PartitionEncodingGoldens/generate_spark.py
 """
 import atexit
 import hashlib
+import importlib.metadata
 import json
 import os
 import shutil
@@ -160,7 +164,9 @@ def main(out_dir: str) -> None:
     out = {
         "engine": "apache-spark",
         "version": pyspark.__version__,
-        "delta": "3.2.0",
+        # Read from the installed distribution (the committed fixture was generated when this was a typed
+        # constant; Spark's Delta version is anchored independently by the engine-written engineInfo).
+        "delta": importlib.metadata.version("delta-spark"),
         "note": "Reference (dir, add.path) partition-encoding golden. Emitted by real Spark; never from DeltaSharp.",
         "column": "region",
         "matrix": matrix,
@@ -181,10 +187,20 @@ def _strip_crc(root: str) -> None:
 
 
 def _write_checksums(out_dir: str) -> None:
+    """Mint SHA256SUMS over exactly the tree the test can see. The test reads the fixtures as COPIED
+    beside its binary, and the .NET SDK neither copies dot-directories nor preserves symlinks (it copies a
+    link's target as a regular file), so refuse both rather than list something the test cannot check.
+    Finder's .DS_Store is skipped: it is never copied, and .gitignore keeps it out of commits."""
     lines = []
-    for root, _dirs, files in os.walk(out_dir):
+    for root, dirs, files in os.walk(out_dir):
+        for name in dirs + files:
+            rel = os.path.relpath(os.path.join(root, name), out_dir)
+            if os.path.islink(os.path.join(root, name)):
+                raise SystemExit(f"refusing to checksum a symlink: {rel!r}")
+            if name.startswith(".") and name != ".DS_Store":
+                raise SystemExit(f"refusing to checksum a dot-entry the test cannot see: {rel!r}")
         for name in sorted(files):
-            if name == "SHA256SUMS":
+            if name in ("SHA256SUMS", ".DS_Store"):
                 continue
             p = os.path.join(root, name)
             h = hashlib.sha256(open(p, "rb").read()).hexdigest()
