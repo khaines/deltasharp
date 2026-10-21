@@ -1293,22 +1293,24 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         List<string> shadows = ShadowingTypes(typeof(PartitionEncodingGoldenDifferentialTests), bound);
         global::Xunit.Assert.True(
             shadows.Count == 0,
-            "a type elsewhere in the test assembly shadows a name this file binds, and could change what it means "
-            + "(a constant from it would be inlined unseen). Rename it, or move it into a child namespace, which does "
-            + $"not outrank this file's usings: [{string.Join(", ", shadows.Select(Escape))}]");
+            "a type elsewhere in the test assembly sits where it outranks this file's usings: it shares a name this file "
+            + "binds (a constant from it would be inlined unseen), or it declares extension methods (which outrank "
+            + "`using System.Linq` whatever its name). Move it into a child namespace (e.g. DeltaSharp.Storage.Tests.Delta.Helpers), "
+            + $"or rename a same-named type: [{string.Join(", ", shadows.Select(Escape))}]");
     }
 
     // The checks above run in the same compilation as any file that might try to subvert them, so the code they
     // rest on — the IL walk and the shadow enumeration — must not bind through anything such a file could redefine:
     // no extension method (an extension in an enclosing namespace outranks `using System.Linq`), no interpolated
     // string (its handler type is looked up by name), and no type or namespace name except `global::`-rooted ones
-    // (an alias or an enclosing type would win). Interceptors, which can redirect even a `global::` call, are
+    // (an alias or an enclosing type would win), no member bound by a language pattern (a query, a deconstruction, an
+    // await, an extension GetEnumerator) and no tuple syntax (its ValueTuple type is looked up by name). Interceptors, which can redirect even a `global::` call, are
     // switched off for this project in its csproj. This fact keeps that core as written.
     private static readonly string[] TrustedCore =
     {
         nameof(ShadowingTypes), nameof(AttributeValues), nameof(ReferenceWalk), nameof(ReferencesOutside),
         nameof(DeclaredMembers), nameof(TypeAndNested), nameof(Expand), nameof(IsWithin), nameof(FileLocalTypeName),
-        nameof(IsCompilerGenerated), nameof(OpCodeTable), nameof(MemberTokens),
+        nameof(IsCompilerGenerated), nameof(BuildOpCodeTable), nameof(MemberTokens),
     };
 
     [Fact]
@@ -1359,6 +1361,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("List<int> a = new(); return a.Count;")]
     [InlineData("System.Collections.Generic.List<int> a = new(); return a.Count;")]
     [InlineData("return (int)StringComparison.Ordinal;")]
+    [InlineData("int[] a = { 1 }; foreach (int x in from y in a select y) { return x; } return 0;")]
+    [InlineData("int[] a = { 1 }; foreach (int x in from y in a where y > 0 select y + 1) { return x; } return 0;")]
+    [InlineData("(int a, int b) = global::System.Tuple.Create(1, 2); return a + b;")]
+    [InlineData("global::System.Func<int> f = new int[0].Count; return f();")]
+    [InlineData("(int A, int B) t = (1, 2); return t.A;")]
+    [InlineData("int[] a = { 1, 2 }; return a[^1];")]
+    [InlineData("int[] a = [1]; return a.Length;")]
+    [InlineData("return Escape(null).Length;")]
+    [InlineData("var a = new int[1]; return a.Length;")]
     public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
     {
         GuardResult result = FindFixtureTextFindings(
@@ -1376,18 +1387,60 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private static List<string> TrustedCoreFindings(SemanticModel model, SyntaxNode member, ref int typeNames)
     {
         var findings = new List<string>();
+        var extensionCalls = new HashSet<IOperation>();
+        INamedTypeSymbol? owner = model.GetDeclaredSymbol(member.Ancestors().OfType<TypeDeclarationSyntax>().First());
         foreach (SyntaxNode node in member.DescendantNodesAndSelf())
         {
             string where = $"line {node.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
+
+            // Every extension call under this node, including the implicit ones a language pattern binds (a query
+            // clause, a collection-initializer Add), not only the calls written as such.
+            foreach (IOperation inner in model.GetOperation(node)?.DescendantsAndSelf() ?? Enumerable.Empty<IOperation>())
+            {
+                ISymbol? used = inner switch
+                {
+                    IInvocationOperation call => call.TargetMethod,
+                    IMethodReferenceOperation group => group.Method,
+                    IPropertyReferenceOperation property => property.Property,
+                    IFieldReferenceOperation field => field.Field,
+                    IBinaryOperation { OperatorMethod: { } method } => method,
+                    IUnaryOperation { OperatorMethod: { } method } => method,
+                    _ => null,
+                };
+                string at = $"line {inner.Syntax.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
+                if (used is IMethodSymbol { IsExtensionMethod: true } || used?.ContainingType is { IsExtension: true })
+                {
+                    if (extensionCalls.Add(inner))
+                    {
+                        findings.Add($"{at}: extension member {used!.Name}");
+                    }
+                }
+                else if (used is not null && owner is not null && SymbolEqualityComparer.Default.Equals(used.ContainingType, owner)
+                    && used is not IMethodSymbol { MethodKind: MethodKind.LocalFunction or MethodKind.AnonymousFunction }
+                    && Array.IndexOf(TrustedCore, used.Name) < 0 && extensionCalls.Add(inner))
+                {
+                    // The core is closed under calls: a member of this class it reaches is core too.
+                    findings.Add($"{at}: reaches {used.Name}, which is not in the trusted core");
+                }
+            }
+
             if (node is InterpolatedStringExpressionSyntax)
             {
                 findings.Add($"{where}: interpolated string");
             }
-            else if (model.GetOperation(node) is IInvocationOperation { TargetMethod.IsExtensionMethod: true } call && call.Syntax == node)
+            else if (node is QueryExpressionSyntax or AwaitExpressionSyntax or ForEachVariableStatementSyntax
+                    or TupleTypeSyntax or TupleExpressionSyntax or WithExpressionSyntax or RangeExpressionSyntax
+                    or CollectionExpressionSyntax or PositionalPatternClauseSyntax or AttributeListSyntax
+                || node.IsKind(SyntaxKind.IndexExpression)
+                || node is AssignmentExpressionSyntax { Left: TupleExpressionSyntax or DeclarationExpressionSyntax }
+                || (node is ForEachStatementSyntax loop && model.GetForEachStatementInfo(loop).GetEnumeratorMethod is { IsExtensionMethod: true }))
             {
-                findings.Add($"{where}: extension method {call.TargetMethod.Name}");
+                // Each binds a method by pattern (Select/Where, GetAwaiter, Deconstruct, GetEnumerator, a collection
+                // builder) that an extension in an enclosing namespace could supply, a well-known type (ValueTuple,
+                // Index, Range) a source declaration could replace, or an attribute type by unrooted name.
+                findings.Add($"{where}: pattern-bound member ({node.Kind()})");
             }
-            else if (node is SimpleNameSyntax name && !name.IsVar
+            else if (node is SimpleNameSyntax name
                 && model.GetSymbolInfo(name).Symbol is INamespaceOrTypeSymbol symbol
                 && !(symbol is INamedTypeSymbol own && own.Locations.Any(location => location.IsInSource)))
             {
@@ -1469,7 +1522,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private static global::System.Collections.Generic.List<string> ShadowingTypes(
         global::System.Type self, global::System.Collections.Generic.HashSet<string> names)
     {
-        var enclosing = new global::System.Collections.Generic.HashSet<string>(global::System.StringComparer.Ordinal);
+        global::System.Collections.Generic.HashSet<string> enclosing = new(global::System.StringComparer.Ordinal);
         enclosing.Add(string.Empty);
         string prefix = string.Empty;
         foreach (string part in (self.Namespace ?? string.Empty).Split('.'))
@@ -1481,7 +1534,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
         }
 
-        var found = new global::System.Collections.Generic.List<string>();
+        global::System.Collections.Generic.List<string> found = new();
         foreach (global::System.Type type in self.Assembly.GetTypes())
         {
             if (type.DeclaringType is null && type != self && enclosing.Contains(type.Namespace ?? string.Empty)
@@ -1529,8 +1582,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // rebind the walk that is meant to catch such a rebinding (FixtureTextGuard_TrustedCoreBindsNothingRebindable).
     private static ReferenceWalk ReferencesOutside(global::System.Type self)
     {
-        var outside = new global::System.Collections.Generic.SortedSet<string>(global::System.StringComparer.Ordinal);
+        global::System.Collections.Generic.SortedSet<string> outside = new(global::System.StringComparer.Ordinal);
+        global::System.Reflection.Emit.OpCode[][] opCodes = BuildOpCodeTable();
         int references = 0;
+
+        // Compiler-generated helpers outside the class (`<PrivateImplementationDetails>` span and inline-array
+        // helpers) that the class calls: their bodies are walked too, because they call well-known framework members
+        // (MemoryMarshal, Unsafe) that a source declaration in another file would silently replace.
+        global::System.Collections.Generic.List<global::System.Reflection.MethodBase> helpers = new();
+        global::System.Collections.Generic.HashSet<global::System.Reflection.MethodBase> helpersSeen = new();
 
         void Check(string from, global::System.Type? touched)
         {
@@ -1548,7 +1608,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             foreach (global::System.Reflection.CustomAttributeData attribute in attributes)
             {
                 Check(from, attribute.AttributeType);
-                var values = new global::System.Collections.Generic.List<global::System.Type?>();
+                global::System.Collections.Generic.List<global::System.Type?> values = new();
                 foreach (global::System.Reflection.CustomAttributeTypedArgument argument in attribute.ConstructorArguments)
                 {
                     AttributeValues(argument, values);
@@ -1608,7 +1668,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 return;
             }
 
-            foreach (int token in MemberTokens(il))
+            foreach (int token in MemberTokens(il, opCodes))
             {
                 references++;
                 global::System.Reflection.MemberInfo target = method.Module.ResolveMember(
@@ -1622,6 +1682,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 else if (target is global::System.Reflection.MethodBase called)
                 {
                     Check(from, called.DeclaringType);
+                    if (called.DeclaringType is { } helperType && helperType.Assembly == self.Assembly
+                        && !IsWithin(helperType, self) && IsCompilerGenerated(helperType) && helpersSeen.Add(called))
+                    {
+                        helpers.Add(called);
+                    }
+
                     if (called.IsGenericMethod)
                     {
                         foreach (global::System.Type argument in called.GetGenericArguments())
@@ -1675,6 +1741,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
         }
 
+        for (int i = 0; i < helpers.Count; i++)
+        {
+            CheckMethod(helpers[i].DeclaringType!, helpers[i]);
+        }
+
         return new ReferenceWalk(outside, references);
     }
 
@@ -1706,7 +1777,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             yield break;
         }
 
-        var parts = new global::System.Collections.Generic.List<global::System.Type>();
+        global::System.Collections.Generic.List<global::System.Type> parts = new();
         if (type.IsFunctionPointer)
         {
             parts.AddRange(type.GetFunctionPointerParameterTypes());
@@ -1786,21 +1857,30 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         return false;
     }
 
-    // TRUSTED CORE.
-    private static readonly global::System.Lazy<(global::System.Reflection.Emit.OpCode[] OneByte, global::System.Reflection.Emit.OpCode[] TwoByte)> OpCodeTable = new(() =>
+    // TRUSTED CORE: one-byte opcodes in [0], 0xFE-prefixed ones in [1] — two arrays, not a tuple (whose ValueTuple
+    // type a source declaration could replace), built afresh for each walk rather than held in a static that code
+    // elsewhere could rewrite by reflection.
+    private static global::System.Reflection.Emit.OpCode[][] BuildOpCodeTable()
     {
-        var oneByte = new global::System.Reflection.Emit.OpCode[256];
-        var twoByte = new global::System.Reflection.Emit.OpCode[256];
+        global::System.Reflection.Emit.OpCode[] oneByte = new global::System.Reflection.Emit.OpCode[256];
+        global::System.Reflection.Emit.OpCode[] twoByte = new global::System.Reflection.Emit.OpCode[256];
         foreach (global::System.Reflection.FieldInfo field in typeof(global::System.Reflection.Emit.OpCodes).GetFields(
             global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.Static))
         {
-            var opCode = (global::System.Reflection.Emit.OpCode)field.GetValue(null)!;
+            global::System.Reflection.Emit.OpCode opCode = (global::System.Reflection.Emit.OpCode)field.GetValue(null)!;
             ushort value = unchecked((ushort)opCode.Value);
-            (opCode.Size == 1 ? oneByte : twoByte)[value & 0xFF] = opCode;
+            if (opCode.Size == 1)
+            {
+                oneByte[value & 0xFF] = opCode;
+            }
+            else
+            {
+                twoByte[value & 0xFF] = opCode;
+            }
         }
 
-        return (oneByte, twoByte);
-    });
+        return new[] { oneByte, twoByte };
+    }
 
     // The decoder's operand sizes, pinned on hand-built IL: each body puts one operand of a given width before a
     // `call 0x0A000001`, with bytes that decode to a different token stream if that width is wrong.
@@ -1830,16 +1910,16 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [MemberData(nameof(OperandWidthIndices))]
     public void FixtureTextGuard_DecodesEveryOperandWidth(int index)
     {
-        int[] tokens = MemberTokens(OperandWidthBodies[index]).ToArray();
+        int[] tokens = MemberTokens(OperandWidthBodies[index], BuildOpCodeTable()).ToArray();
         Assert.True(tokens.SequenceEqual(new[] { 0x0A000001 }), $"body {index} decoded to [{string.Join(", ", tokens.Select(t => t.ToString("X8", System.Globalization.CultureInfo.InvariantCulture)).Select(Escape))}]");
     }
 
     // The metadata tokens an IL body references (call, newobj, ldfld, ldtoken, castclass, …). TRUSTED CORE.
-    private static global::System.Collections.Generic.IEnumerable<int> MemberTokens(byte[] il)
+    private static global::System.Collections.Generic.IEnumerable<int> MemberTokens(byte[] il, global::System.Reflection.Emit.OpCode[][] table)
     {
         for (int i = 0; i < il.Length;)
         {
-            global::System.Reflection.Emit.OpCode opCode = il[i] == 0xFE ? OpCodeTable.Value.TwoByte[il[i + 1]] : OpCodeTable.Value.OneByte[il[i]];
+            global::System.Reflection.Emit.OpCode opCode = il[i] == 0xFE ? table[1][il[i + 1]] : table[0][il[i]];
             if (opCode.Size == 0)
             {
                 throw new global::System.InvalidOperationException("unknown IL opcode at offset " + i);
@@ -2481,8 +2561,13 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// SyntaxKinds, DiagnosticSeverity, BinaryOperatorKind) are pinned by self-tests running this same compiled code;
     /// `#elif`/`#else` cannot appear without `#if`, and `#define`/`#undef` act the same in the guard and the build. A StringComparison alias can
     /// only loosen a name match (case or culture), which widens what is checked rather than exempting anything. A
-    /// same-named type in an IMPORTED namespace, or an interceptor, needs a configuration edit (CS0436 disabled, or
-    /// interceptors re-enabled), like the project-file case.</para>
+    /// same-named type in an IMPORTED namespace that this file names needs a configuration edit (CS0436 disabled);
+    /// a well-known type the compiler binds without a name (MemoryMarshal, ValueTuple, Index…) is a type in the test
+    /// assembly as soon as it is redeclared there, so any use of it — from this class or from a compiler-generated
+    /// helper it calls, whose body is walked too — is refused by the IL fact; and an interceptor needs interceptors
+    /// re-enabled, like the project-file case. Code in the test assembly that runs unprompted (a module initializer)
+    /// and rewrites this class's private state by reflection is runtime tampering, not a rebinding, and is out of
+    /// scope; the guard keeps no shared mutable state for it to rewrite.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {

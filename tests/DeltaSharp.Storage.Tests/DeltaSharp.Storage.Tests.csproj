@@ -96,6 +96,8 @@
     <PropertyGroup>
       <InterceptorsNamespaces />
       <InterceptorsPreviewNamespaces />
+      <!-- ...and the same switches passed directly as compiler features are renamed out of effect. -->
+      <Features>$(Features.Replace('InterceptorsNamespaces=', 'Disabled.InterceptorsNamespaces=').Replace('InterceptorsPreviewNamespaces=', 'Disabled.InterceptorsPreviewNamespaces='))</Features>
     </PropertyGroup>
   </Target>
 </Project>
