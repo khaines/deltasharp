@@ -102,7 +102,8 @@
     </PropertyGroup>
     <!-- The values the compiler is about to receive go into the assembly, and
          FixtureTextGuard_InterceptorsAreOffForThisAssembly fails unless they are empty. Deleting a line above, or
-         this whole target, turns that fact red instead of quietly re-enabling interceptors. -->
+         this whole target, turns that fact red instead of quietly re-enabling interceptors. A later target that
+         sets them again after this one is a project-file edit, like the rest of the guard's stated residual. -->
     <WriteLinesToFile File="$(_InterceptorsRecord)" Overwrite="true" WriteOnlyWhenDifferent="true"
                       Lines="[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.InterceptorsNamespaces&quot;, @&quot;$([MSBuild]::Escape($(InterceptorsNamespaces.Replace('&quot;', '&quot;&quot;'))))&quot;)];[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.InterceptorsPreviewNamespaces&quot;, @&quot;$([MSBuild]::Escape($(InterceptorsPreviewNamespaces.Replace('&quot;', '&quot;&quot;'))))&quot;)];[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.Features&quot;, @&quot;$([MSBuild]::Escape($(Features.Replace('&quot;', '&quot;&quot;'))))&quot;)]" />
     <ItemGroup>

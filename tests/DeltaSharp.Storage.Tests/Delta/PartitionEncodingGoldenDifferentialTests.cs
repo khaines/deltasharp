@@ -1180,8 +1180,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // has no reference to this assembly and no errors, so the loaded class must reach nothing in the assembly
     // outside itself; this reads every member token in its IL, its catch, local variable and member signature types,
     // its types' bases and interfaces, and every attribute (with its typeof arguments) on its types, members,
-    // parameters and return values. Only compiler-synthesized helpers are exempt (IsCompilerGenerated) — never a
-    // `file`-local type, because an interceptor never needs a name.
+    // parameters and return values. Compiler-synthesized helpers (IsCompilerGenerated) are not reported themselves,
+    // but each one the class calls has its own body walked; a `file`-local type is never exempt, because an
+    // interceptor never needs a name.
     [Fact]
     public void FixtureTextGuard_CallsNothingElseInTheTestAssembly()
     {
@@ -1218,6 +1219,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + "public static class Ext { public static string Shout(this string s) => s; }\n"
             + "public static class Holder { public static int X = 1; }\n"
             + "file static class Hidden { public static int Twice(int x) => x * 2; }\n"
+            + "namespace System.Runtime.InteropServices { public static class MemoryMarshal { public static System.ReadOnlySpan<T> CreateReadOnlySpan<T>(scoped ref readonly T reference, int length) => default; } }\n"
             + (reaches
                 ? "[Attr(typeof(Tagged), Named = typeof(NamedArg), Many = new[] { typeof(ArrArg), typeof(ArrArg2) }, Deeper = new object[] { new object[] { typeof(Nest2), new object[] { typeof(Nest3) } }, EnumInArr.A }, Kind = EnumArg.A)]\npublic sealed class C : B, IMark\n{\n"
                     + "    [FieldAttr] private int _f;\n"
@@ -1236,7 +1238,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     + "        var nested = new List<List<Deep>>(); double scale = 1.5;\n"
                     + "        LocalOnly? kept = null; try { s = s.Trim(); } catch (Caught) { s = string.Empty; } System.GC.KeepAlive(kept);\n"
                     + "        return s.Shout().Length + Holder.X + list.Count + Enumerable.Empty<Gen>().Count() + f(_f) + t.Name.Length + Private()\n"
-                    + "            + (Takes(null, s) ? 1 : 0) + nested.Count + (int)scale;\n    }\n}\n"
+                    + "            + (Takes(null, s) ? 1 : 0) + nested.Count + (int)scale + string.Concat(\"a\", \"b\", \"c\", \"d\", s).Length;\n    }\n}\n"
                 : "public sealed class C\n{\n    private int _f;\n"
                     + "    public int Run(string s)\n    {\n"
                     + "        var list = new List<int>(); Func<int, int> f = x => x * 2;\n"
@@ -1261,7 +1263,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 .Order(StringComparer.Ordinal)
                 .ToList();
             string[] expected = reaches
-                ? new[] { "ArrArg", "ArrArg2", "Attr", "B", "Caught", "Deep", "Elem", "EnumArg", "EnumInArr", "EventAttr", "Ext", "FieldAttr", "FieldSig", "FpArg", "FpDeep", "FpRet", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "NamedArg", "Nest2", "Nest3", "Other", "ParamAttr", "PrivOnly", "PropAttr", "RetAttr", "SigOnly", "StaticInit", "Tagged", "Tested" }
+                ? new[] { "ArrArg", "ArrArg2", "Attr", "B", "Caught", "Deep", "Elem", "EnumArg", "EnumInArr", "EventAttr", "Ext", "FieldAttr", "FieldSig", "FpArg", "FpDeep", "FpRet", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "NamedArg", "Nest2", "Nest3", "Other", "ParamAttr", "PrivOnly", "PropAttr", "RetAttr", "SigOnly", "StaticInit", "System.Runtime.InteropServices.MemoryMarshal", "Tagged", "Tested" }
                 : Array.Empty<string>();
             Assert.True(
                 walk.Clean == !reaches && reached.SequenceEqual(expected),
@@ -1334,6 +1336,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 MethodDeclarationSyntax method => method.Identifier.Text,
                 FieldDeclarationSyntax field => field.Declaration.Variables[0].Identifier.Text,
                 RecordDeclarationSyntax record => record.Identifier.Text,
+                ClassDeclarationSyntax nested => nested.Identifier.Text,
+                StructDeclarationSyntax nested => nested.Identifier.Text,
                 _ => null,
             };
             if (name is null || Array.IndexOf(TrustedCore, name) < 0)
@@ -1361,20 +1365,22 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     public void FixtureTextGuard_InterceptorsAreOffForThisAssembly()
     {
         var recorded = new Dictionary<string, string>(StringComparer.Ordinal);
+        int records = 0;
         foreach (global::System.Reflection.AssemblyMetadataAttribute attribute in
             global::System.Reflection.CustomAttributeExtensions.GetCustomAttributes<global::System.Reflection.AssemblyMetadataAttribute>(
                 typeof(PartitionEncodingGoldenDifferentialTests).Assembly))
         {
             if (attribute.Key.StartsWith("FixtureTextGuard.", StringComparison.Ordinal))
             {
+                records++;
                 recorded[attribute.Key] = attribute.Value ?? string.Empty;
             }
         }
 
         global::Xunit.Assert.True(
-            recorded.Count == 3,
-            "the csproj target NoInterceptorsForTheFixtureTextGuard did not record the compiler's interceptor settings; "
-            + $"restore it (found [{string.Join(", ", recorded.Keys.Select(Escape))}])");
+            records == 3 && recorded.Count == 3,
+            "the csproj target NoInterceptorsForTheFixtureTextGuard did not record the compiler's interceptor settings "
+            + $"exactly once each; restore it, and declare no other FixtureTextGuard.* metadata (found {records} records, [{string.Join(", ", recorded.Keys.Select(Escape))}])");
         global::Xunit.Assert.True(
             recorded["FixtureTextGuard.InterceptorsNamespaces"].Length == 0
             && recorded["FixtureTextGuard.InterceptorsPreviewNamespaces"].Length == 0,
@@ -1382,7 +1388,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + Escape(recorded["FixtureTextGuard.InterceptorsNamespaces"]) + ", InterceptorsPreviewNamespaces="
             + Escape(recorded["FixtureTextGuard.InterceptorsPreviewNamespaces"]));
         string[] active = recorded["FixtureTextGuard.Features"]
-            .Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Split(new[] { ';', ',' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
             .Where(feature => feature.StartsWith("InterceptorsNamespaces=", StringComparison.OrdinalIgnoreCase)
                 || feature.StartsWith("InterceptorsPreviewNamespaces=", StringComparison.OrdinalIgnoreCase))
             .ToArray();
@@ -1407,6 +1413,19 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("int[] a = [1]; return a.Length;")]
     [InlineData("return Escape(null).Length;")]
     [InlineData("var a = new int[1]; return a.Length;")]
+    [InlineData("int[] a = { 1, 2 }; return a[0..1].Length;")]
+    [InlineData("global::System.Collections.Generic.KeyValuePair<int, int> p = new(1, 2); return p is (1, 2) ? 1 : 0;")]
+    [InlineData("var (a, b) = new global::System.Collections.Generic.KeyValuePair<int, int>(1, 2); return a + b;")]
+    [InlineData("foreach (var (k, v) in new global::System.Collections.Generic.Dictionary<int, int>()) { return k + v; } return 0;")]
+    [InlineData("global::System.Collections.Generic.KeyValuePair<int, int> p = default; return (p with { }).Key;")]
+    [InlineData("[global::System.Obsolete] static int L() => 1; return L();")]
+    [InlineData("foreach (int x in 3) { return x; } return 0; } } public static class X { public static global::System.Collections.Generic.IEnumerator<int> GetEnumerator(this int i) { yield return i; } static void Z() {")]
+    [InlineData("return 3.Twice; } } public static class X { extension(int i) { public int Twice => i * 2; } static void Z() {")]
+    [InlineData("return P; } private static int P => 1; static void Z() {")]
+    [InlineData("return F; } private static int F = 1; static void Z() {")]
+    [InlineData("return N.T(); } private static class N { public static int T() => 1; } static void Z() {")]
+    [InlineData("object o = new N(); return o.GetHashCode(); } private sealed class N { } static void Z() {")]
+    [InlineData("global::System.Collections.Generic.List<int> a = new(); a += 1; return a.Count; } } public static class X { extension(global::System.Collections.Generic.List<int>) { public static global::System.Collections.Generic.List<int> operator +(global::System.Collections.Generic.List<int> l, int i) => l; } static void Z() {")]
     public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
     {
         GuardResult result = FindFixtureTextFindings(
@@ -1442,6 +1461,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     IFieldReferenceOperation field => field.Field,
                     IBinaryOperation { OperatorMethod: { } method } => method,
                     IUnaryOperation { OperatorMethod: { } method } => method,
+                    ICompoundAssignmentOperation { OperatorMethod: { } method } => method,
+                    IIncrementOrDecrementOperation { OperatorMethod: { } method } => method,
+                    IConversionOperation { OperatorMethod: { } method } => method,
+                    IObjectCreationOperation creation => creation.Constructor,
+                    IEventReferenceOperation @event => @event.Event,
                     _ => null,
                 };
                 string at = $"line {inner.Syntax.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
@@ -1452,12 +1476,14 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                         findings.Add($"{at}: extension member {used!.Name}");
                     }
                 }
-                else if (used is not null && owner is not null && SymbolEqualityComparer.Default.Equals(used.ContainingType, owner)
+                else if (used is not null && owner is not null
                     && used is not IMethodSymbol { MethodKind: MethodKind.LocalFunction or MethodKind.AnonymousFunction }
-                    && Array.IndexOf(TrustedCore, used.Name) < 0 && extensionCalls.Add(inner))
+                    && MemberOfClass(used, owner) is { } reached
+                    && Array.IndexOf(TrustedCore, reached) < 0 && extensionCalls.Add(inner))
                 {
-                    // The core is closed under calls: a member of this class it reaches is core too.
-                    findings.Add($"{at}: reaches {used.Name}, which is not in the trusted core");
+                    // The core is closed under calls: a member of this class it reaches — or of a type nested in it,
+                    // which is listed (and checked) by that type's name — is core too.
+                    findings.Add($"{at}: reaches {reached}, which is not in the trusted core");
                 }
             }
 
@@ -1497,6 +1523,24 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         }
 
         return findings;
+    }
+
+    // The member directly under `owner` that contains `used` (itself, or the nested type it is declared in), or null
+    // when `used` is not declared inside `owner`.
+    private static string? MemberOfClass(ISymbol used, INamedTypeSymbol owner)
+    {
+        ISymbol current = used;
+        while (current.ContainingType is { } container)
+        {
+            if (SymbolEqualityComparer.Default.Equals(container, owner))
+            {
+                return current.Name;
+            }
+
+            current = container;
+        }
+
+        return null;
     }
 
     // The shadow check is pinned on a loaded snippet: only top-level types in this namespace, an enclosing one or the
@@ -2604,7 +2648,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// helper it calls, whose body is walked too — is refused by the IL fact; and an interceptor needs interceptors
     /// re-enabled, like the project-file case. Code in the test assembly that runs unprompted (a module initializer)
     /// and rewrites this class's private state by reflection is runtime tampering, not a rebinding, and is out of
-    /// scope; the guard keeps no shared mutable state for it to rewrite.</para>
+    /// scope. That includes the rule tables the guard reads (NonPrintingAssertions, OutputWriterTypes,
+    /// TrustedCore…), which are static; each is pinned by self-tests, so rewriting one turns rows red.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
