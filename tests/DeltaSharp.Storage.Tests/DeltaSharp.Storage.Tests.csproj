@@ -96,14 +96,16 @@
     <PropertyGroup>
       <InterceptorsNamespaces />
       <InterceptorsPreviewNamespaces />
-      <!-- ...and the same switches passed directly as compiler features are renamed out of effect. -->
-      <Features>$(Features.Replace('InterceptorsNamespaces=', 'Disabled.InterceptorsNamespaces=').Replace('InterceptorsPreviewNamespaces=', 'Disabled.InterceptorsPreviewNamespaces='))</Features>
+      <!-- ...and the same switches passed directly as compiler features, with or without a value, are renamed out
+           of effect. -->
+      <Features>$(Features.Replace('InterceptorsNamespaces', 'Disabled.InterceptorsNamespaces').Replace('InterceptorsPreviewNamespaces', 'Disabled.InterceptorsPreviewNamespaces'))</Features>
       <_InterceptorsRecord>$(IntermediateOutputPath)InterceptorsAsCompiled.g.cs</_InterceptorsRecord>
     </PropertyGroup>
     <!-- The values the compiler is about to receive go into the assembly, and
          FixtureTextGuard_InterceptorsAreOffForThisAssembly fails unless they are empty. Deleting a line above, or
-         this whole target, turns that fact red instead of quietly re-enabling interceptors. A later target that
-         sets them again after this one is a project-file edit, like the rest of the guard's stated residual. -->
+         this whole target, turns that fact red instead of quietly re-enabling interceptors. Two project-file edits
+         are stated residual, like the rest of the guard's: a later target that sets them again after this one,
+         and deleting this target while some other file declares the same records. -->
     <WriteLinesToFile File="$(_InterceptorsRecord)" Overwrite="true" WriteOnlyWhenDifferent="true"
                       Lines="[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.InterceptorsNamespaces&quot;, @&quot;$([MSBuild]::Escape($(InterceptorsNamespaces.Replace('&quot;', '&quot;&quot;'))))&quot;)];[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.InterceptorsPreviewNamespaces&quot;, @&quot;$([MSBuild]::Escape($(InterceptorsPreviewNamespaces.Replace('&quot;', '&quot;&quot;'))))&quot;)];[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.Features&quot;, @&quot;$([MSBuild]::Escape($(Features.Replace('&quot;', '&quot;&quot;'))))&quot;)]" />
     <ItemGroup>

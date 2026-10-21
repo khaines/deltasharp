@@ -1389,8 +1389,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + Escape(recorded["FixtureTextGuard.InterceptorsPreviewNamespaces"]));
         string[] active = recorded["FixtureTextGuard.Features"]
             .Split(new[] { ';', ',' }, StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .Where(feature => feature.StartsWith("InterceptorsNamespaces=", StringComparison.OrdinalIgnoreCase)
-                || feature.StartsWith("InterceptorsPreviewNamespaces=", StringComparison.OrdinalIgnoreCase))
+            .Where(feature => feature.StartsWith("InterceptorsNamespaces", StringComparison.OrdinalIgnoreCase)
+                || feature.StartsWith("InterceptorsPreviewNamespaces", StringComparison.OrdinalIgnoreCase))
             .ToArray();
         global::Xunit.Assert.True(
             active.Length == 0,
@@ -1426,6 +1426,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("return N.T(); } private static class N { public static int T() => 1; } static void Z() {")]
     [InlineData("object o = new N(); return o.GetHashCode(); } private sealed class N { } static void Z() {")]
     [InlineData("global::System.Collections.Generic.List<int> a = new(); a += 1; return a.Count; } } public static class X { extension(global::System.Collections.Generic.List<int>) { public static global::System.Collections.Generic.List<int> operator +(global::System.Collections.Generic.List<int> l, int i) => l; } static void Z() {")]
+    [InlineData("return ((global::System.IComparable<int>)default(S)).CompareTo(1); } private struct S : global::System.IComparable<int> { public int CompareTo(int o) => 1; } static void Z() {")]
+    [InlineData("return ((global::System.IComparable<int>)global::System.Activator.CreateInstance<N>()).CompareTo(1); } private sealed class N : global::System.IComparable<int> { public int CompareTo(int o) => 1; } static void Z() {")]
+    [InlineData("foreach (int x in default(N)) { return x; } return 0; } private struct N { public global::System.Collections.Generic.IEnumerator<int> GetEnumerator() { yield return 1; } } static void Z() {")]
     public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
     {
         GuardResult result = FindFixtureTextFindings(
@@ -1482,7 +1485,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     && Array.IndexOf(TrustedCore, reached) < 0 && extensionCalls.Add(inner))
                 {
                     // The core is closed under calls: a member of this class it reaches — or of a type nested in it,
-                    // which is listed (and checked) by that type's name — is core too.
+                    // which is listed (and checked) by that type's name — is core too. A nested type it only names is
+                    // caught below.
                     findings.Add($"{at}: reaches {reached}, which is not in the trusted core");
                 }
             }
@@ -1502,6 +1506,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 // builder) that an extension in an enclosing namespace could supply, a well-known type (ValueTuple,
                 // Index, Range) a source declaration could replace, or an attribute type by unrooted name.
                 findings.Add($"{where}: pattern-bound member ({node.Kind()})");
+            }
+            else if (node is SimpleNameSyntax nestedName && owner is not null
+                && model.GetSymbolInfo(nestedName).Symbol is INamedTypeSymbol nestedType
+                && MemberOfClass(nestedType.OriginalDefinition, owner) is { } named
+                && Array.IndexOf(TrustedCore, named) < 0)
+            {
+                // A type nested in this class that the core only names (default(T), typeof, a cast, a type argument,
+                // a foreach or using over it) can still run its members by dispatch or by pattern, so it is core too.
+                findings.Add($"{where}: names {named}, which is not in the trusted core");
             }
             else if (node is SimpleNameSyntax name
                 && model.GetSymbolInfo(name).Symbol is INamespaceOrTypeSymbol symbol
