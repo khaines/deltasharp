@@ -1088,24 +1088,25 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // FindFixtureTextFindings. It does not see text a library composes from its own input when it fails (the
         // Parse family, file/encoding/regex APIs, System.Text.Json, Parquet.Net) or reflection, nor the own-code
         // shapes listed as its residual there; that residual is tracked in #917, and this file feeds fixture text to
-        // none of those library APIs on a failure path. Two facts check that what the guard compiled is what runs:
+        // none of those library APIs on a failure path. Three facts check that what the guard compiled is what runs:
         // FixtureTextGuard_ChecksTheClassThatRuns (no other source adds members, by name and arity; `partial` is a
-        // finding here too) and FixtureTextGuard_CallsNothingElseInTheTestAssembly (no other source rebinds a call
-        // made here to code in the test assembly).
+        // finding here too), FixtureTextGuard_CallsNothingElseInTheTestAssembly (no other source rebinds a call made
+        // here to code in the test assembly) and FixtureTextGuard_NothingShadowsANameThisFileBinds (no type elsewhere
+        // in the assembly shadows a name this file binds, so an inlined constant cannot change unseen).
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
-        Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
+        global::Xunit.Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
 
         using var reader = new StreamReader(stream!);
         GuardResult result = FindFixtureTextFindings(reader.ReadToEnd(), "DeltaSharp.Storage.Tests");
 
         // A file that does not compile here binds nothing, and every rule below would pass vacuously.
-        Assert.True(
+        global::Xunit.Assert.True(
             result.CompileErrors.Count == 0,
             $"{EmbeddedSourceName} does not compile inside the guard, so its symbols cannot be checked. It must compile on "
             + "its own, without the rest of the test assembly (copy a shared helper into the class):\n  "
             + string.Join("\n  ", result.CompileErrors.Select(Escape)));
-        Assert.True(
+        global::Xunit.Assert.True(
             result.Findings.Count == 0,
             $"{EmbeddedSourceName}: fixture text can reach the CI log unescaped. Render it with Escape(…), compare "
             + "through the AssertFixture*/AssertValue* helpers, read dictionaries with TryGetValue; the rules are on "
@@ -1114,31 +1115,35 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
         // Nor may it pass by seeing nothing: the floors catch a wholesale loss, and the per-member coverage oracle
         // inside the guard catches a single skipped member.
-        Assert.True(result.SinksChecked >= 80, $"guard checked only {result.SinksChecked} sinks");
-        Assert.True(result.EscapeCalls >= 55, $"guard saw only {result.EscapeCalls} calls to Escape");
+        global::Xunit.Assert.True(result.SinksChecked >= 80, $"guard checked only {result.SinksChecked} sinks");
+        global::Xunit.Assert.True(result.EscapeCalls >= 55, $"guard saw only {result.EscapeCalls} calls to Escape");
     }
 
+    // These facts, and FixtureTextGuard_HoldsOverThisFile, report through `global::Xunit.Assert`: a type named Assert
+    // in an enclosing namespace, or an alias, in another file could otherwise swallow the very verdict that reports it.
+    //
     // The guard's unit is the embedded FILE; the claim's unit is the CLASS that runs. They are the same only if no
     // other source contributes to the class (`partial` is a finding for that reason), the embedded copy is the one
     // compiled, and its names bind as they do in the guard's compilation. This fact checks the first two by member
     // name and arity: the members the guard compiled must be exactly the members the test host loaded. The third is
-    // FixtureTextGuard_CallsNothingElseInTheTestAssembly, for bindings into the test assembly.
+    // FixtureTextGuard_CallsNothingElseInTheTestAssembly, for bindings into the test assembly, and
+    // FixtureTextGuard_NothingShadowsANameThisFileBinds, for inlined constants.
     [Fact]
     public void FixtureTextGuard_ChecksTheClassThatRuns()
     {
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
-        Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
+        global::Xunit.Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
 
         using var reader = new StreamReader(stream!);
         GuardResult result = FindFixtureTextFindings(reader.ReadToEnd(), "DeltaSharp.Storage.Tests");
         INamedTypeSymbol? compiled = result.Compilation.GetTypeByMetadataName(typeof(PartitionEncodingGoldenDifferentialTests).FullName!);
-        Assert.True(compiled is not null, $"{EmbeddedSourceName} does not declare the class under test");
+        global::Xunit.Assert.True(compiled is not null, $"{EmbeddedSourceName} does not declare the class under test");
 
         ShapeDifference difference = CompareShapes(compiled!, typeof(PartitionEncodingGoldenDifferentialTests));
-        Assert.True(difference.Loaded.Contains($"{nameof(FixtureTextGuard_ChecksTheClassThatRuns)}/0"), "the loaded shape does not list this test");
-        Assert.True(difference.Loaded.Any(m => m.StartsWith($"{nameof(GoldenRow)}.", StringComparison.Ordinal)), "the loaded shape lists no nested type");
-        Assert.True(
+        global::Xunit.Assert.True(difference.Loaded.Contains($"{nameof(FixtureTextGuard_ChecksTheClassThatRuns)}/0"), "the loaded shape does not list this test");
+        global::Xunit.Assert.True(difference.Loaded.Any(m => m.StartsWith($"{nameof(GoldenRow)}.", StringComparison.Ordinal)), "the loaded shape lists no nested type");
+        global::Xunit.Assert.True(
             difference.Same,
             $"the class that runs is not the class the guard checked. Only loaded: "
             + $"[{string.Join(", ", difference.OnlyLoaded.Select(Escape))}]; only in {EmbeddedSourceName}: "
@@ -1180,8 +1185,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     public void FixtureTextGuard_CallsNothingElseInTheTestAssembly()
     {
         ReferenceWalk walk = ReferencesOutside(typeof(PartitionEncodingGoldenDifferentialTests));
-        Assert.True(walk.References >= 1000, $"the IL walk saw only {walk.References} member references");
-        Assert.True(
+        global::Xunit.Assert.True(walk.References >= 1000, $"the IL walk saw only {walk.References} member references");
+        global::Xunit.Assert.True(
             walk.Clean,
             "code elsewhere in the test assembly is bound into the class the guard checked. This file must stand alone: "
             + "copy a shared helper into the class rather than calling it (coverlet's IncludeTestAssembly also instruments "
@@ -1198,11 +1203,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         string source =
             "public class B { }\n"
-            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class Attr : System.Attribute { public Attr(System.Type? t) { } public System.Type? Named { get; set; } public System.Type[]? Many { get; set; } }\n"
+            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class Attr : System.Attribute { public Attr(System.Type? t) { } public System.Type? Named { get; set; } public System.Type[]? Many { get; set; } public object[]? Deeper { get; set; } public EnumArg Kind { get; set; } }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class FieldAttr : System.Attribute { }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class ParamAttr : System.Attribute { }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class RetAttr : System.Attribute { }\n"
-            + "public sealed class Tagged { }\npublic sealed class NamedArg { }\npublic sealed class ArrArg { }\npublic sealed class FpArg { }\npublic sealed class Deep { }\npublic sealed class Other { }\npublic sealed class Gen { }\npublic sealed class Elem { }\n"
+            + "public sealed class Tagged { }\npublic sealed class NamedArg { }\npublic sealed class ArrArg { }\npublic sealed class ArrArg2 { }\npublic sealed class FpDeep { }\npublic sealed class FpRet { }\npublic sealed class FpArg { }\npublic sealed class Deep { }\npublic sealed class Nest2 { }\npublic enum EnumArg { A }\npublic sealed class Other { }\npublic sealed class Gen { }\npublic sealed class Elem { }\n"
             + "public interface IMark { }\npublic sealed class Caught : System.Exception { }\npublic sealed class LocalOnly { }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class MethodAttr : System.Attribute { }\n"
             + "public static class StaticInit { public static int Y = 2; }\npublic static class PrivOnly { public static int Z = 3; }\n"
@@ -1213,12 +1218,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + "public static class Holder { public static int X = 1; }\n"
             + "file static class Hidden { public static int Twice(int x) => x * 2; }\n"
             + (reaches
-                ? "[Attr(typeof(Tagged), Named = typeof(NamedArg), Many = new[] { typeof(ArrArg) })]\npublic sealed class C : B, IMark\n{\n"
+                ? "[Attr(typeof(Tagged), Named = typeof(NamedArg), Many = new[] { typeof(ArrArg), typeof(ArrArg2) }, Deeper = new object[] { new object[] { typeof(Nest2) } }, Kind = EnumArg.A)]\npublic sealed class C : B, IMark\n{\n"
                     + "    [FieldAttr] private int _f;\n"
                     + "    private static readonly int Seed = StaticInit.Y;\n"
                     + "    internal static FieldSig? Unused;\n"
                     + "    [PropAttr] public int P => 0;\n"
-                    + "    private static unsafe void Fp(delegate*<FpArg, void> f) { }\n"
+                    + "    private static unsafe void Fp(delegate*<FpArg, List<FpDeep>, FpRet> f) { }\n"
                     + "    [EventAttr] public event Action? E;\n"
                     + "    private static int Private() => PrivOnly.Z + Seed;\n"
                     + "    private static bool Takes(SigOnly? x, object o) => o is Tested;\n"
@@ -1255,7 +1260,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 .Order(StringComparer.Ordinal)
                 .ToList();
             string[] expected = reaches
-                ? new[] { "ArrArg", "Attr", "B", "Caught", "Deep", "Elem", "EventAttr", "Ext", "FieldAttr", "FieldSig", "FpArg", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "NamedArg", "Other", "ParamAttr", "PrivOnly", "PropAttr", "RetAttr", "SigOnly", "StaticInit", "Tagged", "Tested" }
+                ? new[] { "ArrArg", "ArrArg2", "Attr", "B", "Caught", "Deep", "Elem", "EnumArg", "EventAttr", "Ext", "FieldAttr", "FieldSig", "FpArg", "FpDeep", "FpRet", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "NamedArg", "Nest2", "Other", "ParamAttr", "PrivOnly", "PropAttr", "RetAttr", "SigOnly", "StaticInit", "Tagged", "Tested" }
                 : Array.Empty<string>();
             Assert.True(
                 walk.Clean == !reaches && reached.SequenceEqual(expected),
@@ -1277,18 +1282,19 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
-        Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
+        global::Xunit.Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
 
         using var reader = new StreamReader(stream!);
         GuardResult result = FindFixtureTextFindings(reader.ReadToEnd(), "DeltaSharp.Storage.Tests");
         HashSet<string> bound = BoundTypeNames(result.Compilation);
-        Assert.True(bound.Contains(nameof(GoldenRow)) && bound.Contains("TypeKind"), "the guard bound no type names");
+        global::Xunit.Assert.True(bound.Contains("TypeKind") && bound.Contains("List`1") && bound.Contains("Convert") && !bound.Contains(nameof(GoldenRow)), "the guard bound no outside type names, or bound its own");
 
         List<string> shadows = ShadowingTypes(typeof(PartitionEncodingGoldenDifferentialTests), bound);
-        Assert.True(
+        global::Xunit.Assert.True(
             shadows.Count == 0,
             "a type elsewhere in the test assembly shadows a name this file binds, and could change what it means "
-            + $"(a constant from it would be inlined unseen): [{string.Join(", ", shadows.Select(Escape))}]");
+            + "(a constant from it would be inlined unseen). Rename it, or move it into a child namespace, which does "
+            + $"not outrank this file's usings: [{string.Join(", ", shadows.Select(Escape))}]");
     }
 
     // The shadow check is pinned on a loaded snippet: only top-level types in an enclosing or the global namespace
@@ -1298,9 +1304,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         GuardResult result = FindFixtureTextFindings(
             "namespace N.M { public sealed class C { public sealed class Nested { } } }\n"
-            + "namespace N { public static class Shadow { } }\nnamespace N.M { public static class Sibling { } }\n"
+            + "namespace N { internal static class Shadow { } }\nnamespace N.M { public static class Sibling { } }\n"
             + "namespace N.M.Deeper { public static class Below { } }\nnamespace Other { public static class Away { } }\n"
-            + "public static class Glob { }\n",
+            + "internal enum Glob { A }\n",
             "ShadowSnippet");
         Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
 
@@ -1322,7 +1328,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         }
     }
 
-    // Every type name (metadata name, so generic arity included) the compilation binds anywhere in its first tree.
+    // Every type name (metadata name, so generic arity included) the compilation binds anywhere in its first tree to
+    // a type it does NOT declare: a type declared in this file is nested here (or file-local), and a nested type
+    // outranks any namespace type, so nothing can shadow it.
     private static HashSet<string> BoundTypeNames(CSharpCompilation compilation)
     {
         SyntaxTree tree = compilation.SyntaxTrees.First();
@@ -1330,7 +1338,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         var names = new HashSet<string>(StringComparer.Ordinal);
         foreach (SimpleNameSyntax name in tree.GetRoot().DescendantNodes().OfType<SimpleNameSyntax>())
         {
-            if (model.GetSymbolInfo(name).Symbol is INamedTypeSymbol type)
+            if (model.GetSymbolInfo(name).Symbol is INamedTypeSymbol type && !type.Locations.Any(location => location.IsInSource))
             {
                 names.Add(type.MetadataName);
             }
@@ -1356,6 +1364,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             .Order(StringComparer.Ordinal)
             .ToList();
     }
+
+    // A typeof inside an array argument arrives as a collection of typed arguments, nested to any depth.
+    private static IEnumerable<object?> AttributeValues(object? value) =>
+        value is IReadOnlyCollection<System.Reflection.CustomAttributeTypedArgument> items
+            ? items.SelectMany(item => AttributeValues(item.Value))
+            : new[] { value };
 
     private sealed record ReferenceWalk(SortedSet<string> Outside, int References)
     {
@@ -1389,10 +1403,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 foreach (System.Reflection.CustomAttributeTypedArgument argument in attribute.ConstructorArguments
                     .Concat(attribute.NamedArguments.Select(named => named.TypedValue)))
                 {
-                    // A typeof inside an array argument arrives as a collection of typed arguments.
-                    foreach (object? value in argument.Value is IReadOnlyCollection<System.Reflection.CustomAttributeTypedArgument> items
-                        ? items.Select(item => item.Value)
-                        : new[] { argument.Value })
+                    Check(from, argument.ArgumentType);
+                    foreach (object? value in AttributeValues(argument.Value))
                     {
                         Check(from, value as Type);
                     }
@@ -1586,8 +1598,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     {
         new byte[] { 0x23, 0, 0, 0, 0, 0x28, 0x02, 0, 0, 0x28, 0x01, 0, 0, 0x0A, 0x2A },         // ldc.r8 (8)
         new byte[] { 0x21, 0, 0, 0, 0, 0x28, 0x02, 0, 0, 0x28, 0x01, 0, 0, 0x0A, 0x2A },         // ldc.i8 (8)
-        new byte[] { 0x22, 0x28, 0x02, 0, 0, 0x28, 0x01, 0, 0, 0x0A, 0x2A },                     // ldc.r4 (4)
-        new byte[] { 0xFE, 0x0C, 0x28, 0x00, 0x28, 0x01, 0, 0, 0x0A, 0x2A },                    // ldloc (2)
+        new byte[] { 0x22, 0, 0, 0x28, 0x02, 0x28, 0x01, 0, 0, 0x0A, 0x2A },                     // ldc.r4 (4)
+        new byte[] { 0xFE, 0x0C, 0x00, 0x28, 0x28, 0x01, 0, 0, 0x0A, 0x2A },                    // ldloc (2)
         new byte[] { 0x11, 0x28, 0x28, 0x01, 0, 0, 0x0A, 0x2A },                                 // ldloc.s (1)
         new byte[] { 0x45, 0x01, 0, 0, 0, 0x28, 0x02, 0, 0, 0x28, 0x01, 0, 0, 0x0A, 0x2A },      // switch (4 + 4n)
         new byte[] { 0x72, 0x28, 0x02, 0, 0x70, 0x28, 0x01, 0, 0, 0x0A, 0x2A },                  // ldstr (4, not a member)
@@ -1923,6 +1935,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("static class G { public static void H<T>(T v) => Xunit.Assert.True(false, $\"{v}\"); }", "G.H(row.Value);")]
     [InlineData("using System.Collections.Immutable;", "_ = names.ToImmutableDictionary(n => n);")]
     [InlineData("using System.Collections.Immutable;", "_ = names.ToImmutableSortedDictionary(n => n, n => 1);")]
+    [InlineData("static class Tg { public static int Tag<T>(IEnumerable<T> s) => 0; public static string Tag<T>(ReadOnlySpan<T> s) => \"\"; }", "Assert.True(ok, $\"{Tg.Tag(new[] { row.Value })}\");")]
     public void FixtureTextGuard_FlagsEveryKnownEvasion(string usings, string body)
     {
         GuardResult result = FindFixtureTextFindings(GuardSnippet(usings, body), "GuardSnippet");
@@ -2249,19 +2262,25 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// using, to a member OUTSIDE the test assembly (the framework or a project reference) rather than to code in
     /// it, which FixtureTextGuard_CallsNothingElseInTheTestAssembly refuses; and a constant (enum member or const
     /// field) rebound by a global using ALIAS in another file, which is inlined and leaves no runtime trace (a
-    /// shadowing TYPE is refused by FixtureTextGuard_NothingShadowsANameThisFileBinds, and the guard's own
-    /// constants are pinned by self-tests running this same compiled code). All of it is tracked in #917.</para>
+    /// shadowing TYPE is refused by FixtureTextGuard_NothingShadowsANameThisFileBinds; the compiler options are
+    /// `global::`-qualified; the rule constants — TypeKind, SpecialType, SyntaxKind, DiagnosticSeverity,
+    /// BinaryOperatorKind — are pinned by self-tests running this same compiled code; and a StringComparison alias
+    /// can only make an ordinal name match ignore case, which no rule here depends on; a same-named type in an IMPORTED
+    /// namespace needs CS0436 disabled by configuration, a configuration edit like the project-file case). All of it
+    /// is tracked in #917.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
-        var parseOptions = new CSharpParseOptions(LanguageVersion.Latest);
+        // The compiler options are written `global::`-qualified: a global using alias or a same-named type in another
+        // file cannot redefine them (an older language version binds some calls to different overloads).
+        var parseOptions = new CSharpParseOptions(global::Microsoft.CodeAnalysis.CSharp.LanguageVersion.Latest);
         SyntaxTree tree = CSharpSyntaxTree.ParseText(source, parseOptions);
         CSharpCompilation compilation = CSharpCompilation.Create(
             assemblyName,
             new[] { tree, CSharpSyntaxTree.ParseText(ImplicitUsings, parseOptions) },
             GuardReferences.Value,
             new CSharpCompilationOptions(
-                OutputKind.DynamicallyLinkedLibrary, nullableContextOptions: NullableContextOptions.Enable, allowUnsafe: true));
+                global::Microsoft.CodeAnalysis.OutputKind.DynamicallyLinkedLibrary, nullableContextOptions: global::Microsoft.CodeAnalysis.NullableContextOptions.Enable, allowUnsafe: true));
         List<string> compileErrors = compilation.GetDiagnostics()
             .Where(d => d.Severity == DiagnosticSeverity.Error)
             .Select(d => d.ToString())
