@@ -1088,10 +1088,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // FindFixtureTextFindings. It does not see text a library composes from its own input when it fails (the
         // Parse family, file/encoding/regex APIs, System.Text.Json, Parquet.Net) or reflection, nor the own-code
         // shapes listed as its residual there; that residual is tracked in #917, and this file feeds fixture text to
-        // none of those library APIs on a failure path. Two facts check that
-        // what the guard compiled is what runs: FixtureTextGuard_ChecksTheClassThatRuns (no other source adds
-        // members; `partial` is a finding here too) and FixtureTextGuard_CallsNothingElseInTheTestAssembly (no other
-        // source rebinds a call made here).
+        // none of those library APIs on a failure path. Two facts check that what the guard compiled is what runs:
+        // FixtureTextGuard_ChecksTheClassThatRuns (no other source adds members, by name and arity; `partial` is a
+        // finding here too) and FixtureTextGuard_CallsNothingElseInTheTestAssembly (no other source rebinds a call
+        // made here to code in the test assembly).
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
         Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
@@ -1102,7 +1102,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // A file that does not compile here binds nothing, and every rule below would pass vacuously.
         Assert.True(
             result.CompileErrors.Count == 0,
-            $"{EmbeddedSourceName} does not compile inside the guard, so its symbols cannot be checked:\n  "
+            $"{EmbeddedSourceName} does not compile inside the guard, so its symbols cannot be checked. It must compile on "
+            + "its own, without the rest of the test assembly (copy a shared helper into the class):\n  "
             + string.Join("\n  ", result.CompileErrors.Select(Escape)));
         Assert.True(
             result.Findings.Count == 0,
@@ -1119,9 +1120,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
     // The guard's unit is the embedded FILE; the claim's unit is the CLASS that runs. They are the same only if no
     // other source contributes to the class (`partial` is a finding for that reason), the embedded copy is the one
-    // compiled, and its names bind as they do in the guard's compilation. This fact checks the first two: the members
-    // the guard compiled must be exactly the members the test host loaded. The third is
-    // FixtureTextGuard_CallsNothingElseInTheTestAssembly.
+    // compiled, and its names bind as they do in the guard's compilation. This fact checks the first two by member
+    // name and arity: the members the guard compiled must be exactly the members the test host loaded. The third is
+    // FixtureTextGuard_CallsNothingElseInTheTestAssembly, for bindings into the test assembly.
     [Fact]
     public void FixtureTextGuard_ChecksTheClassThatRuns()
     {
@@ -1138,13 +1139,16 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(difference.Loaded.Contains($"{nameof(FixtureTextGuard_ChecksTheClassThatRuns)}/0"), "the loaded shape does not list this test");
         Assert.True(difference.Loaded.Any(m => m.StartsWith($"{nameof(GoldenRow)}.", StringComparison.Ordinal)), "the loaded shape lists no nested type");
         Assert.True(
-            difference.OnlyLoaded.Count == 0 && difference.OnlyInSource.Count == 0,
+            difference.Same,
             $"the class that runs is not the class the guard checked. Only loaded: "
             + $"[{string.Join(", ", difference.OnlyLoaded.Select(Escape))}]; only in {EmbeddedSourceName}: "
             + $"[{string.Join(", ", difference.OnlyInSource.Select(Escape))}]");
     }
 
-    private sealed record ShapeDifference(List<string> Loaded, List<string> OnlyLoaded, List<string> OnlyInSource);
+    private sealed record ShapeDifference(List<string> Loaded, List<string> OnlyLoaded, List<string> OnlyInSource)
+    {
+        public bool Same => OnlyLoaded.Count == 0 && OnlyInSource.Count == 0;
+    }
 
     // Multiset difference of the two shapes, so a duplicated entry (two members collapsing to one name) counts.
     private static ShapeDifference CompareShapes(INamedTypeSymbol source, Type loaded)
@@ -1168,13 +1172,106 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // together — so another file could rebind a call made here: an extension method or type in an enclosing
     // namespace, a global using alias, an interceptor, a base class added by another part. The guard's compilation
     // has no reference to this assembly and no errors, so the loaded class must reach nothing in the assembly
-    // outside itself; this reads every call, field, type and token in its IL, and its types' bases, interfaces and
-    // attributes. Compiler-generated helpers (`<PrivateImplementationDetails>`) cannot be named from C# and are
-    // exempt.
+    // outside itself; this reads every member token in its IL, its catch, local variable and member signature types,
+    // its types' bases and interfaces, and every attribute (with its typeof arguments) on its types, members,
+    // parameters and return values. Only names no
+    // source can produce are exempt (IsCompilerGenerated) — a `file`-local type is not, because an interceptor never
+    // needs a name.
     [Fact]
     public void FixtureTextGuard_CallsNothingElseInTheTestAssembly()
     {
-        Type self = typeof(PartitionEncodingGoldenDifferentialTests);
+        ReferenceWalk walk = ReferencesOutside(typeof(PartitionEncodingGoldenDifferentialTests));
+        Assert.True(walk.References >= 1000, $"the IL walk saw only {walk.References} member references");
+        Assert.True(
+            walk.Clean,
+            "code elsewhere in the test assembly is bound into the class the guard checked. This file must stand alone: "
+            + "copy a shared helper into the class rather than calling it (coverlet's IncludeTestAssembly also instruments "
+            + $"it — run without that option): [{string.Join(", ", walk.Outside.Select(Escape))}]");
+    }
+
+    // The walk is pinned on a compiled snippet: one class reaching another type of its own assembly by every route
+    // the walk reads, and one reaching none. Each entry of the expected set is one route; dropping it from the walk
+    // drops that entry.
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void FixtureTextGuard_CallsNothingElseSeesEveryRoute(bool reaches)
+    {
+        string source =
+            "public class B { }\n"
+            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class Attr : System.Attribute { public Attr(System.Type? t) { } }\n"
+            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class FieldAttr : System.Attribute { }\n"
+            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class ParamAttr : System.Attribute { }\n"
+            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class RetAttr : System.Attribute { }\n"
+            + "public sealed class Tagged { }\npublic sealed class Other { }\npublic sealed class Gen { }\npublic sealed class Elem { }\n"
+            + "public interface IMark { }\npublic sealed class Caught : System.Exception { }\npublic sealed class LocalOnly { }\n"
+            + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class MethodAttr : System.Attribute { }\n"
+            + "public static class StaticInit { public static int Y = 2; }\npublic static class PrivOnly { public static int Z = 3; }\n"
+            + "public sealed class SigOnly { }\npublic sealed class Tested { }\npublic sealed class FieldSig { }\n"
+            + "public static class Ext { public static string Shout(this string s) => s; }\n"
+            + "public static class Holder { public static int X = 1; }\n"
+            + "file static class Hidden { public static int Twice(int x) => x * 2; }\n"
+            + (reaches
+                ? "[Attr(typeof(Tagged))]\npublic sealed class C : B, IMark\n{\n"
+                    + "    [FieldAttr] private int _f;\n"
+                    + "    private static readonly int Seed = StaticInit.Y;\n"
+                    + "    internal static FieldSig? Unused;\n"
+                    + "    private static int Private() => PrivOnly.Z + Seed;\n"
+                    + "    private static bool Takes(SigOnly? x, object o) => o is Tested;\n"
+                    + "    [MethodAttr]\n"
+                    + "    [return: RetAttr]\n"
+                    + "    public int Run([ParamAttr] string s)\n    {\n"
+                    + "        var list = new List<Other>(); Type t = typeof(Elem[]);\n"
+                    + "        Func<int, int> f = x => Hidden.Twice(x);\n"
+                    + "        LocalOnly? kept = null; try { s = s.Trim(); } catch (Caught) { s = string.Empty; } System.GC.KeepAlive(kept);\n"
+                    + "        return s.Shout().Length + Holder.X + list.Count + Enumerable.Empty<Gen>().Count() + f(_f) + t.Name.Length + Private()\n"
+                    + "            + (Takes(null, s) ? 1 : 0);\n    }\n}\n"
+                : "public sealed class C\n{\n    private int _f;\n"
+                    + "    public int Run(string s)\n    {\n"
+                    + "        var list = new List<int>(); Func<int, int> f = x => x * 2;\n"
+                    + "        return s.Length + list.Count + f(_f);\n    }\n}\n");
+        GuardResult result = FindFixtureTextFindings(source, "RouteSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+
+        // A file-local type needs a file path to be emitted.
+        SyntaxTree snippet = result.Compilation.SyntaxTrees.First();
+        CSharpCompilation compilation = result.Compilation.ReplaceSyntaxTree(snippet, snippet.WithFilePath("Routes.cs"));
+        using var image = new MemoryStream();
+        Assert.True(compilation.Emit(image).Success, "the route snippet did not emit");
+        image.Position = 0;
+        var context = new System.Runtime.Loader.AssemblyLoadContext(nameof(FixtureTextGuard_CallsNothingElseSeesEveryRoute), isCollectible: true);
+        try
+        {
+            ReferenceWalk walk = ReferencesOutside(context.LoadFromStream(image).GetType("C", throwOnError: true)!);
+            List<string> reached = walk.Outside
+                .Select(entry => entry[(entry.IndexOf(" -> ", StringComparison.Ordinal) + 4)..])
+                .Select(target => target.Contains("__", StringComparison.Ordinal) ? target[(target.LastIndexOf("__", StringComparison.Ordinal) + 2)..] : target)
+                .Distinct()
+                .Order(StringComparer.Ordinal)
+                .ToList();
+            string[] expected = reaches
+                ? new[] { "Attr", "B", "Caught", "Elem", "Ext", "FieldAttr", "FieldSig", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "Other", "ParamAttr", "PrivOnly", "RetAttr", "SigOnly", "StaticInit", "Tagged", "Tested" }
+                : Array.Empty<string>();
+            Assert.True(
+                walk.Clean == !reaches && reached.SequenceEqual(expected),
+                $"the walk reached [{string.Join(", ", reached.Select(Escape))}]");
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    private sealed record ReferenceWalk(SortedSet<string> Outside, int References)
+    {
+        public bool Clean => Outside.Count == 0;
+    }
+
+    // Everything the loaded class (and its nested and compiler-generated types) reaches: IL tokens, catch types,
+    // local variable types, member signature types, base types, interfaces, and attributes — with their typeof
+    // arguments — on types, members, parameters and return values.
+    private static ReferenceWalk ReferencesOutside(Type self)
+    {
         var outside = new SortedSet<string>(StringComparer.Ordinal);
         int references = 0;
 
@@ -1189,6 +1286,19 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
         }
 
+        void CheckAttributes(string from, IEnumerable<System.Reflection.CustomAttributeData> attributes)
+        {
+            foreach (System.Reflection.CustomAttributeData attribute in attributes)
+            {
+                Check(from, attribute.AttributeType);
+                foreach (System.Reflection.CustomAttributeTypedArgument argument in attribute.ConstructorArguments
+                    .Concat(attribute.NamedArguments.Select(named => named.TypedValue)))
+                {
+                    Check(from, argument.Value as Type);
+                }
+            }
+        }
+
         foreach (Type type in TypeAndNested(self))
         {
             Check(type.Name, type.BaseType);
@@ -1197,19 +1307,44 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 Check(type.Name, contract);
             }
 
-            foreach (System.Reflection.CustomAttributeData attribute in type.GetCustomAttributesData())
+            CheckAttributes(type.Name, type.GetCustomAttributesData());
+            foreach (System.Reflection.MemberInfo member in type.GetFields(DeclaredMembers)
+                .Concat<System.Reflection.MemberInfo>(type.GetProperties(DeclaredMembers))
+                .Concat(type.GetEvents(DeclaredMembers)))
             {
-                Check(type.Name, attribute.AttributeType);
+                CheckAttributes($"{type.Name}.{member.Name}", member.GetCustomAttributesData());
+                Check($"{type.Name}.{member.Name}", member switch
+                {
+                    System.Reflection.FieldInfo field => field.FieldType,
+                    System.Reflection.PropertyInfo property => property.PropertyType,
+                    System.Reflection.EventInfo @event => @event.EventHandlerType,
+                    _ => null,
+                });
             }
 
             foreach (System.Reflection.MethodBase method in type.GetMethods(DeclaredMembers).Concat<System.Reflection.MethodBase>(type.GetConstructors(DeclaredMembers)))
             {
-                foreach (System.Reflection.CustomAttributeData attribute in method.GetCustomAttributesData())
+                string from = $"{type.Name}.{method.Name}";
+                CheckAttributes(from, method.GetCustomAttributesData());
+                foreach (System.Reflection.ParameterInfo parameter in method.GetParameters()
+                    .Concat(method is System.Reflection.MethodInfo { ReturnParameter: { } returned } ? new[] { returned } : Array.Empty<System.Reflection.ParameterInfo>()))
                 {
-                    Check($"{type.Name}.{method.Name}", attribute.AttributeType);
+                    CheckAttributes(from, parameter.GetCustomAttributesData());
+                    Check(from, parameter.ParameterType);
                 }
 
-                byte[]? il = method.GetMethodBody()?.GetILAsByteArray();
+                System.Reflection.MethodBody? body = method.GetMethodBody();
+                foreach (System.Reflection.ExceptionHandlingClause clause in body?.ExceptionHandlingClauses ?? Array.Empty<System.Reflection.ExceptionHandlingClause>())
+                {
+                    Check(from, clause.Flags == System.Reflection.ExceptionHandlingClauseOptions.Clause ? clause.CatchType : null);
+                }
+
+                foreach (System.Reflection.LocalVariableInfo local in body?.LocalVariables ?? Array.Empty<System.Reflection.LocalVariableInfo>())
+                {
+                    Check(from, local.LocalType);
+                }
+
+                byte[]? il = body?.GetILAsByteArray();
                 foreach (int token in il is null ? Enumerable.Empty<int>() : MemberTokens(il))
                 {
                     references++;
@@ -1220,29 +1355,25 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     switch (target)
                     {
                         case Type touched:
-                            Check($"{type.Name}.{method.Name}", touched);
+                            Check(from, touched);
                             break;
                         case System.Reflection.MethodBase called:
-                            Check($"{type.Name}.{method.Name}", called.DeclaringType);
+                            Check(from, called.DeclaringType);
                             foreach (Type argument in called.IsGenericMethod ? called.GetGenericArguments() : Type.EmptyTypes)
                             {
-                                Check($"{type.Name}.{method.Name}", argument);
+                                Check(from, argument);
                             }
 
                             break;
                         default:
-                            Check($"{type.Name}.{method.Name}", target.DeclaringType);
+                            Check(from, target.DeclaringType);
                             break;
                     }
                 }
             }
         }
 
-        Assert.True(references >= 1000, $"the IL walk saw only {references} member references");
-        Assert.True(
-            outside.Count == 0,
-            "code elsewhere in the test assembly is bound into the class the guard checked: "
-            + $"[{string.Join(", ", outside.Select(Escape))}]");
+        return new ReferenceWalk(outside, references);
     }
 
     private const System.Reflection.BindingFlags DeclaredMembers = System.Reflection.BindingFlags.DeclaredOnly
@@ -1252,7 +1383,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     private static IEnumerable<Type> TypeAndNested(Type type) =>
         new[] { type }.Concat(type.GetNestedTypes(DeclaredMembers).SelectMany(TypeAndNested));
 
-    // A type and every type it is built from: generic arguments, element types, declaring types.
+    // A type and every type it is built from: generic arguments, element types, declaring types. An array, pointer
+    // or by-ref type is declared nowhere itself (`T[]` reports the assembly of its type parameter), so only its
+    // element is.
     private static IEnumerable<Type> Expand(Type? type)
     {
         if (type is null || type.IsGenericParameter)
@@ -1260,7 +1393,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             yield break;
         }
 
-        yield return type;
+        if (!type.HasElementType)
+        {
+            yield return type;
+        }
+
         foreach (Type part in (type.HasElementType ? new[] { type.GetElementType()! } : Type.EmptyTypes)
             .Concat(type.IsGenericType ? type.GetGenericArguments() : Type.EmptyTypes)
             .Concat(type.DeclaringType is { } declaring ? new[] { declaring } : Type.EmptyTypes))
@@ -1285,11 +1422,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         return false;
     }
 
+    // Only names no source can produce: `<>`-prefixed closures, anonymous types and inline arrays, and
+    // `<PrivateImplementationDetails>`. NOT every name containing `<` — a `file`-local type is emitted as
+    // `<FileName>F…__Name`, and is exactly the shape an interceptor generator writes.
     private static bool IsCompilerGenerated(Type type)
     {
         for (Type? current = type; current is not null; current = current.DeclaringType)
         {
-            if (current.Name.Contains('<'))
+            if (current.Name.StartsWith("<>", StringComparison.Ordinal)
+                || current.Name.StartsWith("<PrivateImplementationDetails>", StringComparison.Ordinal))
             {
                 return true;
             }
@@ -1381,7 +1522,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + "    private async Task<int> Later() { await Task.Yield(); return Zero; }\n"
             + "    private int Twice() { int Double(int x) => x * 2; Func<int, int> f = x => x + Names.Length; return Double(f(1)); }\n"
             + "    public void " + (renamed ? "Fire" : "Raise") + "() => Changed?.Invoke(Nothing, EventArgs.Empty);\n"
-            + (more ? "    public void Raise(int n) { }\n    public object Clone() => this;\n" : string.Empty)
+            + (more ? "    public void Raise(int n) { }\n    public object Clone() => this;\n    public C(int n) { }\n    public C() { }\n" : string.Empty)
             + "}\n";
 
         GuardResult source = FindFixtureTextFindings(Snippet(false), "ShapeSnippet");
@@ -1399,14 +1540,47 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             Assert.True(difference.Loaded.Any(m => m.StartsWith("Engine.", StringComparison.Ordinal)), "the loaded shape lists no nested type");
             (string[] onlyLoaded, string[] onlyInSource) = variant switch
             {
-                1 => (new[] { ":System.ICloneable", "Cell.Y", "Clone/0", "Raise/1", "Row.get_Extra/0" }, Array.Empty<string>()),
+                1 => (new[] { ".ctor/1", ":System.ICloneable", "Cell.Y", "Clone/0", "Raise/1", "Row.get_Extra/0" }, Array.Empty<string>()),
                 2 => (new[] { "Fire/0" }, new[] { "Raise/0" }),
                 _ => (Array.Empty<string>(), Array.Empty<string>()),
             };
             Assert.True(
-                difference.OnlyLoaded.SequenceEqual(onlyLoaded) && difference.OnlyInSource.SequenceEqual(onlyInSource),
+                difference.Same == (variant == 0)
+                    && difference.OnlyLoaded.SequenceEqual(onlyLoaded) && difference.OnlyInSource.SequenceEqual(onlyInSource),
                 $"only loaded: [{string.Join(", ", difference.OnlyLoaded.Select(Escape))}]; "
                 + $"only in source: [{string.Join(", ", difference.OnlyInSource.Select(Escape))}]");
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // The exemption above must not cover a `file`-local type, whose emitted name also contains `<`: compiled,
+    // emitted and loaded, a file-local class is checked and a lambda's closure class is exempt.
+    [Fact]
+    public void FixtureTextGuard_ExemptsOnlyCompilerGeneratedTypes()
+    {
+        GuardResult result = FindFixtureTextFindings(
+            "file static class Hidden { public static int Twice(int x) => x * 2; }\n"
+            + "public static class C { public static Func<int, int> F(int k) => x => Hidden.Twice(x + k); }\n",
+            "ExemptionSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+
+        // A file-local type needs a file path to be emitted.
+        SyntaxTree snippet = result.Compilation.SyntaxTrees.First();
+        CSharpCompilation compilation = result.Compilation.ReplaceSyntaxTree(snippet, snippet.WithFilePath("Exemption.cs"));
+        using var image = new MemoryStream();
+        Assert.True(compilation.Emit(image).Success, "the exemption snippet did not emit");
+        image.Position = 0;
+        var context = new System.Runtime.Loader.AssemblyLoadContext(nameof(FixtureTextGuard_ExemptsOnlyCompilerGeneratedTypes), isCollectible: true);
+        try
+        {
+            Type[] types = context.LoadFromStream(image).GetTypes();
+            Type fileLocal = types.Single(t => t.Name.EndsWith("__Hidden", StringComparison.Ordinal));
+            Type closure = types.Single(t => t.DeclaringType?.Name == "C" && t.Name.StartsWith("<>", StringComparison.Ordinal));
+            Assert.True(!IsCompilerGenerated(fileLocal), $"a file-local type is exempt: {Escape(fileLocal.Name)}");
+            Assert.True(IsCompilerGenerated(closure), $"a closure class is not exempt: {Escape(closure.Name)}");
         }
         finally
         {
@@ -1904,9 +2078,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// culture-dependent number text (a mutated NumberFormat.NegativeSign makes a number print text); reaching a
     /// stream through Unsafe.As or a file handle; per-site (rather than per-member) coverage; an embedded copy that
     /// is not the compiled file yet declares the same member names and arities (a project-file edit; bodies,
-    /// signature types and attributes could differ); and a call here rebound by another file to a DIFFERENT
-    /// framework member (through a global using) rather than to code in the test assembly, which
-    /// FixtureTextGuard_CallsNothingElseInTheTestAssembly refuses. All of it is tracked in #917.</para>
+    /// signature types and attributes could differ); and a call here rebound by another file, through a global
+    /// using, to a member OUTSIDE the test assembly (the framework or a project reference) rather than to code in
+    /// it, which FixtureTextGuard_CallsNothingElseInTheTestAssembly refuses. All of it is tracked in #917.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
