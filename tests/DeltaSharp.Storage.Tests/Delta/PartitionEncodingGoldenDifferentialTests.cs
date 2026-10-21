@@ -1087,7 +1087,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // assertions, exceptions, dictionary key echoes, output writers, theory display names — listed on
         // FindFixtureTextFindings. It does not see text a library composes from its own input when it fails (the
         // Parse family, file/encoding/regex APIs, System.Text.Json, Parquet.Net) or reflection; that residual is
-        // tracked in #917, and this file feeds fixture text to none of them on a failure path.
+        // tracked in #917, and this file feeds fixture text to none of them on a failure path. That the file IS the
+        // class is checked too: `partial` is a finding, and FixtureTextGuard_ChecksTheClassThatRuns compares the
+        // members compiled here with the members the test host loaded.
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
         Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
@@ -1107,10 +1109,84 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + "FindFixtureTextFindings:\n  "
             + string.Join("\n  ", result.Findings.Select(Escape)));
 
-        // Nor may it pass by seeing nothing. MEASURED-AT cf9c401+: 88 sinks and 61 Escape calls; the floors catch a
-        // wholesale loss, and the per-member coverage oracle inside the guard catches a single skipped member.
+        // Nor may it pass by seeing nothing: the floors catch a wholesale loss, and the per-member coverage oracle
+        // inside the guard catches a single skipped member.
         Assert.True(result.SinksChecked >= 80, $"guard checked only {result.SinksChecked} sinks");
         Assert.True(result.EscapeCalls >= 55, $"guard saw only {result.EscapeCalls} calls to Escape");
+    }
+
+    // The guard's unit is the embedded FILE; the claim's unit is the CLASS that runs. They are the same only if no
+    // other source contributes to the class (`partial` is a finding for that reason) and the embedded copy is the
+    // one compiled. So the members the guard compiled must be exactly the members the test host loaded.
+    [Fact]
+    public void FixtureTextGuard_ChecksTheClassThatRuns()
+    {
+        using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
+            .GetManifestResourceStream(EmbeddedSourceName);
+        Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
+
+        using var reader = new StreamReader(stream!);
+        GuardResult result = FindFixtureTextFindings(reader.ReadToEnd(), "DeltaSharp.Storage.Tests");
+        INamedTypeSymbol? compiled = result.Compilation.GetTypeByMetadataName(typeof(PartitionEncodingGoldenDifferentialTests).FullName!);
+        Assert.True(compiled is not null, $"{EmbeddedSourceName} does not declare the class under test");
+
+        List<string> fromSource = SourceShape(compiled!, string.Empty).Where(m => !m.Contains('<')).Order(StringComparer.Ordinal).ToList();
+        List<string> loaded = LoadedShape(typeof(PartitionEncodingGoldenDifferentialTests), string.Empty)
+            .Where(m => !m.Contains('<')).Order(StringComparer.Ordinal).ToList();
+        Assert.True(loaded.Contains($"{nameof(FixtureTextGuard_ChecksTheClassThatRuns)}/0"), "the loaded shape does not list this test");
+        Assert.True(
+            fromSource.SequenceEqual(loaded),
+            $"the class that runs is not the class the guard checked. Only loaded: "
+            + $"[{string.Join(", ", loaded.Except(fromSource).Select(Escape))}]; only in {EmbeddedSourceName}: "
+            + $"[{string.Join(", ", fromSource.Except(loaded).Select(Escape))}]");
+    }
+
+    // Member shape as name/arity, so an added overload changes it; compiler-generated members are dropped by caller.
+    private static IEnumerable<string> SourceShape(INamedTypeSymbol type, string path)
+    {
+        foreach (ISymbol member in type.GetMembers())
+        {
+            switch (member)
+            {
+                case IMethodSymbol method:
+                    yield return $"{path}{method.MetadataName}/{method.Parameters.Length}";
+                    break;
+                case IFieldSymbol field:
+                    yield return path + field.MetadataName;
+                    break;
+                case INamedTypeSymbol nested:
+                    foreach (string shape in SourceShape(nested, $"{path}{nested.MetadataName}."))
+                    {
+                        yield return shape;
+                    }
+
+                    break;
+            }
+        }
+    }
+
+    private static IEnumerable<string> LoadedShape(Type type, string path)
+    {
+        const System.Reflection.BindingFlags Declared = System.Reflection.BindingFlags.DeclaredOnly
+            | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
+            | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
+        foreach (System.Reflection.MethodBase method in type.GetMethods(Declared).Concat<System.Reflection.MethodBase>(type.GetConstructors(Declared)))
+        {
+            yield return $"{path}{method.Name}/{method.GetParameters().Length}";
+        }
+
+        foreach (System.Reflection.FieldInfo field in type.GetFields(Declared))
+        {
+            yield return path + field.Name;
+        }
+
+        foreach (Type nested in type.GetNestedTypes(Declared))
+        {
+            foreach (string shape in LoadedShape(nested, $"{path}{nested.Name}."))
+            {
+                yield return shape;
+            }
+        }
     }
 
     // Every evasion review found against the earlier guards, each in a method the guard must flag. Kept beside
@@ -1207,6 +1283,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("", "Console.Title = row.Value!;")]
     [InlineData("", "_ = new StreamWriter(Stream.Null);")]
     [InlineData("", "_ = System.Collections.Immutable.ImmutableDictionary<string, int>.Empty.AddRange(names.Select(n => new KeyValuePair<string, int>(n, 1)));")]
+    [InlineData("", "Assert.True(ok, $\"{row.Value![0]}\");")]
+    [InlineData("", "System.Diagnostics.Trace.WriteLine(row.Value);")]
+    [InlineData("", "dynamic d = row.Value!; _ = new Dictionary<string, int>()[d];")]
+    [InlineData("partial class P { }", "")]
     public void FixtureTextGuard_FlagsEveryKnownEvasion(string usings, string body)
     {
         GuardResult result = FindFixtureTextFindings(GuardSnippet(usings, body), "GuardSnippet");
@@ -1364,10 +1444,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     }
 
     // MemberData resolves through base types: an inherited member — overload or property — that yields text must
-    // be refused too.
+    // be refused too. Shape 2 hides the base property behind a text-free method, so the lookup is not empty and only
+    // the property's own type can decide.
     [Theory]
     [InlineData(0)]
     [InlineData(1)]
+    [InlineData(2)]
     public void FixtureTextGuard_FlagsTextBearingTheoryDataInheritedOverload(int shape)
     {
         string inherited = shape == 0
@@ -1376,7 +1458,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         string Source =
             "using Xunit;\n" + inherited
             + "public sealed class C : B\n{\n    private static string Escape(string? s) => s ?? \"<null>\";\n"
-            + (shape == 0 ? "    public static new TheoryData<int> Rows() => new() { 1 };\n" : string.Empty)
+            + (shape != 1 ? "    public static new TheoryData<int> Rows() => new() { 1 };\n" : string.Empty)
             + "    [Theory]\n    [MemberData(nameof(Rows)" + (shape == 0 ? ", 1" : string.Empty) + ")]\n"
             + "    public void T(int value) => Assert.True(value > 0);\n}\n";
         GuardResult result = FindFixtureTextFindings(Source, "GuardSnippet");
@@ -1384,6 +1466,32 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(
             result.Findings.Any(f => f.Contains("MemberData", StringComparison.Ordinal)),
             $"an inherited text-yielding overload was not refused: [{string.Join("; ", result.Findings.Select(Escape))}]");
+    }
+
+    // ... and text-free data is accepted however it is declared — field, property, or inherited method — so the
+    // member lookup is not simply "refuse anything that is not a method on this class".
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void FixtureTextGuard_AcceptsTextFreeTheoryData(int shape)
+    {
+        string data = shape switch
+        {
+            0 => "    public static readonly TheoryData<int> Rows = new() { 1 };\n",
+            1 => "    public static TheoryData<int> Rows => new() { 1 };\n",
+            _ => string.Empty,
+        };
+        string source = "using Xunit;\n"
+            + "public class B { public static TheoryData<int> Rows() => new() { 1 }; }\n"
+            + "public sealed class C" + (shape == 2 ? " : B" : string.Empty)
+            + "\n{\n    private static string Escape(string? s) => s ?? \"<null>\";\n" + data
+            + "    [Theory]\n    [MemberData(nameof(Rows))]\n    public void T(int value) => Assert.True(value > 0);\n}\n";
+        GuardResult result = FindFixtureTextFindings(source, "GuardSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+        Assert.True(
+            result.Findings.Count == 0,
+            $"text-free theory data shape {shape} was refused: [{string.Join("; ", result.Findings.Select(Escape))}]");
     }
 
     // The per-member coverage oracle fires on its own: an assertion-shaped call the guard does not recognise as a
@@ -1420,7 +1528,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         + "        Assert.True(expected == actual, $\"{what}: {Escape(expected)} {Escape(actual)}\");\n"
         + "    public void M(GoldenRow row, string[] names, int count, bool ok)\n    {\n        " + body + "\n    }\n}\n";
 
-    private sealed record GuardResult(List<string> Findings, List<string> CompileErrors, int SinksChecked, int EscapeCalls);
+    private sealed record GuardResult(
+        List<string> Findings, List<string> CompileErrors, int SinksChecked, int EscapeCalls, CSharpCompilation Compilation);
 
     private const string ImplicitUsings =
         "global using System;\nglobal using System.Collections.Generic;\nglobal using System.IO;\nglobal using System.Linq;\n"
@@ -1468,7 +1577,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// <item>a conditional-compilation directive is a finding: code it disables here could be enabled by the
     /// real build's symbols and would ship unchecked;</item>
     /// <item>an exception type declared in this file is a finding: its Message could read a property or static
-    /// field set after construction, which no argument sink sees.</item>
+    /// field set after construction, which no argument sink sees;</item>
+    /// <item>a <c>partial</c> type is a finding: its other parts compile into the class from files the guard does
+    /// not see (FixtureTextGuard_ChecksTheClassThatRuns separately compares the compiled and loaded members).</item>
     /// </list>
     /// A sink value is safe only if it is a compile-time constant; a number, boolean or enum (no text can ride
     /// on it under an unmutated culture); a call to THE <see cref="Escape"/> method (by symbol — and no other declaration may be named
@@ -1481,8 +1592,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// own-code shapes judged contrived here: reassigning `what` by ref, out or deconstruction; duplicate keys
     /// through KeyedCollection.Add, OrderedDictionary.Insert/SetAt or a dictionary's GetAlternateLookup indexer;
     /// culture-dependent number text (a mutated NumberFormat.NegativeSign makes a number print text); reaching a
-    /// stream through Unsafe.As or a file handle; and per-site (rather than per-member) coverage. All of it is
-    /// tracked in #917.</para>
+    /// stream through Unsafe.As or a file handle; per-site (rather than per-member) coverage; and an embedded copy
+    /// that is not the compiled file yet declares the same members (a project-file edit; only bodies would differ).
+    /// All of it is tracked in #917.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
@@ -1517,6 +1629,16 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 || trivia.IsKind(SyntaxKind.UndefDirectiveTrivia))
             {
                 findings.Add($"line {trivia.GetLocation().GetLineSpan().StartLinePosition.Line + 1}: conditional compilation hides code from the guard");
+            }
+        }
+
+        // The guard compiles one file; a partial type could put code in another file that joins the same class.
+        foreach (BaseTypeDeclarationSyntax type in root.DescendantNodes().OfType<BaseTypeDeclarationSyntax>())
+        {
+            if (type.Modifiers.Any(SyntaxKind.PartialKeyword))
+            {
+                findings.Add($"line {type.GetLocation().GetLineSpan().StartLinePosition.Line + 1}: partial type "
+                    + $"{type.Identifier.Text}: its other parts are outside the guard");
             }
         }
 
@@ -1880,7 +2002,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
         }
 
-        return new GuardResult(findings, compileErrors, sinks, escapeCalls);
+        return new GuardResult(findings, compileErrors, sinks, escapeCalls, compilation);
     }
 
     // Conversions that throw on a duplicate key with the key in the message. (ToLookup groups duplicates instead.)
