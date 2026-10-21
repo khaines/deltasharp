@@ -88,4 +88,14 @@
     <EmbeddedResource Include="../../src/DeltaSharp.Storage/Backends/LocalFileSystemBackend.cs" LogicalName="LocalFileSystemBackend.cs" />
   </ItemGroup>
 
+  <!-- No interceptors in this project. PartitionEncodingGoldenDifferentialTests' fixture-text guard rests on code
+       that no other file of the assembly can rebind, and an interceptor can redirect any call site, even a
+       global::-qualified one. The SDK adds a namespace to these properties after the project file is read, so they
+       are cleared just before compiling. -->
+  <Target Name="NoInterceptorsForTheFixtureTextGuard" BeforeTargets="CoreCompile">
+    <PropertyGroup>
+      <InterceptorsNamespaces />
+      <InterceptorsPreviewNamespaces />
+    </PropertyGroup>
+  </Target>
 </Project>

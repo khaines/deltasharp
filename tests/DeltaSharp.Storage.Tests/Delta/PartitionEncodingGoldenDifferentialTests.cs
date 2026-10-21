@@ -872,7 +872,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
             Assert.True(File.Exists(filePath), $"SHA256SUMS references a missing file: {Escape(relative)}");
             Assert.True(
-                (File.GetAttributes(filePath) & FileAttributes.ReparsePoint) == 0,
+                (File.GetAttributes(filePath) & global::System.IO.FileAttributes.ReparsePoint) == 0,
                 $"SHA256SUMS references a symbolic link, which hashes its target: {Escape(relative)}");
             string actualHash = Convert.ToHexStringLower(System.Security.Cryptography.SHA256.HashData(File.ReadAllBytes(filePath)));
             Assert.True(
@@ -890,7 +890,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         {
             string relative = Path.GetRelativePath(engineDir, entry).Replace(Path.DirectorySeparatorChar, '/');
             Assert.True(
-                (File.GetAttributes(entry) & FileAttributes.ReparsePoint) == 0,
+                (File.GetAttributes(entry) & global::System.IO.FileAttributes.ReparsePoint) == 0,
                 $"{Escape(engineDirName)}: the fixture tree contains a symbolic link: {Escape(relative)}");
             if (Directory.Exists(entry) || relative == "SHA256SUMS")
             {
@@ -1119,8 +1119,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         global::Xunit.Assert.True(result.EscapeCalls >= 55, $"guard saw only {result.EscapeCalls} calls to Escape");
     }
 
-    // These facts, and FixtureTextGuard_HoldsOverThisFile, report through `global::Xunit.Assert`: a type named Assert
-    // in an enclosing namespace, or an alias, in another file could otherwise swallow the very verdict that reports it.
+    // This fact, FixtureTextGuard_CallsNothingElseInTheTestAssembly, FixtureTextGuard_NothingShadowsANameThisFileBinds
+    // and FixtureTextGuard_HoldsOverThisFile report through `global::Xunit.Assert`: a type named Assert in an enclosing
+    // namespace, or an alias, in another file could otherwise swallow the very verdict that reports it.
     //
     // The guard's unit is the embedded FILE; the claim's unit is the CLASS that runs. They are the same only if no
     // other source contributes to the class (`partial` is a finding for that reason), the embedded copy is the one
@@ -1207,7 +1208,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class FieldAttr : System.Attribute { }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class ParamAttr : System.Attribute { }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class RetAttr : System.Attribute { }\n"
-            + "public sealed class Tagged { }\npublic sealed class NamedArg { }\npublic sealed class ArrArg { }\npublic sealed class ArrArg2 { }\npublic sealed class FpDeep { }\npublic sealed class FpRet { }\npublic sealed class FpArg { }\npublic sealed class Deep { }\npublic sealed class Nest2 { }\npublic enum EnumArg { A }\npublic sealed class Other { }\npublic sealed class Gen { }\npublic sealed class Elem { }\n"
+            + "public sealed class Tagged { }\npublic sealed class NamedArg { }\npublic sealed class ArrArg { }\npublic sealed class ArrArg2 { }\npublic sealed class FpDeep { }\npublic sealed class FpRet { }\npublic sealed class FpArg { }\npublic sealed class Deep { }\npublic sealed class Nest2 { }\npublic sealed class Nest3 { }\npublic enum EnumArg { A }\npublic enum EnumInArr { A }\npublic sealed class Other { }\npublic sealed class Gen { }\npublic sealed class Elem { }\n"
             + "public interface IMark { }\npublic sealed class Caught : System.Exception { }\npublic sealed class LocalOnly { }\n"
             + "[System.AttributeUsage(System.AttributeTargets.All)] public sealed class MethodAttr : System.Attribute { }\n"
             + "public static class StaticInit { public static int Y = 2; }\npublic static class PrivOnly { public static int Z = 3; }\n"
@@ -1218,7 +1219,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + "public static class Holder { public static int X = 1; }\n"
             + "file static class Hidden { public static int Twice(int x) => x * 2; }\n"
             + (reaches
-                ? "[Attr(typeof(Tagged), Named = typeof(NamedArg), Many = new[] { typeof(ArrArg), typeof(ArrArg2) }, Deeper = new object[] { new object[] { typeof(Nest2) } }, Kind = EnumArg.A)]\npublic sealed class C : B, IMark\n{\n"
+                ? "[Attr(typeof(Tagged), Named = typeof(NamedArg), Many = new[] { typeof(ArrArg), typeof(ArrArg2) }, Deeper = new object[] { new object[] { typeof(Nest2), new object[] { typeof(Nest3) } }, EnumInArr.A }, Kind = EnumArg.A)]\npublic sealed class C : B, IMark\n{\n"
                     + "    [FieldAttr] private int _f;\n"
                     + "    private static readonly int Seed = StaticInit.Y;\n"
                     + "    internal static FieldSig? Unused;\n"
@@ -1260,7 +1261,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 .Order(StringComparer.Ordinal)
                 .ToList();
             string[] expected = reaches
-                ? new[] { "ArrArg", "ArrArg2", "Attr", "B", "Caught", "Deep", "Elem", "EnumArg", "EventAttr", "Ext", "FieldAttr", "FieldSig", "FpArg", "FpDeep", "FpRet", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "NamedArg", "Nest2", "Other", "ParamAttr", "PrivOnly", "PropAttr", "RetAttr", "SigOnly", "StaticInit", "Tagged", "Tested" }
+                ? new[] { "ArrArg", "ArrArg2", "Attr", "B", "Caught", "Deep", "Elem", "EnumArg", "EnumInArr", "EventAttr", "Ext", "FieldAttr", "FieldSig", "FpArg", "FpDeep", "FpRet", "Gen", "Hidden", "Holder", "IMark", "LocalOnly", "MethodAttr", "NamedArg", "Nest2", "Nest3", "Other", "ParamAttr", "PrivOnly", "PropAttr", "RetAttr", "SigOnly", "StaticInit", "Tagged", "Tested" }
                 : Array.Empty<string>();
             Assert.True(
                 walk.Clean == !reaches && reached.SequenceEqual(expected),
@@ -1297,8 +1298,120 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + $"not outrank this file's usings: [{string.Join(", ", shadows.Select(Escape))}]");
     }
 
-    // The shadow check is pinned on a loaded snippet: only top-level types in an enclosing or the global namespace
-    // count, the class itself does not, and a type elsewhere does not.
+    // The checks above run in the same compilation as any file that might try to subvert them, so the code they
+    // rest on — the IL walk and the shadow enumeration — must not bind through anything such a file could redefine:
+    // no extension method (an extension in an enclosing namespace outranks `using System.Linq`), no interpolated
+    // string (its handler type is looked up by name), and no type or namespace name except `global::`-rooted ones
+    // (an alias or an enclosing type would win). Interceptors, which can redirect even a `global::` call, are
+    // switched off for this project in its csproj. This fact keeps that core as written.
+    private static readonly string[] TrustedCore =
+    {
+        nameof(ShadowingTypes), nameof(AttributeValues), nameof(ReferenceWalk), nameof(ReferencesOutside),
+        nameof(DeclaredMembers), nameof(TypeAndNested), nameof(Expand), nameof(IsWithin), nameof(FileLocalTypeName),
+        nameof(IsCompilerGenerated), nameof(OpCodeTable), nameof(MemberTokens),
+    };
+
+    [Fact]
+    public void FixtureTextGuard_TrustedCoreBindsNothingRebindable()
+    {
+        using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
+            .GetManifestResourceStream(EmbeddedSourceName);
+        global::Xunit.Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
+
+        using var reader = new StreamReader(stream!);
+        GuardResult result = FindFixtureTextFindings(reader.ReadToEnd(), "DeltaSharp.Storage.Tests");
+        var findings = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        int typeNames = 0;
+        SyntaxTree tree = result.Compilation.SyntaxTrees.First();
+        SemanticModel model = result.Compilation.GetSemanticModel(tree);
+        foreach (MemberDeclarationSyntax member in tree.GetRoot().DescendantNodes().OfType<MemberDeclarationSyntax>())
+        {
+            string? name = member switch
+            {
+                MethodDeclarationSyntax method => method.Identifier.Text,
+                FieldDeclarationSyntax field => field.Declaration.Variables[0].Identifier.Text,
+                RecordDeclarationSyntax record => record.Identifier.Text,
+                _ => null,
+            };
+            if (name is null || Array.IndexOf(TrustedCore, name) < 0)
+            {
+                continue;
+            }
+
+            seen.Add(name);
+            findings.AddRange(TrustedCoreFindings(model, member, ref typeNames));
+        }
+
+        global::Xunit.Assert.True(
+            seen.SetEquals(TrustedCore) && typeNames >= 100,
+            $"the trusted-core check saw [{string.Join(", ", seen.Order(StringComparer.Ordinal).Select(Escape))}] and {typeNames} type names");
+        global::Xunit.Assert.True(
+            findings.Count == 0,
+            "the trusted core binds through something another file could redefine; use `global::`-qualified framework "
+            + $"types, plain loops and string concatenation there: [{string.Join(", ", findings.Select(Escape))}]");
+    }
+
+    // ... and it does find each kind of rebindable binding.
+    [Theory]
+    [InlineData("int[] a = { 1 }; return a.Length + a.Count();")]
+    [InlineData("return $\"{1}\".Length;")]
+    [InlineData("List<int> a = new(); return a.Count;")]
+    [InlineData("System.Collections.Generic.List<int> a = new(); return a.Count;")]
+    [InlineData("return (int)StringComparison.Ordinal;")]
+    public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
+    {
+        GuardResult result = FindFixtureTextFindings(
+            "public static class C\n{\n    private static string Escape(string? s) => s ?? \"<null>\";\n"
+            + "    public static int M()\n    {\n        " + body + "\n    }\n}\n",
+            "TrustedSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+        SyntaxTree tree = result.Compilation.SyntaxTrees.First();
+        MethodDeclarationSyntax method = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.Text == "M");
+        int typeNames = 0;
+        List<string> findings = TrustedCoreFindings(result.Compilation.GetSemanticModel(tree), method, ref typeNames);
+        Assert.True(findings.Count > 0, $"the trusted-core check accepted {Escape(body)}");
+    }
+
+    private static List<string> TrustedCoreFindings(SemanticModel model, SyntaxNode member, ref int typeNames)
+    {
+        var findings = new List<string>();
+        foreach (SyntaxNode node in member.DescendantNodesAndSelf())
+        {
+            string where = $"line {node.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
+            if (node is InterpolatedStringExpressionSyntax)
+            {
+                findings.Add($"{where}: interpolated string");
+            }
+            else if (model.GetOperation(node) is IInvocationOperation { TargetMethod.IsExtensionMethod: true } call && call.Syntax == node)
+            {
+                findings.Add($"{where}: extension method {call.TargetMethod.Name}");
+            }
+            else if (node is SimpleNameSyntax name && !name.IsVar
+                && model.GetSymbolInfo(name).Symbol is INamespaceOrTypeSymbol symbol
+                && !(symbol is INamedTypeSymbol own && own.Locations.Any(location => location.IsInSource)))
+            {
+                typeNames++;
+                bool rooted = name.Parent switch
+                {
+                    AliasQualifiedNameSyntax alias => alias.Name == name || alias.Alias.Identifier.IsKind(SyntaxKind.GlobalKeyword),
+                    QualifiedNameSyntax qualified => qualified.Right == name,
+                    MemberAccessExpressionSyntax access => access.Name == name,
+                    _ => false,
+                };
+                if (!rooted && !name.Identifier.IsKind(SyntaxKind.GlobalKeyword))
+                {
+                    findings.Add($"{where}: unrooted type or namespace name {name.Identifier.Text}");
+                }
+            }
+        }
+
+        return findings;
+    }
+
+    // The shadow check is pinned on a loaded snippet: only top-level types in this namespace, an enclosing one or the
+    // global namespace count — named ones, and any that declares extension methods — the class itself does not, and a
+    // type elsewhere does not.
     [Fact]
     public void FixtureTextGuard_ShadowCheckSeesEnclosingNamespacesOnly()
     {
@@ -1306,7 +1419,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             "namespace N.M { public sealed class C { public sealed class Nested { } } }\n"
             + "namespace N { internal static class Shadow { } }\nnamespace N.M { public static class Sibling { } }\n"
             + "namespace N.M.Deeper { public static class Below { } }\nnamespace Other { public static class Away { } }\n"
-            + "internal enum Glob { A }\n",
+            + "internal enum Glob { A }\n"
+            + "namespace N { internal static class Helpers { public static int Twice(this int x) => x * 2; } }\n"
+            + "namespace Other { public static class FarExt { public static int Thrice(this int x) => x * 3; } }\n",
             "ShadowSnippet");
         Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
 
@@ -1319,7 +1434,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             Type self = context.LoadFromStream(image).GetType("N.M.C", throwOnError: true)!;
             List<string> shadows = ShadowingTypes(self, new HashSet<string>(StringComparer.Ordinal) { "C", "Nested", "Shadow", "Sibling", "Below", "Away", "Glob" });
             Assert.True(
-                shadows.SequenceEqual(new[] { "Glob", "N.M.Sibling", "N.Shadow" }),
+                shadows.SequenceEqual(new[] { "Glob", "N.Helpers", "N.M.Sibling", "N.Shadow" }),
                 $"the shadow check reported [{string.Join(", ", shadows.Select(Escape))}]");
         }
         finally
@@ -1347,197 +1462,291 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         return names;
     }
 
-    // Top-level types of self's assembly, other than self, named in `names` and declared in self's namespace, an
-    // enclosing one, or the global namespace — the places that outrank a using directive.
-    private static List<string> ShadowingTypes(Type self, HashSet<string> names)
+    // Top-level types of self's assembly, other than self, declared in self's namespace, an enclosing one, or the
+    // global namespace — the places that outrank a using directive — that are named in `names` or declare extension
+    // methods (an extension there outranks `using System.Linq`, whatever its name). TRUSTED CORE: see
+    // FixtureTextGuard_TrustedCoreBindsNothingRebindable.
+    private static global::System.Collections.Generic.List<string> ShadowingTypes(
+        global::System.Type self, global::System.Collections.Generic.HashSet<string> names)
     {
-        var enclosing = new HashSet<string>(StringComparer.Ordinal) { string.Empty };
-        string[] parts = (self.Namespace ?? string.Empty).Split('.', StringSplitOptions.RemoveEmptyEntries);
-        for (int i = 1; i <= parts.Length; i++)
+        var enclosing = new global::System.Collections.Generic.HashSet<string>(global::System.StringComparer.Ordinal);
+        enclosing.Add(string.Empty);
+        string prefix = string.Empty;
+        foreach (string part in (self.Namespace ?? string.Empty).Split('.'))
         {
-            enclosing.Add(string.Join('.', parts.Take(i)));
+            if (part.Length > 0)
+            {
+                prefix = prefix.Length == 0 ? part : prefix + "." + part;
+                enclosing.Add(prefix);
+            }
         }
 
-        return self.Assembly.GetTypes()
-            .Where(t => t.DeclaringType is null && t != self && enclosing.Contains(t.Namespace ?? string.Empty) && names.Contains(t.Name))
-            .Select(t => t.Namespace is null ? t.Name : $"{t.Namespace}.{t.Name}")
-            .Order(StringComparer.Ordinal)
-            .ToList();
+        var found = new global::System.Collections.Generic.List<string>();
+        foreach (global::System.Type type in self.Assembly.GetTypes())
+        {
+            if (type.DeclaringType is null && type != self && enclosing.Contains(type.Namespace ?? string.Empty)
+                && (names.Contains(type.Name)
+                    || type.IsDefined(typeof(global::System.Runtime.CompilerServices.ExtensionAttribute), false)))
+            {
+                found.Add(type.Namespace is null ? type.Name : type.Namespace + "." + type.Name);
+            }
+        }
+
+        found.Sort(global::System.StringComparer.Ordinal);
+        return found;
     }
 
-    // A typeof inside an array argument arrives as a collection of typed arguments, nested to any depth.
-    private static IEnumerable<object?> AttributeValues(object? value) =>
-        value is IReadOnlyCollection<System.Reflection.CustomAttributeTypedArgument> items
-            ? items.SelectMany(item => AttributeValues(item.Value))
-            : new[] { value };
+    // A typeof (or enum) inside an array argument arrives as a collection of typed arguments, nested to any depth;
+    // each element's own argument type is reported with its value. TRUSTED CORE.
+    private static void AttributeValues(
+        global::System.Reflection.CustomAttributeTypedArgument argument,
+        global::System.Collections.Generic.List<global::System.Type?> into)
+    {
+        into.Add(argument.ArgumentType);
+        if (argument.Value is global::System.Collections.Generic.IReadOnlyCollection<global::System.Reflection.CustomAttributeTypedArgument> items)
+        {
+            foreach (global::System.Reflection.CustomAttributeTypedArgument item in items)
+            {
+                AttributeValues(item, into);
+            }
+        }
+        else
+        {
+            into.Add(argument.Value as global::System.Type);
+        }
+    }
 
-    private sealed record ReferenceWalk(SortedSet<string> Outside, int References)
+    // TRUSTED CORE.
+    private sealed record ReferenceWalk(global::System.Collections.Generic.SortedSet<string> Outside, int References)
     {
         public bool Clean => Outside.Count == 0;
     }
 
     // Everything the loaded class (and its nested and compiler-generated types) reaches: IL tokens, catch types,
     // local variable types, member signature types, base types, interfaces, and attributes — with their typeof
-    // arguments — on types, members, parameters and return values.
-    private static ReferenceWalk ReferencesOutside(Type self)
+    // arguments — on types, members, parameters and return values. TRUSTED CORE: written with `global::`-qualified
+    // framework types, plain loops and no extension methods or interpolation, so nothing another file declares can
+    // rebind the walk that is meant to catch such a rebinding (FixtureTextGuard_TrustedCoreBindsNothingRebindable).
+    private static ReferenceWalk ReferencesOutside(global::System.Type self)
     {
-        var outside = new SortedSet<string>(StringComparer.Ordinal);
+        var outside = new global::System.Collections.Generic.SortedSet<string>(global::System.StringComparer.Ordinal);
         int references = 0;
 
-        void Check(string from, Type? touched)
+        void Check(string from, global::System.Type? touched)
         {
-            foreach (Type type in Expand(touched))
+            foreach (global::System.Type type in Expand(touched))
             {
                 if (type.Assembly == self.Assembly && !IsWithin(type, self) && !IsCompilerGenerated(type))
                 {
-                    outside.Add($"{from} -> {type.FullName}");
+                    outside.Add(from + " -> " + type.FullName);
                 }
             }
         }
 
-        void CheckAttributes(string from, IEnumerable<System.Reflection.CustomAttributeData> attributes)
+        void CheckAttributes(string from, global::System.Collections.Generic.IList<global::System.Reflection.CustomAttributeData> attributes)
         {
-            foreach (System.Reflection.CustomAttributeData attribute in attributes)
+            foreach (global::System.Reflection.CustomAttributeData attribute in attributes)
             {
                 Check(from, attribute.AttributeType);
-                foreach (System.Reflection.CustomAttributeTypedArgument argument in attribute.ConstructorArguments
-                    .Concat(attribute.NamedArguments.Select(named => named.TypedValue)))
+                var values = new global::System.Collections.Generic.List<global::System.Type?>();
+                foreach (global::System.Reflection.CustomAttributeTypedArgument argument in attribute.ConstructorArguments)
                 {
-                    Check(from, argument.ArgumentType);
-                    foreach (object? value in AttributeValues(argument.Value))
-                    {
-                        Check(from, value as Type);
-                    }
+                    AttributeValues(argument, values);
+                }
+
+                foreach (global::System.Reflection.CustomAttributeNamedArgument named in attribute.NamedArguments)
+                {
+                    AttributeValues(named.TypedValue, values);
+                }
+
+                foreach (global::System.Type? value in values)
+                {
+                    Check(from, value);
                 }
             }
         }
 
-        foreach (Type type in TypeAndNested(self))
+        void CheckParameter(string from, global::System.Reflection.ParameterInfo parameter)
+        {
+            CheckAttributes(from, parameter.GetCustomAttributesData());
+            Check(from, parameter.ParameterType);
+        }
+
+        void CheckMethod(global::System.Type type, global::System.Reflection.MethodBase method)
+        {
+            string from = type.Name + "." + method.Name;
+            CheckAttributes(from, method.GetCustomAttributesData());
+            foreach (global::System.Reflection.ParameterInfo parameter in method.GetParameters())
+            {
+                CheckParameter(from, parameter);
+            }
+
+            if (method is global::System.Reflection.MethodInfo info)
+            {
+                CheckParameter(from, info.ReturnParameter);
+            }
+
+            global::System.Reflection.MethodBody? body = method.GetMethodBody();
+            if (body is null)
+            {
+                return;
+            }
+
+            foreach (global::System.Reflection.ExceptionHandlingClause clause in body.ExceptionHandlingClauses)
+            {
+                Check(from, clause.Flags == global::System.Reflection.ExceptionHandlingClauseOptions.Clause ? clause.CatchType : null);
+            }
+
+            foreach (global::System.Reflection.LocalVariableInfo local in body.LocalVariables)
+            {
+                Check(from, local.LocalType);
+            }
+
+            byte[]? il = body.GetILAsByteArray();
+            if (il is null)
+            {
+                return;
+            }
+
+            foreach (int token in MemberTokens(il))
+            {
+                references++;
+                global::System.Reflection.MemberInfo target = method.Module.ResolveMember(
+                    token,
+                    type.IsGenericType ? type.GetGenericArguments() : null,
+                    method.IsGenericMethod ? method.GetGenericArguments() : null)!;
+                if (target is global::System.Type touched)
+                {
+                    Check(from, touched);
+                }
+                else if (target is global::System.Reflection.MethodBase called)
+                {
+                    Check(from, called.DeclaringType);
+                    if (called.IsGenericMethod)
+                    {
+                        foreach (global::System.Type argument in called.GetGenericArguments())
+                        {
+                            Check(from, argument);
+                        }
+                    }
+                }
+                else
+                {
+                    Check(from, target.DeclaringType);
+                }
+            }
+        }
+
+        foreach (global::System.Type type in TypeAndNested(self))
         {
             Check(type.Name, type.BaseType);
-            foreach (Type contract in type.GetInterfaces())
+            foreach (global::System.Type contract in type.GetInterfaces())
             {
                 Check(type.Name, contract);
             }
 
             CheckAttributes(type.Name, type.GetCustomAttributesData());
-            foreach (System.Reflection.MemberInfo member in type.GetFields(DeclaredMembers)
-                .Concat<System.Reflection.MemberInfo>(type.GetProperties(DeclaredMembers))
-                .Concat(type.GetEvents(DeclaredMembers)))
+            foreach (global::System.Reflection.FieldInfo field in type.GetFields(DeclaredMembers))
             {
-                CheckAttributes($"{type.Name}.{member.Name}", member.GetCustomAttributesData());
-                Check($"{type.Name}.{member.Name}", member switch
-                {
-                    System.Reflection.FieldInfo field => field.FieldType,
-                    System.Reflection.PropertyInfo property => property.PropertyType,
-                    System.Reflection.EventInfo @event => @event.EventHandlerType,
-                    _ => null,
-                });
+                CheckAttributes(type.Name + "." + field.Name, field.GetCustomAttributesData());
+                Check(type.Name + "." + field.Name, field.FieldType);
             }
 
-            foreach (System.Reflection.MethodBase method in type.GetMethods(DeclaredMembers).Concat<System.Reflection.MethodBase>(type.GetConstructors(DeclaredMembers)))
+            foreach (global::System.Reflection.PropertyInfo property in type.GetProperties(DeclaredMembers))
             {
-                string from = $"{type.Name}.{method.Name}";
-                CheckAttributes(from, method.GetCustomAttributesData());
-                foreach (System.Reflection.ParameterInfo parameter in method.GetParameters()
-                    .Concat(method is System.Reflection.MethodInfo { ReturnParameter: { } returned } ? new[] { returned } : Array.Empty<System.Reflection.ParameterInfo>()))
-                {
-                    CheckAttributes(from, parameter.GetCustomAttributesData());
-                    Check(from, parameter.ParameterType);
-                }
+                CheckAttributes(type.Name + "." + property.Name, property.GetCustomAttributesData());
+                Check(type.Name + "." + property.Name, property.PropertyType);
+            }
 
-                System.Reflection.MethodBody? body = method.GetMethodBody();
-                foreach (System.Reflection.ExceptionHandlingClause clause in body?.ExceptionHandlingClauses ?? Array.Empty<System.Reflection.ExceptionHandlingClause>())
-                {
-                    Check(from, clause.Flags == System.Reflection.ExceptionHandlingClauseOptions.Clause ? clause.CatchType : null);
-                }
+            foreach (global::System.Reflection.EventInfo @event in type.GetEvents(DeclaredMembers))
+            {
+                CheckAttributes(type.Name + "." + @event.Name, @event.GetCustomAttributesData());
+                Check(type.Name + "." + @event.Name, @event.EventHandlerType);
+            }
 
-                foreach (System.Reflection.LocalVariableInfo local in body?.LocalVariables ?? Array.Empty<System.Reflection.LocalVariableInfo>())
-                {
-                    Check(from, local.LocalType);
-                }
+            foreach (global::System.Reflection.MethodInfo method in type.GetMethods(DeclaredMembers))
+            {
+                CheckMethod(type, method);
+            }
 
-                byte[]? il = body?.GetILAsByteArray();
-                foreach (int token in il is null ? Enumerable.Empty<int>() : MemberTokens(il))
-                {
-                    references++;
-                    System.Reflection.MemberInfo target = method.Module.ResolveMember(
-                        token,
-                        type.IsGenericType ? type.GetGenericArguments() : null,
-                        method.IsGenericMethod ? method.GetGenericArguments() : null)!;
-                    switch (target)
-                    {
-                        case Type touched:
-                            Check(from, touched);
-                            break;
-                        case System.Reflection.MethodBase called:
-                            Check(from, called.DeclaringType);
-                            foreach (Type argument in called.IsGenericMethod ? called.GetGenericArguments() : Type.EmptyTypes)
-                            {
-                                Check(from, argument);
-                            }
-
-                            break;
-                        default:
-                            Check(from, target.DeclaringType);
-                            break;
-                    }
-                }
+            foreach (global::System.Reflection.ConstructorInfo constructor in type.GetConstructors(DeclaredMembers))
+            {
+                CheckMethod(type, constructor);
             }
         }
 
         return new ReferenceWalk(outside, references);
     }
 
-    private const System.Reflection.BindingFlags DeclaredMembers = System.Reflection.BindingFlags.DeclaredOnly
-        | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
-        | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
+    // TRUSTED CORE.
+    private const global::System.Reflection.BindingFlags DeclaredMembers = global::System.Reflection.BindingFlags.DeclaredOnly
+        | global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.NonPublic
+        | global::System.Reflection.BindingFlags.Instance | global::System.Reflection.BindingFlags.Static;
 
-    private static IEnumerable<Type> TypeAndNested(Type type) =>
-        new[] { type }.Concat(type.GetNestedTypes(DeclaredMembers).SelectMany(TypeAndNested));
+    // TRUSTED CORE.
+    private static global::System.Collections.Generic.IEnumerable<global::System.Type> TypeAndNested(global::System.Type type)
+    {
+        yield return type;
+        foreach (global::System.Type nested in type.GetNestedTypes(DeclaredMembers))
+        {
+            foreach (global::System.Type inner in TypeAndNested(nested))
+            {
+                yield return inner;
+            }
+        }
+    }
 
     // A type and every type it is built from: generic arguments, element types, declaring types, function-pointer
     // signatures. An array, pointer, by-ref or function-pointer type is declared nowhere itself (`T[]` reports the
-    // assembly of its type parameter), so only its parts are.
-    private static IEnumerable<Type> Expand(Type? type)
+    // assembly of its type parameter), so only its parts are. TRUSTED CORE.
+    private static global::System.Collections.Generic.IEnumerable<global::System.Type> Expand(global::System.Type? type)
     {
         if (type is null || type.IsGenericParameter)
         {
             yield break;
         }
 
+        var parts = new global::System.Collections.Generic.List<global::System.Type>();
         if (type.IsFunctionPointer)
         {
-            foreach (Type part in type.GetFunctionPointerParameterTypes().Append(type.GetFunctionPointerReturnType()))
+            parts.AddRange(type.GetFunctionPointerParameterTypes());
+            parts.Add(type.GetFunctionPointerReturnType());
+        }
+        else
+        {
+            if (!type.HasElementType)
             {
-                foreach (Type expanded in Expand(part))
-                {
-                    yield return expanded;
-                }
+                yield return type;
+            }
+            else
+            {
+                parts.Add(type.GetElementType()!);
             }
 
-            yield break;
+            if (type.IsGenericType)
+            {
+                parts.AddRange(type.GetGenericArguments());
+            }
+
+            if (type.DeclaringType is { } declaring)
+            {
+                parts.Add(declaring);
+            }
         }
 
-        if (!type.HasElementType)
+        foreach (global::System.Type part in parts)
         {
-            yield return type;
-        }
-
-        foreach (Type part in (type.HasElementType ? new[] { type.GetElementType()! } : Type.EmptyTypes)
-            .Concat(type.IsGenericType ? type.GetGenericArguments() : Type.EmptyTypes)
-            .Concat(type.DeclaringType is { } declaring ? new[] { declaring } : Type.EmptyTypes))
-        {
-            foreach (Type expanded in Expand(part))
+            foreach (global::System.Type expanded in Expand(part))
             {
                 yield return expanded;
             }
         }
     }
 
-    private static bool IsWithin(Type type, Type container)
+    // TRUSTED CORE.
+    private static bool IsWithin(global::System.Type type, global::System.Type container)
     {
-        for (Type? current = type; current is not null; current = current.DeclaringType)
+        for (global::System.Type? current = type; current is not null; current = current.DeclaringType)
         {
             if (current == container)
             {
@@ -1551,13 +1760,13 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // Only compiler-synthesized helpers: `<>`-prefixed closures, anonymous types and inline arrays, and
     // `<PrivateImplementationDetails>`. Never a `file`-local type or anything nested in one, whatever its file is
     // named: it is emitted as `<FileName>F{sha256}__Name` (`<>F…` for a file named `.cs`), and is exactly the shape an
-    // interceptor generator writes.
-    private static readonly System.Text.RegularExpressions.Regex FileLocalTypeName =
-        new("^<[^>]*>F[0-9A-F]{64}__", System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+    // interceptor generator writes. TRUSTED CORE.
+    private static readonly global::System.Text.RegularExpressions.Regex FileLocalTypeName =
+        new("^<[^>]*>F[0-9A-F]{64}__", global::System.Text.RegularExpressions.RegexOptions.CultureInvariant);
 
-    private static bool IsCompilerGenerated(Type type)
+    private static bool IsCompilerGenerated(global::System.Type type)
     {
-        for (Type? current = type; current is not null; current = current.DeclaringType)
+        for (global::System.Type? current = type; current is not null; current = current.DeclaringType)
         {
             if (FileLocalTypeName.IsMatch(current.Name))
             {
@@ -1565,10 +1774,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
         }
 
-        for (Type? current = type; current is not null; current = current.DeclaringType)
+        for (global::System.Type? current = type; current is not null; current = current.DeclaringType)
         {
-            if (current.Name.StartsWith("<>", StringComparison.Ordinal)
-                || current.Name.StartsWith("<PrivateImplementationDetails>", StringComparison.Ordinal))
+            if (current.Name.StartsWith("<>", global::System.StringComparison.Ordinal)
+                || current.Name.StartsWith("<PrivateImplementationDetails>", global::System.StringComparison.Ordinal))
             {
                 return true;
             }
@@ -1577,14 +1786,15 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         return false;
     }
 
-    private static readonly Lazy<(System.Reflection.Emit.OpCode[] OneByte, System.Reflection.Emit.OpCode[] TwoByte)> OpCodeTable = new(() =>
+    // TRUSTED CORE.
+    private static readonly global::System.Lazy<(global::System.Reflection.Emit.OpCode[] OneByte, global::System.Reflection.Emit.OpCode[] TwoByte)> OpCodeTable = new(() =>
     {
-        var oneByte = new System.Reflection.Emit.OpCode[256];
-        var twoByte = new System.Reflection.Emit.OpCode[256];
-        foreach (System.Reflection.FieldInfo field in typeof(System.Reflection.Emit.OpCodes).GetFields(
-            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+        var oneByte = new global::System.Reflection.Emit.OpCode[256];
+        var twoByte = new global::System.Reflection.Emit.OpCode[256];
+        foreach (global::System.Reflection.FieldInfo field in typeof(global::System.Reflection.Emit.OpCodes).GetFields(
+            global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.Static))
         {
-            var opCode = (System.Reflection.Emit.OpCode)field.GetValue(null)!;
+            var opCode = (global::System.Reflection.Emit.OpCode)field.GetValue(null)!;
             ushort value = unchecked((ushort)opCode.Value);
             (opCode.Size == 1 ? oneByte : twoByte)[value & 0xFF] = opCode;
         }
@@ -1624,39 +1834,39 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(tokens.SequenceEqual(new[] { 0x0A000001 }), $"body {index} decoded to [{string.Join(", ", tokens.Select(t => t.ToString("X8", System.Globalization.CultureInfo.InvariantCulture)).Select(Escape))}]");
     }
 
-    // The metadata tokens an IL body references (call, newobj, ldfld, ldtoken, castclass, …).
-    private static IEnumerable<int> MemberTokens(byte[] il)
+    // The metadata tokens an IL body references (call, newobj, ldfld, ldtoken, castclass, …). TRUSTED CORE.
+    private static global::System.Collections.Generic.IEnumerable<int> MemberTokens(byte[] il)
     {
         for (int i = 0; i < il.Length;)
         {
-            System.Reflection.Emit.OpCode opCode = il[i] == 0xFE ? OpCodeTable.Value.TwoByte[il[i + 1]] : OpCodeTable.Value.OneByte[il[i]];
+            global::System.Reflection.Emit.OpCode opCode = il[i] == 0xFE ? OpCodeTable.Value.TwoByte[il[i + 1]] : OpCodeTable.Value.OneByte[il[i]];
             if (opCode.Size == 0)
             {
-                throw new InvalidOperationException($"unknown IL opcode at offset {i}");
+                throw new global::System.InvalidOperationException("unknown IL opcode at offset " + i);
             }
 
             i += opCode.Size;
             switch (opCode.OperandType)
             {
-                case System.Reflection.Emit.OperandType.InlineMethod or System.Reflection.Emit.OperandType.InlineField
-                    or System.Reflection.Emit.OperandType.InlineType or System.Reflection.Emit.OperandType.InlineTok:
-                    yield return BitConverter.ToInt32(il, i);
+                case global::System.Reflection.Emit.OperandType.InlineMethod or global::System.Reflection.Emit.OperandType.InlineField
+                    or global::System.Reflection.Emit.OperandType.InlineType or global::System.Reflection.Emit.OperandType.InlineTok:
+                    yield return global::System.BitConverter.ToInt32(il, i);
                     i += 4;
                     break;
-                case System.Reflection.Emit.OperandType.InlineNone:
+                case global::System.Reflection.Emit.OperandType.InlineNone:
                     break;
-                case System.Reflection.Emit.OperandType.ShortInlineBrTarget or System.Reflection.Emit.OperandType.ShortInlineI
-                    or System.Reflection.Emit.OperandType.ShortInlineVar:
+                case global::System.Reflection.Emit.OperandType.ShortInlineBrTarget or global::System.Reflection.Emit.OperandType.ShortInlineI
+                    or global::System.Reflection.Emit.OperandType.ShortInlineVar:
                     i += 1;
                     break;
-                case System.Reflection.Emit.OperandType.InlineVar:
+                case global::System.Reflection.Emit.OperandType.InlineVar:
                     i += 2;
                     break;
-                case System.Reflection.Emit.OperandType.InlineI8 or System.Reflection.Emit.OperandType.InlineR:
+                case global::System.Reflection.Emit.OperandType.InlineI8 or global::System.Reflection.Emit.OperandType.InlineR:
                     i += 8;
                     break;
-                case System.Reflection.Emit.OperandType.InlineSwitch:
-                    i += 4 + (4 * BitConverter.ToInt32(il, i));
+                case global::System.Reflection.Emit.OperandType.InlineSwitch:
+                    i += 4 + (4 * global::System.BitConverter.ToInt32(il, i));
                     break;
                 default:
                     i += 4;
@@ -2258,16 +2468,21 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// culture-dependent number text (a mutated NumberFormat.NegativeSign makes a number print text); reaching a
     /// stream through Unsafe.As or a file handle; per-site (rather than per-member) coverage; an embedded copy that
     /// is not the compiled file yet declares the same member names and arities (a project-file edit; bodies,
-    /// signature types and attributes could differ); and a call here rebound by another file, through a global
-    /// using, to a member OUTSIDE the test assembly (the framework or a project reference) rather than to code in
-    /// it, which FixtureTextGuard_CallsNothingElseInTheTestAssembly refuses; and a constant (enum member or const
-    /// field) rebound by a global using ALIAS in another file, which is inlined and leaves no runtime trace (a
-    /// shadowing TYPE is refused by FixtureTextGuard_NothingShadowsANameThisFileBinds; the compiler options are
-    /// `global::`-qualified; the rule constants — TypeKind, SpecialType, SyntaxKind, DiagnosticSeverity,
-    /// BinaryOperatorKind — are pinned by self-tests running this same compiled code; and a StringComparison alias
-    /// can only make an ordinal name match ignore case, which no rule here depends on; a same-named type in an IMPORTED
-    /// namespace needs CS0436 disabled by configuration, a configuration edit like the project-file case). All of it
-    /// is tracked in #917.</para>
+    /// signature types and attributes could differ); a call here rebound by another file, through a global using,
+    /// to a member OUTSIDE the test assembly (the framework or a project reference); and a constant (enum member or
+    /// const field) rebound by a global using ALIAS in another file, which is inlined and leaves no runtime trace.
+    /// All of it is tracked in #917.</para>
+    /// <para>What bounds that residual: rebinding to code INSIDE the test assembly is refused by
+    /// FixtureTextGuard_CallsNothingElseInTheTestAssembly, and a shadowing type or extension class by
+    /// FixtureTextGuard_NothingShadowsANameThisFileBinds; both rest on a trusted core that binds nothing another file
+    /// can redefine (FixtureTextGuard_TrustedCoreBindsNothingRebindable), interceptors are switched off for this
+    /// project, and the guard's facts report through `global::Xunit.Assert`. The compiler options are
+    /// `global::`-qualified, and the load-bearing rule constants (TypeKind, SpecialType, the `#if` and `partial`
+    /// SyntaxKinds, DiagnosticSeverity, BinaryOperatorKind) are pinned by self-tests running this same compiled code;
+    /// `#elif`/`#else` cannot appear without `#if`, and `#define`/`#undef` act the same in the guard and the build. A StringComparison alias can
+    /// only loosen a name match (case or culture), which widens what is checked rather than exempting anything. A
+    /// same-named type in an IMPORTED namespace, or an interceptor, needs a configuration edit (CS0436 disabled, or
+    /// interceptors re-enabled), like the project-file case.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
