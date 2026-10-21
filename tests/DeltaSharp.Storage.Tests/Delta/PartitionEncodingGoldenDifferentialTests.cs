@@ -1354,6 +1354,43 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + $"types, plain loops and string concatenation there: [{string.Join(", ", findings.Select(Escape))}]");
     }
 
+    // The csproj's NoInterceptorsForTheFixtureTextGuard target records in this assembly the interceptor settings the
+    // compiler was handed. An interceptor can redirect even a `global::` call in the trusted core, so none may be set:
+    // a deleted line in that target, or the target itself, fails here rather than quietly switching them back on.
+    [Fact]
+    public void FixtureTextGuard_InterceptorsAreOffForThisAssembly()
+    {
+        var recorded = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (global::System.Reflection.AssemblyMetadataAttribute attribute in
+            global::System.Reflection.CustomAttributeExtensions.GetCustomAttributes<global::System.Reflection.AssemblyMetadataAttribute>(
+                typeof(PartitionEncodingGoldenDifferentialTests).Assembly))
+        {
+            if (attribute.Key.StartsWith("FixtureTextGuard.", StringComparison.Ordinal))
+            {
+                recorded[attribute.Key] = attribute.Value ?? string.Empty;
+            }
+        }
+
+        global::Xunit.Assert.True(
+            recorded.Count == 3,
+            "the csproj target NoInterceptorsForTheFixtureTextGuard did not record the compiler's interceptor settings; "
+            + $"restore it (found [{string.Join(", ", recorded.Keys.Select(Escape))}])");
+        global::Xunit.Assert.True(
+            recorded["FixtureTextGuard.InterceptorsNamespaces"].Length == 0
+            && recorded["FixtureTextGuard.InterceptorsPreviewNamespaces"].Length == 0,
+            "interceptors are enabled for this assembly: InterceptorsNamespaces="
+            + Escape(recorded["FixtureTextGuard.InterceptorsNamespaces"]) + ", InterceptorsPreviewNamespaces="
+            + Escape(recorded["FixtureTextGuard.InterceptorsPreviewNamespaces"]));
+        string[] active = recorded["FixtureTextGuard.Features"]
+            .Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            .Where(feature => feature.StartsWith("InterceptorsNamespaces=", StringComparison.OrdinalIgnoreCase)
+                || feature.StartsWith("InterceptorsPreviewNamespaces=", StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+        global::Xunit.Assert.True(
+            active.Length == 0,
+            $"interceptors are enabled through compiler features: [{string.Join(", ", active.Select(Escape))}]");
+    }
+
     // ... and it does find each kind of rebindable binding.
     [Theory]
     [InlineData("int[] a = { 1 }; return a.Length + a.Count();")]

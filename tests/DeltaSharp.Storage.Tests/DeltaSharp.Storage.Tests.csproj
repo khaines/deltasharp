@@ -98,6 +98,16 @@
       <InterceptorsPreviewNamespaces />
       <!-- ...and the same switches passed directly as compiler features are renamed out of effect. -->
       <Features>$(Features.Replace('InterceptorsNamespaces=', 'Disabled.InterceptorsNamespaces=').Replace('InterceptorsPreviewNamespaces=', 'Disabled.InterceptorsPreviewNamespaces='))</Features>
+      <_InterceptorsRecord>$(IntermediateOutputPath)InterceptorsAsCompiled.g.cs</_InterceptorsRecord>
     </PropertyGroup>
+    <!-- The values the compiler is about to receive go into the assembly, and
+         FixtureTextGuard_InterceptorsAreOffForThisAssembly fails unless they are empty. Deleting a line above, or
+         this whole target, turns that fact red instead of quietly re-enabling interceptors. -->
+    <WriteLinesToFile File="$(_InterceptorsRecord)" Overwrite="true" WriteOnlyWhenDifferent="true"
+                      Lines="[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.InterceptorsNamespaces&quot;, @&quot;$([MSBuild]::Escape($(InterceptorsNamespaces.Replace('&quot;', '&quot;&quot;'))))&quot;)];[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.InterceptorsPreviewNamespaces&quot;, @&quot;$([MSBuild]::Escape($(InterceptorsPreviewNamespaces.Replace('&quot;', '&quot;&quot;'))))&quot;)];[assembly: global::System.Reflection.AssemblyMetadata(&quot;FixtureTextGuard.Features&quot;, @&quot;$([MSBuild]::Escape($(Features.Replace('&quot;', '&quot;&quot;'))))&quot;)]" />
+    <ItemGroup>
+      <Compile Include="$(_InterceptorsRecord)" />
+      <FileWrites Include="$(_InterceptorsRecord)" />
+    </ItemGroup>
   </Target>
 </Project>
