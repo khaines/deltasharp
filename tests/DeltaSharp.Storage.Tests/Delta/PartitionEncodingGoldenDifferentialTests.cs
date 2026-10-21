@@ -1086,10 +1086,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         // SCOPE, stated rather than implied: the guard checks the channels this file's OWN code can use —
         // assertions, exceptions, dictionary key echoes, output writers, theory display names — listed on
         // FindFixtureTextFindings. It does not see text a library composes from its own input when it fails (the
-        // Parse family, file/encoding/regex APIs, System.Text.Json, Parquet.Net) or reflection; that residual is
-        // tracked in #917, and this file feeds fixture text to none of them on a failure path. That the file IS the
-        // class is checked too: `partial` is a finding, and FixtureTextGuard_ChecksTheClassThatRuns compares the
-        // members compiled here with the members the test host loaded.
+        // Parse family, file/encoding/regex APIs, System.Text.Json, Parquet.Net) or reflection, nor the own-code
+        // shapes listed as its residual there; that residual is tracked in #917, and this file feeds fixture text to
+        // none of those library APIs on a failure path. Two facts check that
+        // what the guard compiled is what runs: FixtureTextGuard_ChecksTheClassThatRuns (no other source adds
+        // members; `partial` is a finding here too) and FixtureTextGuard_CallsNothingElseInTheTestAssembly (no other
+        // source rebinds a call made here).
         using Stream? stream = typeof(PartitionEncodingGoldenDifferentialTests).Assembly
             .GetManifestResourceStream(EmbeddedSourceName);
         Assert.True(stream is not null, $"embedded source {EmbeddedSourceName} is missing");
@@ -1116,8 +1118,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     }
 
     // The guard's unit is the embedded FILE; the claim's unit is the CLASS that runs. They are the same only if no
-    // other source contributes to the class (`partial` is a finding for that reason) and the embedded copy is the
-    // one compiled. So the members the guard compiled must be exactly the members the test host loaded.
+    // other source contributes to the class (`partial` is a finding for that reason), the embedded copy is the one
+    // compiled, and its names bind as they do in the guard's compilation. This fact checks the first two: the members
+    // the guard compiled must be exactly the members the test host loaded. The third is
+    // FixtureTextGuard_CallsNothingElseInTheTestAssembly.
     [Fact]
     public void FixtureTextGuard_ChecksTheClassThatRuns()
     {
@@ -1130,20 +1134,303 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         INamedTypeSymbol? compiled = result.Compilation.GetTypeByMetadataName(typeof(PartitionEncodingGoldenDifferentialTests).FullName!);
         Assert.True(compiled is not null, $"{EmbeddedSourceName} does not declare the class under test");
 
-        List<string> fromSource = SourceShape(compiled!, string.Empty).Where(m => !m.Contains('<')).Order(StringComparer.Ordinal).ToList();
-        List<string> loaded = LoadedShape(typeof(PartitionEncodingGoldenDifferentialTests), string.Empty)
-            .Where(m => !m.Contains('<')).Order(StringComparer.Ordinal).ToList();
-        Assert.True(loaded.Contains($"{nameof(FixtureTextGuard_ChecksTheClassThatRuns)}/0"), "the loaded shape does not list this test");
+        ShapeDifference difference = CompareShapes(compiled!, typeof(PartitionEncodingGoldenDifferentialTests));
+        Assert.True(difference.Loaded.Contains($"{nameof(FixtureTextGuard_ChecksTheClassThatRuns)}/0"), "the loaded shape does not list this test");
+        Assert.True(difference.Loaded.Any(m => m.StartsWith($"{nameof(GoldenRow)}.", StringComparison.Ordinal)), "the loaded shape lists no nested type");
         Assert.True(
-            fromSource.SequenceEqual(loaded),
+            difference.OnlyLoaded.Count == 0 && difference.OnlyInSource.Count == 0,
             $"the class that runs is not the class the guard checked. Only loaded: "
-            + $"[{string.Join(", ", loaded.Except(fromSource).Select(Escape))}]; only in {EmbeddedSourceName}: "
-            + $"[{string.Join(", ", fromSource.Except(loaded).Select(Escape))}]");
+            + $"[{string.Join(", ", difference.OnlyLoaded.Select(Escape))}]; only in {EmbeddedSourceName}: "
+            + $"[{string.Join(", ", difference.OnlyInSource.Select(Escape))}]");
     }
+
+    private sealed record ShapeDifference(List<string> Loaded, List<string> OnlyLoaded, List<string> OnlyInSource);
+
+    // Multiset difference of the two shapes, so a duplicated entry (two members collapsing to one name) counts.
+    private static ShapeDifference CompareShapes(INamedTypeSymbol source, Type loaded)
+    {
+        List<string> fromSource = Comparable(SourceShape(source, string.Empty));
+        List<string> fromLoaded = Comparable(LoadedShape(loaded, string.Empty));
+        List<string> onlyLoaded = fromLoaded.ToList();
+        List<string> onlyInSource = new();
+        foreach (string member in fromSource)
+        {
+            if (!onlyLoaded.Remove(member))
+            {
+                onlyInSource.Add(member);
+            }
+        }
+
+        return new ShapeDifference(fromLoaded, onlyLoaded, onlyInSource);
+    }
+
+    // The guard compiles this file WITHOUT the rest of the test assembly, while the real build compiles them
+    // together — so another file could rebind a call made here: an extension method or type in an enclosing
+    // namespace, a global using alias, an interceptor, a base class added by another part. The guard's compilation
+    // has no reference to this assembly and no errors, so the loaded class must reach nothing in the assembly
+    // outside itself; this reads every call, field, type and token in its IL, and its types' bases, interfaces and
+    // attributes. Compiler-generated helpers (`<PrivateImplementationDetails>`) cannot be named from C# and are
+    // exempt.
+    [Fact]
+    public void FixtureTextGuard_CallsNothingElseInTheTestAssembly()
+    {
+        Type self = typeof(PartitionEncodingGoldenDifferentialTests);
+        var outside = new SortedSet<string>(StringComparer.Ordinal);
+        int references = 0;
+
+        void Check(string from, Type? touched)
+        {
+            foreach (Type type in Expand(touched))
+            {
+                if (type.Assembly == self.Assembly && !IsWithin(type, self) && !IsCompilerGenerated(type))
+                {
+                    outside.Add($"{from} -> {type.FullName}");
+                }
+            }
+        }
+
+        foreach (Type type in TypeAndNested(self))
+        {
+            Check(type.Name, type.BaseType);
+            foreach (Type contract in type.GetInterfaces())
+            {
+                Check(type.Name, contract);
+            }
+
+            foreach (System.Reflection.CustomAttributeData attribute in type.GetCustomAttributesData())
+            {
+                Check(type.Name, attribute.AttributeType);
+            }
+
+            foreach (System.Reflection.MethodBase method in type.GetMethods(DeclaredMembers).Concat<System.Reflection.MethodBase>(type.GetConstructors(DeclaredMembers)))
+            {
+                foreach (System.Reflection.CustomAttributeData attribute in method.GetCustomAttributesData())
+                {
+                    Check($"{type.Name}.{method.Name}", attribute.AttributeType);
+                }
+
+                byte[]? il = method.GetMethodBody()?.GetILAsByteArray();
+                foreach (int token in il is null ? Enumerable.Empty<int>() : MemberTokens(il))
+                {
+                    references++;
+                    System.Reflection.MemberInfo target = method.Module.ResolveMember(
+                        token,
+                        type.IsGenericType ? type.GetGenericArguments() : null,
+                        method.IsGenericMethod ? method.GetGenericArguments() : null)!;
+                    switch (target)
+                    {
+                        case Type touched:
+                            Check($"{type.Name}.{method.Name}", touched);
+                            break;
+                        case System.Reflection.MethodBase called:
+                            Check($"{type.Name}.{method.Name}", called.DeclaringType);
+                            foreach (Type argument in called.IsGenericMethod ? called.GetGenericArguments() : Type.EmptyTypes)
+                            {
+                                Check($"{type.Name}.{method.Name}", argument);
+                            }
+
+                            break;
+                        default:
+                            Check($"{type.Name}.{method.Name}", target.DeclaringType);
+                            break;
+                    }
+                }
+            }
+        }
+
+        Assert.True(references >= 1000, $"the IL walk saw only {references} member references");
+        Assert.True(
+            outside.Count == 0,
+            "code elsewhere in the test assembly is bound into the class the guard checked: "
+            + $"[{string.Join(", ", outside.Select(Escape))}]");
+    }
+
+    private const System.Reflection.BindingFlags DeclaredMembers = System.Reflection.BindingFlags.DeclaredOnly
+        | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
+        | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
+
+    private static IEnumerable<Type> TypeAndNested(Type type) =>
+        new[] { type }.Concat(type.GetNestedTypes(DeclaredMembers).SelectMany(TypeAndNested));
+
+    // A type and every type it is built from: generic arguments, element types, declaring types.
+    private static IEnumerable<Type> Expand(Type? type)
+    {
+        if (type is null || type.IsGenericParameter)
+        {
+            yield break;
+        }
+
+        yield return type;
+        foreach (Type part in (type.HasElementType ? new[] { type.GetElementType()! } : Type.EmptyTypes)
+            .Concat(type.IsGenericType ? type.GetGenericArguments() : Type.EmptyTypes)
+            .Concat(type.DeclaringType is { } declaring ? new[] { declaring } : Type.EmptyTypes))
+        {
+            foreach (Type expanded in Expand(part))
+            {
+                yield return expanded;
+            }
+        }
+    }
+
+    private static bool IsWithin(Type type, Type container)
+    {
+        for (Type? current = type; current is not null; current = current.DeclaringType)
+        {
+            if (current == container)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsCompilerGenerated(Type type)
+    {
+        for (Type? current = type; current is not null; current = current.DeclaringType)
+        {
+            if (current.Name.Contains('<'))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static readonly Lazy<(System.Reflection.Emit.OpCode[] OneByte, System.Reflection.Emit.OpCode[] TwoByte)> OpCodeTable = new(() =>
+    {
+        var oneByte = new System.Reflection.Emit.OpCode[256];
+        var twoByte = new System.Reflection.Emit.OpCode[256];
+        foreach (System.Reflection.FieldInfo field in typeof(System.Reflection.Emit.OpCodes).GetFields(
+            System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Static))
+        {
+            var opCode = (System.Reflection.Emit.OpCode)field.GetValue(null)!;
+            ushort value = unchecked((ushort)opCode.Value);
+            (opCode.Size == 1 ? oneByte : twoByte)[value & 0xFF] = opCode;
+        }
+
+        return (oneByte, twoByte);
+    });
+
+    // The metadata tokens an IL body references (call, newobj, ldfld, ldtoken, castclass, …).
+    private static IEnumerable<int> MemberTokens(byte[] il)
+    {
+        for (int i = 0; i < il.Length;)
+        {
+            System.Reflection.Emit.OpCode opCode = il[i] == 0xFE ? OpCodeTable.Value.TwoByte[il[i + 1]] : OpCodeTable.Value.OneByte[il[i]];
+            if (opCode.Size == 0)
+            {
+                throw new InvalidOperationException($"unknown IL opcode at offset {i}");
+            }
+
+            i += opCode.Size;
+            switch (opCode.OperandType)
+            {
+                case System.Reflection.Emit.OperandType.InlineMethod or System.Reflection.Emit.OperandType.InlineField
+                    or System.Reflection.Emit.OperandType.InlineType or System.Reflection.Emit.OperandType.InlineTok:
+                    yield return BitConverter.ToInt32(il, i);
+                    i += 4;
+                    break;
+                case System.Reflection.Emit.OperandType.InlineNone:
+                    break;
+                case System.Reflection.Emit.OperandType.ShortInlineBrTarget or System.Reflection.Emit.OperandType.ShortInlineI
+                    or System.Reflection.Emit.OperandType.ShortInlineVar:
+                    i += 1;
+                    break;
+                case System.Reflection.Emit.OperandType.InlineVar:
+                    i += 2;
+                    break;
+                case System.Reflection.Emit.OperandType.InlineI8 or System.Reflection.Emit.OperandType.InlineR:
+                    i += 8;
+                    break;
+                case System.Reflection.Emit.OperandType.InlineSwitch:
+                    i += 4 + (4 * BitConverter.ToInt32(il, i));
+                    break;
+                default:
+                    i += 4;
+                    break;
+            }
+        }
+    }
+
+    // The two shapes agree for the member kinds this file could gain in an ordinary edit, so a failure above means a
+    // real difference, not a Roslyn/reflection mismatch; and the comparison reports exactly what another part could
+    // add — an overload, a nested member, a field, an interface — or rename at the same member count. Compiled from
+    // source, emitted, loaded, compared. Variant 0 loads the same source, 1 adds members, 2 renames one.
+    [Theory]
+    [InlineData(0)]
+    [InlineData(1)]
+    [InlineData(2)]
+    public void FixtureTextGuard_ShapeComparisonAcceptsOrdinaryMembers(int variant)
+    {
+        static string Snippet(bool more, bool renamed = false) =>
+            "public sealed class C" + (more ? " : System.ICloneable" : string.Empty) + "\n{\n"
+            + "    private enum Engine { Spark, DeltaRs }\n"
+            + "    private readonly record struct Pair(int A);\n"
+            + "    private sealed record Row(string? Value)" + (more ? " { public int Extra => 1; }" : ";") + "\n"
+            + "    private struct Cell { public int X;" + (more ? " public int Y;" : string.Empty) + " }\n"
+            + "    private sealed class Box<T> { public T? Item; }\n"
+            + "    public event EventHandler? Changed;\n"
+            + "    private static readonly object? Nothing = null;\n"
+            + "    private static readonly int Zero = 0;\n"
+            + "    private static readonly string[] Names = { \"a\" };\n"
+            + "    private const int Limit = 3;\n"
+            + "    public int Size { get; init; }\n"
+            + "    private IEnumerable<int> Count() { yield return Limit; }\n"
+            + "    private async Task<int> Later() { await Task.Yield(); return Zero; }\n"
+            + "    private int Twice() { int Double(int x) => x * 2; Func<int, int> f = x => x + Names.Length; return Double(f(1)); }\n"
+            + "    public void " + (renamed ? "Fire" : "Raise") + "() => Changed?.Invoke(Nothing, EventArgs.Empty);\n"
+            + (more ? "    public void Raise(int n) { }\n    public object Clone() => this;\n" : string.Empty)
+            + "}\n";
+
+        GuardResult source = FindFixtureTextFindings(Snippet(false), "ShapeSnippet");
+        GuardResult emitted = variant == 0 ? source : FindFixtureTextFindings(Snippet(variant == 1, variant == 2), "ShapeSnippet");
+        Assert.True(source.CompileErrors.Count == 0 && emitted.CompileErrors.Count == 0, string.Join("; ", emitted.CompileErrors.Select(Escape)));
+
+        using var image = new MemoryStream();
+        Assert.True(emitted.Compilation.Emit(image).Success, "the shape snippet did not emit");
+        image.Position = 0;
+        var context = new System.Runtime.Loader.AssemblyLoadContext(nameof(FixtureTextGuard_ShapeComparisonAcceptsOrdinaryMembers), isCollectible: true);
+        try
+        {
+            ShapeDifference difference = CompareShapes(
+                source.Compilation.GetTypeByMetadataName("C")!, context.LoadFromStream(image).GetType("C", throwOnError: true)!);
+            Assert.True(difference.Loaded.Any(m => m.StartsWith("Engine.", StringComparison.Ordinal)), "the loaded shape lists no nested type");
+            (string[] onlyLoaded, string[] onlyInSource) = variant switch
+            {
+                1 => (new[] { ":System.ICloneable", "Cell.Y", "Clone/0", "Raise/1", "Row.get_Extra/0" }, Array.Empty<string>()),
+                2 => (new[] { "Fire/0" }, new[] { "Raise/0" }),
+                _ => (Array.Empty<string>(), Array.Empty<string>()),
+            };
+            Assert.True(
+                difference.OnlyLoaded.SequenceEqual(onlyLoaded) && difference.OnlyInSource.SequenceEqual(onlyInSource),
+                $"only loaded: [{string.Join(", ", difference.OnlyLoaded.Select(Escape))}]; "
+                + $"only in source: [{string.Join(", ", difference.OnlyInSource.Select(Escape))}]");
+        }
+        finally
+        {
+            context.Unload();
+        }
+    }
+
+    // Compiler-generated names are dropped, and so are parameterless and static constructors: the compiler emits
+    // or elides them by rules reflection and Roslyn do not share (an implicit struct constructor is never emitted,
+    // an empty static one is dropped). The `partial` rule, not this shape, keeps a constructor from another file.
+    private static List<string> Comparable(IEnumerable<string> shape) => shape
+        .Where(m => !m.Contains('<') && !m.EndsWith("..ctor/0", StringComparison.Ordinal) && !m.EndsWith("..cctor/0", StringComparison.Ordinal)
+            && m != ".ctor/0" && m != ".cctor/0")
+        .Order(StringComparer.Ordinal)
+        .ToList();
 
     // Member shape as name/arity, so an added overload changes it; compiler-generated members are dropped by caller.
     private static IEnumerable<string> SourceShape(INamedTypeSymbol type, string path)
     {
+        foreach (INamedTypeSymbol contract in type.AllInterfaces.Concat(type.BaseType is { } baseType ? new[] { baseType } : Array.Empty<INamedTypeSymbol>()))
+        {
+            yield return $"{path}:{(contract.ContainingNamespace.IsGlobalNamespace ? string.Empty : contract.ContainingNamespace + ".")}{contract.MetadataName}";
+        }
+
         foreach (ISymbol member in type.GetMembers())
         {
             switch (member)
@@ -1167,20 +1454,24 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
     private static IEnumerable<string> LoadedShape(Type type, string path)
     {
-        const System.Reflection.BindingFlags Declared = System.Reflection.BindingFlags.DeclaredOnly
-            | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic
-            | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Static;
-        foreach (System.Reflection.MethodBase method in type.GetMethods(Declared).Concat<System.Reflection.MethodBase>(type.GetConstructors(Declared)))
+        foreach (Type contract in type.GetInterfaces().Concat(type.BaseType is { } baseType ? new[] { baseType } : Type.EmptyTypes))
+        {
+            yield return $"{path}:{(string.IsNullOrEmpty(contract.Namespace) ? string.Empty : contract.Namespace + ".")}{contract.Name}";
+        }
+
+        foreach (System.Reflection.MethodBase method in type.GetMethods(DeclaredMembers).Concat<System.Reflection.MethodBase>(type.GetConstructors(DeclaredMembers)))
         {
             yield return $"{path}{method.Name}/{method.GetParameters().Length}";
         }
 
-        foreach (System.Reflection.FieldInfo field in type.GetFields(Declared))
+        // An enum's `value__` and a field-like event's backing field have no symbol on the source side.
+        foreach (System.Reflection.FieldInfo field in type.GetFields(DeclaredMembers)
+            .Where(f => !f.IsSpecialName && type.GetEvent(f.Name, DeclaredMembers) is null))
         {
             yield return path + field.Name;
         }
 
-        foreach (Type nested in type.GetNestedTypes(Declared))
+        foreach (Type nested in type.GetNestedTypes(DeclaredMembers))
         {
             foreach (string shape in LoadedShape(nested, $"{path}{nested.Name}."))
             {
@@ -1287,6 +1578,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("", "System.Diagnostics.Trace.WriteLine(row.Value);")]
     [InlineData("", "dynamic d = row.Value!; _ = new Dictionary<string, int>()[d];")]
     [InlineData("partial class P { }", "")]
+    [InlineData("", "Assert.True(ok, $\"{(char)count}\");")]
+    [InlineData("", "ArgumentOutOfRangeException.ThrowIfEqual(count, 1, $\"{row.Value}\");")]
+    [InlineData("", "Assert.True(ok, $\"{(char?)row.Value![0]}\");")]
+    [InlineData("static class G { public static void H<T>(T v) => Xunit.Assert.True(false, $\"{v}\"); }", "G.H(row.Value);")]
+    [InlineData("using System.Collections.Immutable;", "_ = names.ToImmutableDictionary(n => n);")]
+    [InlineData("using System.Collections.Immutable;", "_ = names.ToImmutableSortedDictionary(n => n, n => 1);")]
     public void FixtureTextGuard_FlagsEveryKnownEvasion(string usings, string body)
     {
         GuardResult result = FindFixtureTextFindings(GuardSnippet(usings, body), "GuardSnippet");
@@ -1297,6 +1594,16 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(
             result.Findings.Any(f => !f.Contains("the guard checked no sink", StringComparison.Ordinal)),
             $"the guard accepted {Escape(usings)} {Escape(body)}: [{string.Join("; ", result.Findings.Select(Escape))}]");
+    }
+
+    // The non-printing allow-list is exactly the members whose overloads take no value to print beside the message:
+    // adding any other name (Equal, Single, Matches, …) would let its value-printing overloads through.
+    [Fact]
+    public void FixtureTextGuard_NonPrintingAssertionsAreExactlyTheMessageOnlyOnes()
+    {
+        Assert.True(
+            NonPrintingAssertions.SetEquals(new[] { "True", "False", "Fail", "NotEmpty", "NotNull" }),
+            $"the non-printing allow-list changed: [{string.Join(", ", NonPrintingAssertions.Order(StringComparer.Ordinal).Select(Escape))}]");
     }
 
     // ... and accepts the shapes this file actually relies on, so the rule is not simply "reject everything".
@@ -1450,7 +1757,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData(0)]
     [InlineData(1)]
     [InlineData(2)]
-    public void FixtureTextGuard_FlagsTextBearingTheoryDataInheritedOverload(int shape)
+    public void FixtureTextGuard_FlagsTextBearingTheoryDataInheritedMember(int shape)
     {
         string inherited = shape == 0
             ? "public class B { public static TheoryData<string> Rows(int n) => new() { \"a\" }; }\n"
@@ -1579,7 +1886,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// <item>an exception type declared in this file is a finding: its Message could read a property or static
     /// field set after construction, which no argument sink sees;</item>
     /// <item>a <c>partial</c> type is a finding: its other parts compile into the class from files the guard does
-    /// not see (FixtureTextGuard_ChecksTheClassThatRuns separately compares the compiled and loaded members).</item>
+    /// not see (FixtureTextGuard_ChecksTheClassThatRuns separately compares the compiled and loaded members, base
+    /// type and interfaces, and FixtureTextGuard_CallsNothingElseInTheTestAssembly refuses a base type, attribute
+    /// or call bound to code in the test assembly outside the class; a part adding only a constructor body or a
+    /// framework attribute changes neither, so this rule is the one that stops it).</item>
     /// </list>
     /// A sink value is safe only if it is a compile-time constant; a number, boolean or enum (no text can ride
     /// on it under an unmutated culture); a call to THE <see cref="Escape"/> method (by symbol — and no other declaration may be named
@@ -1592,9 +1902,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     /// own-code shapes judged contrived here: reassigning `what` by ref, out or deconstruction; duplicate keys
     /// through KeyedCollection.Add, OrderedDictionary.Insert/SetAt or a dictionary's GetAlternateLookup indexer;
     /// culture-dependent number text (a mutated NumberFormat.NegativeSign makes a number print text); reaching a
-    /// stream through Unsafe.As or a file handle; per-site (rather than per-member) coverage; and an embedded copy
-    /// that is not the compiled file yet declares the same members (a project-file edit; only bodies would differ).
-    /// All of it is tracked in #917.</para>
+    /// stream through Unsafe.As or a file handle; per-site (rather than per-member) coverage; an embedded copy that
+    /// is not the compiled file yet declares the same member names and arities (a project-file edit; bodies,
+    /// signature types and attributes could differ); and a call here rebound by another file to a DIFFERENT
+    /// framework member (through a global using) rather than to code in the test assembly, which
+    /// FixtureTextGuard_CallsNothingElseInTheTestAssembly refuses. All of it is tracked in #917.</para>
     /// </summary>
     private static GuardResult FindFixtureTextFindings(string source, string assemblyName)
     {
