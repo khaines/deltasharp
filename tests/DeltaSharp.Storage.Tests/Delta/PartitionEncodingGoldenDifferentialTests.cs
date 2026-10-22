@@ -1429,6 +1429,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("return ((global::System.IComparable<int>)default(S)).CompareTo(1); } private struct S : global::System.IComparable<int> { public int CompareTo(int o) => 1; } static void Z() {")]
     [InlineData("return ((global::System.IComparable<int>)global::System.Activator.CreateInstance<N>()).CompareTo(1); } private sealed class N : global::System.IComparable<int> { public int CompareTo(int o) => 1; } static void Z() {")]
     [InlineData("foreach (int x in default(N)) { return x; } return 0; } private struct N { public global::System.Collections.Generic.IEnumerator<int> GetEnumerator() { yield return 1; } } static void Z() {")]
+    [InlineData("return ((global::System.IComparable<int>)default(S)).CompareTo(1); } } public struct S : global::System.IComparable<int> { public int CompareTo(int o) => 1; } public static class X { static void Z() {")]
+    [InlineData("return typeof(C).Name.Length;")]
     public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
     {
         GuardResult result = FindFixtureTextFindings(
@@ -1485,7 +1487,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     && Array.IndexOf(TrustedCore, reached) < 0 && extensionCalls.Add(inner))
                 {
                     // The core is closed under calls: a member of this class it reaches — or of a type nested in it,
-                    // which is listed (and checked) by that type's name — is core too. A nested type it only names is
+                    // which is listed (and checked) by that type's name — is core too. A source type it only names is
                     // caught below.
                     findings.Add($"{at}: reaches {reached}, which is not in the trusted core");
                 }
@@ -1509,11 +1511,13 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
             else if (node is SimpleNameSyntax nestedName && owner is not null
                 && model.GetSymbolInfo(nestedName).Symbol is INamedTypeSymbol nestedType
-                && MemberOfClass(nestedType.OriginalDefinition, owner) is { } named
-                && Array.IndexOf(TrustedCore, named) < 0)
+                && nestedType.Locations.Any(location => location.IsInSource)
+                && (MemberOfClass(nestedType.OriginalDefinition, owner) ?? nestedType.Name) is { } named
+                && (MemberOfClass(nestedType.OriginalDefinition, owner) is null || Array.IndexOf(TrustedCore, named) < 0))
             {
-                // A type nested in this class that the core only names (default(T), typeof, a cast, a type argument,
-                // a foreach or using over it) can still run its members by dispatch or by pattern, so it is core too.
+                // A source type the core only names (default(T), typeof, a cast, a type argument, a foreach or using
+                // over it) can still run its members by dispatch or by pattern, so it must be a nested type in the
+                // trusted core: this class itself, a top-level type in this file and a file-local one never are.
                 findings.Add($"{where}: names {named}, which is not in the trusted core");
             }
             else if (node is SimpleNameSyntax name
@@ -1591,8 +1595,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     }
 
     // Every type name (metadata name, so generic arity included) the compilation binds anywhere in its first tree to
-    // a type it does NOT declare: a type declared in this file is nested here (or file-local), and a nested type
-    // outranks any namespace type, so nothing can shadow it.
+    // a type it does NOT declare. A type declared in this file is nested here, or else the reference walk flags its use
+    // and the trusted-core check flags the core naming it; a nested type outranks any namespace type, so nothing can
+    // shadow it.
     private static HashSet<string> BoundTypeNames(CSharpCompilation compilation)
     {
         SyntaxTree tree = compilation.SyntaxTrees.First();
