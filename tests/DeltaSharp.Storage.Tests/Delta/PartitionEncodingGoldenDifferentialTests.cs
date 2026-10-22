@@ -1307,7 +1307,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // string (its handler type is looked up by name), and no type or namespace name except `global::`-rooted ones
     // (an alias or an enclosing type would win), no member bound by a language pattern (a query, a deconstruction, an
     // await, an extension GetEnumerator) and no tuple syntax (its ValueTuple type is looked up by name). Nor may it
-    // reach code in source outside itself, by name or otherwise, or call reflection that runs code. Interceptors, which
+    // reach code in source outside itself, by name or otherwise, run in an unsafe context, or call anything on the
+    // framework's reflection surface beyond the metadata reads on its allow-list (ReflectionMember). Interceptors, which
     // can redirect even a `global::` call, are switched off for this project in its csproj. This fact keeps that core
     // as written.
     private static readonly string[] TrustedCore =
@@ -1329,6 +1330,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         var findings = new List<string>();
         var seen = new HashSet<string>(StringComparer.Ordinal);
         int typeNames = 0;
+        var reflectionUsed = new HashSet<string>(StringComparer.Ordinal);
         SyntaxTree tree = result.Compilation.SyntaxTrees.First();
         SemanticModel model = result.Compilation.GetSemanticModel(tree);
         foreach (MemberDeclarationSyntax member in tree.GetRoot().DescendantNodes().OfType<MemberDeclarationSyntax>())
@@ -1348,7 +1350,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
 
             seen.Add(name);
-            findings.AddRange(TrustedCoreFindings(model, member, ref typeNames));
+            findings.AddRange(TrustedCoreFindings(model, member, ref typeNames, reflectionUsed));
         }
 
         global::Xunit.Assert.True(
@@ -1358,6 +1360,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             findings.Count == 0,
             "the trusted core binds through something another file could redefine; use `global::`-qualified framework "
             + $"types, plain loops and string concatenation there: [{string.Join(", ", findings.Select(Escape))}]");
+        string[] unused = AllowedReflection.Where(allowed => !reflectionUsed.Contains(allowed)).Order(StringComparer.Ordinal).ToArray();
+        global::Xunit.Assert.True(
+            unused.Length == 0 && reflectionUsed.Contains(FieldValue),
+            $"the reflection allow-list holds members the trusted core no longer calls; remove them: [{string.Join(", ", unused.Select(Escape))}]");
     }
 
     // The csproj's NoInterceptorsForTheFixtureTextGuard target records in this assembly the interceptor settings the
@@ -1435,6 +1441,24 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("return typeof(C).Name.Length;")]
     [InlineData("return global::System.Activator.CreateInstance(typeof(int)) is null ? 0 : 1;")]
     [InlineData("return typeof(int).GetMethod(\"GetHashCode\", global::System.Type.EmptyTypes)!.Invoke(1, null) is null ? 0 : 1;")]
+    [InlineData("foreach (global::System.Reflection.PropertyInfo p in typeof(string).GetProperties()) { return p.GetValue(\"x\") is null ? 0 : 1; } return 0;")]
+    [InlineData("foreach (global::System.Reflection.EventInfo e in typeof(global::System.AppDomain).GetEvents()) { e.AddEventHandler(null, null); } return 0;")]
+    [InlineData("foreach (global::System.Reflection.FieldInfo f in typeof(string).GetFields(global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.Static)) { return f.GetValue(null) is null ? 0 : 1; } return 0;")]
+    [InlineData("foreach (global::System.Reflection.FieldInfo o in typeof(global::System.Reflection.Emit.OpCodes).GetFields()) { global::System.Reflection.FieldInfo f = typeof(string).GetFields()[0]; return f.GetValue(null) is null ? 0 : 1; } return 0;")]
+    [InlineData("return global::System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(object)) is null ? 0 : 1;")]
+    [InlineData("return typeof(int).InvokeMember(\"GetHashCode\", global::System.Reflection.BindingFlags.InvokeMethod, null, 1, null) is null ? 0 : 1;")]
+    [InlineData("return global::System.Linq.Expressions.Expression.Lambda<global::System.Func<int>>(global::System.Linq.Expressions.Expression.Constant(1)).Compile()();")]
+    [InlineData("return global::System.ComponentModel.TypeDescriptor.CreateInstance(null, typeof(object), null, null) is null ? 0 : 1;")]
+    [InlineData("global::System.Func<int> f = () => 1; return (int)f.DynamicInvoke()!;")]
+    [InlineData("return global::System.AppDomain.CurrentDomain.GetAssemblies().Length;")]
+    [InlineData("return global::System.Attribute.GetCustomAttribute(typeof(int), typeof(global::System.ObsoleteAttribute)) is null ? 0 : 1;")]
+    [InlineData("return default(global::System.RuntimeMethodHandle).GetFunctionPointer() == 0 ? 0 : 1;")]
+    [InlineData("return default(global::System.RuntimeTypeHandle).Value == 0 ? 0 : 1;")]
+    [InlineData("return default(global::System.RuntimeFieldHandle).Value == 0 ? 0 : 1;")]
+    [InlineData("return default(global::System.ModuleHandle).MDStreamVersion;")]
+    [InlineData("int x = 1; return (int)global::System.TypedReference.ToObject(__makeref(x));")]
+    [InlineData("unsafe { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); }")]
+    [InlineData("return L(); static unsafe int L() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); }")]
     public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
     {
         GuardResult result = FindFixtureTextFindings(
@@ -1450,10 +1474,13 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     }
 
     // ... including the ways into this file's other code that name no type: a `using static` above the core, `this`
-    // in an instance member, and (above) reflection over a Type the core already holds.
+    // in an instance member, an unsafe enclosing type, a source type posing as a framework one on the reflection
+    // allow-list, and (above) reflection over a Type the core already holds.
     [Theory]
     [InlineData("using static X;\npublic static class C { public static int M() { return T(); } }\npublic static class X { public static int T() => 1; }")]
     [InlineData("public sealed class C : global::System.IComparable<int> { public int CompareTo(int o) => 1; public int M() { return ((global::System.IComparable<int>)this).CompareTo(1); } }")]
+    [InlineData("public static unsafe class C { public static int M() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } }")]
+    [InlineData("using static System.Reflection.Assembly;\npublic static class C { public static int M() { return GetTypes(); } }\nnamespace System.Reflection { public static class Assembly { public static int GetTypes() => 1; } }")]
     public void FixtureTextGuard_TrustedCoreCheckFindsUnnamedRoutes(string source)
     {
         GuardResult result = FindFixtureTextFindings(source, "TrustedSnippet");
@@ -1465,9 +1492,16 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         Assert.True(findings.Count > 0, $"the trusted-core check accepted {Escape(source)}");
     }
 
-    private static List<string> TrustedCoreFindings(SemanticModel model, SyntaxNode member, ref int typeNames)
+    private static List<string> TrustedCoreFindings(
+        SemanticModel model, SyntaxNode member, ref int typeNames, HashSet<string>? reflectionUsed = null)
     {
         var findings = new List<string>();
+        if (member.AncestorsAndSelf().Any(node => node is MemberDeclarationSyntax { Modifiers: var modifiers }
+            && modifiers.Any(SyntaxKind.UnsafeKeyword)))
+        {
+            findings.Add("an unsafe context");
+        }
+
         var extensionCalls = new HashSet<IOperation>();
         INamedTypeSymbol? owner = model.GetDeclaredSymbol(member.Ancestors().OfType<TypeDeclarationSyntax>().First());
         foreach (SyntaxNode node in member.DescendantNodesAndSelf())
@@ -1502,9 +1536,16 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                         findings.Add($"{at}: extension member {used!.Name}");
                     }
                 }
-                else if (used is not null && RunsCodeByReflection(used) && extensionCalls.Add(inner))
+                else if (used is not null && ReflectionMember(used) is { } reflected && extensionCalls.Add(inner))
                 {
-                    findings.Add($"{at}: {used.ContainingType?.Name}.{used.Name} runs code chosen at run time");
+                    if (AllowedReflection.Contains(reflected) || (reflected == FieldValue && ReadsAnOpCode(inner)))
+                    {
+                        reflectionUsed?.Add(reflected);
+                    }
+                    else
+                    {
+                        findings.Add($"{at}: {reflected}, which is not on the trusted core's reflection allow-list");
+                    }
                 }
                 else if (used is not null && owner is not null
                     && used is not IMethodSymbol { MethodKind: MethodKind.LocalFunction or MethodKind.AnonymousFunction }
@@ -1516,6 +1557,14 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     // never is. A source type it only names is caught below.
                     findings.Add($"{at}: reaches {reached}, which is not in the trusted core");
                 }
+            }
+
+            if (node is UnsafeStatementSyntax
+                || (node is LocalFunctionStatementSyntax local && local.Modifiers.Any(SyntaxKind.UnsafeKeyword)))
+            {
+                // A pointer (a function pointer from a method handle, or a raw write) reaches code and state no
+                // binding names, so the core runs in no unsafe context at all (see also the member check above).
+                findings.Add($"{where}: unsafe code");
             }
 
             if (node is InterpolatedStringExpressionSyntax)
@@ -1585,26 +1634,112 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         return outermost.Locations.Any(location => location.IsInSource) ? definition.ToDisplayString() : null;
     }
 
-    // A framework member that runs code picked at run time: it creates an object of a Type it is handed, or invokes,
-    // binds or initializes a member it is handed. Through one the core could run this class's code holding only its
-    // Type (IsWithin's `container`); the core reads metadata and calls none of them.
-    private static bool RunsCodeByReflection(ISymbol used)
+    // The framework's reflection and code-running surface: a member of one of these can create an object of a Type it
+    // is handed, or invoke, bind, initialize or read a member it is handed, so through one the core could run this
+    // class's code, or reach its state, holding only its Type (IsWithin's `container`). Returns the member's
+    // `Type.Member` key, or null for anything else (and for anything declared in source, which is not the framework).
+    private static string? ReflectionMember(ISymbol used)
     {
-        string type = used.ContainingType?.ToDisplayString() ?? string.Empty;
-        string space = used.ContainingNamespace?.ToDisplayString() ?? string.Empty;
-        return type == "System.Activator"
-            || (CodeRunningReflection.Contains(used.Name)
-                && (space.StartsWith("System.Reflection", StringComparison.Ordinal)
-                    || space.StartsWith("System.Runtime", StringComparison.Ordinal)
-                    || type is "System.Type" or "System.Delegate" or "System.AppDomain" or "System.Attribute"));
+        ISymbol definition = used.OriginalDefinition;
+        if (definition.ContainingType is not { } type || type.Locations.Any(location => location.IsInSource))
+        {
+            return null;
+        }
+
+        string name = type.ToDisplayString();
+        string space = type.ContainingNamespace?.ToDisplayString() ?? string.Empty;
+        bool surface = ReflectionTypes.Contains(name)
+            || ReflectionNamespaces.Any(root => space == root || space.StartsWith(root + ".", StringComparison.Ordinal));
+        return surface ? name + "." + definition.Name : null;
     }
 
-    private static readonly HashSet<string> CodeRunningReflection = new(StringComparer.Ordinal)
+    private static readonly string[] ReflectionNamespaces =
     {
-        "Invoke", "InvokeMember", "DynamicInvoke", "CreateDelegate", "CreateInstance", "CreateInstanceFrom",
-        "CreateInstanceAndUnwrap", "GetUninitializedObject", "RunClassConstructor", "RunModuleConstructor",
-        "GetCustomAttribute", "GetCustomAttributes",
+        "System.Reflection", "System.Runtime", "System.Linq.Expressions", "System.ComponentModel",
     };
+
+    private static readonly HashSet<string> ReflectionTypes = new(StringComparer.Ordinal)
+    {
+        "System.Type", "System.Activator", "System.Delegate", "System.AppDomain",
+        "System.Attribute", "System.RuntimeMethodHandle", "System.RuntimeTypeHandle", "System.RuntimeFieldHandle",
+        "System.ModuleHandle", "System.TypedReference",
+    };
+
+    // What the trusted core calls on that surface: each only reads metadata, and FixtureTextGuard_TrustedCoreBindsNothingRebindable
+    // fails on any entry the core no longer uses, so the list cannot grow quietly. Anything else there is a finding.
+    private static readonly HashSet<string> AllowedReflection = new(StringComparer.Ordinal)
+    {
+        "System.Reflection.Assembly.GetTypes", "System.Reflection.Assembly.op_Equality",
+        "System.Reflection.BindingFlags.DeclaredOnly", "System.Reflection.BindingFlags.Instance",
+        "System.Reflection.BindingFlags.NonPublic", "System.Reflection.BindingFlags.Public",
+        "System.Reflection.BindingFlags.Static",
+        "System.Reflection.CustomAttributeData.AttributeType",
+        "System.Reflection.CustomAttributeData.ConstructorArguments",
+        "System.Reflection.CustomAttributeData.NamedArguments",
+        "System.Reflection.CustomAttributeNamedArgument.TypedValue",
+        "System.Reflection.CustomAttributeTypedArgument.ArgumentType",
+        "System.Reflection.CustomAttributeTypedArgument.Value",
+        "System.Reflection.Emit.OpCode.OperandType", "System.Reflection.Emit.OpCode.Size",
+        "System.Reflection.Emit.OpCode.Value",
+        "System.Reflection.Emit.OperandType.InlineField", "System.Reflection.Emit.OperandType.InlineI8",
+        "System.Reflection.Emit.OperandType.InlineMethod", "System.Reflection.Emit.OperandType.InlineNone",
+        "System.Reflection.Emit.OperandType.InlineR", "System.Reflection.Emit.OperandType.InlineSwitch",
+        "System.Reflection.Emit.OperandType.InlineTok", "System.Reflection.Emit.OperandType.InlineType",
+        "System.Reflection.Emit.OperandType.InlineVar", "System.Reflection.Emit.OperandType.ShortInlineBrTarget",
+        "System.Reflection.Emit.OperandType.ShortInlineI", "System.Reflection.Emit.OperandType.ShortInlineVar",
+        "System.Reflection.EventInfo.EventHandlerType",
+        "System.Reflection.ExceptionHandlingClause.CatchType", "System.Reflection.ExceptionHandlingClause.Flags",
+        "System.Reflection.ExceptionHandlingClauseOptions.Clause",
+        "System.Reflection.FieldInfo.FieldType",
+        "System.Reflection.LocalVariableInfo.LocalType",
+        "System.Reflection.MemberInfo.DeclaringType", "System.Reflection.MemberInfo.GetCustomAttributesData",
+        "System.Reflection.MemberInfo.IsDefined", "System.Reflection.MemberInfo.Module",
+        "System.Reflection.MemberInfo.Name",
+        "System.Reflection.MethodBase.GetGenericArguments", "System.Reflection.MethodBase.GetMethodBody",
+        "System.Reflection.MethodBase.GetParameters", "System.Reflection.MethodBase.IsGenericMethod",
+        "System.Reflection.MethodBody.ExceptionHandlingClauses", "System.Reflection.MethodBody.GetILAsByteArray",
+        "System.Reflection.MethodBody.LocalVariables",
+        "System.Reflection.MethodInfo.ReturnParameter",
+        "System.Reflection.Module.ResolveMember",
+        "System.Reflection.ParameterInfo.GetCustomAttributesData", "System.Reflection.ParameterInfo.ParameterType",
+        "System.Reflection.PropertyInfo.PropertyType",
+        "System.Type.Assembly", "System.Type.BaseType", "System.Type.DeclaringType", "System.Type.FullName",
+        "System.Type.GetConstructors", "System.Type.GetElementType", "System.Type.GetEvents", "System.Type.GetFields",
+        "System.Type.GetFunctionPointerParameterTypes", "System.Type.GetFunctionPointerReturnType",
+        "System.Type.GetGenericArguments", "System.Type.GetInterfaces", "System.Type.GetMethods",
+        "System.Type.GetNestedTypes", "System.Type.GetProperties", "System.Type.HasElementType",
+        "System.Type.IsFunctionPointer", "System.Type.IsGenericParameter", "System.Type.IsGenericType",
+        "System.Type.Namespace", "System.Type.op_Equality", "System.Type.op_Inequality",
+    };
+
+    // FieldInfo.GetValue runs a class constructor and hands back a static field's value, so the core may call it only
+    // on a field enumerated from typeof(OpCodes) (BuildOpCodeTable), never on a field of a Type it was handed.
+    private const string FieldValue = "System.Reflection.FieldInfo.GetValue";
+
+    private static bool ReadsAnOpCode(IOperation call)
+    {
+        if (call is not IInvocationOperation { Instance: ILocalReferenceOperation { Local: var field } })
+        {
+            return false;
+        }
+
+        for (IOperation? parent = call.Parent; parent is not null; parent = parent.Parent)
+        {
+            if (parent is IForEachLoopOperation loop && loop.Locals.Contains(field, SymbolEqualityComparer.Default))
+            {
+                IOperation collection = loop.Collection;
+                while (collection is IConversionOperation conversion)
+                {
+                    collection = conversion.Operand;
+                }
+
+                return collection is IInvocationOperation { Instance: ITypeOfOperation { TypeOperand: var opCodes } }
+                    && opCodes.ToDisplayString() == "System.Reflection.Emit.OpCodes";
+            }
+        }
+
+        return false;
+    }
 
     // The member directly under `owner` that contains `used` (itself, or the nested type it is declared in), or null
     // when `used` is not declared inside `owner`.
