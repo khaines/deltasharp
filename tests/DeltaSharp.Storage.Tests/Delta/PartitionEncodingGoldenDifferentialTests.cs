@@ -1306,8 +1306,10 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // no extension method (an extension in an enclosing namespace outranks `using System.Linq`), no interpolated
     // string (its handler type is looked up by name), and no type or namespace name except `global::`-rooted ones
     // (an alias or an enclosing type would win), no member bound by a language pattern (a query, a deconstruction, an
-    // await, an extension GetEnumerator) and no tuple syntax (its ValueTuple type is looked up by name). Interceptors, which can redirect even a `global::` call, are
-    // switched off for this project in its csproj. This fact keeps that core as written.
+    // await, an extension GetEnumerator) and no tuple syntax (its ValueTuple type is looked up by name). Nor may it
+    // reach code in source outside itself, by name or otherwise, or call reflection that runs code. Interceptors, which
+    // can redirect even a `global::` call, are switched off for this project in its csproj. This fact keeps that core
+    // as written.
     private static readonly string[] TrustedCore =
     {
         nameof(ShadowingTypes), nameof(AttributeValues), nameof(ReferenceWalk), nameof(ReferencesOutside),
@@ -1431,6 +1433,8 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("foreach (int x in default(N)) { return x; } return 0; } private struct N { public global::System.Collections.Generic.IEnumerator<int> GetEnumerator() { yield return 1; } } static void Z() {")]
     [InlineData("return ((global::System.IComparable<int>)default(S)).CompareTo(1); } } public struct S : global::System.IComparable<int> { public int CompareTo(int o) => 1; } public static class X { static void Z() {")]
     [InlineData("return typeof(C).Name.Length;")]
+    [InlineData("return global::System.Activator.CreateInstance(typeof(int)) is null ? 0 : 1;")]
+    [InlineData("return typeof(int).GetMethod(\"GetHashCode\", global::System.Type.EmptyTypes)!.Invoke(1, null) is null ? 0 : 1;")]
     public void FixtureTextGuard_TrustedCoreCheckFindsRebindableBindings(string body)
     {
         GuardResult result = FindFixtureTextFindings(
@@ -1443,6 +1447,22 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         int typeNames = 0;
         List<string> findings = TrustedCoreFindings(result.Compilation.GetSemanticModel(tree), method, ref typeNames);
         Assert.True(findings.Count > 0, $"the trusted-core check accepted {Escape(body)}");
+    }
+
+    // ... including the ways into this file's other code that name no type: a `using static` above the core, `this`
+    // in an instance member, and (above) reflection over a Type the core already holds.
+    [Theory]
+    [InlineData("using static X;\npublic static class C { public static int M() { return T(); } }\npublic static class X { public static int T() => 1; }")]
+    [InlineData("public sealed class C : global::System.IComparable<int> { public int CompareTo(int o) => 1; public int M() { return ((global::System.IComparable<int>)this).CompareTo(1); } }")]
+    public void FixtureTextGuard_TrustedCoreCheckFindsUnnamedRoutes(string source)
+    {
+        GuardResult result = FindFixtureTextFindings(source, "TrustedSnippet");
+        Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
+        SyntaxTree tree = result.Compilation.SyntaxTrees.First();
+        MethodDeclarationSyntax method = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.Text == "M");
+        int typeNames = 0;
+        List<string> findings = TrustedCoreFindings(result.Compilation.GetSemanticModel(tree), method, ref typeNames);
+        Assert.True(findings.Count > 0, $"the trusted-core check accepted {Escape(source)}");
     }
 
     private static List<string> TrustedCoreFindings(SemanticModel model, SyntaxNode member, ref int typeNames)
@@ -1471,6 +1491,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                     IConversionOperation { OperatorMethod: { } method } => method,
                     IObjectCreationOperation creation => creation.Constructor,
                     IEventReferenceOperation @event => @event.Event,
+                    IInstanceReferenceOperation { Type: INamedTypeSymbol self } => self,
                     _ => null,
                 };
                 string at = $"line {inner.Syntax.GetLocation().GetLineSpan().StartLinePosition.Line + 1}";
@@ -1481,14 +1502,18 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                         findings.Add($"{at}: extension member {used!.Name}");
                     }
                 }
+                else if (used is not null && RunsCodeByReflection(used) && extensionCalls.Add(inner))
+                {
+                    findings.Add($"{at}: {used.ContainingType?.Name}.{used.Name} runs code chosen at run time");
+                }
                 else if (used is not null && owner is not null
                     && used is not IMethodSymbol { MethodKind: MethodKind.LocalFunction or MethodKind.AnonymousFunction }
-                    && MemberOfClass(used, owner) is { } reached
-                    && Array.IndexOf(TrustedCore, reached) < 0 && extensionCalls.Add(inner))
+                    && OutsideTrustedCore(used, owner) is { } reached && extensionCalls.Add(inner))
                 {
                     // The core is closed under calls: a member of this class it reaches — or of a type nested in it,
-                    // which is listed (and checked) by that type's name — is core too. A source type it only names is
-                    // caught below.
+                    // which is listed (and checked) by that type's name — is core too, and so is anything else in
+                    // source it reaches, however it got there (a `using static`, `this`, an implicit receiver), which
+                    // never is. A source type it only names is caught below.
                     findings.Add($"{at}: reaches {reached}, which is not in the trusted core");
                 }
             }
@@ -1509,11 +1534,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
                 // Index, Range) a source declaration could replace, or an attribute type by unrooted name.
                 findings.Add($"{where}: pattern-bound member ({node.Kind()})");
             }
-            else if (node is SimpleNameSyntax nestedName && owner is not null
-                && model.GetSymbolInfo(nestedName).Symbol is INamedTypeSymbol nestedType
-                && nestedType.Locations.Any(location => location.IsInSource)
-                && (MemberOfClass(nestedType.OriginalDefinition, owner) ?? nestedType.Name) is { } named
-                && (MemberOfClass(nestedType.OriginalDefinition, owner) is null || Array.IndexOf(TrustedCore, named) < 0))
+            else if (node is SimpleNameSyntax sourceName && owner is not null
+                && model.GetSymbolInfo(sourceName).Symbol is INamedTypeSymbol sourceType
+                && OutsideTrustedCore(sourceType, owner) is { } named)
             {
                 // A source type the core only names (default(T), typeof, a cast, a type argument, a foreach or using
                 // over it) can still run its members by dispatch or by pattern, so it must be a nested type in the
@@ -1541,6 +1564,47 @@ public sealed class PartitionEncodingGoldenDifferentialTests
 
         return findings;
     }
+
+    // Where `used` falls outside the trusted core: the member directly under `owner` that holds it when that member
+    // is not listed, or the full name of anything else declared in source (this class itself, another type in this
+    // file, or a member of one). Null for a listed member and for anything from a referenced assembly.
+    private static string? OutsideTrustedCore(ISymbol used, INamedTypeSymbol owner)
+    {
+        ISymbol definition = used.OriginalDefinition;
+        if (MemberOfClass(definition, owner) is { } member)
+        {
+            return Array.IndexOf(TrustedCore, member) < 0 ? member : null;
+        }
+
+        ISymbol outermost = definition;
+        while (outermost.ContainingType is { } container)
+        {
+            outermost = container;
+        }
+
+        return outermost.Locations.Any(location => location.IsInSource) ? definition.ToDisplayString() : null;
+    }
+
+    // A framework member that runs code picked at run time: it creates an object of a Type it is handed, or invokes,
+    // binds or initializes a member it is handed. Through one the core could run this class's code holding only its
+    // Type (IsWithin's `container`); the core reads metadata and calls none of them.
+    private static bool RunsCodeByReflection(ISymbol used)
+    {
+        string type = used.ContainingType?.ToDisplayString() ?? string.Empty;
+        string space = used.ContainingNamespace?.ToDisplayString() ?? string.Empty;
+        return type == "System.Activator"
+            || (CodeRunningReflection.Contains(used.Name)
+                && (space.StartsWith("System.Reflection", StringComparison.Ordinal)
+                    || space.StartsWith("System.Runtime", StringComparison.Ordinal)
+                    || type is "System.Type" or "System.Delegate" or "System.AppDomain" or "System.Attribute"));
+    }
+
+    private static readonly HashSet<string> CodeRunningReflection = new(StringComparer.Ordinal)
+    {
+        "Invoke", "InvokeMember", "DynamicInvoke", "CreateDelegate", "CreateInstance", "CreateInstanceFrom",
+        "CreateInstanceAndUnwrap", "GetUninitializedObject", "RunClassConstructor", "RunModuleConstructor",
+        "GetCustomAttribute", "GetCustomAttributes",
+    };
 
     // The member directly under `owner` that contains `used` (itself, or the nested type it is declared in), or null
     // when `used` is not declared inside `owner`.
