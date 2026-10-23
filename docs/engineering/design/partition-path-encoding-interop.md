@@ -4,35 +4,40 @@
 > **Issues:** [#806](https://github.com/khaines/deltasharp/issues/806) — Delta partition NAME/VALUE encoding: Spark/delta-rs interop round-trip (two-layer physical-segment + URI-encoded add.path); [#708](https://github.com/khaines/deltasharp/issues/708) — partition column names written raw while values are percent-encoded (origin)
 > **Author:** design-doc skill (orchestrated)
 > **Reviewers:** cloud-native-distributed-systems-architect, delta-storage-format-engineer, reliability-test-chaos-engineer, cloud-native-security-sme, cloud-native-site-reliability-engineer, performance-benchmarking-engineer
-> **Last Updated:** 2026-10-20
+> **Last Updated:** 2026-10-23
 > **Related:** PR #797 (the #708 scope-correction that percent-encoded both NAME and value with `Uri.EscapeDataString` — directory-injection hardening retained, but not Spark-parity), #696 (message-hygiene recognizer that must stay fixed regardless), OrphanCleanup encoding-robust protection (#489 lineage)
 
 ---
 
 ## 1 · Overview
 
-DeltaSharp composes a Hive-style partition directory segment as
-`Uri.EscapeDataString(name) + "=" + Uri.EscapeDataString(value)` and stores the resulting relative path
-**verbatim** in `add.path` — it neither URI-encodes the whole path on write nor URI-decodes it on read
-(`DeltaWriteEncoding.HivePartitionSegment`, `DeltaWriteTarget.DataFilePath`, `DeltaReadSource` opens
-`add.Path` directly). This is a **known, documented deviation** from two independent contracts:
+> **Status of this section:** the problem statement below describes what DeltaSharp did **before #806**.
+> Inc-A (#896, decoded-first read resolver) and Inc-B (#898, two-layer write and OPTIMIZE) replaced it on
+> `main` with the scheme this design specifies; tables already written in the legacy layouts stay readable
+> through the §2.3 fallback.
 
-1. **On-disk layout** does not match Apache Spark / delta-rs. Spark composes the directory with
+Before #806, DeltaSharp composed a Hive-style partition directory segment as
+`Uri.EscapeDataString(name) + "=" + Uri.EscapeDataString(value)` and stored the resulting relative path
+**verbatim** in `add.path` — it neither URI-encoded the whole path on write nor URI-decoded it on read
+(`DeltaWriteEncoding.HivePartitionSegment`, `DeltaWriteTarget.DataFilePath`, `DeltaReadSource` opened
+`add.Path` directly). This was a **known, documented deviation** from two independent contracts:
+
+1. **On-disk layout** did not match Apache Spark / delta-rs. Spark composes the directory with
    `ExternalCatalogUtils.escapePathName` — a Hive-derived 128-entry ASCII bitset that escapes only
    `0x01–0x1F`, `" # % ' * / : = ? \`, `DEL`, `{ [ ] ^` (and, on Windows, `space < > | `) and **passes
    non-ASCII and space (non-Windows) through unescaped**. `Uri.EscapeDataString` uses the RFC-3986
    *unreserved* alphabet: it escapes space (`%20`), all non-ASCII (`%C3%A9`), and a different reserved
-   set. So DeltaSharp and Spark produce **different directory names** for any partition NAME or VALUE
+   set. So DeltaSharp and Spark produced **different directory names** for any partition NAME or VALUE
    outside the ASCII-unreserved set.
 2. **`add.path`** is, per the Delta protocol, a **URI-encoded** relative path (RFC 2396) that must be
    URI-**decoded** to recover the object key — measured (O1) as Java `URI.toString` path-quoting: value
    `a b` is on disk as `country=a b/…` and stored as `country=a%20b/…`, with the `=` kept literal.
-   DeltaSharp treats `add.path` as a literal object key on both write and read.
+   DeltaSharp treated `add.path` as a literal object key on both write and read.
 
-**Consequence:** a DeltaSharp table whose partition names/values contain characters outside the
-RFC-3986 unreserved set is **not round-trippable with Spark/delta-rs** — the directory Spark expects and
-the `add.path` Spark writes both differ from what DeltaSharp emits, and a Spark-written table's
-URI-encoded `add.path` is mis-resolved by DeltaSharp's literal-key read.
+**Consequence:** a DeltaSharp table whose partition names/values contained characters outside the
+RFC-3986 unreserved set was **not round-trippable with Spark/delta-rs** — the directory Spark expects and
+the `add.path` Spark writes both differed from what DeltaSharp emitted, and a Spark-written table's
+URI-encoded `add.path` was mis-resolved by DeltaSharp's literal-key read.
 
 This design specifies the **correct two-layer scheme** (#806) and a **fail-closed, backward-compatible
 migration** for the DeltaSharp tables already written in the two legacy layouts (pre-#797 raw-name, and
