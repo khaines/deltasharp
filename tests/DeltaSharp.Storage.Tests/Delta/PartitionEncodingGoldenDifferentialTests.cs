@@ -1310,9 +1310,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // reach code in source outside itself by name or through `this`, run in an unsafe context, or call anything on the
     // framework's reflection surface (ReflectionMember) beyond the reads on AllowedReflection and FieldInfo.GetValue on
     // OpCodes' own fields (ReadsAnOpCode). A delegate or object the core takes from framework-wide state (AppContext, a
-    // thread-local slot) and calls through a framework interface or delegate is not checked here: that is residual
-    // (#917), kept out by review. Interceptors, which can redirect even a `global::` call, are switched off for this
-    // project in its csproj. This fact keeps that core as written.
+    // thread-local slot) and calls through a framework interface, delegate or virtual member is not checked here:
+    // that is residual (#917), kept out by review. Interceptors, which can redirect even a `global::` call, are
+    // switched off for this project in its csproj. This fact keeps that core as written.
     private static readonly string[] TrustedCore =
     {
         nameof(ShadowingTypes), nameof(AttributeValues), nameof(ReferenceWalk), nameof(ReferencesOutside),
@@ -1489,6 +1489,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("public static unsafe class C { public static int M() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } }")]
     [InlineData("public static class C { public static unsafe int M() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } }")]
     [InlineData("public static class C { private static class M { public static unsafe int Z() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } } }")]
+    [InlineData("public static class C { private static class M { private struct Q { private unsafe int* P; } } }")]
     [InlineData("using static System.Reflection.Assembly;\npublic static class C { public static int M() { return GetTypes(); } }\nnamespace System.Reflection { public static class Assembly { public static int GetTypes() => 1; } }")]
     public void FixtureTextGuard_TrustedCoreCheckFindsUnnamedRoutes(string source)
     {
