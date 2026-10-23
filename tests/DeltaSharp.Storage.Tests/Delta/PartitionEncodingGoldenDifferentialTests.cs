@@ -41,7 +41,7 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// <see cref="FixtureTextGuard_HoldsOverThisFile"/> checks the channels this file's own code can use, on a
 /// compiled, symbol-bound view of it (the list is on <c>FindFixtureTextFindings</c>). Its stated residual is
 /// text a library composes from its own input when it fails — the Parse family, file, encoding and regex APIs,
-/// System.Text.Json, Parquet.Net — and reflection (#917).</para>
+/// System.Text.Json, Parquet.Net — reflection, and a delegate or object taken from framework-wide state (#917).</para>
 /// </summary>
 public sealed class PartitionEncodingGoldenDifferentialTests
 {
@@ -1307,10 +1307,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     // string (its handler type is looked up by name), and no type or namespace name except `global::`-rooted ones
     // (an alias or an enclosing type would win), no member bound by a language pattern (a query, a deconstruction, an
     // await, an extension GetEnumerator) and no tuple syntax (its ValueTuple type is looked up by name). Nor may it
-    // reach code in source outside itself, by name or otherwise, run in an unsafe context, or call anything on the
-    // framework's reflection surface beyond the metadata reads on its allow-list (ReflectionMember). Interceptors, which
-    // can redirect even a `global::` call, are switched off for this project in its csproj. This fact keeps that core
-    // as written.
+    // reach code in source outside itself by name or through `this`, run in an unsafe context, or call anything on the
+    // framework's reflection surface (ReflectionMember) beyond the reads on AllowedReflection and FieldInfo.GetValue on
+    // OpCodes' own fields (ReadsAnOpCode). A delegate or object the core takes from framework-wide state (AppContext, a
+    // thread-local slot) and calls through a framework interface or delegate is not checked here: that is residual
+    // (#917), kept out by review. Interceptors, which can redirect even a `global::` call, are switched off for this
+    // project in its csproj. This fact keeps that core as written.
     private static readonly string[] TrustedCore =
     {
         nameof(ShadowingTypes), nameof(AttributeValues), nameof(ReferenceWalk), nameof(ReferencesOutside),
@@ -1362,8 +1364,11 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             + $"types, plain loops and string concatenation there: [{string.Join(", ", findings.Select(Escape))}]");
         string[] unused = AllowedReflection.Where(allowed => !reflectionUsed.Contains(allowed)).Order(StringComparer.Ordinal).ToArray();
         global::Xunit.Assert.True(
-            unused.Length == 0 && reflectionUsed.Contains(FieldValue),
+            unused.Length == 0,
             $"the reflection allow-list holds members the trusted core no longer calls; remove them: [{string.Join(", ", unused.Select(Escape))}]");
+        global::Xunit.Assert.True(
+            reflectionUsed.Contains(FieldValue),
+            "the trusted core no longer reads OpCodes by FieldInfo.GetValue; remove FieldValue and ReadsAnOpCode");
     }
 
     // The csproj's NoInterceptorsForTheFixtureTextGuard target records in this assembly the interceptor settings the
@@ -1446,6 +1451,7 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     [InlineData("foreach (global::System.Reflection.FieldInfo f in typeof(string).GetFields(global::System.Reflection.BindingFlags.Public | global::System.Reflection.BindingFlags.Static)) { return f.GetValue(null) is null ? 0 : 1; } return 0;")]
     [InlineData("foreach (global::System.Reflection.FieldInfo o in typeof(global::System.Reflection.Emit.OpCodes).GetFields()) { global::System.Reflection.FieldInfo f = typeof(string).GetFields()[0]; return f.GetValue(null) is null ? 0 : 1; } return 0;")]
     [InlineData("return global::System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(object)) is null ? 0 : 1;")]
+    [InlineData("return typeof(int).TypeInitializer is null ? 0 : 1;")]
     [InlineData("return typeof(int).InvokeMember(\"GetHashCode\", global::System.Reflection.BindingFlags.InvokeMethod, null, 1, null) is null ? 0 : 1;")]
     [InlineData("return global::System.Linq.Expressions.Expression.Lambda<global::System.Func<int>>(global::System.Linq.Expressions.Expression.Constant(1)).Compile()();")]
     [InlineData("return global::System.ComponentModel.TypeDescriptor.CreateInstance(null, typeof(object), null, null) is null ? 0 : 1;")]
@@ -1474,21 +1480,25 @@ public sealed class PartitionEncodingGoldenDifferentialTests
     }
 
     // ... including the ways into this file's other code that name no type: a `using static` above the core, `this`
-    // in an instance member, an unsafe enclosing type, a source type posing as a framework one on the reflection
-    // allow-list, and (above) reflection over a Type the core already holds.
+    // in an instance member, `unsafe` on the core member, an enclosing type or a member of a nested core type, a source
+    // type posing as a framework one on the reflection allow-list, and (above) reflection over a Type the core already
+    // holds. The core member is the method or nested type named M.
     [Theory]
     [InlineData("using static X;\npublic static class C { public static int M() { return T(); } }\npublic static class X { public static int T() => 1; }")]
     [InlineData("public sealed class C : global::System.IComparable<int> { public int CompareTo(int o) => 1; public int M() { return ((global::System.IComparable<int>)this).CompareTo(1); } }")]
     [InlineData("public static unsafe class C { public static int M() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } }")]
+    [InlineData("public static class C { public static unsafe int M() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } }")]
+    [InlineData("public static class C { private static class M { public static unsafe int Z() { delegate*<int, int> p = &global::System.Math.Abs; return p(-1); } } }")]
     [InlineData("using static System.Reflection.Assembly;\npublic static class C { public static int M() { return GetTypes(); } }\nnamespace System.Reflection { public static class Assembly { public static int GetTypes() => 1; } }")]
     public void FixtureTextGuard_TrustedCoreCheckFindsUnnamedRoutes(string source)
     {
         GuardResult result = FindFixtureTextFindings(source, "TrustedSnippet");
         Assert.True(result.CompileErrors.Count == 0, string.Join("; ", result.CompileErrors.Select(Escape)));
         SyntaxTree tree = result.Compilation.SyntaxTrees.First();
-        MethodDeclarationSyntax method = tree.GetRoot().DescendantNodes().OfType<MethodDeclarationSyntax>().Single(m => m.Identifier.Text == "M");
+        MemberDeclarationSyntax member = tree.GetRoot().DescendantNodes().OfType<MemberDeclarationSyntax>()
+            .Single(m => m is MethodDeclarationSyntax { Identifier.Text: "M" } or TypeDeclarationSyntax { Identifier.Text: "M" });
         int typeNames = 0;
-        List<string> findings = TrustedCoreFindings(result.Compilation.GetSemanticModel(tree), method, ref typeNames);
+        List<string> findings = TrustedCoreFindings(result.Compilation.GetSemanticModel(tree), member, ref typeNames);
         Assert.True(findings.Count > 0, $"the trusted-core check accepted {Escape(source)}");
     }
 
@@ -1560,10 +1570,12 @@ public sealed class PartitionEncodingGoldenDifferentialTests
             }
 
             if (node is UnsafeStatementSyntax
-                || (node is LocalFunctionStatementSyntax local && local.Modifiers.Any(SyntaxKind.UnsafeKeyword)))
+                || (node is LocalFunctionStatementSyntax local && local.Modifiers.Any(SyntaxKind.UnsafeKeyword))
+                || (node != member && node is MemberDeclarationSyntax { Modifiers: var nested } && nested.Any(SyntaxKind.UnsafeKeyword)))
             {
                 // A pointer (a function pointer from a method handle, or a raw write) reaches code and state no
-                // binding names, so the core runs in no unsafe context at all (see also the member check above).
+                // binding names, so the core runs in no unsafe context at all: not in a block, a local function or a
+                // member of a nested core type (the core member itself and its enclosing types are checked above).
                 findings.Add($"{where}: unsafe code");
             }
 
@@ -1665,8 +1677,9 @@ public sealed class PartitionEncodingGoldenDifferentialTests
         "System.ModuleHandle", "System.TypedReference",
     };
 
-    // What the trusted core calls on that surface: each only reads metadata, and FixtureTextGuard_TrustedCoreBindsNothingRebindable
-    // fails on any entry the core no longer uses, so the list cannot grow quietly. Anything else there is a finding.
+    // What the trusted core calls on that surface: metadata reads, enum constants and equality tests, none of which runs
+    // code. FixtureTextGuard_TrustedCoreBindsNothingRebindable fails on any entry the core no longer uses, so the list
+    // cannot grow quietly. Anything else there is a finding.
     private static readonly HashSet<string> AllowedReflection = new(StringComparer.Ordinal)
     {
         "System.Reflection.Assembly.GetTypes", "System.Reflection.Assembly.op_Equality",
