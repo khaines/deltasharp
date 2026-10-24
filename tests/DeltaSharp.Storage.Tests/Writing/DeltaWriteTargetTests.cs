@@ -228,7 +228,8 @@ public sealed class DeltaWriteTargetTests : IDisposable
         // #708: a legal-but-hostile partition column name (space AND quote) must be percent-encoded into
         // add.path (BOTH key and value), yet round-trip correctly on read because partition truth lives in
         // add.partitionValues, not in the directory string. This also retires the write-path half of the
-        // Hive-redaction residual #714 (a DeltaSharp-authored key can no longer carry a quote or whitespace).
+        // Hive-redaction residual #714 for the QUOTE: escapePathName escapes both ASCII quotes, though since
+        // #806 an ASCII space stays raw on the on-disk key (only add.path carries it as %20).
         const string hostileColumn = "my col'x";
         var schema = new StructType(new[]
         {
@@ -289,8 +290,8 @@ public sealed class DeltaWriteTargetTests : IDisposable
         // directory-injection hardening (#708), now via Spark's escapePathName alphabet (#806 layer 1).
         //
         // NOTE: a raw ".." is NOT neutralized by this ENCODER (escapePathName does not escape '.', so ".."
-        // survives verbatim) — the '..' path-climb control is the committer guard
-        // EnsureNoneModePartitionNamesSafe / FindUnsafePathSegmentReason, tested separately, not this encoder.
+        // survives verbatim) — the '..' path-climb control is the committer guard EnsureNoneModePartitionNamesSafe
+        // / FindUnsafePathSegmentReason, tested separately, not this encoder.
         string segment = DeltaWriteEncoding.HivePartitionSegment(column, "v");
 
         Assert.DoesNotContain('/', segment);                 // no fabricated sub-directory ('/' -> %2F)

@@ -197,8 +197,9 @@ internal static class ColumnMapping
     // budget: it accepts every real name by a wide margin (a minted physical name is "col-<uuid>" = 40 bytes;
     // a logical partition name is typically far shorter) while guaranteeing >=127 bytes of headroom for
     // "=value" for any name without escapable ASCII (see the RESIDUAL below). A crafted ~300-byte name is
-    // rejected fail-closed when DeltaSharp commits the metaData (and, for a mapped physicalName, at load)
-    // instead of failing a later partitioned write.
+    // rejected fail-closed before it can be committed: by this check when DeltaSharp commits the metaData
+    // (on a create with data the file is staged first, and an over-255-byte encoded segment fails even
+    // earlier at DeltaWriteEncoding.HivePartitionSegment), and for a mapped physicalName also at load.
     //
     // RESIDUAL (#919): this bound is on the RAW name in UTF-8 bytes, but the NAME is written through
     // DeltaWriteEncoding.EscapePathName (#806 layer 1). That alphabet passes non-ASCII through unescaped, so a
@@ -431,15 +432,16 @@ internal static class ColumnMapping
     /// slash/traversal/control character in either is neutralised at write time (the value is data, not
     /// committed metaData). NUL is the exception: it is outside Spark's escape set, so a NUL in a value
     /// reaches the backend raw and fails closed there with an unclassified exception (#921). So does a NUL in
-    /// a none-mode partition NAME on a data write or OPTIMIZE: the committer's safe-segment check would reject
-    /// it, but the data file is staged first, so the backend throws before commit (and a foreign-committed
-    /// table's name is never re-checked); a mapped physicalName is instead checked here, at commit and load.
-    /// <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>, layer 2); the
-    /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>
-    /// legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim — empirically verified),
-    /// so the binding constraint on a physical name is uniformly the partition-directory path, not the
-    /// footer. (Note: the length bound is on the RAW name; the ENCODED-length residual for an escape-heavy
-    /// ASCII name is tracked under #919 — see <c>MaxPathSegmentNameBytes</c>.)</para>
+    /// a none-mode partition NAME: on a fresh create with data the file is staged before the committer's
+    /// safe-segment check runs, and on a foreign-committed table (append or OPTIMIZE) that check never runs at
+    /// all. A mapped physicalName is also checked here at load, so a foreign one is rejected before any
+    /// staging (DeltaSharp itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on top
+    /// (<c>ToAddPath</c>, layer 2); the staged data-file name is a crypto-random hex token, never
+    /// metaData-derived; and Parquet <b>column-name</b> legality imposes nothing (Parquet.Net 6.1.0
+    /// round-trips ANY column name verbatim — empirically verified), so the binding constraint on a physical
+    /// name is uniformly the partition-directory path, not the footer. (Note: the length bound is on the RAW
+    /// name; the ENCODED-length residual for an escape-heavy ASCII name is tracked under #919 — see
+    /// <c>MaxPathSegmentNameBytes</c>.)</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A nested (non-leaf) mapped column, a missing/empty physical
     /// name, an unsafe (non-path-segment) physical name, a duplicate physical name, a missing id, a
