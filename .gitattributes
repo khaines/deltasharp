@@ -12,3 +12,9 @@
 *.jpeg binary
 *.gif binary
 *.ico binary
+
+# Reference-engine Parquet goldens (#806 Inc-C). Without this they rely on git's
+# text=auto NUL-byte heuristic; a regenerated fixture lacking an early NUL would be
+# silently CRLF->LF normalized, corrupting the file and firing the SHA256 tripwire
+# as a misleading "provenance violation".
+*.parquet binary
