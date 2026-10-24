@@ -15,11 +15,12 @@ namespace DeltaSharp.Storage.Delta;
 /// <item>a token whose very presence discloses something the message must not carry (physical data-schema
 /// content, secrets) is <b>dropped</b> from the <c>Message</c> and, where useful, kept on a typed property a
 /// caller can read and redact at its own sink;</item>
-/// <item><b>data-derived content is dropped, never sanitized.</b> A table-relative object path is Hive-encoded
-/// (<c>email=alice%40example.com/part-….parquet</c>), so its directory segments embed partition VALUES — which
+/// <item><b>data-derived content is dropped, never sanitized.</b> A table-relative object path is Hive-style
+/// (<c>email=alice@example.com/part-….parquet</c>), so its directory segments embed partition VALUES — which
 /// are COLUMN VALUES, i.e. table data and potentially PII. <see cref="Sanitize"/> does not help: an email
-/// address is neither a control character nor over the cap, so it would survive verbatim and
-/// <c>Uri.UnescapeDataString</c> recovers it. Every path echo therefore goes through
+/// address is neither a control character nor over the cap, so it would survive verbatim (a legacy or
+/// foreign path's <c>%40</c> spelling is recovered by <c>Uri.UnescapeDataString</c>). Every path echo
+/// therefore goes through
 /// <see cref="DescribePath"/>, which keeps the file name and the partition COLUMN NAMES (both sanitized) and
 /// discards the values, with the raw path retained on a typed property. The same applies to a path that
 /// arrives inside FOREIGN TEXT: stripping the absolute root from a framework exception message leaves the
@@ -120,11 +121,11 @@ internal static class DiagnosticText
     /// Renders a table-relative object path for a fault message or log line, keeping the partition
     /// <b>context</b> while dropping every partition <b>value</b>.
     /// <para>DeltaSharp lays data out Hive-style, so a relative path such as
-    /// <c>email=alice%40example.com/region=EU/part-DD73….parquet</c> embeds COLUMN VALUES in its directory
+    /// <c>email=alice@example.com/region=EU/part-DD73….parquet</c> embeds COLUMN VALUES in its directory
     /// segments. Those values are table DATA — potentially PII — and no amount of sanitizing removes them:
     /// <see cref="Sanitize"/> strips control characters and caps length, but an email address is neither a
     /// control character nor longer than the cap, so it would survive verbatim (and
-    /// <c>Uri.UnescapeDataString</c> recovers the original from the percent-encoding). Data-derived content is
+    /// <c>Uri.UnescapeDataString</c> recovers the original from any percent-encoding). Data-derived content is
     /// therefore <b>dropped</b>, never sanitized.</para>
     /// <para>Dropping the whole path would cost the operator the context they need, so this renders the file
     /// name plus the partition COLUMN NAMES parsed from the <c>key=value</c> segments — e.g.
@@ -154,8 +155,9 @@ internal static class DiagnosticText
     /// so a foreign, non-canonical path <c>name=a/b</c> renders <c>'b' (partitioned by: name)</c>. This is the
     /// safe direction for a Hive path and is unreachable for DeltaSharp-written paths (the write door's
     /// <c>DeltaWriteEncoding.EscapePathName</c> escapes a <c>/</c> in the value to <c>%2F</c> on disk, which
-    /// <c>add.path</c> then carries as <c>%252F</c>; the name cannot hold a <c>/</c> at all); the opposite
-    /// <c>\</c> ambiguity is resolved the other way (never toward disclosure) because a backslash is only a separator on some platforms. (2) The
+    /// <c>add.path</c> then carries as <c>%252F</c>; a <c>/</c> in the column name is rejected at commit and,
+    /// on a foreign-committed table, escaped the same way); the opposite <c>\</c> ambiguity is resolved the
+    /// other way (never toward disclosure) because a backslash is only a separator on some platforms. (2) The
     /// TERMINAL segment is echoed as the file name; a foreign writer that names a file by a data subject
     /// (rather than <c>part-*.parquet</c>) could surface that name — bounded and sanitized, but not dropped.
     /// Both are documented residuals, not the value-in-a-partition-segment disclosure this method closes.</para>

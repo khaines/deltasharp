@@ -565,7 +565,7 @@ public sealed class DeltaOptimizeTests : IDisposable
         Assert.Equal(usBefore, Sorted(await ReadRowsAsync(new[] { output.Path }))); // US rows preserved.
     }
 
-    // A partition value carrying reserved / traversal characters is percent-encoded (Uri.EscapeDataString)
+    // A partition value carrying reserved / traversal characters is escaped (Spark's escapePathName, #806)
     // into a SINGLE safe directory segment on the compacted output path — IDENTICAL to the write path
     // (DeltaWriteTarget.DataFilePath) — so OPTIMIZE neither escapes the confined table root nor fabricates
     // spurious sub-directories, while the log keeps the value verbatim (partition truth). Red-team #583 R7:

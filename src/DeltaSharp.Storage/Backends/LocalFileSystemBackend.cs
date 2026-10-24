@@ -926,9 +926,10 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     // in the very same message from which DescribePath just dropped it:
     //
     //   Deleting 'part-x.parquet' (partitioned by: email, region) failed:
-    //   IOException: Could not delete file '<table-root>/email=alice%40example.com/region=EU/part-x.parquet'
+    //   IOException: Could not delete file '<table-root>/email=alice@example.com/region=EU/part-x.parquet'
     //
-    // and Uri.UnescapeDataString recovers the address. `{detail}` was correctly out of scope for #664, which
+    // with the address verbatim ('@' is escaped by neither layer of the #806 write; a legacy or foreign path's
+    // %40 spelling is recovered by Uri.UnescapeDataString). `{detail}` was correctly out of scope for #664, which
     // was about inner-exception/ToString() rendering; the Hive-path ruling is newer and converts it from a
     // log-injection question into a PII channel in Message itself. Only a value that follows a separator and
     // a `key=` is rewritten, so ordinary text such as "errno=13" is untouched.
@@ -1020,10 +1021,12 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //   * Key class excluding whitespace and quotes: a key containing a space, tab, CR, U+2028, NBSP, an
     //     apostrophe or a double quote made the group unable to span to the '=', and with only one legal
     //     start position per segment the recognizer then matched NOTHING. Unlike the three above this is
-    //     not a foreign-table hypothetical: DeltaWriteTarget percent-encodes the partition VALUE but writes
-    //     the column NAME raw, and nothing in this assembly validates a partition column name — so a table
-    //     partitioned by a legal Delta column such as `my col` or `o'brien` emits the leaking shape on
-    //     DeltaSharp's OWN happy path, with no adversary involved at all.
+    //     not a foreign-table hypothetical: before #708 DeltaWriteTarget percent-encoded the partition VALUE
+    //     but wrote the column NAME raw, and nothing in this assembly validated a partition column name — so
+    //     a table partitioned by a legal Delta column such as `my col` or `o'brien` emitted the leaking shape
+    //     on DeltaSharp's OWN happy path, with no adversary involved at all. Since #806 the physical key the
+    //     backend sees escapes both ASCII quotes but keeps an ASCII space raw (Spark's escapePathName), so
+    //     `my col` is a happy-path shape again and `o'brien` (now `o%27brien`) is not.
     //   * Literal '=' only: a segment whose separator arrived percent-encoded ("email%3Dvalue") is a Hive
     //     directory the recognizer did not recognize. Both spellings are now accepted.
     //
@@ -1036,7 +1039,8 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //
     // An UNENCODED space in a partition VALUE is now fully covered whenever a right delimiter exists -- the
     // delimited branches admit whitespace in the value precisely because add.path is FOREIGN and a foreign
-    // writer is under no obligation to percent-encode (DeltaSharp itself does). It under-redacts only in the
+    // writer is under no obligation to percent-encode -- and since #806 DeltaSharp's own physical key leaves an
+    // ASCII space raw too (escapePathName; only add.path carries %20). It under-redacts only in the
     // undelimited branch 4, which is residual R1 below: "name=Alice Taylor" at the very end of a message
     // renders as "name=<value> Taylor". That partial-match shape is exactly why branch order matters.
     //
@@ -1116,10 +1120,11 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //       monotonicity regression against 9220b66 and is tracked by #714. As of #708 the WRITE-PATH half is
     //       retired FOR NEW WRITES: DeltaWriteEncoding.HivePartitionSegment now escapes the partition column
     //       NAME as well as the value (Spark's escapePathName alphabet since #806, which escapes both ASCII
-    //       quotes), so a DeltaSharp-authored add.path key WRITTEN AFTER #708 can no longer carry a quote
-    //       and cannot produce this both-quote-and-whitespace shape. R2 remains reachable via a
-    //       FOREIGN add.path (a key alphabet DeltaSharp does not control) AND via a LEGACY DeltaSharp-authored
-    //       add.path written BEFORE #708 (raw, unencoded keys) -- the encoding retires the residual for NEW
+    //       quotes), so neither the physical key nor the add.path of a DeltaSharp-authored file WRITTEN
+    //       AFTER #708 can carry a quote, and neither can produce this both-quote-and-whitespace shape. R2
+    //       remains reachable via a FOREIGN add.path (a key alphabet DeltaSharp does not control) AND via a
+    //       LEGACY DeltaSharp-authored add.path written BEFORE #708 (raw, unencoded column-name keys) -- the
+    //       encoding retires the residual for NEW
     //       writes only, not retroactively -- which is why Redact_MonotonicityMatrix still asserts
     //       declinedR2 > 0: the recognizer must handle both foreign and legacy input forever.
     //

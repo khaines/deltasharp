@@ -18,8 +18,8 @@ namespace DeltaSharp.Storage.Diagnostics;
 /// The audit line (AC3) names a discovered candidate <b>file</b> and the bounded <b>decision</b>/<b>reason</b>
 /// for why it was kept or deleted, and is the load-bearing evidence an operator needs to audit a
 /// data-loss-sensitive delete, so it is rendered here at <c>Debug</c>.
-/// <para><b>The candidate is rendered as a DESCRIPTION, not a raw path.</b> DeltaSharp writes Hive-encoded
-/// paths, so a candidate key such as <c>email=alice%40example.com/part-….parquet</c> embeds partition VALUES
+/// <para><b>The candidate is rendered as a DESCRIPTION, not a raw path.</b> DeltaSharp writes Hive-style
+/// paths, so a candidate key such as <c>email=alice@example.com/part-….parquet</c> embeds partition VALUES
 /// — column values, i.e. table data and potentially PII — and the raw <c>add.path</c> is foreign, untrusted
 /// text that can carry CRLF and forge a log line on a text sink. Unlike an exception <c>Message</c>, a
 /// <see cref="LoggerMessage"/> emits unconditionally from inside DeltaSharp, so it bypasses any

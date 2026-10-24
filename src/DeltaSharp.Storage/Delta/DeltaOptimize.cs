@@ -777,9 +777,10 @@ internal sealed class DeltaOptimize
     // partition directory ("col=value/"), using Spark's __HIVE_DEFAULT_PARTITION__ sentinel for a null
     // value. BOTH the partition column NAME and the value are escaped with Spark's escapePathName alphabet
     // (DeltaWriteEncoding.EscapePathName) via DeltaWriteEncoding.HivePartitionSegment — IDENTICAL to the write
-    // path (DeltaWriteTarget.DataFilePath) and byte-for-byte what Spark writes (#806 layer 1). '/', '\', '=',
-    // ':' and control characters are escaped, so a hostile name/value becomes a single safe directory segment
-    // instead of escaping the confined table root or fabricating spurious sub-directories (the #708
+    // path (DeltaWriteTarget.DataFilePath) and byte-for-byte what Spark writes on non-Windows hosts (#806
+    // layer 1). '/', '\', '=', ':' and controls 0x01–0x1F and DEL are escaped, so a hostile name/value becomes
+    // a single safe directory segment instead of escaping the confined table root or fabricating spurious
+    // sub-directories (the #708
     // hardening); space and non-ASCII pass through, as in Spark. The caller URI-encodes the returned relative
     // path into add.path (DeltaWriteEncoding.ToAddPath, layer 2).
     // Partition membership is authoritative from the add action, not the path; the directory only keeps the

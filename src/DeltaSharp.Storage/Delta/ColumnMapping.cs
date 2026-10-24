@@ -194,10 +194,10 @@ internal static class ColumnMapping
     // name as "name=value", so the NAME alone must stay well under that ceiling to leave room for the "=value"
     // suffix (the value is data-dependent and escaped by DeltaWriteEncoding.EscapePathName, Spark's
     // escapePathName alphabet — e.g. __HIVE_DEFAULT_PARTITION__ is 26 bytes). 128 bytes is half the component
-    // budget: it accepts every real name by a wide margin (a minted
-    // physical name is "col-<uuid>" = 40 bytes; a logical partition name is typically far shorter) while
-    // guaranteeing >=127 bytes of headroom for "=value". A crafted ~300-byte name is rejected fail-closed at
-    // commit/load instead of failing a later partitioned write at the path-resolution/confined-root guard.
+    // budget: it accepts every real name by a wide margin (a minted physical name is "col-<uuid>" = 40 bytes;
+    // a logical partition name is typically far shorter) while guaranteeing >=127 bytes of headroom for
+    // "=value" for any name without escapable ASCII (see the RESIDUAL below). A crafted ~300-byte name is
+    // rejected fail-closed at commit/load instead of failing a later partitioned write.
     //
     // RESIDUAL (#919): this bound is on the RAW name in UTF-8 bytes, but the NAME is written through
     // DeltaWriteEncoding.EscapePathName (#806 layer 1). That alphabet passes non-ASCII through unescaped, so a
@@ -421,12 +421,12 @@ internal static class ColumnMapping
     /// <c>none</c> mode is a no-op here (its fields may carry stray mapping metadata harmlessly — unchanged
     /// posture). This is an explicit choke point (not an incidental ctor throw), so the guarantee holds
     /// regardless of how the schema is built.</para>
-    /// <para><b>Not a gap — the name→path dimension is complete across all modes (#572 R7).</b> Every
+    /// <para><b>Not an injection gap — the name→path dimension is complete across all modes (#572 R7).</b> Every
     /// metaData-controlled name that becomes a filesystem path segment is safe-segment + length validated: the
     /// mapped physicalName (name/id, here); the logical partition name (none, at the committer). A partition
     /// <b>name AND value</b> are both escaped into the physical directory segment with Spark's
     /// <c>escapePathName</c> alphabet (<c>DeltaWriteEncoding.EscapePathName</c>, #806 layer 1; since #708 the
-    /// NAME too, not only the value), which escapes <c>/ \ = :</c> and control characters, so a
+    /// NAME too, not only the value), which escapes <c>/ \ = :</c> and controls 0x01–0x1F and DEL, so a
     /// slash/traversal/control character in either is neutralised at write time (the value is data, not
     /// committed metaData); <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>, layer 2); the
     /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>

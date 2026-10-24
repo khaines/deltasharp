@@ -5509,9 +5509,9 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     }
 
     [Theory]
-    // SPARK'S escapePathName DOES NOT ESCAPE AN APOSTROPHE, and add.path is foreign, so a quote inside a
-    // partition VALUE is a real shape rather than a constructed one. These rows carry two assertions each,
-    // and they pin two different halves of ClosingQuoteValue:
+    // add.path IS FOREIGN, so a quote inside a partition VALUE is a real shape rather than a constructed one:
+    // Spark's escapePathName writes an apostrophe as %27, but nothing obliges a foreign writer to escape it.
+    // These rows carry two assertions each, and they pin two different halves of ClosingQuoteValue:
     //
     //   * no fragment of the value survives -- pins the value run being PERMISSIVE. A quote-excluding value
     //     run stops at the apostrophe, and the quote-delimited branches then decline; only the
@@ -5635,8 +5635,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     [Theory]
     // POSSESSIVE PARTITION VALUES, ACROSS EVERY SPELLING A REAL PRODUCER EMITS. Reported independently by
     // two reviewers with these exact values; kept under their names because the rows are the evidence.
-    // Spark's escapePathName leaves an apostrophe raw and add.path is foreign, so `Teachers' Union` is an
-    // ordinary partition value, not a crafted one.
+    // add.path is foreign, so `Teachers' Union` is an ordinary partition value, not a crafted one (Spark's
+    // escapePathName writes the apostrophe as %27, but a foreign writer need not escape it).
     //
     // The axis that matters here is the MESSAGE ENVELOPE, not the value: the same value is reported by
     // .NET inside single quotes, inside double quotes, with trailing prose, and bare. A reviewer probing
@@ -5948,8 +5948,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         // is the single follower class the closing-quote boundary set excludes. `Boys' Club` -- apostrophe
         // then SPACE -- was outside the corpus, and it partial-matched. So the axis is not "does the value
         // contain a quote" but "what comes immediately after it", and the rows below range over the whole
-        // boundary set. add.path is FOREIGN, and Spark's escapePathName leaves an apostrophe raw, so none
-        // of these depends on what DeltaSharp itself writes.
+        // boundary set. add.path is FOREIGN (Spark escapes an apostrophe to %27, but nothing
+        // obliges a foreign writer to), so none of these depends on what DeltaSharp itself writes.
         // THE VALUE LATTICE IS GENERATED FROM A STRUCTURAL ALPHABET, NOT ENUMERATED BY HAND, AND THE
         // PAYLOAD IS A SENTINEL RATHER THAN PROSE. The previous rows were readable strings
         // (`Aaaa'Bbbb`) scored by splitting on a hard-coded character set. That set enumerated the

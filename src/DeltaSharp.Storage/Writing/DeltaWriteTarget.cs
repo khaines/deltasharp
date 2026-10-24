@@ -885,8 +885,10 @@ public sealed class DeltaWriteTarget : IDisposable
         foreach (string column in partitionColumns)
         {
             partitionValues.TryGetValue(column, out string? value);
-            // #708: encode BOTH the column name and the value via DeltaWriteEncoding.HivePartitionSegment,
-            // so a legal-but-hostile column name (space, quote, control char) cannot land raw in add.path.
+            // #708/#806: escape BOTH the column name and the value via DeltaWriteEncoding.HivePartitionSegment
+            // (layer 1, Spark's escapePathName), so a legal-but-hostile column name cannot land a quote,
+            // separator or control char raw on disk. A space stays raw on disk, as in Spark; only add.path
+            // (ToAddPath, layer 2) carries it as %20.
             segments.Add(DeltaWriteEncoding.HivePartitionSegment(column, value));
         }
 
