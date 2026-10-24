@@ -428,7 +428,9 @@ internal static class ColumnMapping
     /// <c>escapePathName</c> alphabet (<c>DeltaWriteEncoding.EscapePathName</c>, #806 layer 1; since #708 the
     /// NAME too, not only the value), which escapes <c>/ \ = :</c> and controls 0x01–0x1F and DEL, so a
     /// slash/traversal/control character in either is neutralised at write time (the value is data, not
-    /// committed metaData); <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>, layer 2); the
+    /// committed metaData). NUL is the exception: it is outside Spark's escape set, so a NUL in a VALUE
+    /// reaches the backend raw and fails closed there with an unclassified exception (#921); a NUL in a name
+    /// is rejected here. <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>, layer 2); the
     /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>
     /// legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim — empirically verified),
     /// so the binding constraint on a physical name is uniformly the partition-directory path, not the

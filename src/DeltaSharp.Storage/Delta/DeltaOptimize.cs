@@ -780,9 +780,9 @@ internal sealed class DeltaOptimize
     // path (DeltaWriteTarget.DataFilePath) and byte-for-byte what Spark writes on non-Windows hosts (#806
     // layer 1). '/', '\', '=', ':' and controls 0x01–0x1F and DEL are escaped, so a hostile name/value becomes
     // a single safe directory segment instead of escaping the confined table root or fabricating spurious
-    // sub-directories (the #708
-    // hardening); space and non-ASCII pass through, as in Spark. The caller URI-encodes the returned relative
-    // path into add.path (DeltaWriteEncoding.ToAddPath, layer 2).
+    // sub-directories (the #708 hardening); space and non-ASCII pass through, as in Spark. NUL also passes
+    // (it is outside Spark's set): a NUL in a value fails closed at the backend, unclassified (#921). The
+    // caller URI-encodes the returned relative path into add.path (DeltaWriteEncoding.ToAddPath, layer 2).
     // Partition membership is authoritative from the add action, not the path; the directory only keeps the
     // object layout tidy and consistent with the write path.
     private string BuildOutputPath(

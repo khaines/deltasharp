@@ -15,17 +15,16 @@ namespace DeltaSharp.Storage.Delta;
 /// <item>a token whose very presence discloses something the message must not carry (physical data-schema
 /// content, secrets) is <b>dropped</b> from the <c>Message</c> and, where useful, kept on a typed property a
 /// caller can read and redact at its own sink;</item>
-/// <item><b>data-derived content is dropped, never sanitized.</b> A table-relative object path is Hive-style
+/// <item><b>data-derived content is dropped, never sanitized.</b> A table-relative object path is Hive-encoded
 /// (<c>email=alice@example.com/part-….parquet</c>), so its directory segments embed partition VALUES — which
 /// are COLUMN VALUES, i.e. table data and potentially PII. <see cref="Sanitize"/> does not help: an email
 /// address is neither a control character nor over the cap, so it would survive verbatim (a legacy or
 /// foreign path's <c>%40</c> spelling is recovered by <c>Uri.UnescapeDataString</c>). Every path echo
-/// therefore goes through
-/// <see cref="DescribePath"/>, which keeps the file name and the partition COLUMN NAMES (both sanitized) and
-/// discards the values, with the raw path retained on a typed property. The same applies to a path that
-/// arrives inside FOREIGN TEXT: stripping the absolute root from a framework exception message leaves the
-/// table-RELATIVE remainder, which is still Hive-encoded, so a backend must also strip the <c>=value</c> out
-/// of any surviving <c>key=value</c> segment before that text reaches a <c>Message</c>;</item>
+/// therefore goes through <see cref="DescribePath"/>, which keeps the file name and the partition COLUMN
+/// NAMES (both sanitized) and discards the values, with the raw path retained on a typed property. The same
+/// applies to a path that arrives inside FOREIGN TEXT: stripping the absolute root from a framework exception
+/// message leaves the table-RELATIVE remainder, which is still Hive-encoded, so a backend must also strip the
+/// <c>=value</c> out of any surviving <c>key=value</c> segment before that text reaches a <c>Message</c>;</item>
 /// <item>the <b>shape</b> of a path is not data and is kept: whether it was rooted, how many parent
 /// traversals it used, how many directories were dropped, and whether it sits under a DeltaSharp-generated
 /// control directory. These are counts and fixed literals. Keeping them is what stops a confinement

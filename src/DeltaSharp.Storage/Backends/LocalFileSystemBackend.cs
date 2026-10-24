@@ -1022,11 +1022,12 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //     apostrophe or a double quote made the group unable to span to the '=', and with only one legal
     //     start position per segment the recognizer then matched NOTHING. Unlike the three above this is
     //     not a foreign-table hypothetical: before #708 DeltaWriteTarget percent-encoded the partition VALUE
-    //     but wrote the column NAME raw, and nothing in this assembly validated a partition column name — so
-    //     a table partitioned by a legal Delta column such as `my col` or `o'brien` emitted the leaking shape
-    //     on DeltaSharp's OWN happy path, with no adversary involved at all. Since #806 the physical key the
-    //     backend sees escapes both ASCII quotes but keeps an ASCII space raw (Spark's escapePathName), so
-    //     `my col` is a happy-path shape again and `o'brien` (now `o%27brien`) is not.
+    //     but wrote the column NAME raw, and the #572 R7 path-segment check (EnsureNoneModePartitionNamesSafe)
+    //     accepts a space and an apostrophe — so a table partitioned by a legal Delta column such as `my col`
+    //     or `o'brien` emitted the leaking shape on DeltaSharp's OWN happy path, with no adversary involved.
+    //     Since #806 the physical key the backend sees escapes both ASCII quotes but keeps an ASCII space raw
+    //     (Spark's escapePathName), so `my col` is a happy-path shape again and `o'brien` (now `o%27brien`)
+    //     is not.
     //   * Literal '=' only: a segment whose separator arrived percent-encoded ("email%3Dvalue") is a Hive
     //     directory the recognizer did not recognize. Both spellings are now accepted.
     //
@@ -1124,8 +1125,8 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //       AFTER #708 can carry a quote, and neither can produce this both-quote-and-whitespace shape. R2
     //       remains reachable via a FOREIGN add.path (a key alphabet DeltaSharp does not control) AND via a
     //       LEGACY DeltaSharp-authored add.path written BEFORE #708 (raw, unencoded column-name keys) -- the
-    //       encoding retires the residual for NEW
-    //       writes only, not retroactively -- which is why Redact_MonotonicityMatrix still asserts
+    //       encoding retires the residual for NEW writes only, not retroactively -- which is why
+    //       Redact_MonotonicityMatrix still asserts
     //       declinedR2 > 0: the recognizer must handle both foreign and legacy input forever.
     //
     // R3 -- {quote INSIDE the value} -- is closed for the balanced quoting a framework message emits; an

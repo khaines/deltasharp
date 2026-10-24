@@ -4745,7 +4745,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         //   Deleting 'part-x.parquet' (partitioned by: email, region) failed:
         //   IOException: Could not delete file '<table-root>/email=alice%40example.com/region=EU/part-x.parquet'
         //
-        // {detail} was correctly out of scope for #664 (inner-exception/ToString rendering); the Hive-path
+        // (That was the pre-#806 spelling; since #806 the '@' is literal on disk, which only strengthens the
+        // case.) {detail} was correctly out of scope for #664 (inner-exception/ToString rendering); the Hive-path
         // ruling is newer and turns it into a PII channel in Message itself.
         await _backend.PutIfAbsentAsync(PartitionedPath, new byte[] { 1 }, CancellationToken.None);
 
@@ -5948,8 +5949,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         // is the single follower class the closing-quote boundary set excludes. `Boys' Club` -- apostrophe
         // then SPACE -- was outside the corpus, and it partial-matched. So the axis is not "does the value
         // contain a quote" but "what comes immediately after it", and the rows below range over the whole
-        // boundary set. add.path is FOREIGN (Spark escapes an apostrophe to %27, but nothing
-        // obliges a foreign writer to), so none of these depends on what DeltaSharp itself writes.
+        // boundary set. add.path is FOREIGN (Spark escapes an apostrophe to %27, but nothing obliges a
+        // foreign writer to), so none of these depends on what DeltaSharp itself writes.
         // THE VALUE LATTICE IS GENERATED FROM A STRUCTURAL ALPHABET, NOT ENUMERATED BY HAND, AND THE
         // PAYLOAD IS A SENTINEL RATHER THAN PROSE. The previous rows were readable strings
         // (`Aaaa'Bbbb`) scored by splitting on a hard-coded character set. That set enumerated the
