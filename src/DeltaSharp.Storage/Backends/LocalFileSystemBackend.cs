@@ -1020,13 +1020,15 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //     why the recognizer must still cover it — the input is a FOREIGN add.path.
     //   * Key class excluding whitespace and quotes: a key containing a space, tab, CR, U+2028, NBSP, an
     //     apostrophe or a double quote made the group unable to span to the '=', and with only one legal
-    //     start position per segment the recognizer then matched NOTHING. Unlike the three above this is
-    //     not a foreign-table hypothetical: before #708 DeltaWriteTarget percent-encoded the partition VALUE
-    //     but wrote the column NAME raw, and the #572 R7 path-segment check (EnsureNoneModePartitionNamesSafe)
-    //     accepts a space and an apostrophe — so a table partitioned by a legal Delta column such as `my col`
-    //     or `o'brien` emitted the leaking shape on DeltaSharp's OWN happy path, with no adversary involved.
-    //     Since #806 the backend's physical key escapes both ASCII quotes but keeps an ASCII space raw
-    //     (Spark's escapePathName): `my col` is a happy-path shape again, `o'brien` (now `o%27brien`) is not.
+    //     start position per segment the recognizer then matched NOTHING. Unlike the three above, the space,
+    //     NBSP and quote keys are not a foreign-table hypothetical: before #708 DeltaWriteTarget
+    //     percent-encoded the partition VALUE but wrote the column NAME raw, and the #572 R7 path-segment check
+    //     (EnsureNoneModePartitionNamesSafe) accepts a space, an NBSP and both quotes — so a table partitioned
+    //     by a legal Delta column such as `my col` or `o'brien` emitted the leaking shape on DeltaSharp's OWN
+    //     happy path, with no adversary involved. (R7 rejects the tab, CR and U+2028 keys, so those were
+    //     always foreign-only.) Since #806 the backend's physical key escapes both ASCII quotes but keeps an
+    //     ASCII space and an NBSP raw (Spark's escapePathName): `my col` is a happy-path shape again,
+    //     `o'brien` (now `o%27brien`) is not.
     //   * Literal '=' only: a segment whose separator arrived percent-encoded ("email%3Dvalue") is a Hive
     //     directory the recognizer did not recognize. Both spellings are now accepted.
     //

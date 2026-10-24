@@ -197,9 +197,9 @@ internal static class ColumnMapping
     // budget: it accepts every real name by a wide margin (a minted physical name is "col-<uuid>" = 40 bytes;
     // a logical partition name is typically far shorter) while guaranteeing >=127 bytes of headroom for
     // "=value" for any name without escapable ASCII (see the RESIDUAL below). A crafted ~300-byte name is
-    // rejected fail-closed before it can be committed: by this check when DeltaSharp commits the metaData
-    // (on a create with data the file is staged first, and an over-255-byte encoded segment fails even
-    // earlier at DeltaWriteEncoding.HivePartitionSegment), and for a mapped physicalName also at load.
+    // rejected fail-closed: before DeltaSharp commits it (by this check at commit; on a create with data the
+    // file is staged first, and an over-255-byte encoded segment fails even earlier at
+    // DeltaWriteEncoding.HivePartitionSegment), and, for a foreign mapped physicalName, at load.
     //
     // RESIDUAL (#919): this bound is on the RAW name in UTF-8 bytes, but the NAME is written through
     // DeltaWriteEncoding.EscapePathName (#806 layer 1). That alphabet passes non-ASCII through unescaped, so a
@@ -433,10 +433,11 @@ internal static class ColumnMapping
     /// committed metaData). NUL is the exception: it is outside Spark's escape set, so a NUL in a value
     /// reaches the backend raw and fails closed there with an unclassified exception (#921). So does a NUL in
     /// a none-mode partition NAME: on a fresh create with data the file is staged before the committer's
-    /// safe-segment check runs, and on a foreign-committed table (append or OPTIMIZE) that check never runs at
-    /// all. A mapped physicalName is also checked here at load, so a foreign one is rejected before any
-    /// staging (DeltaSharp itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on top
-    /// (<c>ToAddPath</c>, layer 2); the staged data-file name is a crypto-random hex token, never
+    /// safe-segment check runs, and on a foreign-committed table (append or OPTIMIZE) that check runs only if
+    /// the operation itself commits metaData (e.g. a mergeSchema append; OPTIMIZE never does), and then still
+    /// after staging. A mapped physicalName is also checked here at load, so a foreign one is rejected before
+    /// any staging (DeltaSharp itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on
+    /// top (<c>ToAddPath</c>, layer 2); the staged data-file name is a crypto-random hex token, never
     /// metaData-derived; and Parquet <b>column-name</b> legality imposes nothing (Parquet.Net 6.1.0
     /// round-trips ANY column name verbatim — empirically verified), so the binding constraint on a physical
     /// name is uniformly the partition-directory path, not the footer. (Note: the length bound is on the RAW
@@ -1655,8 +1656,9 @@ internal static class ColumnMapping
     /// mapped physical name (a separator, <c>=</c>, <c>:</c>, control char, <c>.</c>/<c>..</c>,
     /// whitespace-only, or over-<see cref="MaxPathSegmentNameBytes"/>-byte name would restructure/escape the
     /// directory tree or exceed the filesystem path-component limit). A crafted <c>partitionColumns</c> naming
-    /// an unsafe column (e.g. <c>../escape</c>) commits and loads today and only fails a later partitioned
-    /// write at the path/confined-root guard; this rejects it fail-closed at COMMIT (table unchanged). Like
+    /// an unsafe column (e.g. <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned
+    /// write then failed at the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
+    /// (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at COMMIT (table unchanged). Like
     /// <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
     /// NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is too broad for a
     /// load-side name check; the committer guarantees no NEW unsafe-partition-name table is published. It is
