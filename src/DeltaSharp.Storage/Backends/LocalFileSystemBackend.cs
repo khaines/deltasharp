@@ -1114,9 +1114,10 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //       free win. Confined in practice to a message naming a partition DIRECTORY, since a data file
     //       appends "/part-<guid>.parquet" and so supplies the separator branch 1 needs. This is a
     //       monotonicity regression against 9220b66 and is tracked by #714. As of #708 the WRITE-PATH half is
-    //       retired FOR NEW WRITES: DeltaWriteEncoding.HivePartitionSegment now percent-encodes the partition
-    //       column NAME as well as the value, so a DeltaSharp-authored add.path key WRITTEN AFTER #708 can no
-    //       longer carry a quote or whitespace and cannot produce this shape. R2 remains reachable via a
+    //       retired FOR NEW WRITES: DeltaWriteEncoding.HivePartitionSegment now escapes the partition column
+    //       NAME as well as the value (Spark's escapePathName alphabet since #806, which escapes both ASCII
+    //       quotes), so a DeltaSharp-authored add.path key WRITTEN AFTER #708 can no longer carry a quote
+    //       and cannot produce this both-quote-and-whitespace shape. R2 remains reachable via a
     //       FOREIGN add.path (a key alphabet DeltaSharp does not control) AND via a LEGACY DeltaSharp-authored
     //       add.path written BEFORE #708 (raw, unencoded keys) -- the encoding retires the residual for NEW
     //       writes only, not retroactively -- which is why Redact_MonotonicityMatrix still asserts

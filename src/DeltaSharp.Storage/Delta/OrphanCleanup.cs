@@ -57,16 +57,20 @@ internal readonly record struct OrphanDecision(string Path, OrphanClassification
 ///
 /// <para><b>Path-encoding robustness (data-loss critical).</b> Delta's protocol URI-encodes the file paths
 /// stored in the log (<c>add.path</c>/<c>remove.path</c>): a file literally named <c>a b.parquet</c> on disk
-/// is recorded as <c>a%20b.parquet</c> in the log. As of #708 DeltaSharp writes <b>percent-encoded</b> Hive
-/// keys AND values (<c>Uri.EscapeDataString</c> on both the partition column name and the value), but tables
-/// written BEFORE #708 carry raw unencoded keys, and a Spark-written / Delta-protocol table encodes with a
-/// different alphabet — while a directory listing always yields the raw disk key. Matching a raw candidate
+/// is recorded as <c>a%20b.parquet</c> in the log. Since #806 (Inc-B) DeltaSharp writes the Spark two-layer
+/// scheme: the on-disk partition directory is escaped with Spark's <c>escapePathName</c> alphabet
+/// (<c>DeltaWriteEncoding.EscapePathName</c>, on both the column name and the value), and <c>add.path</c> is
+/// that disk key URI-encoded once more (<c>DeltaWriteEncoding.ToAddPath</c>). Older tables differ: those
+/// written between #708 and #806 used the legacy <c>Uri.EscapeDataString</c> scheme with the disk key stored
+/// literally in <c>add.path</c>, and those written BEFORE #708 carry raw unencoded keys — while a directory
+/// listing always yields the raw disk key. Matching a raw candidate
 /// against only the raw log path would classify the still-active <c>a b.parquet</c> as an orphan and delete
 /// it. The protected sets are therefore the <b>union</b> of each log path and its
 /// <see cref="Uri.UnescapeDataString(string)"/> decoding, and a candidate key is tested against that union
 /// under BOTH its raw form and its own decoding (#490) — so the comparison is canonical on BOTH sides. This
-/// protects legacy-raw, current DeltaSharp-encoded, and Spark-encoded tables alike, regardless of whether the
-/// LISTING yields the raw disk key (today's <c>LocalFileSystemBackend</c>) or a URI-ENCODED key (a future
+/// protects legacy-raw, legacy-<c>EscapeDataString</c>, and current two-layer (DeltaSharp and Spark) tables
+/// alike, regardless of whether the LISTING yields the raw disk key (today's <c>LocalFileSystemBackend</c>)
+/// or a URI-ENCODED key (a future
 /// S3/ADLS/GCS backend that returns encoded listing keys); it can only ever <i>over</i>-protect (a rare
 /// filename containing a literal <c>%</c> sequence that happens to decode to
 /// another candidate's name), never over-delete.</para>

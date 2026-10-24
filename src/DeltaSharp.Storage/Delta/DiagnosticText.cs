@@ -152,9 +152,10 @@ internal static class DiagnosticText
     /// <para><b>Accepted residuals (Privacy seat, #686):</b> (1) a raw <c>/</c> INSIDE a partition value is
     /// treated as a component boundary (not part of the value), because on a real store it genuinely is one —
     /// so a foreign, non-canonical path <c>name=a/b</c> renders <c>'b' (partitioned by: name)</c>. This is the
-    /// safe direction for a Hive path and is unreachable for DeltaSharp-written paths (the write door
-    /// <c>Uri.EscapeDataString</c>s the value to <c>%2F</c>); the opposite <c>\</c> ambiguity is resolved the
-    /// other way (never toward disclosure) because a backslash is only a separator on some platforms. (2) The
+    /// safe direction for a Hive path and is unreachable for DeltaSharp-written paths (the write door's
+    /// <c>DeltaWriteEncoding.EscapePathName</c> escapes a <c>/</c> in the value to <c>%2F</c> on disk, which
+    /// <c>add.path</c> then carries as <c>%252F</c>; the name cannot hold a <c>/</c> at all); the opposite
+    /// <c>\</c> ambiguity is resolved the other way (never toward disclosure) because a backslash is only a separator on some platforms. (2) The
     /// TERMINAL segment is echoed as the file name; a foreign writer that names a file by a data subject
     /// (rather than <c>part-*.parquet</c>) could surface that name — bounded and sanitized, but not dropped.
     /// Both are documented residuals, not the value-in-a-partition-segment disclosure this method closes.</para>
