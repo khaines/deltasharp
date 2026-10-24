@@ -57,19 +57,22 @@ internal readonly record struct OrphanDecision(string Path, OrphanClassification
 ///
 /// <para><b>Path-encoding robustness (data-loss critical).</b> Delta's protocol URI-encodes the file paths
 /// stored in the log (<c>add.path</c>/<c>remove.path</c>): a file literally named <c>a b.parquet</c> on disk
-/// is recorded as <c>a%20b.parquet</c> in the log. As of #708 DeltaSharp writes <b>percent-encoded</b> Hive
-/// keys AND values (<c>Uri.EscapeDataString</c> on both the partition column name and the value), but tables
-/// written BEFORE #708 carry raw unencoded keys, and a Spark-written / Delta-protocol table encodes with a
-/// different alphabet — while a directory listing always yields the raw disk key. Matching a raw candidate
-/// against only the raw log path would classify the still-active <c>a b.parquet</c> as an orphan and delete
-/// it. The protected sets are therefore the <b>union</b> of each log path and its
-/// <see cref="Uri.UnescapeDataString(string)"/> decoding, and a candidate key is tested against that union
-/// under BOTH its raw form and its own decoding (#490) — so the comparison is canonical on BOTH sides. This
-/// protects legacy-raw, current DeltaSharp-encoded, and Spark-encoded tables alike, regardless of whether the
-/// LISTING yields the raw disk key (today's <c>LocalFileSystemBackend</c>) or a URI-ENCODED key (a future
-/// S3/ADLS/GCS backend that returns encoded listing keys); it can only ever <i>over</i>-protect (a rare
-/// filename containing a literal <c>%</c> sequence that happens to decode to
-/// another candidate's name), never over-delete.</para>
+/// is recorded as <c>a%20b.parquet</c> in the log. Since #806 (Inc-B) DeltaSharp writes the Spark two-layer
+/// scheme: the on-disk partition directory is escaped with Spark's <c>escapePathName</c> alphabet
+/// (<c>DeltaWriteEncoding.EscapePathName</c>, on both the column name and the value), and <c>add.path</c> is
+/// that disk key URI-encoded once more (<c>DeltaWriteEncoding.ToAddPath</c>). Older DeltaSharp tables differ:
+/// those written between #708 and #806 used the legacy <c>Uri.EscapeDataString</c> scheme on both name and
+/// value with the disk key stored literally in <c>add.path</c>, and those written BEFORE #708 carry raw
+/// partition column NAMES (the value was already <c>Uri.EscapeDataString</c>-encoded) — while a directory
+/// listing always yields the raw disk key. Matching a raw candidate against only the raw log path would
+/// classify the still-active <c>a b.parquet</c> as an orphan and delete it. The protected sets are therefore
+/// the <b>union</b> of each log path and its <see cref="Uri.UnescapeDataString(string)"/> decoding, and a
+/// candidate key is tested against that union under BOTH its raw form and its own decoding (#490) — so the
+/// comparison is canonical on BOTH sides. This protects every legacy and current DeltaSharp layout and any
+/// Delta-protocol writer's table (Spark, delta-rs) alike, regardless of whether the LISTING yields the raw
+/// disk key (today's <c>LocalFileSystemBackend</c>) or a URI-ENCODED key (a future S3/ADLS/GCS backend that
+/// returns encoded listing keys); it can only ever <i>over</i>-protect (a rare filename containing a literal
+/// <c>%</c> sequence that happens to decode to another candidate's name), never over-delete.</para>
 ///
 /// <para><b>Referenced-path assumption (non-<c>add.path</c> references).</b> The active/tombstone protected
 /// sets are built from <c>add.path</c> and <c>remove.path</c>. Two classes of file are referenced by
@@ -128,9 +131,10 @@ internal static class OrphanCleanup
         ArgumentNullException.ThrowIfNull(candidates);
 
         // Encoding-robust protected sets: a raw disk key matches a log path under raw-equality OR
-        // URI-decoded-equality, so both DeltaSharp-unencoded and Spark-encoded (e.g. "a%20b.parquet")
-        // tables protect the same real file. Building the log side as {raw} ∪ {UnescapeDataString(raw)}
-        // and comparing the raw candidate key against it can only over-protect, never over-delete.
+        // URI-decoded-equality, so a literal log path (legacy DeltaSharp, before #806) and a URI-encoded one
+        // (e.g. "a%20b.parquet": Spark, delta-rs, and DeltaSharp since #806) protect the same real file.
+        // Building the log side as {raw} ∪ {UnescapeDataString(raw)} and comparing the raw candidate key
+        // against it can only over-protect, never over-delete.
         //
         // STORY-05.5.1: a deletion vector's on-disk `.bin` sidecar (a `'u'` DV) is referenced by
         // add.deletionVector, NOT add.path, so it must be protected explicitly or VACUUM would reclaim a live
@@ -206,11 +210,11 @@ internal static class OrphanCleanup
     /// log path in both raw and decoded forms (<see cref="BuildEncodingRobustSet"/>), which matches a raw
     /// listing key against an encoded (Spark/Delta-protocol) log. This normalizes the LISTING side too, so the
     /// comparison is canonical on BOTH sides: a future object-store backend (S3/ADLS/GCS) that returns
-    /// URI-ENCODED listing keys (e.g. <c>a%20b.parquet</c> for on-disk <c>a b.parquet</c>) still matches an
-    /// UNENCODED (DeltaSharp-written) log path. Decoding the candidate can only ADD a match, so this can only
-    /// ever over-protect (retain an orphan), never under-protect (delete a live file) — the monotonic
-    /// over-protect invariant is preserved. <see cref="StringComparer.Ordinal"/> throughout (paths are
-    /// byte-exact keys, never culture-folded).</summary>
+    /// URI-ENCODED listing keys (e.g. <c>a%20b.parquet</c> for on-disk <c>a b.parquet</c>) still matches a
+    /// LITERAL log path (a legacy DeltaSharp table, written before #806). Decoding the candidate can only ADD a
+    /// match, so this can only ever over-protect (retain an orphan), never under-protect (delete a live file) —
+    /// the monotonic over-protect invariant is preserved. <see cref="StringComparer.Ordinal"/> throughout (paths
+    /// are byte-exact keys, never culture-folded).</summary>
     private static bool MatchesEncodingRobust(ImmutableHashSet<string> protectionSet, string candidatePath)
     {
         if (protectionSet.Contains(candidatePath))
@@ -254,9 +258,9 @@ internal static class OrphanCleanup
     }
 
     /// <summary>Builds the protection set as the union of each log path and its URI-decoded form, so a raw
-    /// (unencoded) disk key is matched whether the log stored the path encoded (Spark/Delta protocol) or
-    /// unencoded (DeltaSharp). <see cref="StringComparer.Ordinal"/> is preserved (paths are byte-exact keys,
-    /// never culture-folded).</summary>
+    /// (unencoded) disk key is matched whether the log stored the path URI-encoded (the Delta protocol: Spark,
+    /// delta-rs, and DeltaSharp since #806) or literally (legacy DeltaSharp, before #806).
+    /// <see cref="StringComparer.Ordinal"/> is preserved (paths are byte-exact keys, never culture-folded).</summary>
     private static ImmutableHashSet<string> BuildEncodingRobustSet(IEnumerable<string> logPaths)
     {
         var builder = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);

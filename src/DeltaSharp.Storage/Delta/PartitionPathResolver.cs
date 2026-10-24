@@ -10,7 +10,7 @@ namespace DeltaSharp.Storage.Delta;
 /// (<c>docs/engineering/design/partition-path-encoding-interop.md</c>, §2.3/§2.5).
 /// </summary>
 /// <remarks>
-/// <para><b>Decoded-first, open-then-fallback (design §2.3).</b> A protocol-conforming (or, once Inc-B lands,
+/// <para><b>Decoded-first, open-then-fallback (design §2.3).</b> A protocol-conforming (or, since Inc-B, a
 /// DeltaSharp two-layer) path decodes to the real key, so the resolver <b>opens the decoded key first</b> and,
 /// only on a <see cref="StorageErrorKind.NotFound"/>, falls back to opening the <b>literal</b> path. This
 /// reads all three on-disk layouts without an existence probe: a path with no percent-encoding
