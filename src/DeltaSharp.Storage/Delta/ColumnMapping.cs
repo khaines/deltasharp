@@ -197,7 +197,8 @@ internal static class ColumnMapping
     // budget: it accepts every real name by a wide margin (a minted physical name is "col-<uuid>" = 40 bytes;
     // a logical partition name is typically far shorter) while guaranteeing >=127 bytes of headroom for
     // "=value" for any name without escapable ASCII (see the RESIDUAL below). A crafted ~300-byte name is
-    // rejected fail-closed at commit/load instead of failing a later partitioned write.
+    // rejected fail-closed when DeltaSharp commits the metaData (and, for a mapped physicalName, at load)
+    // instead of failing a later partitioned write.
     //
     // RESIDUAL (#919): this bound is on the RAW name in UTF-8 bytes, but the NAME is written through
     // DeltaWriteEncoding.EscapePathName (#806 layer 1). That alphabet passes non-ASCII through unescaped, so a
@@ -428,9 +429,12 @@ internal static class ColumnMapping
     /// <c>escapePathName</c> alphabet (<c>DeltaWriteEncoding.EscapePathName</c>, #806 layer 1; since #708 the
     /// NAME too, not only the value), which escapes <c>/ \ = :</c> and controls 0x01–0x1F and DEL, so a
     /// slash/traversal/control character in either is neutralised at write time (the value is data, not
-    /// committed metaData). NUL is the exception: it is outside Spark's escape set, so a NUL in a VALUE
-    /// reaches the backend raw and fails closed there with an unclassified exception (#921); a NUL in a name
-    /// is rejected here. <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>, layer 2); the
+    /// committed metaData). NUL is the exception: it is outside Spark's escape set, so a NUL in a value
+    /// reaches the backend raw and fails closed there with an unclassified exception (#921). So does a NUL in
+    /// a none-mode partition NAME on a data write or OPTIMIZE: the committer's safe-segment check would reject
+    /// it, but the data file is staged first, so the backend throws before commit (and a foreign-committed
+    /// table's name is never re-checked); a mapped physicalName is instead checked here, at commit and load.
+    /// <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>, layer 2); the
     /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>
     /// legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim — empirically verified),
     /// so the binding constraint on a physical name is uniformly the partition-directory path, not the

@@ -194,12 +194,12 @@ public sealed class OrphanCleanupTests : IDisposable
         // #490 (mirror of EncodedActiveLogPath_ProtectsUnencodedDiskCandidate). The prior test covers a
         // Spark-ENCODED log path with a RAW listing key (today's LocalFileSystemBackend). This covers the
         // OTHER direction the union must also handle: a LITERAL log path (legacy DeltaSharp, before #806)
-        // with a URI-ENCODED listing key — the shape a future object-store backend (S3/ADLS/GCS) would produce
-        // if it returned encoded keys. The active file is recorded UNENCODED ("obj active.parquet"), but the (simulated
-        // encoding) listing yields "obj%20active.parquet". Decoding ONLY the log side would leave the union as
-        // {"obj active.parquet"}, which does not contain the encoded candidate key → the still-active file
-        // would be classified deletable → data loss. The candidate must be normalized too (raw ∪ decoded on
-        // BOTH sides).
+        // with a URI-ENCODED listing key — the shape a future object-store backend (S3/ADLS/GCS) would
+        // produce if it returned encoded keys. The active file is recorded UNENCODED ("obj active.parquet"),
+        // but the (simulated encoding) listing yields "obj%20active.parquet". Decoding ONLY the log side would
+        // leave the union as {"obj active.parquet"}, which does not contain the encoded candidate key → the
+        // still-active file would be classified deletable → data loss. The candidate must be normalized too
+        // (raw ∪ decoded on BOTH sides).
         await DeltaTestHarness.WriteCommitAsync(_backend, 0, DeltaTestHarness.Protocol(), DeltaTestHarness.Metadata());
         await DeltaTestHarness.WriteCommitAsync(_backend, 1, DeltaTestHarness.Add("obj active.parquet"));
         Snapshot snapshot = await new DeltaLog(_backend).LoadSnapshotAsync();

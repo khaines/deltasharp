@@ -1025,9 +1025,8 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //     but wrote the column NAME raw, and the #572 R7 path-segment check (EnsureNoneModePartitionNamesSafe)
     //     accepts a space and an apostrophe — so a table partitioned by a legal Delta column such as `my col`
     //     or `o'brien` emitted the leaking shape on DeltaSharp's OWN happy path, with no adversary involved.
-    //     Since #806 the physical key the backend sees escapes both ASCII quotes but keeps an ASCII space raw
-    //     (Spark's escapePathName), so `my col` is a happy-path shape again and `o'brien` (now `o%27brien`)
-    //     is not.
+    //     Since #806 the backend's physical key escapes both ASCII quotes but keeps an ASCII space raw
+    //     (Spark's escapePathName): `my col` is a happy-path shape again, `o'brien` (now `o%27brien`) is not.
     //   * Literal '=' only: a segment whose separator arrived percent-encoded ("email%3Dvalue") is a Hive
     //     directory the recognizer did not recognize. Both spellings are now accepted.
     //
@@ -1126,8 +1125,8 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //       remains reachable via a FOREIGN add.path (a key alphabet DeltaSharp does not control) AND via a
     //       LEGACY DeltaSharp-authored add.path written BEFORE #708 (raw, unencoded column-name keys) -- the
     //       encoding retires the residual for NEW writes only, not retroactively -- which is why
-    //       Redact_MonotonicityMatrix still asserts
-    //       declinedR2 > 0: the recognizer must handle both foreign and legacy input forever.
+    //       Redact_MonotonicityMatrix still asserts declinedR2 > 0: the recognizer must handle both foreign
+    //       and legacy input forever.
     //
     // R3 -- {quote INSIDE the value} -- is closed for the balanced quoting a framework message emits; an
     // unclosed opening quote belongs to R1 instead.
