@@ -60,14 +60,14 @@
          GA baseline (10.0.0) so locked-mode restore stays reproducible across SDK patches
          (same rationale as the ILLink pin in Directory.Build.props). Meter/ActivitySource live
          in the shared framework (System.Diagnostics.DiagnosticSource) and need no package. -->
-    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.11" />
+    <PackageVersion Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.13" />
   </ItemGroup>
 
   <ItemGroup>
     <!-- Test toolchain. -->
-    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+    <PackageVersion Include="Microsoft.NET.Test.Sdk" Version="18.11.0" />
     <PackageVersion Include="xunit" Version="2.9.3" />
-    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.0" />
+    <PackageVersion Include="xunit.runner.visualstudio" Version="4.0.1" />
     <!-- Coverage collection (FEAT-00.2 / #106 STORY-00.2.3). coverlet.collector is the
          xunit-integrated data collector invoked by the "XPlat Code Coverage" collector; it
          instruments the already-built assemblies at test-run time (no rebuild required) and
@@ -75,7 +75,7 @@
          (referenced with PrivateAssets=all in each test project) — never a runtime dependency.
          The 10.0.x line ships build/net8.0 + build/net10.0, matching both test TFMs (ADR-0014).
          See docs/engineering/design/quality-gates.md. -->
-    <PackageVersion Include="coverlet.collector" Version="10.0.1" />
+    <PackageVersion Include="coverlet.collector" Version="10.1.0" />
   </ItemGroup>
 
   <!-- lane:01.5 (FEAT-01.5 / #127 STORY-01.5.1, #128 STORY-01.5.2) — API-governance
