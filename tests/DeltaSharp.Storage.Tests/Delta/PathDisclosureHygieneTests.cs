@@ -4881,12 +4881,13 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     [InlineData("=")]
     // Round-8: the key class excluded whitespace and quotes, so any of these made the group unable to span to
     // the '=' and -- the lookbehind admitting exactly ONE start position per segment -- the recognizer matched
-    // NOTHING. Unlike every other row here, the space, NBSP and quote rows were not foreign-table shapes:
-    // before #708 DeltaWriteTarget percent-encoded the partition VALUE but wrote the column NAME raw, and the
-    // #572 R7 name check accepts a space, an NBSP and both quotes, so a table partitioned by `my col` or
-    // `o'brien` emitted them on the happy path. (R7 rejects the tab, CR and U+2028 rows, so those were always
-    // foreign-only.) Every row stays: add.path may be foreign-authored, legacy pre-#708 tables exist, and since
-    // #806 a space or NBSP is raw on DeltaSharp's own on-disk key again.
+    // NOTHING. Unlike the other fail-open rows here, the space, NBSP and quote rows were not foreign-table
+    // shapes: before #708 DeltaWriteTarget percent-encoded the partition VALUE but wrote the column NAME raw,
+    // and the #572 R7 name check accepts a space, an NBSP and both quotes, so a table partitioned by `my col`
+    // or `o'brien` emitted them on the happy path. (The name check now rejects the tab and CR rows, since #572
+    // R7, and the U+2028 row, since the #683 Zl/Zp/Cf arm, so DeltaSharp no longer emits those.) Every row
+    // stays: add.path may be foreign-authored, legacy pre-#708 tables exist, and since #806 a space or NBSP is
+    // raw on DeltaSharp's own on-disk key again.
     [InlineData("my col")]
     [InlineData("my\tcol")]
     [InlineData("my\rcol")]
@@ -5285,7 +5286,7 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     public async Task Redact_NoGenuineDoorOnThisBackendSurfacesARuntimePath()
     {
         // The exact class branch 2 exists for: a legacy pre-#708 key (raw space) with the legacy %40 value.
-        // Since #806 DeltaSharp writes "my col=alice.taylor@example.com" (the space is still raw on disk).
+        // Since #806 DeltaSharp writes "my col=alice.taylor@example.com" (the space is raw on disk again).
         string segment = "my col=" + EncodedValue;
         Directory.CreateDirectory(Path.Combine(_root, segment));
         await File.WriteAllBytesAsync(Path.Combine(_root, segment, "x.parquet"), [1], CancellationToken.None);
@@ -5928,7 +5929,7 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         // Column names spanning the key-content lattice. All are LEGAL Delta column names, and before #708
         // DeltaWriteTarget emitted the name RAW into add.path (only the value was percent-encoded), so every
         // one of these was reachable on DeltaSharp's own write path; they stay reachable via foreign add.paths
-        // and legacy pre-#708 tables, and since #806 a space-only key is raw on DeltaSharp's own on-disk key.
+        // and legacy pre-#708 tables, and since #806 a key such as `my col` is raw on DeltaSharp's own on-disk key.
         (string Key, bool Space, bool Quote)[] keys =
         [
             ("email", false, false),

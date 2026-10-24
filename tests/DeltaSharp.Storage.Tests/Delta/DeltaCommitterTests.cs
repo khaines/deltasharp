@@ -695,8 +695,9 @@ public sealed class DeltaCommitterTests : IDisposable
         // deltaspec R6: a column-mapped physicalName doubles as a Parquet column name AND a Hive
         // partition-directory segment ("physicalName=value/"), so it MUST be a safe single path segment. A
         // crafted mapped metaData whose physicalName is a traversal/separator/'='/':'/control/whitespace-only
-        // name commits + loads today and only fails a LATER partition-planning/staging op (the confined-root
-        // guard rejects "../escape=v/part-….parquet"). The shared validator (EnsureSafePhysicalName) now
+        // name would otherwise commit + load; before #708 it then failed a LATER partition-planning/staging op
+        // (the confined-root guard rejected "../escape=v/part-….parquet"), and since #708/#806 the writer
+        // escapes the '/' instead ("..%2Fescape=v", one segment). The shared validator (EnsureSafePhysicalName) now
         // rejects every such name fail-closed at COMMIT (and load), for name AND id mode. Parquet.Net itself
         // round-trips any column name verbatim (it imposes no constraint) — the binding constraint is the path.
         Snapshot genesis = GenesisSnapshot();
@@ -827,8 +828,10 @@ public sealed class DeltaCommitterTests : IDisposable
         // deltaspec R7 finding #2: in NONE mode there is no physical mapping, so a partition column's LOGICAL
         // name IS the partition-directory path segment ("logicalName=value/"). R6's physicalName check only
         // covers mapped modes; a crafted none-mode metaData whose partitionColumns names an unsafe/over-long
-        // LOGICAL column ("../escape", "a/b", "col=x", a ~300-byte name) commits + loads today and only fails a
-        // later partitioned write at the confined-root/path guard. The committer now applies the SAME
+        // LOGICAL column ("../escape", "a/b", "col=x", a ~300-byte name) would otherwise commit + load; before
+        // #708 a later partitioned write then failed at the confined-root/path guard (since #708/#806 the writer
+        // escapes the separators instead, and a ~300-byte name fails the encoded-length bound). The committer
+        // now applies the SAME
         // safe-segment + length contract to none-mode partition names (EnsureNoneModePartitionNamesSafe),
         // fail-closed at COMMIT. The column IS in the schema (the all-mode existence check passes first), so it
         // is the NEW name-safety check that fires.

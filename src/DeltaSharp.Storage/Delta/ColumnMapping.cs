@@ -221,7 +221,8 @@ internal static class ColumnMapping
     // round-trips ANY name verbatim (empirically verified — no footer constraint), so the binding constraint is
     // uniformly the partition path:
     //   - '/' or '\'  : a path separator splits/restructures the directory tree, and with '..' escapes the
-    //                   confined table root (caught fail-closed at the backend, but rejected here earlier);
+    //                   confined table root (before #708 a raw name reached the backend's confined-root guard;
+    //                   since #708/#806 the writer escapes it to %2F/%5C instead);
     //   - '='         : the Hive key=value delimiter — corrupts partition-dir parsing (the reader splits on '=');
     //   - ':'         : roots a Windows drive / NTFS alternate-data-stream path (the absolute/rooted vector);
     //   - control char: filesystem-hostile and a log/path-injection vector;
@@ -231,7 +232,10 @@ internal static class ColumnMapping
     //                   allowed, matching the confined-root guard's own posture);
     //   - > MaxPathSegmentNameBytes UTF-8 bytes: exceeds the portable path-component budget (R7).
     // Real names ('col-<uuid>', or a normal logical partition name) satisfy all of this, so only a crafted or
-    // foreign metaData can trip it.
+    // foreign metaData can trip it. Since #708/#806 the writer itself escapes '/', '\', '=', ':' and controls
+    // 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), and a whole-segment '..' becomes '..=v', so for those
+    // characters this check is defense in depth rather than the only barrier; NUL is outside the escape set
+    // (#921), and the length bound still matters (#919).
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
@@ -1653,9 +1657,11 @@ internal static class ColumnMapping
     /// partition column's <b>logical</b> name IS the partition-directory path segment (<c>logicalName=value/</c>)
     /// — there is no physical mapping to decouple it — so every partition column name MUST be a <b>safe path
     /// segment</b> under the same char + length contract <see cref="EnsureSafePhysicalName"/> enforces on a
-    /// mapped physical name (a separator, <c>=</c>, <c>:</c>, control char, <c>.</c>/<c>..</c>,
-    /// whitespace-only, or over-<see cref="MaxPathSegmentNameBytes"/>-byte name would restructure/escape the
-    /// directory tree or exceed the filesystem path-component limit). A crafted <c>partitionColumns</c> naming
+    /// mapped physical name (before #708 a separator, <c>=</c>, <c>:</c>, control char or <c>.</c>/<c>..</c>
+    /// name was written raw and could restructure/escape the directory tree; the writer now escapes those
+    /// characters, so for them this is defense in depth, while a whitespace-only or
+    /// over-<see cref="MaxPathSegmentNameBytes"/>-byte name is still degenerate or over the path-component
+    /// budget). A crafted <c>partitionColumns</c> naming
     /// an unsafe column (e.g. <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned
     /// write then failed at the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
     /// (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at COMMIT (table unchanged). Like

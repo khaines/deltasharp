@@ -1025,10 +1025,10 @@ internal sealed partial class LocalFileSystemBackend : IStorageBackend, IDisposa
     //     percent-encoded the partition VALUE but wrote the column NAME raw, and the #572 R7 path-segment check
     //     (EnsureNoneModePartitionNamesSafe) accepts a space, an NBSP and both quotes — so a table partitioned
     //     by a legal Delta column such as `my col` or `o'brien` emitted the leaking shape on DeltaSharp's OWN
-    //     happy path, with no adversary involved. (R7 rejects the tab, CR and U+2028 keys, so those were
-    //     always foreign-only.) Since #806 the backend's physical key escapes both ASCII quotes but keeps an
-    //     ASCII space and an NBSP raw (Spark's escapePathName): `my col` is a happy-path shape again,
-    //     `o'brien` (now `o%27brien`) is not.
+    //     happy path, with no adversary involved. (The name check now rejects the tab and CR keys, since #572
+    //     R7, and the U+2028 key, since the #683 Zl/Zp/Cf arm, so DeltaSharp no longer emits those.) Since
+    //     #806 the backend's physical key escapes both ASCII quotes but keeps an ASCII space and an NBSP raw
+    //     (Spark's escapePathName): `my col` is a happy-path shape again, `o'brien` (now `o%27brien`) is not.
     //   * Literal '=' only: a segment whose separator arrived percent-encoded ("email%3Dvalue") is a Hive
     //     directory the recognizer did not recognize. Both spellings are now accepted.
     //

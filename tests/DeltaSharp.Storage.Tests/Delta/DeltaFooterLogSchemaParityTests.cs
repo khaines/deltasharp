@@ -1008,9 +1008,8 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
                 if (document.RootElement.TryGetProperty("add", out JsonElement add)
                     && add.TryGetProperty("path", out JsonElement path))
                 {
-                    // #806: add.path is the URI-encoded (layer 2) form of the physical key. Collect it verbatim
-                    // here; ReadFooterSchema decodes it once to the escapePathName (layer 1) on-disk key before
-                    // opening the file.
+                    // #806: add.path is the URI-encoded (layer 2) form of the physical key. Collect it
+                    // verbatim; ReadFooterSchema decodes it once to the on-disk (layer 1) key before opening.
                     added.Add(path.GetString()!);
                 }
             }
