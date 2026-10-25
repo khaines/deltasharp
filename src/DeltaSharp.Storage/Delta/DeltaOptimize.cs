@@ -798,7 +798,7 @@ internal sealed class DeltaOptimize
         foreach (string column in partitionColumns)
         {
             partitionValues.TryGetValue(column, out string? value);
-            // #708: encode BOTH key and value, IDENTICAL to the write path
+            // #708/#806: encode BOTH key and value, IDENTICAL to the write path
             // (DeltaWriteTarget.DataFilePath -> DeltaWriteEncoding.HivePartitionSegment), so a compacted
             // output's directory layout matches a freshly-written one for every column name.
             sb.Append(DeltaWriteEncoding.HivePartitionSegment(column, value)).Append('/');

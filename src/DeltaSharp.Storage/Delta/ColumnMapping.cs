@@ -232,10 +232,12 @@ internal static class ColumnMapping
     //                   allowed, matching the confined-root guard's own posture);
     //   - > MaxPathSegmentNameBytes UTF-8 bytes: exceeds the portable path-component budget (R7).
     // Real names ('col-<uuid>', or a normal logical partition name) satisfy all of this, so only a crafted or
-    // foreign metaData can trip it. Since #708/#806 the writer itself escapes '/', '\', '=', ':' and controls
-    // 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), and a whole-segment '..' becomes '..=v', so for those
-    // characters this check is defense in depth rather than the only barrier; NUL is outside the escape set
-    // (#921), and the length bound still matters (#919).
+    // foreign metaData can trip it. Since #708/#806 the writer itself escapes '/', '\', '=', ':' and the ASCII
+    // controls 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), so for those characters this check is defense
+    // in depth rather than the only barrier. A whole-segment '.'/'..' was never a traversal on the write path:
+    // the segment is always 'name=value' (e.g. '..=v'), raw name or not. NUL, the C1 controls U+0080–U+009F,
+    // and the Zl/Zp/Cf and lone-surrogate characters are outside the escape set (#921), so for them, as for
+    // the length bound (#919), this check is the only DeltaSharp rejection.
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
@@ -433,9 +435,10 @@ internal static class ColumnMapping
     /// <b>name AND value</b> are both escaped into the physical directory segment with Spark's
     /// <c>escapePathName</c> alphabet (<c>DeltaWriteEncoding.EscapePathName</c>, #806 layer 1; since #708 the
     /// NAME too, not only the value), which escapes <c>/ \ = :</c> and controls 0x01–0x1F and DEL, so a
-    /// slash/traversal/control character in either is neutralised at write time (the value is data, not
-    /// committed metaData). NUL is the exception: it is outside Spark's escape set, so a NUL in a value
-    /// reaches the backend raw and fails closed there with an unclassified exception (#921). So does a NUL in
+    /// slash/traversal/ASCII-control character in either is neutralised at write time (the value is data, not
+    /// committed metaData). A C1 control (U+0080–U+009F) in a value is written raw, as Spark writes it. NUL is
+    /// the other exception: it is outside Spark's escape set, so a NUL in a value reaches the backend raw and
+    /// fails closed there with an unclassified exception (#921). So does a NUL in
     /// a none-mode partition NAME: on a fresh create with data the file is staged before the committer's
     /// safe-segment check runs, and on a foreign-committed table (append or OPTIMIZE) that check runs only if
     /// the operation itself commits metaData (e.g. a mergeSchema append; OPTIMIZE never does), and then still
@@ -1657,13 +1660,15 @@ internal static class ColumnMapping
     /// partition column's <b>logical</b> name IS the partition-directory path segment (<c>logicalName=value/</c>)
     /// — there is no physical mapping to decouple it — so every partition column name MUST be a <b>safe path
     /// segment</b> under the same char + length contract <see cref="EnsureSafePhysicalName"/> enforces on a
-    /// mapped physical name (before #708 a separator, <c>=</c>, <c>:</c>, control char or <c>.</c>/<c>..</c>
-    /// name was written raw and could restructure/escape the directory tree; the writer now escapes those
-    /// characters, so for them this is defense in depth, while a whitespace-only or
-    /// over-<see cref="MaxPathSegmentNameBytes"/>-byte name is still degenerate or over the path-component
-    /// budget). A crafted <c>partitionColumns</c> naming
-    /// an unsafe column (e.g. <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned
-    /// write then failed at the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
+    /// mapped physical name. Before #708 the name was written raw, so a separator, <c>=</c>, <c>:</c> or control
+    /// char could restructure or escape the directory tree. The writer now escapes the separators, <c>=</c>,
+    /// <c>:</c> and the ASCII controls 0x01–0x1F/DEL, so for those this is defense in depth; NUL, the C1
+    /// controls U+0080–U+009F and the line/paragraph/format characters pass the escape unchanged (#921), so for
+    /// them, and for a whitespace-only or over-<see cref="MaxPathSegmentNameBytes"/>-byte name, this check is
+    /// still the only rejection. (A whole-segment <c>.</c>/<c>..</c> name was never a traversal: the segment is
+    /// always <c>name=value</c>.) A crafted <c>partitionColumns</c> naming an unsafe column (e.g.
+    /// <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned write then failed at
+    /// the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
     /// (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at COMMIT (table unchanged). Like
     /// <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
     /// NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is too broad for a
