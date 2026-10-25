@@ -5421,7 +5421,7 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     // Every column name here is a LEGAL Delta column name, and before #708 DeltaWriteTarget emitted the name
     // RAW into add.path (only the VALUE was percent-encoded), so all of these were reachable on DeltaSharp's
     // own write path. They stay reachable via foreign add.paths and legacy pre-#708 tables, and since #806 a
-    // space-only key such as `my col` is raw on DeltaSharp's own on-disk key again.
+    // key with a space, such as `my col`, is raw on DeltaSharp's own on-disk key again (quotes are escaped).
     //
     // (1) Quality: key bearing a quote AND whitespace. The three-branch form excluded quotes in one branch
     //     and whitespace in the other, so their INTERSECTION matched nothing and the value was echoed.
