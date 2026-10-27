@@ -259,8 +259,8 @@ internal static class OrphanCleanup
 
     /// <summary>Builds the protection set as the union of each log path and its URI-decoded form, so a raw
     /// (unencoded) disk key is matched whether the log stored the path URI-encoded (the Delta protocol: Spark,
-    /// delta-rs, and DeltaSharp since #806) or literally (legacy DeltaSharp, before #806).
-    /// <see cref="StringComparer.Ordinal"/> is preserved (paths are byte-exact keys, never culture-folded).</summary>
+    /// delta-rs, and DeltaSharp since #806) or literally (legacy DeltaSharp, before #806). Paths are byte-exact
+    /// keys, never culture-folded, so <see cref="StringComparer.Ordinal"/> is preserved.</summary>
     private static ImmutableHashSet<string> BuildEncodingRobustSet(IEnumerable<string> logPaths)
     {
         var builder = ImmutableHashSet.CreateBuilder<string>(StringComparer.Ordinal);
