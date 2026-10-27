@@ -197,9 +197,8 @@ internal static class ColumnMapping
     // budget: it accepts every real name by a wide margin (a minted physical name is "col-<uuid>" = 40 bytes;
     // a logical partition name is typically far shorter) while guaranteeing >=127 bytes of headroom for
     // "=value" for any name without escapable ASCII (see the RESIDUAL below). A crafted ~300-byte name is
-    // rejected fail-closed: before DeltaSharp commits it (by this check at commit; on a create with data the
-    // file is staged first, and an over-255-byte encoded segment fails even earlier at
-    // DeltaWriteEncoding.HivePartitionSegment), and, for a foreign mapped physicalName, at load.
+    // rejected fail-closed before DeltaSharp commits it (by this check at commit, or earlier by another guard;
+    // #921 records which), and, for a foreign mapped physicalName, at load.
     //
     // RESIDUAL (#919): this bound is on the RAW name in UTF-8 bytes, but the NAME is written through
     // DeltaWriteEncoding.EscapePathName (#806 layer 1). That alphabet passes non-ASCII through unescaped, so a
@@ -207,8 +206,8 @@ internal static class ColumnMapping
     // characters " # % ' * ? { [ ] ^, which this check accepts, to "%XX" (3 bytes each): a 128-char name made
     // only of them passes here yet encodes to 384 bytes, past the 255-byte NAME_MAX budget on its own, and the
     // ">=127 bytes of headroom" above does not hold for it (measured: 84 such chars + "=1" is the most that
-    // fits; 76 with the null sentinel). Such a table commits and loads, but every partitioned write or
-    // OPTIMIZE into it fails closed BEFORE commit at DeltaWriteEncoding.HivePartitionSegment
+    // fits; 76 with the null sentinel). Such a table commits and loads, but every write or OPTIMIZE into it
+    // that builds a partition segment fails closed BEFORE commit at DeltaWriteEncoding.HivePartitionSegment
     // (MaxEncodedPathComponentBytes) — no corruption, no disclosure. Bounding the ESCAPED length here is #919.
     private const int MaxPathSegmentNameBytes = 128;
 
@@ -442,10 +441,10 @@ internal static class ColumnMapping
     /// slash/traversal/ASCII-control character in either is neutralised at write time (the value is data, not
     /// committed metaData). A C1 control (U+0080–U+009F) in a value is written raw, as Spark writes it. NUL is
     /// the other exception: it is outside Spark's escape set, so a NUL in a value reaches the backend raw and
-    /// fails closed there with an unclassified exception (#921). So does a NUL in a none-mode partition NAME: on
-    /// a fresh create with data the file is staged before the committer's safe-segment check runs, and on a
-    /// foreign-committed table (append or OPTIMIZE) that check runs only if the operation itself commits
-    /// metaData (e.g. a mergeSchema append; OPTIMIZE never does), and then still after staging. A mapped
+    /// fails closed there with an unclassified exception (#921). So does a NUL in a none-mode partition NAME:
+    /// the backend rejects the path while the data-bearing write is staging it, before the committer's
+    /// safe-segment check runs; and on a foreign-committed table (append or OPTIMIZE) that check runs only if
+    /// the operation itself commits metaData (e.g. a mergeSchema append; OPTIMIZE never does). A mapped
     /// physicalName is also checked here at load, so a foreign one is rejected before any staging (DeltaSharp
     /// itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>,
     /// layer 2); the staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet
@@ -1675,13 +1674,12 @@ internal static class ColumnMapping
     /// <c>partitionColumns</c> naming an unsafe column (e.g. <c>../escape</c>) would otherwise commit and load;
     /// before #708 a later partitioned write then failed at the path/confined-root guard, and since #708/#806
     /// the <c>/</c> is escaped instead (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at
-    /// COMMIT (table unchanged).
-    /// Like <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
-    /// NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is too broad for a
-    /// load-side name check; the committer guarantees no NEW unsafe-partition-name table is published. It is
-    /// scoped to <c>none</c> mode and to PARTITION columns only: in name/id mode the path segment is the mapped
-    /// physical name (validated by <see cref="ValidateColumnMappingSchema"/>) while the logical name is
-    /// decoupled from the path (it may legitimately hold any Parquet-legal character — the very purpose of
+    /// COMMIT (table unchanged). Like <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check)
+    /// it runs at the committer — NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is
+    /// too broad for a load-side name check; the committer guarantees no NEW unsafe-partition-name table is
+    /// published. It is scoped to <c>none</c> mode and to PARTITION columns only: in name/id mode the path segment
+    /// is the mapped physical name (validated by <see cref="ValidateColumnMappingSchema"/>) while the logical name
+    /// is decoupled from the path (it may legitimately hold any Parquet-legal character — the very purpose of
     /// column mapping); and a non-partition logical name never reaches a path. O(partitionColumns).
     /// </summary>
     /// <exception cref="DeltaProtocolException">A partition column name is not a safe path segment.</exception>
