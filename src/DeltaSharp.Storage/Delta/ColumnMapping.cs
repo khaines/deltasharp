@@ -241,11 +241,12 @@ internal static class ColumnMapping
     // though another guard can fail first: on a data-bearing write the backend's path normalisation
     // (Path.GetFullPath in LocalFileSystemBackend.LexicallyConfine) rejects a NUL at staging, unclassified
     // (#921); and SchemaJson rejects an unpaired surrogate when it serializes the schema (on a data-bearing
-    // create, after the file is staged) and when it parses a foreign schemaString at load. The length bounds
+    // write, after the file is staged) and when it parses a foreign schemaString at load. The length bounds
     // overlap: this check enforces MaxPathSegmentNameBytes on the raw name, while
-    // DeltaWriteEncoding.HivePartitionSegment rejects an encoded segment over 255 bytes at write time. On a
-    // data-bearing write a segment over that bound fails there first, and an escape-heavy name within
-    // MaxPathSegmentNameBytes fails only there (#919).
+    // DeltaWriteEncoding.HivePartitionSegment rejects an encoded segment over 255 bytes, but only when a
+    // data-bearing write or OPTIMIZE builds the segment, and it fails there first. If the raw name is within
+    // MaxPathSegmentNameBytes (an escape-heavy name), this check does not reject it at all, so a metadata-only
+    // commit accepts it (#919).
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
