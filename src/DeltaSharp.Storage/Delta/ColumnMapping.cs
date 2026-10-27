@@ -227,17 +227,23 @@ internal static class ColumnMapping
     //   - ':'         : roots a Windows drive / NTFS alternate-data-stream path (the absolute/rooted vector);
     //   - control char: filesystem-hostile and a log/path-injection vector;
     //   - whitespace-only (or empty): a degenerate, filesystem-hostile segment (some filesystems trim it);
-    //   - '.' or '..' : the WHOLE segment being dot/dot-dot is degenerate/traversal (a '..' SUBSTRING inside an
-    //                   otherwise-safe segment — e.g. 'a..b' — is a valid filename, NOT a traversal, so it is
-    //                   allowed, matching the confined-root guard's own posture);
+    //   - '.' or '..' : the WHOLE segment being dot/dot-dot is degenerate, and a traversal wherever it becomes a
+    //                   whole path component (a '..' SUBSTRING inside an otherwise-safe segment — e.g. 'a..b' —
+    //                   is a valid filename, NOT a traversal, so it is allowed, matching the confined-root guard's
+    //                   own posture);
     //   - > MaxPathSegmentNameBytes UTF-8 bytes: exceeds the portable path-component budget (R7).
     // Real names ('col-<uuid>', or a normal logical partition name) satisfy all of this, so only a crafted or
     // foreign metaData can trip it. Since #708/#806 the writer itself escapes '/', '\', '=', ':' and the ASCII
     // controls 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), so for those characters this check is defense
-    // in depth rather than the only barrier. A whole-segment '.'/'..' was never a traversal on the write path:
-    // the segment is always 'name=value' (e.g. '..=v'), raw name or not. NUL, the C1 controls U+0080–U+009F,
-    // and the Zl/Zp/Cf and lone-surrogate characters are outside the escape set (#921), so for them, as for
-    // the length bound (#919), this check is the only DeltaSharp rejection.
+    // in depth. A whole-segment '.'/'..' was never a traversal on the write path: the segment is always
+    // 'name=value' (e.g. '..=v'), raw name or not. NUL, the C1 controls U+0080–U+009F, and the Zl/Zp/Cf and
+    // lone-surrogate characters pass the escape unchanged (#921). This check rejects them all, though another
+    // guard can fail first: on a data-bearing write the backend's path normalisation (Path.GetFullPath in
+    // LocalFileSystemBackend.LexicallyConfine) rejects a NUL at staging, unclassified (#921), and the schema
+    // serializer (SchemaJson) rejects an unpaired surrogate on every path. The length bounds overlap: this
+    // check enforces MaxPathSegmentNameBytes on the raw name, while DeltaWriteEncoding.HivePartitionSegment
+    // rejects an encoded segment over 255 bytes at write time, which a long or escape-heavy name can hit
+    // first (#919).
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
@@ -438,11 +444,11 @@ internal static class ColumnMapping
     /// slash/traversal/ASCII-control character in either is neutralised at write time (the value is data, not
     /// committed metaData). A C1 control (U+0080–U+009F) in a value is written raw, as Spark writes it. NUL is
     /// the other exception: it is outside Spark's escape set, so a NUL in a value reaches the backend raw and
-    /// fails closed there with an unclassified exception (#921). So does a NUL in
-    /// a none-mode partition NAME: on a fresh create with data the file is staged before the committer's
-    /// safe-segment check runs, and on a foreign-committed table (append or OPTIMIZE) that check runs only if
-    /// the operation itself commits metaData (e.g. a mergeSchema append; OPTIMIZE never does), and then still
-    /// after staging. A mapped physicalName is also checked here at load, so a foreign one is rejected before
+    /// fails closed there with an unclassified exception (#921). So does a NUL in a none-mode partition NAME: on
+    /// a fresh create with data the file is staged before the committer's safe-segment check runs, and on a
+    /// foreign-committed table (append or OPTIMIZE) that check runs only if the operation itself commits
+    /// metaData (e.g. a mergeSchema append; OPTIMIZE never does), and then still after staging. A mapped
+    /// physicalName is also checked here at load, so a foreign one is rejected before
     /// any staging (DeltaSharp itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on
     /// top (<c>ToAddPath</c>, layer 2); the staged data-file name is a crypto-random hex token, never
     /// metaData-derived; and Parquet <b>column-name</b> legality imposes nothing (Parquet.Net 6.1.0
@@ -1660,15 +1666,17 @@ internal static class ColumnMapping
     /// partition column's <b>logical</b> name IS the partition-directory path segment (<c>logicalName=value/</c>)
     /// — there is no physical mapping to decouple it — so every partition column name MUST be a <b>safe path
     /// segment</b> under the same char + length contract <see cref="EnsureSafePhysicalName"/> enforces on a
-    /// mapped physical name. Before #708 the name was written raw, so a separator, <c>=</c>, <c>:</c> or control
-    /// char could restructure or escape the directory tree. The writer now escapes the separators, <c>=</c>,
-    /// <c>:</c> and the ASCII controls 0x01–0x1F/DEL, so for those this is defense in depth; NUL, the C1
-    /// controls U+0080–U+009F and the line/paragraph/format characters pass the escape unchanged (#921), so for
-    /// them, and for a whitespace-only or over-<see cref="MaxPathSegmentNameBytes"/>-byte name, this check is
-    /// still the only rejection. (A whole-segment <c>.</c>/<c>..</c> name was never a traversal: the segment is
-    /// always <c>name=value</c>.) A crafted <c>partitionColumns</c> naming an unsafe column (e.g.
-    /// <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned write then failed at
-    /// the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
+    /// mapped physical name. Before #708 the name was written raw, so every unsafe character reached the path
+    /// unescaped (<c>FindUnsafePathSegmentReason</c> says why each is unsafe). The writer now escapes the
+    /// separators, <c>=</c>, <c>:</c> and the ASCII controls 0x01–0x1F/DEL, so for those this is defense in
+    /// depth. NUL, the C1 controls U+0080–U+009F, the line/paragraph/format characters and lone surrogates pass
+    /// the escape unchanged (#921), and a whitespace-only name is not escaped at all; this check rejects them
+    /// all, though another guard can fail first (see <c>FindUnsafePathSegmentReason</c>). The
+    /// <see cref="MaxPathSegmentNameBytes"/> raw-length bound overlaps the 255-byte encoded-segment bound in
+    /// <c>DeltaWriteEncoding.HivePartitionSegment</c> (#919). (A whole-segment <c>.</c>/<c>..</c> name was never
+    /// a traversal: the segment is always <c>name=value</c>.) A crafted <c>partitionColumns</c> naming an
+    /// unsafe column (e.g. <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned
+    /// write then failed at the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
     /// (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at COMMIT (table unchanged). Like
     /// <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
     /// NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is too broad for a
