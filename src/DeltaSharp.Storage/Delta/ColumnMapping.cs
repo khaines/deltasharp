@@ -237,16 +237,11 @@ internal static class ColumnMapping
     // controls 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), so for those characters this check is defense
     // in depth. A whole-segment '.'/'..' was never a traversal on the write path: the segment is always
     // 'name=value' (e.g. '..=v'), raw name or not. NUL, the C1 controls U+0080–U+009F, and the Zl/Zp/Cf and
-    // lone-surrogate characters pass the escape unchanged (NUL and C1: #921). This check rejects them all,
-    // though another guard can fail first: on a data-bearing write the backend's path normalisation
-    // (Path.GetFullPath in LocalFileSystemBackend.LexicallyConfine) rejects a NUL at staging, unclassified
-    // (#921); and SchemaJson rejects an unpaired surrogate when it serializes the schema (on a data-bearing
-    // write, after the file is staged) and when it parses a foreign schemaString at load. The length bounds
-    // overlap: this check enforces MaxPathSegmentNameBytes on the raw name, while
-    // DeltaWriteEncoding.HivePartitionSegment rejects an encoded segment over 255 bytes, but only when a
-    // data-bearing write or OPTIMIZE builds the segment, and it fails there first. If the raw name is within
-    // MaxPathSegmentNameBytes (an escape-heavy name), this check does not reject it at all, so a metadata-only
-    // commit accepts it (#919).
+    // lone-surrogate characters pass the escape unchanged. This check rejects all of them, but it is not
+    // always the guard that fires: another guard can reject some of them first (#921 records which guard fires
+    // where, and whether the data file is already staged). This check bounds the RAW name
+    // (MaxPathSegmentNameBytes); DeltaWriteEncoding.HivePartitionSegment separately bounds the ENCODED segment
+    // at 255 bytes when a write or OPTIMIZE builds it. Neither bound implies the other (#919).
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
@@ -1671,17 +1666,17 @@ internal static class ColumnMapping
     /// mapped physical name. Before #708 the name was written raw, so every unsafe character reached the path
     /// unescaped (<c>FindUnsafePathSegmentReason</c> says why each is unsafe). The writer now escapes the
     /// separators, <c>=</c>, <c>:</c> and the ASCII controls 0x01–0x1F/DEL, so for those this is defense in
-    /// depth. NUL, the C1 controls U+0080–U+009F, the line/paragraph/format characters and lone surrogates pass
-    /// the escape unchanged (NUL and C1: #921), and so does a name made only of non-control whitespace (space,
-    /// U+00A0, U+3000 and the like); this check rejects them all, though another guard can fail first (see
-    /// <c>FindUnsafePathSegmentReason</c>). The
-    /// <see cref="MaxPathSegmentNameBytes"/> raw-length bound overlaps the 255-byte encoded-segment bound in
-    /// <c>DeltaWriteEncoding.HivePartitionSegment</c> (#919). (A whole-segment <c>.</c>/<c>..</c> name was never
-    /// a traversal: the segment is always <c>name=value</c>.) A crafted <c>partitionColumns</c> naming an
-    /// unsafe column (e.g. <c>../escape</c>) would otherwise commit and load; before #708 a later partitioned
-    /// write then failed at the path/confined-root guard, and since #708/#806 the <c>/</c> is escaped instead
-    /// (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at COMMIT (table unchanged). Like
-    /// <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
+    /// depth. NUL, the C1 controls U+0080–U+009F, the line/paragraph/format characters and lone surrogates
+    /// pass the escape unchanged, and so does a name made only of non-control whitespace (space, U+00A0, U+3000
+    /// and the like). This check rejects all of them, though another guard can reject some earlier (#921). Its
+    /// <see cref="MaxPathSegmentNameBytes"/> raw-length bound and the 255-byte encoded-segment bound in
+    /// <c>DeltaWriteEncoding.HivePartitionSegment</c> do not imply each other (#919). (A whole-segment
+    /// <c>.</c>/<c>..</c> name was never a traversal: the segment is always <c>name=value</c>.) A crafted
+    /// <c>partitionColumns</c> naming an unsafe column (e.g. <c>../escape</c>) would otherwise commit and load;
+    /// before #708 a later partitioned write then failed at the path/confined-root guard, and since #708/#806
+    /// the <c>/</c> is escaped instead (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at
+    /// COMMIT (table unchanged).
+    /// Like <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
     /// NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is too broad for a
     /// load-side name check; the committer guarantees no NEW unsafe-partition-name table is published. It is
     /// scoped to <c>none</c> mode and to PARTITION columns only: in name/id mode the path segment is the mapped
