@@ -237,13 +237,15 @@ internal static class ColumnMapping
     // controls 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), so for those characters this check is defense
     // in depth. A whole-segment '.'/'..' was never a traversal on the write path: the segment is always
     // 'name=value' (e.g. '..=v'), raw name or not. NUL, the C1 controls U+0080–U+009F, and the Zl/Zp/Cf and
-    // lone-surrogate characters pass the escape unchanged (#921). This check rejects them all, though another
-    // guard can fail first: on a data-bearing write the backend's path normalisation (Path.GetFullPath in
-    // LocalFileSystemBackend.LexicallyConfine) rejects a NUL at staging, unclassified (#921), and the schema
-    // serializer (SchemaJson) rejects an unpaired surrogate on every path. The length bounds overlap: this
-    // check enforces MaxPathSegmentNameBytes on the raw name, while DeltaWriteEncoding.HivePartitionSegment
-    // rejects an encoded segment over 255 bytes at write time, which a long or escape-heavy name can hit
-    // first (#919).
+    // lone-surrogate characters pass the escape unchanged (NUL and C1: #921). This check rejects them all,
+    // though another guard can fail first: on a data-bearing write the backend's path normalisation
+    // (Path.GetFullPath in LocalFileSystemBackend.LexicallyConfine) rejects a NUL at staging, unclassified
+    // (#921); and SchemaJson rejects an unpaired surrogate when it serializes the schema (on a data-bearing
+    // create, after the file is staged) and when it parses a foreign schemaString at load. The length bounds
+    // overlap: this check enforces MaxPathSegmentNameBytes on the raw name, while
+    // DeltaWriteEncoding.HivePartitionSegment rejects an encoded segment over 255 bytes at write time. On a
+    // data-bearing write a segment over that bound fails there first, and an escape-heavy name within
+    // MaxPathSegmentNameBytes fails only there (#919).
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
@@ -448,14 +450,13 @@ internal static class ColumnMapping
     /// a fresh create with data the file is staged before the committer's safe-segment check runs, and on a
     /// foreign-committed table (append or OPTIMIZE) that check runs only if the operation itself commits
     /// metaData (e.g. a mergeSchema append; OPTIMIZE never does), and then still after staging. A mapped
-    /// physicalName is also checked here at load, so a foreign one is rejected before
-    /// any staging (DeltaSharp itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on
-    /// top (<c>ToAddPath</c>, layer 2); the staged data-file name is a crypto-random hex token, never
-    /// metaData-derived; and Parquet <b>column-name</b> legality imposes nothing (Parquet.Net 6.1.0
-    /// round-trips ANY column name verbatim — empirically verified), so the binding constraint on a physical
-    /// name is uniformly the partition-directory path, not the footer. (Note: the length bound is on the RAW
-    /// name; the ENCODED-length residual for an escape-heavy ASCII name is tracked under #919 — see
-    /// <c>MaxPathSegmentNameBytes</c>.)</para>
+    /// physicalName is also checked here at load, so a foreign one is rejected before any staging (DeltaSharp
+    /// itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>,
+    /// layer 2); the staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet
+    /// <b>column-name</b> legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim —
+    /// empirically verified), so the binding constraint on a physical name is uniformly the partition-directory
+    /// path, not the footer. (Note: the length bound is on the RAW name; the ENCODED-length residual for an
+    /// escape-heavy ASCII name is tracked under #919 — see <c>MaxPathSegmentNameBytes</c>.)</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A nested (non-leaf) mapped column, a missing/empty physical
     /// name, an unsafe (non-path-segment) physical name, a duplicate physical name, a missing id, a
@@ -1670,8 +1671,9 @@ internal static class ColumnMapping
     /// unescaped (<c>FindUnsafePathSegmentReason</c> says why each is unsafe). The writer now escapes the
     /// separators, <c>=</c>, <c>:</c> and the ASCII controls 0x01–0x1F/DEL, so for those this is defense in
     /// depth. NUL, the C1 controls U+0080–U+009F, the line/paragraph/format characters and lone surrogates pass
-    /// the escape unchanged (#921), and a whitespace-only name is not escaped at all; this check rejects them
-    /// all, though another guard can fail first (see <c>FindUnsafePathSegmentReason</c>). The
+    /// the escape unchanged (NUL and C1: #921), and so does a name made only of non-control whitespace (space,
+    /// U+00A0, U+3000 and the like); this check rejects them all, though another guard can fail first (see
+    /// <c>FindUnsafePathSegmentReason</c>). The
     /// <see cref="MaxPathSegmentNameBytes"/> raw-length bound overlaps the 255-byte encoded-segment bound in
     /// <c>DeltaWriteEncoding.HivePartitionSegment</c> (#919). (A whole-segment <c>.</c>/<c>..</c> name was never
     /// a traversal: the segment is always <c>name=value</c>.) A crafted <c>partitionColumns</c> naming an

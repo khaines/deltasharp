@@ -121,8 +121,8 @@ internal static class DeltaWriteEncoding
     /// ASCII controls 0x01–0x1F/DEL, so a hostile name or value cannot fabricate or escape a directory segment
     /// (the #708 hardening). NUL and every non-ASCII character, including the C1 controls U+0080–U+009F, pass
     /// through as in Spark (#921). The column-name check (<c>ColumnMapping.FindUnsafePathSegmentReason</c>, at
-    /// commit, and at load for a mapped physicalName) is defense in depth for the escaped set and also rejects
-    /// NUL, C1 and line/paragraph/format characters in a name.</para>
+    /// commit, and at load for a mapped physicalName) is defense in depth for <c>/ \ = :</c> and the ASCII
+    /// controls, and also rejects NUL, C1, line/paragraph/format characters and lone surrogates in a name.</para>
     /// <para><b>Encoded-length budget (#806 §2.6).</b> The composed physical segment must fit a filesystem path
     /// component (<see cref="MaxEncodedPathComponentBytes"/>). <see cref="EscapePathName"/>'s non-ASCII
     /// passthrough removes the old <c>Uri.EscapeDataString</c> blow-up; the residual is escape-heavy ASCII (each
