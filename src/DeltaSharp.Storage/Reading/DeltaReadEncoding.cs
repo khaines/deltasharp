@@ -90,7 +90,8 @@ internal static class DeltaReadEncoding
     /// An empty string on a <see cref="StringType"/> column stays <c>""</c>: DeltaSharp writes <c>""</c> verbatim
     /// and reads it back as <c>""</c> (design §3.2, decision D5). Every consumer that decides whether two
     /// committed values denote the same partition value must go through this helper, so the read path and the
-    /// file pruner (<see cref="DeltaSharp.Storage.Delta.FilePruner"/>) agree.
+    /// file pruner (<see cref="DeltaSharp.Storage.Delta.FilePruner"/>) agree. The partition keys of dynamic
+    /// overwrite and OPTIMIZE (<c>PartitionKeyBuilder</c>) do not use it yet (#926).
     /// </summary>
     /// <param name="type">The partition column's data type.</param>
     /// <param name="value">The committed partition-value string, or <see langword="null"/>.</param>

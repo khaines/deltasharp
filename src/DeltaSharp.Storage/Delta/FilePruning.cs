@@ -24,7 +24,10 @@ internal enum DeltaPredicateOp
 
 /// <summary>An exact partition-value filter (<c>partitionColumn = value</c>, or <c>IS NULL</c> when
 /// <paramref name="Value"/> is null). Partition values are stored per file exactly (never truncated), so
-/// this filter prunes soundly.</summary>
+/// this filter prunes soundly. <paramref name="Column"/> is the key <c>add.partitionValues</c> uses (the physical
+/// name under column mapping). <paramref name="Value"/> is a serialized partition value and goes through the
+/// read's null rules (<see cref="DeltaSharp.Storage.Reading.DeltaReadEncoding.NormalizePartitionValue"/>), so on a
+/// non-string column <c>""</c>, like the Hive sentinel on any column, filters as <c>IS NULL</c> (#916).</summary>
 internal sealed record PartitionEqualityFilter(string Column, string? Value);
 
 /// <summary>A data-skipping filter over a (top-level) data column, evaluated against per-file
@@ -55,7 +58,8 @@ internal sealed record FilePruningRequest(
 /// values or per-file statistics <b>prove</b> the file holds no matching row.</summary>
 internal enum FileSkipReason
 {
-    /// <summary>The file's committed partition values differ from an exact partition filter.</summary>
+    /// <summary>The file's committed partition values, read under the read path's null rules, denote a
+    /// different value than an exact partition filter.</summary>
     PartitionMismatch,
 
     /// <summary>The file's tight <c>min</c>/<c>max</c>/<c>nullCount</c> statistics prove no row can

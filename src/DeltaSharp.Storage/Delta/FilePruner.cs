@@ -14,6 +14,8 @@ namespace DeltaSharp.Storage.Delta;
 /// </summary>
 internal static class FilePruner
 {
+    /// <summary>Splits <paramref name="files"/> into the candidates that might satisfy
+    /// <paramref name="request"/> and the files it proves cannot.</summary>
     /// <param name="files">The active files to prune.</param>
     /// <param name="request">The partition and data-skipping filters.</param>
     /// <param name="partitionTypes">The partition columns' data types, keyed by the name
@@ -76,9 +78,11 @@ internal static class FilePruner
     /// <summary>
     /// Whether a file's committed partition value <paramref name="actual"/> may denote the same value as the
     /// filter's <paramref name="expected"/>. Both sides go through
-    /// <see cref="DeltaReadEncoding.NormalizePartitionValue"/>, the helper the read path uses, so a file is
-    /// never pruned for a value the read would return as matching: on an integer column, a committed <c>""</c>
-    /// reads as null and therefore matches <c>IS NULL</c> (#916). With no known <paramref name="type"/>, the
+    /// <see cref="DeltaReadEncoding.NormalizePartitionValue"/>, the helper the read path uses, so the pruner and
+    /// the read agree on which values are null: on an integer column, a committed <c>""</c> reads as null and
+    /// therefore matches <c>IS NULL</c> (#916). Non-null values still compare as raw strings, so a non-canonical
+    /// typed spelling (<c>"05"</c> for 5) can be pruned although the read returns it as matching (#928). With no
+    /// known <paramref name="type"/>, the
     /// value is normalized as a string (the Hive sentinel is null for every type), and an empty string against
     /// a null never proves a mismatch, because a non-string type would read that <c>""</c> as null.
     /// </summary>
