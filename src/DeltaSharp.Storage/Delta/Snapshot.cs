@@ -87,7 +87,32 @@ internal sealed class Snapshot
     /// matching file is a candidate — and the residual predicate remains the scan's responsibility. This is
     /// the file-pruning half of the snapshot's handoff contract to query execution (§2.10.5).
     /// </summary>
-    public FilePruningResult PruneFiles(FilePruningRequest request) => FilePruner.Prune(ActiveFiles, request);
+    public FilePruningResult PruneFiles(FilePruningRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        IReadOnlyDictionary<string, DataType>? partitionTypes =
+            request.PartitionFilters.IsDefaultOrEmpty ? null : PartitionTypesByPhysicalName();
+        return FilePruner.Prune(ActiveFiles, request, partitionTypes);
+    }
+
+    // The partition columns' types keyed by the name add.partitionValues uses (the physical name under column
+    // mapping), so the pruner applies the same null rules as the read path (#916). A partition column absent
+    // from the schema is left out; the pruner then evaluates its filter without a type, which can only keep a
+    // file.
+    private Dictionary<string, DataType> PartitionTypesByPhysicalName()
+    {
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(Metadata.Configuration);
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal);
+        foreach (string column in Metadata.PartitionColumns)
+        {
+            if (Schema.TryGetField(column, out StructField field))
+            {
+                types[ColumnMapping.PhysicalName(field, mode)] = field.DataType;
+            }
+        }
+
+        return types;
+    }
 
     /// <summary>
     /// Builds the read-only, side-effect-free <see cref="TableStatisticsReport"/> an optimizer requests

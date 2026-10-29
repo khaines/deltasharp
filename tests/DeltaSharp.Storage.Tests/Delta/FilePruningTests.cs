@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -141,6 +142,131 @@ public sealed class FilePruningTests
         FilePruningResult result = Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("region", null)));
 
         Assert.Equal(["null.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_IsNull_OnIntegerColumn_KeepsEmptyStringAndSentinelFiles_Issue916()
+    {
+        // #916: on a typed column, a committed "" reads as null (PROTOCOL.md), and so does the Hive sentinel.
+        // The pruner must apply the read's null rules, or IS NULL would prune files a full scan returns as null.
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("n", "")]),
+            File("five.parquet", partitions: [("n", "5")]),
+            File("null.parquet", partitions: [("n", null)]),
+            File("sentinel.parquet", partitions: [("n", "__HIVE_DEFAULT_PARTITION__")]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["n"] = IntegerType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("n", null)), types);
+
+        Assert.Equal(["empty.parquet", "null.parquet", "sentinel.parquet"], result.Candidates.Select(a => a.Path));
+        Assert.Equal(1, result.PrunedByPartition);
+    }
+
+    [Fact]
+    public void PartitionFilter_Equality_OnIntegerColumn_PrunesEmptyStringFile_Issue916()
+    {
+        // The other direction: a "" file reads as null, so it cannot match n = 5 and is pruned (soundly).
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("n", "")]),
+            File("five.parquet", partitions: [("n", "5")]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["n"] = IntegerType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("n", "5")), types);
+
+        Assert.Equal(["five.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_IsNull_OnStringColumn_PrunesEmptyStringFile_D5()
+    {
+        // Design D5: on a STRING column "" is a real value, not null, so IS NULL proves the "" file cannot match.
+        // The sentinel is still null on a string column (the read never materializes the literal).
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("s", "")]),
+            File("null.parquet", partitions: [("s", null)]),
+            File("sentinel.parquet", partitions: [("s", "__HIVE_DEFAULT_PARTITION__")]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["s"] = StringType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("s", null)), types);
+
+        Assert.Equal(["null.parquet", "sentinel.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_IsNull_WithUnknownType_KeepsEmptyStringFile_Issue916()
+    {
+        // With no type for the column, "" may be a typed null, so IS NULL never proves it non-matching; a
+        // non-empty value still prunes. The sentinel is null for every type.
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("c", "")]),
+            File("x.parquet", partitions: [("c", "x")]),
+            File("sentinel.parquet", partitions: [("c", "__HIVE_DEFAULT_PARTITION__")]),
+        ];
+
+        FilePruningResult isNull = Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("c", null)));
+        Assert.Equal(["empty.parquet", "sentinel.parquet"], isNull.Candidates.Select(a => a.Path));
+
+        // ...and an "" filter keeps both the "" file and the null-denoting sentinel file, but prunes "x".
+        FilePruningResult isEmpty = Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("c", "")));
+        Assert.Equal(["empty.parquet", "sentinel.parquet"], isEmpty.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void SnapshotPruneFiles_NameMode_TypesPartitionFiltersByPhysicalName_Issue916()
+    {
+        // End to end through Snapshot.PruneFiles. The type map is keyed by the PHYSICAL name (how
+        // add.partitionValues is keyed under column mapping). The string column pins that the map is actually
+        // used: without its type, "" against IS NULL can never be proven a mismatch, so f2 would be kept.
+        const string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-a\"}},"
+            + "{\"name\":\"n\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-b\"}},"
+            + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"col-c\"}}]}";
+        var metadata = new MetadataAction(
+            Id: "issue-916",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schema,
+            PartitionColumns: ["n", "s"],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty
+                .Add("delta.columnMapping.mode", "name")
+                .Add("delta.columnMapping.maxColumnId", "3"),
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(2, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [
+                File("f1.parquet", partitions: [("col-b", ""), ("col-c", "x")]),
+                File("f2.parquet", partitions: [("col-b", "5"), ("col-c", "")]),
+            ],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        // Integer column: f1's "" reads as null, so it matches IS NULL; f2's "5" does not.
+        FilePruningResult intIsNull =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("col-b", null)));
+        Assert.Equal(["f1.parquet"], intIsNull.Candidates.Select(a => a.Path));
+
+        // String column (D5): f2's "" is a real value, so IS NULL prunes both files.
+        FilePruningResult stringIsNull =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("col-c", null)));
+        Assert.Empty(stringIsNull.Candidates);
     }
 
     [Fact]

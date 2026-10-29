@@ -1,5 +1,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using DeltaSharp.Storage.Reading;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -12,7 +14,16 @@ namespace DeltaSharp.Storage.Delta;
 /// </summary>
 internal static class FilePruner
 {
-    public static FilePruningResult Prune(ImmutableArray<AddFileAction> files, FilePruningRequest request)
+    /// <param name="files">The active files to prune.</param>
+    /// <param name="request">The partition and data-skipping filters.</param>
+    /// <param name="partitionTypes">The partition columns' data types, keyed by the name
+    /// <c>add.partitionValues</c> uses (the physical name under column mapping). A partition filter on a
+    /// column missing from this map is evaluated without a type, which can only forfeit a prune
+    /// (<see cref="PartitionValuesMayMatch"/>).</param>
+    public static FilePruningResult Prune(
+        ImmutableArray<AddFileAction> files,
+        FilePruningRequest request,
+        IReadOnlyDictionary<string, DataType>? partitionTypes = null)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -21,7 +32,7 @@ internal static class FilePruner
 
         foreach (AddFileAction file in files)
         {
-            if (PartitionExcludes(file, request.PartitionFilters))
+            if (PartitionExcludes(file, request.PartitionFilters, partitionTypes))
             {
                 skipped.Add(new SkippedFile(file, FileSkipReason.PartitionMismatch));
                 continue;
@@ -39,20 +50,48 @@ internal static class FilePruner
         return new FilePruningResult(candidates.ToImmutable(), files.Length, skipped.ToImmutable());
     }
 
-    /// <summary>True only if a partition filter proves this file's partition cannot match (its exact,
-    /// committed partition value differs). An unknown partition column never prunes.</summary>
-    private static bool PartitionExcludes(AddFileAction file, ImmutableArray<PartitionEqualityFilter> filters)
+    /// <summary>True only if a partition filter proves this file's partition cannot match (its committed
+    /// partition value denotes a different value). An unknown partition column never prunes.</summary>
+    private static bool PartitionExcludes(
+        AddFileAction file,
+        ImmutableArray<PartitionEqualityFilter> filters,
+        IReadOnlyDictionary<string, DataType>? partitionTypes)
     {
         foreach (PartitionEqualityFilter filter in filters)
         {
-            if (file.PartitionValues.TryGetValue(filter.Column, out string? actual)
-                && !string.Equals(actual, filter.Value, StringComparison.Ordinal))
+            if (file.PartitionValues.TryGetValue(filter.Column, out string? actual))
             {
-                return true;
+                DataType? type = null;
+                partitionTypes?.TryGetValue(filter.Column, out type);
+                if (!PartitionValuesMayMatch(actual, filter.Value, type))
+                {
+                    return true;
+                }
             }
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Whether a file's committed partition value <paramref name="actual"/> may denote the same value as the
+    /// filter's <paramref name="expected"/>. Both sides go through
+    /// <see cref="DeltaReadEncoding.NormalizePartitionValue"/>, the helper the read path uses, so a file is
+    /// never pruned for a value the read would return as matching: on an integer column, a committed <c>""</c>
+    /// reads as null and therefore matches <c>IS NULL</c> (#916). With no known <paramref name="type"/>, the
+    /// value is normalized as a string (the Hive sentinel is null for every type), and an empty string against
+    /// a null never proves a mismatch, because a non-string type would read that <c>""</c> as null.
+    /// </summary>
+    private static bool PartitionValuesMayMatch(string? actual, string? expected, DataType? type)
+    {
+        string? a = DeltaReadEncoding.NormalizePartitionValue(type ?? StringType.Instance, actual);
+        string? e = DeltaReadEncoding.NormalizePartitionValue(type ?? StringType.Instance, expected);
+        if (string.Equals(a, e, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return type is null && (a ?? e) is { Length: 0 } && (a is null || e is null);
     }
 
     /// <summary>True only if some data filter proves, from tight min/max/null statistics, that no row in
