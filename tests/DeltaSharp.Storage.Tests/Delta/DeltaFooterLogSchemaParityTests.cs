@@ -1008,10 +1008,8 @@ public sealed class DeltaFooterLogSchemaParityTests : IDisposable
                 if (document.RootElement.TryGetProperty("add", out JsonElement add)
                     && add.TryGetProperty("path", out JsonElement path))
                 {
-                    // #708: add.path IS the physical relative object key (Hive key AND value are now
-                    // percent-encoded via DeltaWriteEncoding.HivePartitionSegment). Open the file at the
-                    // raw committed path — decoding it would reconstruct the logical column name and no
-                    // longer match the on-disk directory for a non-ASCII/special column name.
+                    // #806: add.path is the URI-encoded (layer 2) form of the physical key. Collect it
+                    // verbatim; ReadFooterSchema decodes it once to the on-disk (layer 1) key before opening.
                     added.Add(path.GetString()!);
                 }
             }

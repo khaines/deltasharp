@@ -117,10 +117,13 @@ internal static class DeltaWriteEncoding
     /// single <c>Uri.UnescapeDataString</c> (<c>PartitionPathResolver</c>, Inc-A). This replaces the pre-#806
     /// <c>Uri.EscapeDataString</c> scheme, whose alphabet diverged from Spark's (it escaped space and all
     /// non-ASCII) and which stored <c>add.path</c> literally.</para>
-    /// <para><b>Injection safety is preserved.</b> <see cref="EscapePathName"/> escapes <c>/ \ = :</c> and
-    /// control characters, so a hostile name or value cannot fabricate or escape a directory segment (the #708
-    /// hardening). The write-door column-name validation (<c>ColumnMapping.FindUnsafePathSegmentReason</c>)
-    /// remains as defense in depth.</para>
+    /// <para><b>Injection safety is preserved.</b> <see cref="EscapePathName"/> escapes <c>/ \ = :</c> and the
+    /// ASCII controls 0x01–0x1F/DEL, so a hostile name or value cannot fabricate or escape a directory segment
+    /// (the #708 hardening). NUL and every non-ASCII character, including the C1 controls U+0080–U+009F, pass
+    /// through as in Spark (#921). The column-name check (<c>ColumnMapping.FindUnsafePathSegmentReason</c>, at
+    /// commit, and at load for a mapped physicalName) is defense in depth for <c>/ \ = :</c> and the ASCII
+    /// controls 0x01–0x1F/DEL, and also rejects NUL, C1, line/paragraph/format characters and lone surrogates
+    /// in a name.</para>
     /// <para><b>Encoded-length budget (#806 §2.6).</b> The composed physical segment must fit a filesystem path
     /// component (<see cref="MaxEncodedPathComponentBytes"/>). <see cref="EscapePathName"/>'s non-ASCII
     /// passthrough removes the old <c>Uri.EscapeDataString</c> blow-up; the residual is escape-heavy ASCII (each

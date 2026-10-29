@@ -228,7 +228,8 @@ public sealed class DeltaWriteTargetTests : IDisposable
         // #708: a legal-but-hostile partition column name (space AND quote) must be percent-encoded into
         // add.path (BOTH key and value), yet round-trip correctly on read because partition truth lives in
         // add.partitionValues, not in the directory string. This also retires the write-path half of the
-        // Hive-redaction residual #714 (a DeltaSharp-authored key can no longer carry a quote or whitespace).
+        // Hive-redaction residual #714 for the QUOTE: escapePathName escapes both ASCII quotes, though since
+        // #806 an ASCII space stays raw on the on-disk key (only add.path carries it as %20).
         const string hostileColumn = "my col'x";
         var schema = new StructType(new[]
         {
@@ -281,16 +282,16 @@ public sealed class DeltaWriteTargetTests : IDisposable
     [Theory]
     [InlineData("a/b")]     // a raw '/' would fabricate a spurious path segment
     [InlineData("a=b")]     // a raw '=' would fabricate a second Hive key/value split
-    [InlineData("région")]  // a non-ASCII name (Uri.EscapeDataString differs from Spark escapePathName)
+    [InlineData("région")]  // a non-ASCII name (escapePathName passes it through unescaped, as Spark does)
     public void HivePartitionSegment_HostileColumnName_IsSingleInjectionSafeSegment(string column)
     {
         // #708: a legal-but-hostile partition column NAME must render as exactly ONE directory segment with
         // exactly ONE structural '=' (the Hive key/value separator) and no embedded '/'. The encoding is a
-        // directory-injection hardening, NOT parity with Spark's escapePathName alphabet (see #806).
+        // directory-injection hardening (#708), now via Spark's escapePathName alphabet (#806 layer 1).
         //
-        // NOTE: a raw ".." is NOT neutralized by this ENCODER (Uri.EscapeDataString treats '.' as unreserved,
-        // so ".." survives verbatim) — the '..' path-climb control is the committer guard
-        // EnsureNoneModePartitionNamesSafe / FindUnsafePathSegmentReason, tested separately, not this encoder.
+        // NOTE: a raw ".." is NOT neutralized by this ENCODER (escapePathName does not escape '.', so ".."
+        // survives verbatim) — the '..' path-climb control is the committer guard EnsureNoneModePartitionNamesSafe
+        // / FindUnsafePathSegmentReason, tested separately, not this encoder.
         string segment = DeltaWriteEncoding.HivePartitionSegment(column, "v");
 
         Assert.DoesNotContain('/', segment);                 // no fabricated sub-directory ('/' -> %2F)

@@ -192,18 +192,23 @@ internal static class ColumnMapping
     // partition-directory segment ("name=value") — #572 deltaspec R7. Filesystems cap a single path component
     // at ~255 bytes (Linux NAME_MAX, macOS, NTFS are all ~255); the partition directory encodes the column
     // name as "name=value", so the NAME alone must stay well under that ceiling to leave room for the "=value"
-    // suffix (the value is data-dependent and Uri.EscapeDataString-encoded — e.g. __HIVE_DEFAULT_PARTITION__ is
-    // 26 bytes). 128 bytes is half the component budget: it accepts every real name by a wide margin (a minted
-    // physical name is "col-<uuid>" = 40 bytes; a logical partition name is typically far shorter) while
-    // guaranteeing >=127 bytes of headroom for "=value". A crafted ~300-byte name is rejected fail-closed at
-    // commit/load instead of failing a later partitioned write at the path-resolution/confined-root guard.
+    // suffix (the value is data-dependent and escaped by DeltaWriteEncoding.EscapePathName, Spark's
+    // escapePathName alphabet — e.g. __HIVE_DEFAULT_PARTITION__ is 26 bytes). 128 bytes is half the component
+    // budget: it accepts every real name by a wide margin (a minted physical name is "col-<uuid>" = 40 bytes;
+    // a logical partition name is typically far shorter) while guaranteeing >=127 bytes of headroom for
+    // "=value" for any name without escapable ASCII (see the RESIDUAL below). A crafted ~300-byte name is
+    // rejected fail-closed before DeltaSharp commits it (by this check at commit, or earlier by another guard;
+    // #921 records which), and, for a foreign mapped physicalName, at load.
     //
-    // RESIDUAL (#806): this bound is on the RAW name in UTF-8 bytes, but since #708 the NAME is ALSO
-    // Uri.EscapeDataString-encoded into the segment (previously only the value was). An all-non-ASCII 128-byte
-    // name expands to ~384 encoded characters (each byte -> "%XX"), which can exceed NAME_MAX for the ENCODED
-    // segment even though the raw name passes this check. Tightening the budget to the ENCODED length (or
-    // adopting Spark's escapePathName alphabet) is tracked with the broader path-encoding parity work under
-    // #806; today the fail-closed direction is a later confined-root/path-resolution guard, not disclosure.
+    // RESIDUAL (#919): this bound is on the RAW name in UTF-8 bytes, but the NAME is written through
+    // DeltaWriteEncoding.EscapePathName (#806 layer 1). That alphabet passes non-ASCII through unescaped, so a
+    // non-ASCII name is NOT expanded (a 128-byte name stays 128 bytes on disk). It does escape the ASCII
+    // characters " # % ' * ? { [ ] ^, which this check accepts, to "%XX" (3 bytes each): a 128-char name made
+    // only of them passes here yet encodes to 384 bytes, past the 255-byte NAME_MAX budget on its own, and the
+    // ">=127 bytes of headroom" above does not hold for it (measured: 84 such chars + "=1" is the most that
+    // fits; 76 with the null sentinel). Such a table commits and loads, but every write or OPTIMIZE into it
+    // that builds a partition segment fails closed BEFORE commit at DeltaWriteEncoding.HivePartitionSegment
+    // (MaxEncodedPathComponentBytes) — no corruption, no disclosure. Bounding the ESCAPED length here is #919.
     private const int MaxPathSegmentNameBytes = 128;
 
     // Judges whether <segment> is a SAFE single filesystem path segment — the shared core of the
@@ -215,17 +220,27 @@ internal static class ColumnMapping
     // round-trips ANY name verbatim (empirically verified — no footer constraint), so the binding constraint is
     // uniformly the partition path:
     //   - '/' or '\'  : a path separator splits/restructures the directory tree, and with '..' escapes the
-    //                   confined table root (caught fail-closed at the backend, but rejected here earlier);
+    //                   confined table root (before #708 a raw name reached the backend's confined-root guard;
+    //                   since #708/#806 the writer escapes it to %2F/%5C instead);
     //   - '='         : the Hive key=value delimiter — corrupts partition-dir parsing (the reader splits on '=');
     //   - ':'         : roots a Windows drive / NTFS alternate-data-stream path (the absolute/rooted vector);
     //   - control char: filesystem-hostile and a log/path-injection vector;
     //   - whitespace-only (or empty): a degenerate, filesystem-hostile segment (some filesystems trim it);
-    //   - '.' or '..' : the WHOLE segment being dot/dot-dot is degenerate/traversal (a '..' SUBSTRING inside an
-    //                   otherwise-safe segment — e.g. 'a..b' — is a valid filename, NOT a traversal, so it is
-    //                   allowed, matching the confined-root guard's own posture);
+    //   - '.' or '..' : the WHOLE segment being dot/dot-dot is degenerate, and a traversal wherever it becomes a
+    //                   whole path component (a '..' SUBSTRING inside an otherwise-safe segment — e.g. 'a..b' —
+    //                   is a valid filename, NOT a traversal, so it is allowed, matching the confined-root guard's
+    //                   own posture);
     //   - > MaxPathSegmentNameBytes UTF-8 bytes: exceeds the portable path-component budget (R7).
     // Real names ('col-<uuid>', or a normal logical partition name) satisfy all of this, so only a crafted or
-    // foreign metaData can trip it.
+    // foreign metaData can trip it. Since #708/#806 the writer itself escapes '/', '\', '=', ':' and the ASCII
+    // controls 0x01–0x1F/DEL (DeltaWriteEncoding.EscapePathName), so for those characters this check is defense
+    // in depth. A whole-segment '.'/'..' was never a traversal on the write path: the segment is always
+    // 'name=value' (e.g. '..=v'), raw name or not. NUL, the C1 controls U+0080–U+009F, and the Zl/Zp/Cf and
+    // lone-surrogate characters pass the escape unchanged. This check rejects all of them, but it is not
+    // always the guard that fires: another guard can reject some of them first (#921 records which guard fires
+    // where, and whether the data file is already staged). This check bounds the RAW name
+    // (MaxPathSegmentNameBytes); DeltaWriteEncoding.HivePartitionSegment separately bounds the ENCODED segment
+    // at 255 bytes when a write or OPTIMIZE builds it. Neither bound implies the other (#919).
     private static string? FindUnsafePathSegmentReason(string segment)
     {
         bool whitespaceOnly = true;
@@ -417,17 +432,26 @@ internal static class ColumnMapping
     /// <c>none</c> mode is a no-op here (its fields may carry stray mapping metadata harmlessly — unchanged
     /// posture). This is an explicit choke point (not an incidental ctor throw), so the guarantee holds
     /// regardless of how the schema is built.</para>
-    /// <para><b>Not a gap — the name→path dimension is complete across all modes (#572 R7).</b> Every
+    /// <para><b>Not an injection gap — the name→path dimension is complete across all modes (#572 R7).</b> Every
     /// metaData-controlled name that becomes a filesystem path segment is safe-segment + length validated: the
     /// mapped physicalName (name/id, here); the logical partition name (none, at the committer). A partition
-    /// <b>name AND value</b> are percent-encoded (<c>Uri.EscapeDataString</c>) into the directory segment
-    /// (since #708 the NAME too, not only the value), so a slash/traversal/control character in either is
-    /// neutralised at write time (the value is data, not committed metaData); the
-    /// staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet <b>column-name</b>
-    /// legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim — empirically verified),
-    /// so the binding constraint on a physical name is uniformly the partition-directory path, not the
-    /// footer. (Note: the length bound is on the RAW name; the ENCODED-length residual for an all-non-ASCII
-    /// name is tracked under #806 — see <c>MaxPathSegmentNameBytes</c>.)</para>
+    /// <b>name AND value</b> are both escaped into the physical directory segment with Spark's
+    /// <c>escapePathName</c> alphabet (<c>DeltaWriteEncoding.EscapePathName</c>, #806 layer 1; since #708 the
+    /// NAME too, not only the value), which escapes <c>/ \ = :</c> and controls 0x01–0x1F and DEL, so a
+    /// slash/traversal/ASCII-control character in either is neutralised at write time (the value is data, not
+    /// committed metaData). A C1 control (U+0080–U+009F) in a value is written raw, as Spark writes it. NUL is
+    /// the other exception: it is outside Spark's escape set, so a NUL in a value reaches the backend raw and
+    /// fails closed there with an unclassified exception (#921). So does a NUL in a none-mode partition NAME:
+    /// the backend rejects the path while the data-bearing write is staging it, before the committer's
+    /// safe-segment check runs; and on a foreign-committed table (append or OPTIMIZE) that check runs only if
+    /// the operation itself commits metaData (e.g. a mergeSchema append; OPTIMIZE never does). A mapped
+    /// physicalName is also checked here at load, so a foreign one is rejected before any staging (DeltaSharp
+    /// itself mints <c>col-&lt;uuid&gt;</c>). <c>add.path</c> is then URI-encoded on top (<c>ToAddPath</c>,
+    /// layer 2); the staged data-file name is a crypto-random hex token, never metaData-derived; and Parquet
+    /// <b>column-name</b> legality imposes nothing (Parquet.Net 6.1.0 round-trips ANY column name verbatim —
+    /// empirically verified), so the binding constraint on a physical name is uniformly the partition-directory
+    /// path, not the footer. (Note: the length bound is on the RAW name; the ENCODED-length residual for an
+    /// escape-heavy ASCII name is tracked under #919 — see <c>MaxPathSegmentNameBytes</c>.)</para>
     /// </summary>
     /// <exception cref="DeltaProtocolException">A nested (non-leaf) mapped column, a missing/empty physical
     /// name, an unsafe (non-path-segment) physical name, a duplicate physical name, a missing id, a
@@ -1638,17 +1662,24 @@ internal static class ColumnMapping
     /// partition column's <b>logical</b> name IS the partition-directory path segment (<c>logicalName=value/</c>)
     /// — there is no physical mapping to decouple it — so every partition column name MUST be a <b>safe path
     /// segment</b> under the same char + length contract <see cref="EnsureSafePhysicalName"/> enforces on a
-    /// mapped physical name (a separator, <c>=</c>, <c>:</c>, control char, <c>.</c>/<c>..</c>,
-    /// whitespace-only, or over-<see cref="MaxPathSegmentNameBytes"/>-byte name would restructure/escape the
-    /// directory tree or exceed the filesystem path-component limit). A crafted <c>partitionColumns</c> naming
-    /// an unsafe column (e.g. <c>../escape</c>) commits and loads today and only fails a later partitioned
-    /// write at the path/confined-root guard; this rejects it fail-closed at COMMIT (table unchanged). Like
-    /// <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check) it runs at the committer —
-    /// NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is too broad for a
-    /// load-side name check; the committer guarantees no NEW unsafe-partition-name table is published. It is
-    /// scoped to <c>none</c> mode and to PARTITION columns only: in name/id mode the path segment is the mapped
-    /// physical name (validated by <see cref="ValidateColumnMappingSchema"/>) while the logical name is
-    /// decoupled from the path (it may legitimately hold any Parquet-legal character — the very purpose of
+    /// mapped physical name. Before #708 the name was written raw, so every unsafe character reached the path
+    /// unescaped (<c>FindUnsafePathSegmentReason</c> says why each is unsafe). The writer now escapes the
+    /// separators, <c>=</c>, <c>:</c> and the ASCII controls 0x01–0x1F/DEL, so for those this is defense in
+    /// depth. NUL, the C1 controls U+0080–U+009F, the line/paragraph/format characters and lone surrogates
+    /// pass the escape unchanged, and so does a name made only of non-control whitespace (space, U+00A0, U+3000
+    /// and the like). This check rejects all of them, though another guard can reject some earlier (#921). Its
+    /// <see cref="MaxPathSegmentNameBytes"/> raw-length bound and the 255-byte encoded-segment bound in
+    /// <c>DeltaWriteEncoding.HivePartitionSegment</c> do not imply each other (#919). (A whole-segment
+    /// <c>.</c>/<c>..</c> name was never a traversal: the segment is always <c>name=value</c>.) A crafted
+    /// <c>partitionColumns</c> naming an unsafe column (e.g. <c>../escape</c>) would otherwise commit and load;
+    /// before #708 a later partitioned write then failed at the path/confined-root guard, and since #708/#806
+    /// the <c>/</c> is escaped instead (<c>..%2Fescape=v</c>, one segment). This rejects it fail-closed at
+    /// COMMIT (table unchanged). Like <see cref="EnsurePartitionColumnsInSchema"/> (the all-mode existence check)
+    /// it runs at the committer — NOT at snapshot load — because the stub-schema log/checkpoint fixture corpus is
+    /// too broad for a load-side name check; the committer guarantees no NEW unsafe-partition-name table is
+    /// published. It is scoped to <c>none</c> mode and to PARTITION columns only: in name/id mode the path segment
+    /// is the mapped physical name (validated by <see cref="ValidateColumnMappingSchema"/>) while the logical name
+    /// is decoupled from the path (it may legitimately hold any Parquet-legal character — the very purpose of
     /// column mapping); and a non-partition logical name never reaches a path. O(partitionColumns).
     /// </summary>
     /// <exception cref="DeltaProtocolException">A partition column name is not a safe path segment.</exception>

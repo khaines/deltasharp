@@ -19,14 +19,14 @@ namespace DeltaSharp.Storage.Tests.Delta;
 /// <summary>
 /// Regressions for the Hive-path DISCLOSURE posture (council round 3, maintainer ruling).
 /// <para>DeltaSharp lays data out Hive-style, so a table-relative object path such as
-/// <c>email=alice.taylor%40example.com/region=EU/part-DD73….parquet</c> embeds partition VALUES — which are
+/// <c>email=alice.taylor@example.com/region=EU/part-DD73….parquet</c> embeds partition VALUES — which are
 /// COLUMN VALUES, i.e. table data and potentially PII. Sanitizing does NOT address that: an email address
 /// contains no control character and is well under the 128-char cap, so it survives
-/// <see cref="DiagnosticText.Sanitize"/> verbatim and <c>Uri.UnescapeDataString</c> recovers the original from
-/// the percent-encoding. The ruling is therefore: <b>keep partition CONTEXT, never partition VALUES</b> —
-/// every path echo renders through <see cref="DiagnosticText.DescribePath"/>, which keeps the sanitized file
-/// name plus the sanitized partition COLUMN NAMES and drops the values, while the raw path stays on a typed
-/// property the table owner can read deliberately.</para>
+/// <see cref="DiagnosticText.Sanitize"/> verbatim (and <c>Uri.UnescapeDataString</c> recovers it from a legacy
+/// or foreign <c>%40</c> spelling). The ruling is therefore: <b>keep partition CONTEXT, never partition
+/// VALUES</b> — every path echo renders through <see cref="DiagnosticText.DescribePath"/>, which keeps the
+/// sanitized file name plus the sanitized partition COLUMN NAMES and drops the values, while the raw path
+/// stays on a typed property the table owner can read deliberately.</para>
 /// <para>Each test drives ONE site so an individual revert turns exactly one test red.</para>
 /// </summary>
 // Two tests here drive the PROCESS-GLOBAL LocalFileSystemBackend.IoFaultHook / DirectoryFsync.FsyncHook
@@ -448,8 +448,9 @@ namespace DeltaSharp.Storage.Tests.Delta;
 [Collection(DeltaSharp.Storage.Tests.BackendFaultInjectionCollection.Name)]
 public sealed partial class PathDisclosureHygieneTests : IDisposable
 {
-    // A PII-shaped partition value, Hive/percent-encoded exactly as the writer emits it. The assertions check
-    // BOTH the encoded and the decoded form, because an attacker or an auditor reading the log will apply
+    // A PII-shaped partition value, percent-encoded as the pre-#806 writer emitted it (still the shape of a
+    // legacy or foreign path; since #806 DeltaSharp writes the '@' literally). The assertions check BOTH the
+    // encoded and the decoded form, because an attacker or an auditor reading the log will apply
     // Uri.UnescapeDataString.
     private const string EncodedValue = "alice.taylor%40example.com";
     private const string DecodedValue = "alice.taylor@example.com";
@@ -4745,7 +4746,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         //   Deleting 'part-x.parquet' (partitioned by: email, region) failed:
         //   IOException: Could not delete file '<table-root>/email=alice%40example.com/region=EU/part-x.parquet'
         //
-        // {detail} was correctly out of scope for #664 (inner-exception/ToString rendering); the Hive-path
+        // (That was the pre-#806 spelling; since #806 the '@' is literal on disk, which only strengthens the
+        // case.) {detail} was correctly out of scope for #664 (inner-exception/ToString rendering); the Hive-path
         // ruling is newer and turns it into a PII channel in Message itself.
         await _backend.PutIfAbsentAsync(PartitionedPath, new byte[] { 1 }, CancellationToken.None);
 
@@ -4879,9 +4881,13 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     [InlineData("=")]
     // Round-8: the key class excluded whitespace and quotes, so any of these made the group unable to span to
     // the '=' and -- the lookbehind admitting exactly ONE start position per segment -- the recognizer matched
-    // NOTHING. Unlike every other row here this is not a foreign-table shape: DeltaWriteTarget percent-encodes
-    // the partition VALUE and writes the column NAME raw, and nothing validates a partition column name, so a
-    // table partitioned by a legal Delta column named `my col` or `o'brien` emits these on the happy path.
+    // NOTHING. Unlike the other fail-open rows here, the space, NBSP and quote rows were not foreign-table
+    // shapes: before #708 DeltaWriteTarget percent-encoded the partition VALUE but wrote the column NAME raw,
+    // and the #572 R7 name check accepts a space, an NBSP and both quotes, so a table partitioned by `my col`
+    // or `o'brien` emitted them on the happy path. (The name check now rejects the tab and CR rows, since #572
+    // R7, and the U+2028 row, since the #683 Zl/Zp/Cf arm, so DeltaSharp no longer emits those.) Every row
+    // stays: add.path may be foreign-authored, legacy pre-#708 tables exist, and since #806 a space or NBSP is
+    // raw on DeltaSharp's own on-disk key again.
     [InlineData("my col")]
     [InlineData("my\tcol")]
     [InlineData("my\rcol")]
@@ -5279,7 +5285,9 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     [Fact]
     public async Task Redact_NoGenuineDoorOnThisBackendSurfacesARuntimePath()
     {
-        string segment = "my col=" + EncodedValue; // the exact class branch 2 exists for; #708 writes it
+        // The exact class branch 2 exists for: a legacy pre-#708 key (raw space) with the legacy %40 value.
+        // Since #806 DeltaSharp writes "my col=alice.taylor@example.com" (the space is raw on disk again).
+        string segment = "my col=" + EncodedValue;
         Directory.CreateDirectory(Path.Combine(_root, segment));
         await File.WriteAllBytesAsync(Path.Combine(_root, segment, "x.parquet"), [1], CancellationToken.None);
         await File.WriteAllBytesAsync(Path.Combine(_root, "f" + segment), [1], CancellationToken.None);
@@ -5410,9 +5418,10 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     // BOTH blocking findings of the re-confirmation round, end-to-end through a real DeleteAsync fault --
     // the monotonicity matrix pins them at the recognizer, these pin them at the message.
     //
-    // Every column name here is a LEGAL Delta column name, and DeltaWriteTarget emits the name RAW into
-    // add.path (only the VALUE is percent-encoded), so all of these are reachable on DeltaSharp's own write
-    // path. They are not foreign-table hypotheticals.
+    // Every column name here is a LEGAL Delta column name, and before #708 DeltaWriteTarget emitted the name
+    // RAW into add.path (only the VALUE was percent-encoded), so all of these were reachable on DeltaSharp's
+    // own write path. They stay reachable via foreign add.paths and legacy pre-#708 tables, and since #806 a
+    // key with a space, such as `my col`, is raw on DeltaSharp's own on-disk key again (quotes are escaped).
     //
     // (1) Quality: key bearing a quote AND whitespace. The three-branch form excluded quotes in one branch
     //     and whitespace in the other, so their INTERSECTION matched nothing and the value was echoed.
@@ -5509,9 +5518,9 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     }
 
     [Theory]
-    // SPARK'S escapePathName DOES NOT ESCAPE AN APOSTROPHE, and add.path is foreign, so a quote inside a
-    // partition VALUE is a real shape rather than a constructed one. These rows carry two assertions each,
-    // and they pin two different halves of ClosingQuoteValue:
+    // add.path IS FOREIGN, so a quote inside a partition VALUE is a real shape rather than a constructed one:
+    // Spark's escapePathName writes an apostrophe as %27, but nothing obliges a foreign writer to escape it.
+    // These rows carry two assertions each, and they pin two different halves of ClosingQuoteValue:
     //
     //   * no fragment of the value survives -- pins the value run being PERMISSIVE. A quote-excluding value
     //     run stops at the apostrophe, and the quote-delimited branches then decline; only the
@@ -5635,8 +5644,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     [Theory]
     // POSSESSIVE PARTITION VALUES, ACROSS EVERY SPELLING A REAL PRODUCER EMITS. Reported independently by
     // two reviewers with these exact values; kept under their names because the rows are the evidence.
-    // Spark's escapePathName leaves an apostrophe raw and add.path is foreign, so `Teachers' Union` is an
-    // ordinary partition value, not a crafted one.
+    // add.path is foreign, so `Teachers' Union` is an ordinary partition value, not a crafted one (Spark's
+    // escapePathName writes the apostrophe as %27, but a foreign writer need not escape it).
     //
     // The axis that matters here is the MESSAGE ENVELOPE, not the value: the same value is reported by
     // .NET inside single quotes, inside double quotes, with trailing prose, and bare. A reviewer probing
@@ -5917,9 +5926,10 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
     [Fact]
     public void Redact_MonotonicityMatrix_EveryCellOutsideTheAllowListStaysRedacted()
     {
-        // Column names spanning the key-content lattice. All are LEGAL Delta column names, and
-        // DeltaWriteTarget emits the name RAW into add.path (only the value is percent-encoded), so every
-        // one of these is reachable on DeltaSharp's own write path -- not a foreign-table hypothetical.
+        // Column names spanning the key-content lattice. All are LEGAL Delta column names, and before #708
+        // DeltaWriteTarget emitted the name RAW into add.path (only the value was percent-encoded), so every
+        // one of these was reachable on DeltaSharp's own write path; they stay reachable via foreign add.paths
+        // and legacy pre-#708 tables, and since #806 a key such as `my col` is raw on DeltaSharp's own on-disk key.
         (string Key, bool Space, bool Quote)[] keys =
         [
             ("email", false, false),
@@ -5948,8 +5958,8 @@ public sealed partial class PathDisclosureHygieneTests : IDisposable
         // is the single follower class the closing-quote boundary set excludes. `Boys' Club` -- apostrophe
         // then SPACE -- was outside the corpus, and it partial-matched. So the axis is not "does the value
         // contain a quote" but "what comes immediately after it", and the rows below range over the whole
-        // boundary set. add.path is FOREIGN, and Spark's escapePathName leaves an apostrophe raw, so none
-        // of these depends on what DeltaSharp itself writes.
+        // boundary set. add.path is FOREIGN (Spark escapes an apostrophe to %27, but nothing obliges a
+        // foreign writer to), so none of these depends on what DeltaSharp itself writes.
         // THE VALUE LATTICE IS GENERATED FROM A STRUCTURAL ALPHABET, NOT ENUMERATED BY HAND, AND THE
         // PAYLOAD IS A SENTINEL RATHER THAN PROSE. The previous rows were readable strings
         // (`Aaaa'Bbbb`) scored by splitting on a hard-coded character set. That set enumerated the
