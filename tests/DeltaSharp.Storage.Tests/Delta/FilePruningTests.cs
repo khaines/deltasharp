@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using DeltaSharp.Storage.Delta;
+using DeltaSharp.Types;
 using Xunit;
 
 namespace DeltaSharp.Storage.Tests.Delta;
@@ -141,6 +142,356 @@ public sealed class FilePruningTests
         FilePruningResult result = Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("region", null)));
 
         Assert.Equal(["null.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_IsNull_OnIntegerColumn_KeepsEmptyStringAndSentinelFiles_Issue916()
+    {
+        // #916: on a typed column, a committed "" reads as null (PROTOCOL.md), and so does the Hive sentinel.
+        // The pruner must apply the read's null rules, or IS NULL would prune files a full scan returns as null.
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("n", "")]),
+            File("five.parquet", partitions: [("n", "5")]),
+            File("null.parquet", partitions: [("n", null)]),
+            File("sentinel.parquet", partitions: [("n", "__HIVE_DEFAULT_PARTITION__")]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["n"] = IntegerType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("n", null)), types);
+
+        Assert.Equal(["empty.parquet", "null.parquet", "sentinel.parquet"], result.Candidates.Select(a => a.Path));
+        Assert.Equal(1, result.PrunedByPartition);
+    }
+
+    [Fact]
+    public void PartitionFilter_Equality_OnIntegerColumn_PrunesEmptyStringFile_Issue916()
+    {
+        // The other direction: a "" file reads as null, so it cannot match n = 5 and is pruned (soundly).
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("n", "")]),
+            File("five.parquet", partitions: [("n", "5")]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["n"] = IntegerType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("n", "5")), types);
+
+        Assert.Equal(["five.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_IsNull_OnStringColumn_PrunesEmptyStringFile_D5()
+    {
+        // Design D5: on a STRING column "" is a real value, not null, so IS NULL proves the "" file cannot match.
+        // The sentinel is still null on a string column (the read never materializes the literal).
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("s", "")]),
+            File("null.parquet", partitions: [("s", null)]),
+            File("sentinel.parquet", partitions: [("s", "__HIVE_DEFAULT_PARTITION__")]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["s"] = StringType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("s", null)), types);
+
+        Assert.Equal(["null.parquet", "sentinel.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("__HIVE_DEFAULT_PARTITION__")]
+    public void PartitionFilter_NullDenotingValue_OnIntegerColumn_FiltersAsIsNull_Issue916(string filterValue)
+    {
+        // The filter's own value goes through the read's null rules: on an integer column, a filter value of ""
+        // or the sentinel denotes null, so it keeps every file that reads as null and prunes "5".
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("n", "")]),
+            File("five.parquet", partitions: [("n", "5")]),
+            File("null.parquet", partitions: [("n", null)]),
+        ];
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal) { ["n"] = IntegerType.Instance };
+
+        FilePruningResult result = FilePruner.Prune(
+            files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("n", filterValue)), types);
+
+        Assert.Equal(["empty.parquet", "null.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_IsNull_WithUnknownType_KeepsEmptyStringFile_Issue916()
+    {
+        // With no type for the column, "" may be a typed null, so IS NULL never proves it non-matching; a
+        // non-empty value still prunes. The sentinel is null for every type.
+        ImmutableArray<AddFileAction> files =
+        [
+            File("empty.parquet", partitions: [("c", "")]),
+            File("x.parquet", partitions: [("c", "x")]),
+            File("sentinel.parquet", partitions: [("c", "__HIVE_DEFAULT_PARTITION__")]),
+        ];
+
+        FilePruningResult isNull =
+            Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("c", null)));
+        Assert.Equal(["empty.parquet", "sentinel.parquet"], isNull.Candidates.Select(a => a.Path));
+
+        // ...and an "" filter keeps both the "" file and the null-denoting sentinel file, but prunes "x".
+        FilePruningResult isEmpty =
+            Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("c", "")));
+        Assert.Equal(["empty.parquet", "sentinel.parquet"], isEmpty.Candidates.Select(a => a.Path));
+    }
+
+    [Theory]
+    [InlineData("name")]
+    [InlineData("id")]
+    [InlineData("none")]
+    public void SnapshotPruneFiles_TypesPartitionFiltersByTheAddKey_InEveryMappingMode_Issue916(string mode)
+    {
+        // End to end through Snapshot.PruneFiles. The type map is keyed by the name add.partitionValues uses: the
+        // PHYSICAL name in name and id mode, the logical name in none mode. The string column pins that the map is
+        // actually used: without its type, "" against IS NULL can never be proven a mismatch, so f2 would be kept.
+        const string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"col-a\"}},"
+            + "{\"name\":\"n\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"col-b\"}},"
+            + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"col-c\"}}]}";
+        ImmutableSortedDictionary<string, string> configuration = mode == "none"
+            ? ImmutableSortedDictionary<string, string>.Empty
+            : ImmutableSortedDictionary<string, string>.Empty
+                .Add("delta.columnMapping.mode", mode)
+                .Add("delta.columnMapping.maxColumnId", "3");
+        (string intKey, string stringKey) = mode == "none" ? ("n", "s") : ("col-b", "col-c");
+        var metadata = new MetadataAction(
+            Id: "issue-916",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schema,
+            PartitionColumns: ["n", "s"],
+            Configuration: configuration,
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(2, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [
+                File("f1.parquet", partitions: [(intKey, ""), (stringKey, "x")]),
+                File("f2.parquet", partitions: [(intKey, "5"), (stringKey, "")]),
+            ],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        // Integer column: f1's "" reads as null, so it matches IS NULL; f2's "5" does not.
+        FilePruningResult intIsNull =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter(intKey, null)));
+        Assert.Equal(["f1.parquet"], intIsNull.Candidates.Select(a => a.Path));
+
+        // String column (D5): f2's "" is a real value, so IS NULL prunes both files.
+        FilePruningResult stringIsNull =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter(stringKey, null)));
+        Assert.Empty(stringIsNull.Candidates);
+    }
+
+    [Fact]
+    public void SnapshotPruneFiles_DuplicatePartitionColumnEntry_KeepsTheType()
+    {
+        // metaData.partitionColumns ["s", "s"] is rejected only at commit, so a foreign table can load with it.
+        // Both entries name the same field, so this is not an ambiguous physical name: the string type is kept
+        // and IS NULL prunes the "" file (D5), as it does with a single entry.
+        var metadata = new MetadataAction(
+            Id: "duplicate-entry",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: "{\"type\":\"struct\",\"fields\":["
+                + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":{}}]}",
+            PartitionColumns: ["s", "s"],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty,
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(1, 2, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [File("empty.parquet", partitions: [("s", "")]), File("null.parquet", partitions: [("s", null)])],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        FilePruningResult result =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("s", null)));
+
+        Assert.Equal(["null.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Theory]
+    [InlineData("n", "s")]   // a last-wins map would type "p" as string
+    [InlineData("s", "n")]   // a first-wins map would type "p" as string
+    public void SnapshotPruneFiles_SharedPhysicalName_DropsTheType_KeepsEmptyStringFile(string first, string second)
+    {
+        // A hand-built snapshot (the load gate rejects two mapped columns with one physical name) where an integer
+        // and a string partition column share the physical name "p". The type is ambiguous, so it is dropped and
+        // IS NULL keeps the "" file, which the integer column's read returns as null. Both orders are tested, so
+        // neither first-wins nor last-wins passes.
+        const string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"n\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"p\"}}]}";
+        var metadata = new MetadataAction(
+            Id: "shared-physical",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schema,
+            PartitionColumns: [first, second],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty
+                .Add("delta.columnMapping.mode", "name")
+                .Add("delta.columnMapping.maxColumnId", "2"),
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(2, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [File("empty.parquet", partitions: [("p", "")])],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        FilePruningResult result =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("p", null)));
+
+        Assert.Equal(["empty.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void PartitionFilter_UnknownType_EmptyStringAgainstNonEmptyValue_Prunes()
+    {
+        // The unknown-type leniency covers only "" against null. A "" file can never equal "x" under any type,
+        // so the filter still prunes it.
+        ImmutableArray<AddFileAction> files = [File("empty.parquet", partitions: [("c", "")])];
+
+        FilePruningResult result =
+            Prune(files, FilePruningRequest.ForPartitions(new PartitionEqualityFilter("c", "x")));
+
+        Assert.Empty(result.Candidates);
+    }
+
+    [Theory]
+    [InlineData("n", "s", "t")]
+    [InlineData("s", "n", "t")]
+    public void SnapshotPruneFiles_ThreeColumnsShareAPhysicalName_TypeStaysDropped(
+        string first, string second, string third)
+    {
+        // Integer n and strings s and t, all with physical name "p". A drop inside the loop would let the third
+        // column add the string type back after the second removed it, and IS NULL would then prune the "" file
+        // that n reads as null.
+        const string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"n\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"t\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"p\"}}]}";
+        var metadata = new MetadataAction(
+            Id: "three-shared",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schema,
+            PartitionColumns: [first, second, third],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty
+                .Add("delta.columnMapping.mode", "name")
+                .Add("delta.columnMapping.maxColumnId", "3"),
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(2, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [File("empty.parquet", partitions: [("p", "")])],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        FilePruningResult result =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("p", null)));
+
+        Assert.Equal(["empty.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
+    [Fact]
+    public void SnapshotPruneFiles_SharedPhysicalName_KeepsOtherColumnsTyped()
+    {
+        // Dropping the ambiguous type of "p" must not drop the type of an unrelated column: "q" is a string
+        // column, so its "" is a real value (D5) and IS NULL prunes the file.
+        const string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"n\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"t\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"q\"}}]}";
+        var metadata = new MetadataAction(
+            Id: "shared-physical-other",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schema,
+            PartitionColumns: ["n", "s", "t"],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty
+                .Add("delta.columnMapping.mode", "name")
+                .Add("delta.columnMapping.maxColumnId", "3"),
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(2, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [File("f.parquet", partitions: [("p", "1"), ("q", "")])],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        FilePruningResult result =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("q", null)));
+
+        Assert.Empty(result.Candidates);
+    }
+
+    [Fact]
+    public void SnapshotPruneFiles_NoPartitionFilter_DoesNotResolveTheSchema()
+    {
+        // The partition types are resolved only for a request with a partition filter, so a data-only request on
+        // a snapshot whose schema cannot be parsed still returns every file instead of throwing.
+        var metadata = new MetadataAction(
+            Id: "bad-schema",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: "not json",
+            PartitionColumns: ["n"],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty,
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(1, 2, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [File("f.parquet", partitions: [("n", "")])],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        FilePruningResult result = snapshot.PruneFiles(FilePruningRequest.Empty);
+
+        Assert.Single(result.Candidates);
     }
 
     [Fact]

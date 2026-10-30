@@ -1,5 +1,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
+using DeltaSharp.Storage.Reading;
+using DeltaSharp.Types;
 
 namespace DeltaSharp.Storage.Delta;
 
@@ -7,12 +9,26 @@ namespace DeltaSharp.Storage.Delta;
 /// The sound, advisory file-pruning evaluator behind <see cref="Snapshot.PruneFiles"/> (design §2.4
 /// data-skipping; STORY-05.2.3 AC2). It prunes an active file <b>only</b> when the log-committed partition
 /// values or per-file statistics <b>prove</b> the file cannot contain a row satisfying the request — so
-/// the surviving candidate set is always a superset of the truly-matching files (soundness), and a
-/// missing/coarse/untrusted statistic merely forfeits a pruning opportunity rather than dropping data.
+/// the surviving candidate set is a superset of the truly-matching files (soundness), and a
+/// missing/coarse/untrusted statistic merely forfeits a pruning opportunity rather than dropping data. One
+/// exception: two different non-null strings the read treats as equal (a non-canonical spelling such as
+/// <c>"05"</c> for 5, or <c>"-0"</c> and <c>"0"</c> on a floating column, which SQL <c>=</c> treats as equal)
+/// compare as raw strings, so a file can be pruned although the read matches it (#928).
 /// </summary>
 internal static class FilePruner
 {
-    public static FilePruningResult Prune(ImmutableArray<AddFileAction> files, FilePruningRequest request)
+    /// <summary>Splits <paramref name="files"/> into the candidates that might satisfy
+    /// <paramref name="request"/> and the files it proves cannot.</summary>
+    /// <param name="files">The active files to prune.</param>
+    /// <param name="request">The partition and data-skipping filters.</param>
+    /// <param name="partitionTypes">The partition columns' data types, keyed by the name
+    /// <c>add.partitionValues</c> uses (the physical name under column mapping). A partition filter on a
+    /// column missing from this map is evaluated without a type, which can only forfeit a prune
+    /// (<see cref="PartitionValuesMayMatch"/>).</param>
+    public static FilePruningResult Prune(
+        ImmutableArray<AddFileAction> files,
+        FilePruningRequest request,
+        IReadOnlyDictionary<string, DataType>? partitionTypes = null)
     {
         ArgumentNullException.ThrowIfNull(request);
 
@@ -21,7 +37,7 @@ internal static class FilePruner
 
         foreach (AddFileAction file in files)
         {
-            if (PartitionExcludes(file, request.PartitionFilters))
+            if (PartitionExcludes(file, request.PartitionFilters, partitionTypes))
             {
                 skipped.Add(new SkippedFile(file, FileSkipReason.PartitionMismatch));
                 continue;
@@ -39,20 +55,52 @@ internal static class FilePruner
         return new FilePruningResult(candidates.ToImmutable(), files.Length, skipped.ToImmutable());
     }
 
-    /// <summary>True only if a partition filter proves this file's partition cannot match (its exact,
-    /// committed partition value differs). An unknown partition column never prunes.</summary>
-    private static bool PartitionExcludes(AddFileAction file, ImmutableArray<PartitionEqualityFilter> filters)
+    /// <summary>True only if a partition filter proves this file's partition cannot match (its committed
+    /// partition value denotes a different value, subject to the raw-string residual in
+    /// <see cref="PartitionValuesMayMatch"/>, #928). An unknown partition column never prunes.</summary>
+    private static bool PartitionExcludes(
+        AddFileAction file,
+        ImmutableArray<PartitionEqualityFilter> filters,
+        IReadOnlyDictionary<string, DataType>? partitionTypes)
     {
         foreach (PartitionEqualityFilter filter in filters)
         {
-            if (file.PartitionValues.TryGetValue(filter.Column, out string? actual)
-                && !string.Equals(actual, filter.Value, StringComparison.Ordinal))
+            if (file.PartitionValues.TryGetValue(filter.Column, out string? actual))
             {
-                return true;
+                DataType? type = null;
+                partitionTypes?.TryGetValue(filter.Column, out type);
+                if (!PartitionValuesMayMatch(actual, filter.Value, type))
+                {
+                    return true;
+                }
             }
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Whether a file's committed partition value <paramref name="actual"/> may denote the same value as the
+    /// filter's <paramref name="expected"/>. Both sides go through
+    /// <see cref="DeltaReadEncoding.NormalizePartitionValue"/>, the helper the read path uses, so the pruner and
+    /// the read agree on which values are null: on an integer column, a committed <c>""</c> reads as null and
+    /// therefore matches <c>IS NULL</c> (#916). Non-null values still compare as raw strings, so a value the read
+    /// treats as equal but spelled differently (<c>"05"</c> against <c>"5"</c>, or <c>"-0"</c> against <c>"0"</c>
+    /// on a floating column) can be pruned although the read returns it as matching (#928). With no known
+    /// <paramref name="type"/>, the value is normalized as a string (the Hive sentinel is null for every type),
+    /// and an empty string against a null never proves a mismatch, because a non-string type would read that
+    /// <c>""</c> as null.
+    /// </summary>
+    private static bool PartitionValuesMayMatch(string? actual, string? expected, DataType? type)
+    {
+        string? a = DeltaReadEncoding.NormalizePartitionValue(type ?? StringType.Instance, actual);
+        string? e = DeltaReadEncoding.NormalizePartitionValue(type ?? StringType.Instance, expected);
+        if (string.Equals(a, e, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        return type is null && (a ?? e) is { Length: 0 } && (a is null || e is null);
     }
 
     /// <summary>True only if some data filter proves, from tight min/max/null statistics, that no row in

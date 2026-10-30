@@ -419,14 +419,16 @@ read decode, and a naive decode corrupts legacy tables. To keep every intermedia
 >
 > * Because `null` and `""` share one directory, the sentinel directory is non-injective on the partition key.
 >   This is safe for OPTIMIZE and dynamic-partition-overwrite because both key on `PartitionKeyBuilder` over
->   `add.partitionValues`, never on the directory name.
+>   `add.partitionValues`, never on the directory name. Those keys compare the raw committed strings, though,
+>   so a foreign `""` on a *typed* column, or a literal sentinel on any column, reads as `null` but is a
+>   different partition from a JSON `null`; that gap is tracked in **#926**.
 > * **The `null`/`""` distinction does not survive a Spark rewrite.** Spark's writer folds `""` to `null`
 >   (repo-backed: Spark's `empty_string.add_partition_values` is `[null, "keep"]`), so any Spark rewrite of a
 >   DeltaSharp table — OPTIMIZE, UPDATE, DELETE, MERGE copy-on-write — silently turns DeltaSharp's `""`
 >   partition rows into `null`. delta-rs reads them as `null` without rewriting.
 > * **Typed partition columns.** A committed `""` on a *non-string* partition column — protocol-legal foreign
->   input — currently throws on read instead of reading as `null`. That is a pre-existing gap outside this
->   increment, tracked with the Spark-rewrite integration test in **#916**.
+>   input — reads as `null`, per PROTOCOL.md (#916, PR #927). The rule lives in
+>   `DeltaReadEncoding.NormalizePartitionValue`, which the file pruner also uses. String columns keep `""` (D5).
 >
 > **Measured details beyond the original assumptions:**
 > 1. **delta-rs escapes a broader on-disk set than Spark** — not only space and non-ASCII but also a number of
@@ -496,8 +498,8 @@ same OR-a/OR-b pattern as #520/#646). Two directions:
 - **E1** — value `null` → `__HIVE_DEFAULT_PARTITION__` sentinel on disk (unescaped), partition value reads back
   as `null`.
 - **E1b** — value `""` → the **same** sentinel directory as `null` (Spark parity at the directory layer, §2.2);
-  `add.partitionValues` records `""`, and DeltaSharp reads it back as `""`, not `null` (D5 — a deliberate
-  departure from the protocol's empty-string-is-null rule; consequences in §3.2).
+  `add.partitionValues` records `""`, and on a string column DeltaSharp reads it back as `""`, not `null` (D5 —
+  a deliberate departure from the protocol's empty-string-is-null rule; consequences in §3.2).
 - **E2** — value that *is* the literal string `__HIVE_DEFAULT_PARTITION__` vs a real null (must stay distinct —
   Spark parity gap guard).
 - **E3** — encoded-length breach (§2.6): an **escape-expanding ASCII** name/value (e.g. a value of N `%`/`/`
@@ -743,8 +745,9 @@ graph LR
   Inc-C):* at the directory layer `""` folds onto the `__HIVE_DEFAULT_PARTITION__` sentinel with `null`, as
   Spark does (§2.2, E1b). At the value layer DeltaSharp writes `""` verbatim into `add.partitionValues` and reads
   it back as `""` — lossless, but a deliberate departure from PROTOCOL.md's empty-string-is-null rule, and not
-  preserved by a Spark rewrite of the table (§3.2). Typed-column `""` reads and the Spark-rewrite integration
-  test are tracked in **#916**, which also re-confirms this decision once measured.
+  preserved by a Spark rewrite of the table (§3.2). A typed-column `""` reads as `null` (#916). The
+  Spark-rewrite integration test needs a Spark environment, so it is item 5 of **#905** (moved from #916), and
+  **#916** re-confirms this decision once it is measured.
 - **O5 — foreign `add.path` read-side length cap.** A concrete pre-decode byte cap for the DoS residual (§5/§6
   T-DoS) must be chosen (independent of the write-door `MaxPathSegmentNameBytes`). *Open: pick the value in Inc-A.*
 - **O6 — stale code comment (follow-up, not this design).** `DeltaWriteEncoding.cs`'s XML comment cites the

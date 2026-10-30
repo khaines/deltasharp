@@ -24,7 +24,12 @@ internal enum DeltaPredicateOp
 
 /// <summary>An exact partition-value filter (<c>partitionColumn = value</c>, or <c>IS NULL</c> when
 /// <paramref name="Value"/> is null). Partition values are stored per file exactly (never truncated), so
-/// this filter prunes soundly.</summary>
+/// this filter prunes soundly, except that two different non-null strings the read treats as equal (a
+/// non-canonical spelling, or <c>"-0"</c> and <c>"0"</c> on a floating column) compare as raw strings (#928).
+/// <paramref name="Column"/> is the key <c>add.partitionValues</c> uses (the physical name under column
+/// mapping). <paramref name="Value"/> is a serialized partition value and goes through the read's null rules
+/// (<see cref="DeltaSharp.Storage.Reading.DeltaReadEncoding.NormalizePartitionValue"/>), so on a non-string
+/// column <c>""</c>, like the Hive sentinel on any column, filters as <c>IS NULL</c> (#916).</summary>
 internal sealed record PartitionEqualityFilter(string Column, string? Value);
 
 /// <summary>A data-skipping filter over a (top-level) data column, evaluated against per-file
@@ -55,7 +60,8 @@ internal sealed record FilePruningRequest(
 /// values or per-file statistics <b>prove</b> the file holds no matching row.</summary>
 internal enum FileSkipReason
 {
-    /// <summary>The file's committed partition values differ from an exact partition filter.</summary>
+    /// <summary>The file's committed partition values, read under the read path's null rules, denote a
+    /// different value than an exact partition filter (non-null values compare as raw strings, #928).</summary>
     PartitionMismatch,
 
     /// <summary>The file's tight <c>min</c>/<c>max</c>/<c>nullCount</c> statistics prove no row can
@@ -75,7 +81,8 @@ internal sealed record SkippedFile(AddFileAction File, FileSkipReason Reason);
 /// that were provably excluded, each with its <see cref="FileSkipReason"/>. Statistics are advisory
 /// (STORY-05.2.3 AC2 / STORY-05.6.3 AC3): a file is skipped only when the log-committed partition values
 /// or statistics <b>prove</b> it holds no matching row, so an absent/coarse/untrusted statistic yields a
-/// forfeited skip (the file stays a candidate and is scanned) — <b>never</b> a wrong answer. Skips are
+/// forfeited skip (the file stays a candidate and is scanned) — <b>never</b> a wrong answer. (One exception is
+/// tracked: two different non-null strings the read treats as equal compare as raw strings, #928.) Skips are
 /// therefore an optimization report, and the residual predicate remains the scan's responsibility.
 /// </summary>
 internal sealed record FilePruningResult(

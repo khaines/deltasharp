@@ -134,11 +134,78 @@ public sealed class DeltaReadEncodingTests
         Assert.True(ex.Message.Length < 200, "bounded type-name message, not the unbounded raw child-shape throw");
     }
 
+    [Theory]
+    [InlineData("boolean")]
+    [InlineData("byte")]
+    [InlineData("short")]
+    [InlineData("integer")]
+    [InlineData("long")]
+    [InlineData("float")]
+    [InlineData("double")]
+    [InlineData("date")]
+    [InlineData("timestamp")]
+    [InlineData("timestamp_ntz")]
+    [InlineData("decimal(10,2)")]   // compact decimal lane
+    [InlineData("decimal(38,2)")]   // wide decimal lane
+    public void BuildConstantColumn_EmptyString_OnNonStringPartition_FillsNull_Issue916(string typeName)
+    {
+        // #916: PROTOCOL.md "Partition Value Serialization" — "An empty string for any type translates to a null
+        // partition value." A foreign writer may commit partitionValues {"col":""} on a typed column; the read
+        // used to throw DeltaStorageException (out of range / unparsable) instead of returning null.
+        DataType type = TypeFor(typeName);
+
+        ColumnVector column = DeltaReadEncoding.BuildConstantColumn(type, string.Empty, rowCount: 3);
+
+        Assert.Equal(type, column.Type);
+        Assert.True(column.HasNulls);
+        for (int r = 0; r < 3; r++)
+        {
+            Assert.True(column.IsNull(r), $"row {r} of an empty-string {typeName} partition must be null");
+        }
+    }
+
+    [Fact]
+    public void BuildConstantColumn_EmptyString_OnStringPartition_StaysEmpty_D5()
+    {
+        // Design §3.2 / D5: DeltaSharp writes "" verbatim for a string partition column and reads it back as "",
+        // NOT null. The #916 protocol rule is applied to non-string types only.
+        ColumnVector column = DeltaReadEncoding.BuildConstantColumn(StringType.Instance, string.Empty, rowCount: 2);
+
+        Assert.False(column.HasNulls);
+        Assert.False(column.IsNull(0));
+        Assert.False(column.IsNull(1));
+    }
+
+    [Theory]
+    [InlineData("integer", null, null)]
+    [InlineData("integer", "", null)]                              // #916: "" on a typed column is null
+    [InlineData("integer", "__HIVE_DEFAULT_PARTITION__", null)]
+    [InlineData("integer", "0", "0")]
+    [InlineData("integer", " ", " ")]                              // only the EMPTY string is null, not whitespace
+    [InlineData("string", null, null)]
+    [InlineData("string", "", "")]                                 // D5: "" on a string column stays ""
+    [InlineData("string", "__HIVE_DEFAULT_PARTITION__", null)]
+    [InlineData("string", "us", "us")]
+    public void NormalizePartitionValue_AppliesTheReadNullRules(string typeName, string? value, string? expected)
+    {
+        Assert.Equal(expected, DeltaReadEncoding.NormalizePartitionValue(TypeFor(typeName), value));
+    }
+
     private static DataType TypeFor(string name) => name switch
     {
+        "boolean" => BooleanType.Instance,
+        "byte" => ByteType.Instance,
+        "short" => ShortType.Instance,
         "integer" => IntegerType.Instance,
         "long" => LongType.Instance,
+        "float" => FloatType.Instance,
+        "double" => DoubleType.Instance,
         "date" => DateType.Instance,
+        "timestamp" => TimestampType.Instance,
+        "timestamp_ntz" => TimestampNtzType.Instance,
+        "decimal(10,2)" => new DecimalType(10, 2),
+        "decimal(38,2)" => new DecimalType(38, 2),
+        "string" => StringType.Instance,
         _ => throw new System.ArgumentOutOfRangeException(nameof(name), name, "unknown type"),
     };
 }

@@ -14,6 +14,7 @@ internal sealed class Snapshot
 {
     private readonly SnapshotLoadMetrics _metrics;
     private StructType? _schema;
+    private Dictionary<string, DataType>? _partitionTypes;
 
     internal Snapshot(
         long version,
@@ -84,10 +85,61 @@ internal sealed class Snapshot
     /// Selects the active files that <b>might</b> satisfy <paramref name="request"/> (partition + data-skip
     /// filters), pruning only files the committed partition values / statistics <b>prove</b> cannot match
     /// (design §2.4; STORY-05.2.3 AC2). The result is a <b>sound over-approximation</b> — every truly
-    /// matching file is a candidate — and the residual predicate remains the scan's responsibility. This is
+    /// matching file is a candidate, except that two different non-null strings the read treats as equal (a
+    /// non-canonical spelling such as <c>"05"</c> for 5, or <c>"-0"</c> and <c>"0"</c> on a floating column,
+    /// which SQL <c>=</c> treats as equal) compare as raw strings (#928) — and the residual predicate remains the
+    /// scan's responsibility. This is
     /// the file-pruning half of the snapshot's handoff contract to query execution (§2.10.5).
     /// </summary>
-    public FilePruningResult PruneFiles(FilePruningRequest request) => FilePruner.Prune(ActiveFiles, request);
+    /// <exception cref="DeltaProtocolException">The request has a partition filter and the column-mapping mode
+    /// cannot be resolved, or the table also has partition columns and its schema or a partition column's
+    /// physical name cannot be resolved (the read path would fail the same way). <see cref="DeltaLog"/> rejects
+    /// each of these at load, so only a snapshot built without that gate reaches this.</exception>
+    public FilePruningResult PruneFiles(FilePruningRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        if (request.PartitionFilters.IsDefaultOrEmpty)
+        {
+            return FilePruner.Prune(ActiveFiles, request);
+        }
+
+        _partitionTypes ??= PartitionTypesByPhysicalName();
+        return FilePruner.Prune(ActiveFiles, request, _partitionTypes);
+    }
+
+    // The partition columns' types keyed by the name add.partitionValues uses (the physical name under column
+    // mapping), so the pruner applies the same null rules as the read path (#916). A partition column absent
+    // from the schema is left out. So is a physical name that two DIFFERENT partition columns share: the load
+    // gate rejects two mapped columns with one physical name, and this keeps a hand-built snapshot sound too. A
+    // column listed twice in metaData.partitionColumns (rejected only at commit, so a foreign table can load
+    // with it) maps to one field and keeps its type. The pruner evaluates a column with no type without one,
+    // which can only forfeit a prune.
+    private Dictionary<string, DataType> PartitionTypesByPhysicalName()
+    {
+        ColumnMappingMode mode = ColumnMapping.ResolveMode(Metadata.Configuration);
+        var types = new Dictionary<string, DataType>(StringComparer.Ordinal);
+        var seenColumns = new HashSet<string>(StringComparer.Ordinal);
+        var shared = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string column in Metadata.PartitionColumns)
+        {
+            if (seenColumns.Add(column) && Schema.TryGetField(column, out StructField field))
+            {
+                string physical = ColumnMapping.PhysicalName(field, mode);
+                if (!types.TryAdd(physical, field.DataType))
+                {
+                    shared.Add(physical);
+                }
+            }
+        }
+
+        // Removed after the loop, so a third column with the same physical name cannot add the type back.
+        foreach (string physical in shared)
+        {
+            types.Remove(physical);
+        }
+
+        return types;
+    }
 
     /// <summary>
     /// Builds the read-only, side-effect-free <see cref="TableStatisticsReport"/> an optimizer requests

@@ -16,16 +16,19 @@ namespace DeltaSharp.Storage.Reading;
 /// lane storage (Date is an epoch-day int, Timestamp an epoch-microsecond long, compact/wide decimals the
 /// unscaled integer). A <see langword="null"/> partition value — or the Hive default-partition sentinel
 /// string (<see cref="DeltaSharp.Storage.Writing.DeltaWriteEncoding.HiveDefaultPartition"/>, which a
-/// non-canonical/foreign writer may record literally) — fills the whole column with nulls.</summary>
+/// non-canonical/foreign writer may record literally), or an empty string on a non-string column (#916) —
+/// fills the whole column with nulls (<see cref="NormalizePartitionValue"/>).</summary>
 internal static class DeltaReadEncoding
 {
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
 
     /// <summary>Builds a constant <see cref="ColumnVector"/> of <paramref name="rowCount"/> rows all equal
-    /// to the partition value <paramref name="value"/> (a <see langword="null"/> string fills nulls),
-    /// parsed from its canonical Delta partition-value string into <paramref name="type"/>'s lane.</summary>
+    /// to the partition value <paramref name="value"/>, parsed from its committed Delta partition-value string
+    /// into <paramref name="type"/>'s lane. A value that <see cref="NormalizePartitionValue"/> reads as null
+    /// fills nulls.</summary>
     /// <param name="type">The partition column's data type.</param>
-    /// <param name="value">The canonical partition-value string, or <see langword="null"/> for a null value.</param>
+    /// <param name="value">The committed partition-value string, or <see langword="null"/>. See
+    /// <see cref="NormalizePartitionValue"/> for the forms read as null.</param>
     /// <param name="rowCount">The number of rows the constant column spans (the file's row count).</param>
     /// <returns>A constant column vector.</returns>
     /// <exception cref="DeltaStorageException">The type is unsupported as a partition column, or the string
@@ -55,15 +58,10 @@ internal static class DeltaReadEncoding
 
         MutableColumnVector vector = ColumnVectors.Create(type, Math.Max(rowCount, 1));
 
-        // A JSON null OR the Hive default-partition sentinel string (`__HIVE_DEFAULT_PARTITION__`, the
-        // shared const from DeltaWriteEncoding) both denote a NULL partition value. #507's write door stores
-        // a real JSON null in `add.partitionValues`, so this is not a #507 round-trip break; but a
-        // non-canonical / foreign writer (or a future directory-derived read) can record the sentinel
-        // literally, and treating it as NULL — rather than trying to parse it into a typed lane — is the
-        // unambiguous cross-engine read behavior (Spark/Delta parity), so a typed (int/long/date) partition
-        // never crashes on the sentinel.
-        if (value is null
-            || string.Equals(value, DeltaWriteEncoding.HiveDefaultPartition, StringComparison.Ordinal))
+        // The null rules (JSON null, the Hive sentinel, and "" on a non-string type) live in one helper that the
+        // file pruner also uses, so a read and a pruning decision cannot disagree on which values are null.
+        string? normalized = NormalizePartitionValue(type, value);
+        if (normalized is null)
         {
             for (int r = 0; r < rowCount; r++)
             {
@@ -73,8 +71,45 @@ internal static class DeltaReadEncoding
             return vector;
         }
 
-        FillTyped(vector, type, value, rowCount);
+        FillTyped(vector, type, normalized, rowCount);
         return vector;
+    }
+
+    /// <summary>
+    /// Maps a committed <c>add.partitionValues</c> string to the value a read sees for a partition column of
+    /// <paramref name="type"/>: <see langword="null"/> for a null partition value, otherwise
+    /// <paramref name="value"/> unchanged. Three forms denote null:
+    /// <list type="bullet">
+    /// <item>a JSON null, which is what DeltaSharp's own write path records (#507);</item>
+    /// <item>the Hive default-partition sentinel string
+    /// (<see cref="DeltaSharp.Storage.Writing.DeltaWriteEncoding.HiveDefaultPartition"/>), which a foreign or
+    /// non-canonical writer may record literally. Reading it as null, rather than parsing it into a typed lane,
+    /// matches Spark, so a typed (int/long/date) partition never fails on it;</item>
+    /// <item>an empty string on any type other than <see cref="StringType"/>. PROTOCOL.md, "Partition Value
+    /// Serialization": "An empty string for any type translates to a null partition value." A foreign writer
+    /// may commit <c>""</c> for a null typed value (#916).</item>
+    /// </list>
+    /// An empty string on a <see cref="StringType"/> column stays <c>""</c>: DeltaSharp writes <c>""</c> verbatim
+    /// and reads it back as <c>""</c> (design §3.2, decision D5). Every consumer that decides whether two
+    /// committed values denote the same partition value must go through this helper, so the read path and the
+    /// file pruner (<see cref="DeltaSharp.Storage.Delta.FilePruner"/>) agree on which values are null (non-null
+    /// equality is a raw-string comparison, #928). The partition keys of dynamic
+    /// overwrite and OPTIMIZE (<c>PartitionKeyBuilder</c>) do not use it yet (#926).
+    /// </summary>
+    /// <param name="type">The partition column's data type.</param>
+    /// <param name="value">The committed partition-value string, or <see langword="null"/>.</param>
+    /// <returns><see langword="null"/> for a null partition value; otherwise <paramref name="value"/>.</returns>
+    public static string? NormalizePartitionValue(DataType type, string? value)
+    {
+        ArgumentNullException.ThrowIfNull(type);
+        if (value is null
+            || string.Equals(value, DeltaWriteEncoding.HiveDefaultPartition, StringComparison.Ordinal)
+            || (value.Length == 0 && type is not StringType))
+        {
+            return null;
+        }
+
+        return value;
     }
 
     private static void FillTyped(MutableColumnVector vector, DataType type, string value, int rowCount)
