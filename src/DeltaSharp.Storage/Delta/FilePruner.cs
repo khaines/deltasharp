@@ -9,8 +9,11 @@ namespace DeltaSharp.Storage.Delta;
 /// The sound, advisory file-pruning evaluator behind <see cref="Snapshot.PruneFiles"/> (design §2.4
 /// data-skipping; STORY-05.2.3 AC2). It prunes an active file <b>only</b> when the log-committed partition
 /// values or per-file statistics <b>prove</b> the file cannot contain a row satisfying the request — so
-/// the surviving candidate set is always a superset of the truly-matching files (soundness), and a
-/// missing/coarse/untrusted statistic merely forfeits a pruning opportunity rather than dropping data.
+/// the surviving candidate set is a superset of the truly-matching files (soundness), and a
+/// missing/coarse/untrusted statistic merely forfeits a pruning opportunity rather than dropping data. One
+/// exception: two different encodings of one non-null typed partition value (<c>"05"</c> for 5, or <c>"-0"</c>
+/// and <c>"0"</c> on a floating column) compare as raw strings, so a file can be pruned although the read
+/// matches it (#928).
 /// </summary>
 internal static class FilePruner
 {
@@ -80,11 +83,11 @@ internal static class FilePruner
     /// filter's <paramref name="expected"/>. Both sides go through
     /// <see cref="DeltaReadEncoding.NormalizePartitionValue"/>, the helper the read path uses, so the pruner and
     /// the read agree on which values are null: on an integer column, a committed <c>""</c> reads as null and
-    /// therefore matches <c>IS NULL</c> (#916). Non-null values still compare as raw strings, so a non-canonical
-    /// typed spelling (<c>"05"</c> for 5) can be pruned although the read returns it as matching (#928). With no
-    /// known <paramref name="type"/>, the
-    /// value is normalized as a string (the Hive sentinel is null for every type), and an empty string against
-    /// a null never proves a mismatch, because a non-string type would read that <c>""</c> as null.
+    /// therefore matches <c>IS NULL</c> (#916). Non-null values still compare as raw strings, so a second encoding
+    /// of the same typed value (<c>"05"</c> for 5, or <c>"-0"</c> for 0 on a floating column) can be pruned
+    /// although the read returns it as matching (#928). With no known <paramref name="type"/>, the value is
+    /// normalized as a string (the Hive sentinel is null for every type), and an empty string against a null
+    /// never proves a mismatch, because a non-string type would read that <c>""</c> as null.
     /// </summary>
     private static bool PartitionValuesMayMatch(string? actual, string? expected, DataType? type)
     {
