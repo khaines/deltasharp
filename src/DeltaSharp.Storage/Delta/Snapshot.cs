@@ -85,9 +85,10 @@ internal sealed class Snapshot
     /// Selects the active files that <b>might</b> satisfy <paramref name="request"/> (partition + data-skip
     /// filters), pruning only files the committed partition values / statistics <b>prove</b> cannot match
     /// (design §2.4; STORY-05.2.3 AC2). The result is a <b>sound over-approximation</b> — every truly
-    /// matching file is a candidate, except that two different encodings of one non-null partition value (a
-    /// non-canonical spelling such as <c>"05"</c>, or <c>"-0"</c> and <c>"0"</c> on a floating column) compare as
-    /// raw strings (#928) — and the residual predicate remains the scan's responsibility. This is
+    /// matching file is a candidate, except that two different non-null strings the read treats as equal (a
+    /// non-canonical spelling such as <c>"05"</c> for 5, or <c>"-0"</c> and <c>"0"</c> on a floating column,
+    /// which SQL <c>=</c> treats as equal) compare as raw strings (#928) — and the residual predicate remains the
+    /// scan's responsibility. This is
     /// the file-pruning half of the snapshot's handoff contract to query execution (§2.10.5).
     /// </summary>
     /// <exception cref="DeltaProtocolException">The request has a partition filter and the column-mapping mode

@@ -24,7 +24,7 @@ internal enum DeltaPredicateOp
 
 /// <summary>An exact partition-value filter (<c>partitionColumn = value</c>, or <c>IS NULL</c> when
 /// <paramref name="Value"/> is null). Partition values are stored per file exactly (never truncated), so
-/// this filter prunes soundly, except that two different encodings of one non-null typed value (a
+/// this filter prunes soundly, except that two different non-null strings the read treats as equal (a
 /// non-canonical spelling, or <c>"-0"</c> and <c>"0"</c> on a floating column) compare as raw strings (#928).
 /// <paramref name="Column"/> is the key <c>add.partitionValues</c> uses (the physical name under column
 /// mapping). <paramref name="Value"/> is a serialized partition value and goes through the read's null rules
@@ -61,7 +61,7 @@ internal sealed record FilePruningRequest(
 internal enum FileSkipReason
 {
     /// <summary>The file's committed partition values, read under the read path's null rules, denote a
-    /// different value than an exact partition filter.</summary>
+    /// different value than an exact partition filter (non-null values compare as raw strings, #928).</summary>
     PartitionMismatch,
 
     /// <summary>The file's tight <c>min</c>/<c>max</c>/<c>nullCount</c> statistics prove no row can
@@ -82,7 +82,7 @@ internal sealed record SkippedFile(AddFileAction File, FileSkipReason Reason);
 /// (STORY-05.2.3 AC2 / STORY-05.6.3 AC3): a file is skipped only when the log-committed partition values
 /// or statistics <b>prove</b> it holds no matching row, so an absent/coarse/untrusted statistic yields a
 /// forfeited skip (the file stays a candidate and is scanned) — <b>never</b> a wrong answer. (One exception is
-/// tracked: two different encodings of one non-null typed partition value compare as raw strings, #928.) Skips are
+/// tracked: two different non-null strings the read treats as equal compare as raw strings, #928.) Skips are
 /// therefore an optimization report, and the residual predicate remains the scan's responsibility.
 /// </summary>
 internal sealed record FilePruningResult(

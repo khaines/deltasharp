@@ -384,6 +384,49 @@ public sealed class FilePruningTests
         Assert.Empty(result.Candidates);
     }
 
+    [Theory]
+    [InlineData("n", "s", "t")]
+    [InlineData("s", "n", "t")]
+    public void SnapshotPruneFiles_ThreeColumnsShareAPhysicalName_TypeStaysDropped(
+        string first, string second, string third)
+    {
+        // Integer n and strings s and t, all with physical name "p". A drop inside the loop would let the third
+        // column add the string type back after the second removed it, and IS NULL would then prune the "" file
+        // that n reads as null.
+        const string schema =
+            "{\"type\":\"struct\",\"fields\":["
+            + "{\"name\":\"n\",\"type\":\"integer\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":1,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"s\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":2,\"delta.columnMapping.physicalName\":\"p\"}},"
+            + "{\"name\":\"t\",\"type\":\"string\",\"nullable\":true,\"metadata\":"
+            + "{\"delta.columnMapping.id\":3,\"delta.columnMapping.physicalName\":\"p\"}}]}";
+        var metadata = new MetadataAction(
+            Id: "three-shared",
+            Name: null,
+            Description: null,
+            Format: new TableFormat("parquet", ImmutableSortedDictionary<string, string>.Empty),
+            SchemaString: schema,
+            PartitionColumns: [first, second, third],
+            Configuration: ImmutableSortedDictionary<string, string>.Empty
+                .Add("delta.columnMapping.mode", "name")
+                .Add("delta.columnMapping.maxColumnId", "3"),
+            CreatedTime: null);
+        var snapshot = new Snapshot(
+            version: 0,
+            new ProtocolAction(2, 5, ImmutableArray<string>.Empty, ImmutableArray<string>.Empty),
+            metadata,
+            [File("empty.parquet", partitions: [("p", "")])],
+            ImmutableArray<RemoveFileAction>.Empty,
+            ImmutableSortedDictionary<string, long>.Empty,
+            SnapshotLoadMetrics.Empty);
+
+        FilePruningResult result =
+            snapshot.PruneFiles(FilePruningRequest.ForPartitions(new PartitionEqualityFilter("p", null)));
+
+        Assert.Equal(["empty.parquet"], result.Candidates.Select(a => a.Path));
+    }
+
     [Fact]
     public void SnapshotPruneFiles_SharedPhysicalName_KeepsOtherColumnsTyped()
     {

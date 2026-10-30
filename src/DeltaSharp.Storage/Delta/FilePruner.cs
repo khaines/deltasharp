@@ -11,9 +11,9 @@ namespace DeltaSharp.Storage.Delta;
 /// values or per-file statistics <b>prove</b> the file cannot contain a row satisfying the request — so
 /// the surviving candidate set is a superset of the truly-matching files (soundness), and a
 /// missing/coarse/untrusted statistic merely forfeits a pruning opportunity rather than dropping data. One
-/// exception: two different encodings of one non-null typed partition value (<c>"05"</c> for 5, or <c>"-0"</c>
-/// and <c>"0"</c> on a floating column) compare as raw strings, so a file can be pruned although the read
-/// matches it (#928).
+/// exception: two different non-null strings the read treats as equal (a non-canonical spelling such as
+/// <c>"05"</c> for 5, or <c>"-0"</c> and <c>"0"</c> on a floating column, which SQL <c>=</c> treats as equal)
+/// compare as raw strings, so a file can be pruned although the read matches it (#928).
 /// </summary>
 internal static class FilePruner
 {
@@ -56,7 +56,8 @@ internal static class FilePruner
     }
 
     /// <summary>True only if a partition filter proves this file's partition cannot match (its committed
-    /// partition value denotes a different value). An unknown partition column never prunes.</summary>
+    /// partition value denotes a different value, subject to the raw-string residual in
+    /// <see cref="PartitionValuesMayMatch"/>, #928). An unknown partition column never prunes.</summary>
     private static bool PartitionExcludes(
         AddFileAction file,
         ImmutableArray<PartitionEqualityFilter> filters,
@@ -83,11 +84,12 @@ internal static class FilePruner
     /// filter's <paramref name="expected"/>. Both sides go through
     /// <see cref="DeltaReadEncoding.NormalizePartitionValue"/>, the helper the read path uses, so the pruner and
     /// the read agree on which values are null: on an integer column, a committed <c>""</c> reads as null and
-    /// therefore matches <c>IS NULL</c> (#916). Non-null values still compare as raw strings, so a second encoding
-    /// of the same typed value (<c>"05"</c> for 5, or <c>"-0"</c> for 0 on a floating column) can be pruned
-    /// although the read returns it as matching (#928). With no known <paramref name="type"/>, the value is
-    /// normalized as a string (the Hive sentinel is null for every type), and an empty string against a null
-    /// never proves a mismatch, because a non-string type would read that <c>""</c> as null.
+    /// therefore matches <c>IS NULL</c> (#916). Non-null values still compare as raw strings, so a value the read
+    /// treats as equal but spelled differently (<c>"05"</c> against <c>"5"</c>, or <c>"-0"</c> against <c>"0"</c>
+    /// on a floating column) can be pruned although the read returns it as matching (#928). With no known
+    /// <paramref name="type"/>, the value is normalized as a string (the Hive sentinel is null for every type),
+    /// and an empty string against a null never proves a mismatch, because a non-string type would read that
+    /// <c>""</c> as null.
     /// </summary>
     private static bool PartitionValuesMayMatch(string? actual, string? expected, DataType? type)
     {

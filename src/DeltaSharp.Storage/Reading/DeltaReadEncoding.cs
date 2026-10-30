@@ -23,10 +23,12 @@ internal static class DeltaReadEncoding
     private static readonly DateOnly UnixEpochDate = new(1970, 1, 1);
 
     /// <summary>Builds a constant <see cref="ColumnVector"/> of <paramref name="rowCount"/> rows all equal
-    /// to the partition value <paramref name="value"/> (a <see langword="null"/> string fills nulls),
-    /// parsed from its canonical Delta partition-value string into <paramref name="type"/>'s lane.</summary>
+    /// to the partition value <paramref name="value"/>, parsed from its committed Delta partition-value string
+    /// into <paramref name="type"/>'s lane. A value that <see cref="NormalizePartitionValue"/> reads as null
+    /// fills nulls.</summary>
     /// <param name="type">The partition column's data type.</param>
-    /// <param name="value">The canonical partition-value string, or <see langword="null"/> for a null value.</param>
+    /// <param name="value">The committed partition-value string, or <see langword="null"/>. See
+    /// <see cref="NormalizePartitionValue"/> for the forms read as null.</param>
     /// <param name="rowCount">The number of rows the constant column spans (the file's row count).</param>
     /// <returns>A constant column vector.</returns>
     /// <exception cref="DeltaStorageException">The type is unsupported as a partition column, or the string
@@ -90,7 +92,8 @@ internal static class DeltaReadEncoding
     /// An empty string on a <see cref="StringType"/> column stays <c>""</c>: DeltaSharp writes <c>""</c> verbatim
     /// and reads it back as <c>""</c> (design §3.2, decision D5). Every consumer that decides whether two
     /// committed values denote the same partition value must go through this helper, so the read path and the
-    /// file pruner (<see cref="DeltaSharp.Storage.Delta.FilePruner"/>) agree. The partition keys of dynamic
+    /// file pruner (<see cref="DeltaSharp.Storage.Delta.FilePruner"/>) agree on which values are null (non-null
+    /// equality is a raw-string comparison, #928). The partition keys of dynamic
     /// overwrite and OPTIMIZE (<c>PartitionKeyBuilder</c>) do not use it yet (#926).
     /// </summary>
     /// <param name="type">The partition column's data type.</param>
