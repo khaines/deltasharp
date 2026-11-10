@@ -1,0 +1,107 @@
+name: NuGet lockfile guard
+
+# Fails a pull request early, with an actionable message, when a committed
+# `packages.lock.json` is out of sync with the project/central-package files.
+#
+# Why this exists (issue #831): Dependabot's NuGet updater regenerates the lock
+# file of a MULTI-TARGETED project (e.g. tests/DeltaSharp.Core.Tests and
+# tests/DeltaSharp.Abstractions.Tests, both `net8.0;net10.0`) for a SINGLE target
+# framework, silently dropping the other TFM section. The CI `--locked-mode`
+# restore then fails deep in the build with a raw NU1004, which is easy to
+# misread. This guard runs a `--force-evaluate` restore and diffs the lock files,
+# so drift is caught quickly and the fix is spelled out.
+#
+# Security posture: this is an ordinary `pull_request` job. It uses the default
+# READ-ONLY `GITHUB_TOKEN`, never pushes, and holds no write permission — so
+# running `dotnet restore` on PR-authored inputs carries no more privilege than
+# the existing build/test jobs in ci.yml. It deliberately does NOT auto-commit a
+# fix (an earlier `pull_request_target` autofix design was rejected in review for
+# running PR-controlled MSBuild under a write token); remediation is a one-line
+# command the author runs locally.
+#
+# The detection/reporting logic lives in `tools/ci/lockfile-guard.sh` (with a
+# `--selftest` suite CI runs first, mirroring the coverage gate), so it is
+# testable and locally reproducible. It checks lock-file DRIFT and
+# DELETION/existence only: deleting a lock file or hiding one behind .gitignore
+# fails the guard instead of leaving `git status` clean and the check green (see
+# `tools/ci/expected-lockfiles.txt`). The script is READ-ONLY: it never writes to
+# the index or the working tree, so it is safe to run over a dirty local
+# checkout without disturbing staged work.
+#
+# Explicitly OUT OF SCOPE: disabling pinning through the build definition
+# (`RestorePackagesWithLockFile=false`). Detecting that statically is not
+# robustly achievable here — MSBuild evaluates properties differently during
+# `restore` than during `-getProperty`, so a restore-session-conditioned opt-out
+# passes any probe yet still disables pinning. Rather than ship a check that
+# gives a false sense of security, that risk is left to human code review: the
+# csproj/props change is visible in the pull-request diff. This guard is
+# advisory.
+#
+# No `paths:` filter: this job must always report a status so it can be promoted
+# to a required check once it has run on `main` (a status check can only be made
+# required after it has executed on the default branch; #456 precedent). Until
+# that promotion it is advisory — see
+# docs/engineering/design/quality-gates.md. A `--force-evaluate` restore on an
+# unchanged tree is a no-op and passes quickly.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lockfile-guard-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lockfile-guard:
+    name: lockfile-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Install the net8.0 runtime plus the exact SDK pinned by global.json, so the
+      # lock content this guard regenerates matches what ci.yml and local developers
+      # produce (a mismatched SDK band could regenerate different lock content and
+      # cause a spurious pass/fail). Mirrors ci.yml.
+      - name: Setup .NET (net8 runtime + pinned SDK)
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: 8.0.x
+          global-json-file: global.json
+
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props', 'Directory.Build.props', 'global.json') }}
+          restore-keys: |
+            nuget-${{ runner.os }}-
+
+      # Regenerate every committed lock file from the current project + central
+      # package files. On an in-sync tree this rewrites nothing.
+      - name: Regenerate lock files (force-evaluate)
+        run: dotnet restore DeltaSharp.sln --force-evaluate
+
+      # Regression-test the guard's own exit-code and reporting contract (drift,
+      # deletion, .gitignore-hiding, manifest drift, path quoting, summary
+      # sanitization, workflow-command injection) against throwaway git
+      # repositories BEFORE trusting it on the real tree — mirroring the
+      # coverage-gate self-test in ci.yml. A broken guard fails the build loudly
+      # here instead of failing open.
+      - name: Lockfile guard self-test
+        run: tools/ci/lockfile-guard.sh --selftest
+
+      # Fail if regeneration changed any lock file, or if the set of tracked
+      # lock files no longer matches tools/ci/expected-lockfiles.txt (deleted,
+      # .gitignore-hidden, or newly added without updating the manifest). All
+      # logic (and its tests) live in the script.
+      - name: Verify lock files are in sync
+        run: tools/ci/lockfile-guard.sh

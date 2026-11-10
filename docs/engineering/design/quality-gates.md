@@ -1,4 +1,4 @@
-# Quality gates: warnings-as-errors, formatting, and coverage
+# Quality gates: warnings-as-errors, formatting, coverage, and lockfile pinning
 
 > **Status:** living document. Created with FEAT-00.2 —
 > [STORY-00.2.1](https://github.com/khaines/deltasharp/blob/main/docs/planning/epics/EPIC-00-engineering-foundations.md#story-0021-analyzer-and-warnings-as-errors-gate)
@@ -17,9 +17,10 @@
 > [11](../checklists/11-documentation-support-checklist.md). Update it whenever a gate, its
 > configuration, or the coverage threshold changes.
 
-DeltaSharp enforces **three automated quality gates** on every pull request and every push to
-`main`, across two CI jobs in [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) so a
-policy violation surfaces on the pull request rather than accumulating as debt:
+DeltaSharp enforces **four automated quality gates** on every pull request and every push to
+`main`, across two CI jobs in [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) plus
+[`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml), so a policy
+violation surfaces on the pull request rather than accumulating as debt:
 
 - **`build-test-format`** — the analyzer/warnings-as-errors gate and the formatting gate, and the
   authoritative **correctness** (test pass/fail) run. Tests run here **uninstrumented**.
@@ -27,12 +28,17 @@ policy violation surfaces on the pull request rather than accumulating as debt:
   **measurement-only**: because coverage instrumentation perturbs execution timing, it must never
   be able to change the correctness verdict, which `build-test-format` owns (see
   [Why coverage is a separate job](#why-coverage-is-a-separate-job)).
+- **`lockfile-guard`** — the NuGet dependency-pinning gate: every committed `packages.lock.json`
+  must match the project/central-package files and must still exist (see
+  [Gate 4](#gate-4--nuget-lockfile-guard-831)).
 
 > **Which checks are merge-blocking.** A CI job blocks the merge button once it is listed in
 > the repository's **branch-protection required status checks**. On `main` the required checks
 > are **`build-test-format`**, **`coverage`**, and **`dco`**, so **all three gates block merge**
 > — including **`coverage`**, which was wired into the required set after it first ran on `main`
 > (#456; a status check can only be made required once it has executed on the default branch).
+> **`lockfile-guard`** (#831) is **advisory** today for the same reason and follows the same
+> post-merge promotion path — see [Gate 4](#gate-4--nuget-lockfile-guard-831).
 > The FEAT-00.3 supply-chain security scans (`sca`, `secret-scan`, `sbom`,
 > `dependency-review`) run on every PR and are documented for the same post-merge promotion in
 > [supply-chain-security.md](supply-chain-security.md).
@@ -42,6 +48,7 @@ policy violation surfaces on the pull request rather than accumulating as debt:
 | 1 | Analyzers & warnings-as-errors | `build-test-format` | `TreatWarningsAsErrors=true` + the .NET / trim / AOT / API analyzers | any analyzer or compiler **warning** is emitted by a build |
 | 2 | Formatting | `build-test-format` | `dotnet format --verify-no-changes` against the checked-in `.editorconfig` | a file does not match the formatting/style rules |
 | 3 | Coverage | `coverage` | `coverlet.collector` + [`tools/coverage/coverage-gate.py`](../../../tools/coverage/coverage-gate.py) | merged line coverage is below the configured floor |
+| 4 | NuGet lockfile pinning | `lockfile-guard` | `dotnet restore --force-evaluate` + [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh) + [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) | a `packages.lock.json` is out of sync, or missing/untracked/ignored |
 
 Every gate has a **local command that reproduces the CI result exactly**, because the policy
 lives in checked-in configuration (`Directory.Build.props`, `.editorconfig`,
@@ -53,6 +60,7 @@ consume — CI adds no hidden flags.
 | 1. Warnings-as-errors | `build-test-format` › `dotnet build DeltaSharp.sln -c Release --no-restore` | `dotnet build -c Release` |
 | 2. Formatting | `build-test-format` › `dotnet format DeltaSharp.sln --verify-no-changes --no-restore` | `dotnet format --verify-no-changes` (fix with `dotnet format`) |
 | 3. Coverage | `coverage` › `dotnet test … --collect:"XPlat Code Coverage" --settings coverlet.runsettings` then `python3 tools/coverage/coverage-gate.py` | see [Reproducing the coverage gate locally](#reproducing-the-coverage-gate-locally) |
+| 4. NuGet lockfile pinning | `lockfile-guard` (in `nuget-lockfile-guard.yml`) › `dotnet restore DeltaSharp.sln --force-evaluate` then `tools/ci/lockfile-guard.sh` | `dotnet restore DeltaSharp.sln --force-evaluate && tools/ci/lockfile-guard.sh` |
 
 ---
 
@@ -440,6 +448,161 @@ the JSON file remains the single enforced source of truth.
 
 ---
 
+## Gate 4 — NuGet lockfile guard (#831)
+
+### What it enforces
+
+The projects that take a **real third-party runtime** `PackageReference` restore with lock-file
+pinning enabled — every test project (via
+[`tests/Directory.Build.props`](../../../tests/Directory.Build.props)) plus the production
+libraries `DeltaSharp.Engine` (Apache.Arrow) and `DeltaSharp.Storage` (Parquet.Net). Their
+committed `packages.lock.json` pins the exact resolved dependency graph (including transitive
+packages) and CI restores with `--locked-mode`. The still-SDK-only `DeltaSharp.Abstractions`,
+`DeltaSharp.Core` and `DeltaSharp.Executor` deliberately commit none: their only package
+references are dev-time analyzers (`BannedApiAnalyzers`, plus `PublicApiAnalyzers` on the packable
+ones — all `PrivateAssets=all`, injected centrally by
+[`Directory.Build.props`](../../../Directory.Build.props)) plus the
+SDK-implicit `Microsoft.NET.ILLink.Tasks`, whose floating, SDK-tied version is precisely what a
+lock file cannot pin (#468). Those analyzer versions are pinned by *version* through Central
+Package Management ([`Directory.Packages.props`](../../../Directory.Packages.props)), not by
+content hash. The samples reference no package at all. See
+[repository layout](repository-layout.md). The **`lockfile-guard`** job in
+[`nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml) protects that
+pinning. It runs a `--force-evaluate` restore and then
+[`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh), which fails when:
+
+1. **drift** — a lock file changed, or a new one appeared, after the restore. This is the bug
+   the gate was created for: Dependabot regenerates the lock file of a **multi-targeted**
+   project (for example `tests/DeltaSharp.Core.Tests`, `net8.0;net10.0`) for a **single** target
+   framework and silently drops the other TFM section. The `--locked-mode` restore in `ci.yml`
+   then fails deep in the build with a raw `NU1004`, which is easy to misread.
+2. **removal** — a lock file listed in
+   [`tools/ci/expected-lockfiles.txt`](../../../tools/ci/expected-lockfiles.txt) is no longer
+   tracked or is missing from the working tree.
+3. **manifest lag** — a tracked lock file is not listed in that manifest.
+
+Checks 2 and 3 exist so the gate **fails closed** on deletion. Drift detection alone can be
+defeated by *deleting* the lock files (or hiding them behind `.gitignore`): `git status` then
+reports a clean tree and the check goes green with the pinning gone. The
+manifest is the committed expectation, so adding or removing a project's lock file is a visible,
+reviewed edit in the same pull request. Ignored lock files are enumerated with
+`git ls-files --others --ignored` rather than `git status --ignored=matching`, which reports
+whole ignored directories (`obj/`) that merely *could* match.
+
+### What it deliberately does not enforce
+
+Disabling pinning through the **build definition** (`RestorePackagesWithLockFile=false` in a
+`.csproj`, `Directory.Build.props` or `Directory.Packages.props`) is **out of scope**. Detecting
+that statically is not robustly achievable in a CI guard: MSBuild evaluates properties
+differently during `restore` than during a `-getProperty` probe, so a restore-session-conditioned
+opt-out passes the probe yet still disables pinning at restore time. Rather than ship a check
+that gives a false sense of security, the guard covers only what it covers robustly and that
+risk is left to human code review — the csproj/props change is visible in the pull-request diff.
+
+The **omission** case is equally out of scope: the manifest is a *set-equality* check against
+the lock files that exist today, so a project that gains its **first third-party runtime
+dependency** without enabling `RestorePackagesWithLockFile` never produces a lock file, is never
+listed in the manifest, and is therefore invisible to the guard. It ships unpinned dependencies. That,
+too, rests on code review of the `.csproj` change.
+
+The guard is advisory.
+
+### Reporting and safety of the job summary
+
+On failure the guard writes the affected paths, a `git diff --stat`, and a **byte-bounded**
+patch (60 000 bytes, well under GitHub's 1 MiB summary cap) to `$GITHUB_STEP_SUMMARY`, plus the
+SDK version used. Lock-file content, lock-file paths and manifest entries are all
+attacker-controllable, so every untrusted sink shares one filter:
+
+* **Line breaks are escaped, as a class.** Before anything is printed, `escape_untrusted`
+  rewrites every byte a line reader or a markdown renderer might treat as a line ending into a
+  visible literal — CR (`\r`), the remaining C0 controls, NEL (`U+0085`), LINE SEPARATOR
+  (`U+2028`) and PARAGRAPH SEPARATOR (`U+2029`). Only LF (the record separator the filters
+  themselves work on) and TAB are left alone. Escaping the whole class rather than only the
+  terminators a given reader is believed to honour means untrusted bytes cannot start a new line
+  anywhere, in either stream or in the summary.
+* **The fence cannot be broken out of.** Untrusted text is wrapped in a five-backtick fence and
+  leading backtick runs are rewritten. The escape runs *before* the fence sanitizer, so a CR
+  embedded in lock-file content cannot end a line and slip a fence past it. This applies to the
+  diff patch as well as to the path lists.
+* **Annotations cannot be forged.** On **stdout and stderr** — the streams the Actions runner
+  scans for
+  [workflow commands](https://docs.github.com/actions/reference/workflow-commands-for-github-actions)
+  — every untrusted line is additionally printed behind a `  - ` bullet, so a path such as
+  `::error::pwned/` (or `benign<CR>::error::…`) cannot begin a line at column 0; indentation
+  alone would not suffice, since the runner tolerates it. The step summary is markdown and is
+  *not* scanned for workflow commands, but the same bulleting is applied there as
+  defense-in-depth.
+
+Paths print unquoted (`core.quotePath=false`) so a non-ASCII path stays copy-pasteable.
+
+The guard has **no side effects**. A lock file that is new (or hidden by `.gitignore`) is
+rendered with `git diff --no-index -- /dev/null <path>`, which produces the same addition hunk an
+intent-to-add marker would, without ever writing to the index. A developer running the guard
+locally therefore keeps their staged work — including a staged lock file, a staged
+`git rm --cached` removal, or a partial `git add -p` — exactly as it was.
+
+### Testing the gate
+
+The guard is CI-critical logic, so it ships with its own regression suite, exactly like the
+coverage gate:
+
+```bash
+tools/ci/lockfile-guard.sh --selftest
+```
+
+It builds throwaway git repositories under `mktemp -d` (removed by an `EXIT` trap) and asserts
+the exit code, the summary content and the *cleanliness of the index* for the in-sync, modified,
+newly-added, worktree-deleted, committed-deletion, `.gitignore`-hidden, ignored-build-output,
+manifest-lag, duplicated-manifest-entry, missing-manifest, empty-manifest,
+`--skip-worktree`-deletion, deliberately-pre-staged, staged-removal, diff-byte-limit,
+unicode/spaced-path, fence-breakout, `::workflow-command`-injection and line-terminator-injection
+(CR/VT/FF/ESC/C0/DEL/NEL/LS/PS in both a manifest entry and lock-file content) cases.
+
+The escaping is pinned **per sink and per rule**: dropping any single sed rule from
+`escape_untrusted`, or dropping the filter from any one of its three sinks, turns the **suite**
+red (verified rule by rule, 8/8). The cases assert against the streams *split the way a line
+reader would split them*, not merely on LF, and each class carries its own oracle:
+
+* every class is asserted by its **escaped form** — `\r`, `\v`, `\f`, `\e`, `\u0085`, `\u2028`,
+  `\u2029` and `?` — in stdout *and* in the step summary;
+* the single-byte classes are additionally asserted by the **absence of the raw byte**: CR, VT and
+  FF by name, plus the whole catch-all range `\001-\010\016-\037\177` as a character class, with
+  every one of its 27 bytes present in the payload, so narrowing the range at any byte leaks one;
+* NEL, LS and PS are multi-byte UTF-8 rather than control bytes, so they are pinned by their
+  escaped-form assertions together with the "no forged workflow command" oracle.
+
+The fence oracle is structural rather than a parity count, so an **even** number of smuggled
+fences is caught too. It walks the rendered lines with a CommonMark-shaped toggle — a close may be
+indented up to three spaces, may be longer than the opener and may carry trailing spaces — and
+fails if the walk ends inside a fence *or* if a payload sentinel is rendered outside one. The
+fixture supplies the geometry that matters: an unchanged five-backtick line in a lock file reaches
+the summary as a space-prefixed diff **context** line, which really would close the guard's block
+were it not sanitized.
+
+The suite needs only `git` — no SDK, no network — and CI runs it **before** the real check.
+
+### Job posture and promotion
+
+The job is an ordinary `pull_request`/`push` job with a **read-only** `GITHUB_TOKEN` and
+`permissions: contents: read`. It never pushes and never auto-commits a fix — an earlier
+`pull_request_target` autofix design was rejected in review for running PR-controlled MSBuild
+under a write token. Remediation is a local command:
+
+```bash
+dotnet restore DeltaSharp.sln --force-evaluate
+git add -- ':(glob,top)**/packages.lock.json'
+git commit -s -m 'deps: regenerate NuGet lock files'
+```
+
+`lockfile-guard` is **advisory until promoted**: a status check can only be added to branch
+protection **after it has first run on `main`**, so it is wired into the required set in a
+follow-up once it has executed there — the same post-merge promotion used for `coverage`
+(#456) and the security scans (#461). It carries no `paths:` filter so it always reports a
+status, which is a precondition for that promotion.
+
+---
+
 ## Local command summary
 
 ```bash
@@ -448,6 +611,7 @@ dotnet format                        # Gate 2: fix formatting (remediation)
 dotnet format --verify-no-changes    # Gate 2: the CI check
 dotnet test -c Release --collect:"XPlat Code Coverage" --settings coverlet.runsettings --results-directory TestResults
 python3 tools/coverage/coverage-gate.py --results-dir TestResults   # Gate 3: coverage floor
+dotnet restore DeltaSharp.sln --force-evaluate && tools/ci/lockfile-guard.sh   # Gate 4: lockfile pinning
 ```
 
 ## References
@@ -461,7 +625,9 @@ python3 tools/coverage/coverage-gate.py --results-dir TestResults   # Gate 3: co
 - [04a — Unit testing checklist](../checklists/04a-unit-testing-checklist.md)
 - [08 — Performance checklist](../checklists/08-performance-checklist.md)
 - [`.github/workflows/ci.yml`](../../../.github/workflows/ci.yml) ·
+  [`.github/workflows/nuget-lockfile-guard.yml`](../../../.github/workflows/nuget-lockfile-guard.yml) ·
   [`Directory.Build.props`](../../../Directory.Build.props) ·
   [`.editorconfig`](../../../.editorconfig) ·
   [`coverlet.runsettings`](../../../coverlet.runsettings) ·
-  [`tools/coverage/`](../../../tools/coverage/)
+  [`tools/coverage/`](../../../tools/coverage/) ·
+  [`tools/ci/lockfile-guard.sh`](../../../tools/ci/lockfile-guard.sh)

@@ -1,0 +1,18 @@
+# Expected NuGet lock files (issue #831).
+#
+# Every `packages.lock.json` that MUST stay tracked, one path per line, sorted
+# (LC_ALL=C). tools/ci/lockfile-guard.sh asserts this list matches the tracked
+# set exactly, so a pull request cannot turn the required `lockfile-guard` check
+# green by DELETING the pinning it guards (or hiding it behind .gitignore).
+#
+# When a project legitimately gains or loses a lock file, update this file in
+# the same pull request — the change is then visible in review.
+#
+# Blank lines and `#` comments are ignored.
+src/DeltaSharp.Engine/packages.lock.json
+src/DeltaSharp.Storage/packages.lock.json
+tests/DeltaSharp.Abstractions.Tests/packages.lock.json
+tests/DeltaSharp.Core.Tests/packages.lock.json
+tests/DeltaSharp.Engine.Tests/packages.lock.json
+tests/DeltaSharp.Executor.Tests/packages.lock.json
+tests/DeltaSharp.Storage.Tests/packages.lock.json
